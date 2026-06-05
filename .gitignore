@@ -1,0 +1,18 @@
+/target/
+
+# Local environment files
+.env
+.env.*
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+
+# Local development files
+.vscode/
+.idea/
+
+# Local secrets
+*.pem
+*.crt
+*.key

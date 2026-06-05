@@ -1,0 +1,19 @@
+# tangle - code directives
+
+- this repo owns the `tangle` Nostr relay, including protocol handling, event validation, session admission, rate limiting, storage, indexing or projection boundaries, subscription fanout, group policy, relay-generated state, and relay-owned signing when explicitly part of the relay contract
+- do not make this repo responsible for user private-key custody, client-side signing, signer approval UX, remote-signer session control, wallet flows, account key management, platform-wide artifacts, publication, promotion, or deployment transport unless an approved spec assigns that responsibility here
+- product behavior should follow approved relay specs and repo-local adopted decisions when they conflict with legacy implementation details
+- prefer the smallest coherent change that fully addresses the request; do not mix unrelated cleanup, speculative refactors, compatibility scaffolding, or roadmap work into the same change
+- inspect the relevant implementation, tests, manifests, specs, and docs before changing behavior
+- do not invent requirements, APIs, dependencies, release processes, or external integration behavior
+- do not depend on private repositories, unpublished artifacts, local machine layouts, absolute paths, or internal monorepo context
+- treat protocol correctness, admission control, tenancy boundaries, privacy, and abuse resistance as core architecture concerns
+- keep relay-owned state explicit and separate from client-owned identity, signer-owned approval, and wallet-owned flows
+- prefer typed protocol, policy, storage, and fanout models over stringly state or implicit mode switches
+- never log relay secrets, private-group event content, invite codes, private group identifiers, or similarly sensitive material at production log levels
+- avoid hidden production panics; use typed errors for expected failure modes
+- avoid `unsafe` unless it is strictly necessary, locally justified, and documented with nearby invariants
+- validate behavior changes with tests that cover protocol edge cases, authorization boundaries, persistence effects, and subscription behavior where relevant
+- use checked-in, repo-owned validation first; run the smallest documented validation that credibly covers the change
+- if validation cannot run, report exactly what was skipped and why; never claim validation passed unless it actually ran
+- keep commits focused and reviewable, using `<scope>: <imperative summary>` unless a repo convention overrides it
