@@ -1,0 +1,6 @@
+[profile.default]
+fail-fast = false
+failure-output = "immediate"
+final-status-level = "slow"
+retries = 0
+status-level = "fail"

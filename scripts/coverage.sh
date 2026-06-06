@@ -7,4 +7,4 @@ if ! cargo llvm-cov --version >/dev/null 2>&1; then
 fi
 
 cargo llvm-cov clean --workspace
-cargo llvm-cov --workspace --all-targets
+cargo llvm-cov --workspace --all-targets --fail-under-lines 100
