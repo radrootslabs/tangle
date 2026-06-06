@@ -282,6 +282,7 @@ pub fn base_migration_plan() -> SurrealMigrationPlan {
         raw_event_schema(),
         event_tag_index_schema(),
         current_event_schema(),
+        deletion_marker_schema(),
     ])
     .expect("base migration plan is strictly ordered")
 }
@@ -359,6 +360,23 @@ DEFINE INDEX IF NOT EXISTS event_current_event ON TABLE event_current COLUMNS ev
 "#,
     )
     .expect("current event schema is valid")
+}
+
+pub fn deletion_marker_schema() -> SurrealMigration {
+    SurrealMigration::new(
+        "0005_deletion_marker",
+        r#"
+DEFINE TABLE IF NOT EXISTS deletion_marker SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS deletion_event_id ON TABLE deletion_marker TYPE string;
+DEFINE FIELD IF NOT EXISTS target_type ON TABLE deletion_marker TYPE string;
+DEFINE FIELD IF NOT EXISTS target_ref ON TABLE deletion_marker TYPE string;
+DEFINE FIELD IF NOT EXISTS author_pubkey ON TABLE deletion_marker TYPE string;
+DEFINE FIELD IF NOT EXISTS deletion_created_at ON TABLE deletion_marker TYPE int;
+DEFINE INDEX IF NOT EXISTS deletion_target ON TABLE deletion_marker COLUMNS target_type, target_ref, deletion_created_at;
+DEFINE INDEX IF NOT EXISTS deletion_author_target ON TABLE deletion_marker COLUMNS author_pubkey, target_type, target_ref;
+"#,
+    )
+    .expect("deletion marker schema is valid")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -889,6 +907,31 @@ mod tests {
             "event_current_address_uid",
             "event_current_kind_pubkey",
             "event_current_event",
+        ] {
+            assert!(info.contains(expected), "missing {expected} in {info}");
+        }
+    }
+
+    #[tokio::test]
+    async fn deletion_marker_schema_defines_author_scoped_target_table() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let info = store
+            .table_info("deletion_marker")
+            .await
+            .expect("table info");
+
+        for expected in [
+            "deletion_event_id",
+            "target_type",
+            "target_ref",
+            "author_pubkey",
+            "deletion_created_at",
+            "deletion_target",
+            "deletion_author_target",
         ] {
             assert!(info.contains(expected), "missing {expected} in {info}");
         }
