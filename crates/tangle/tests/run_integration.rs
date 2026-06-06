@@ -64,6 +64,7 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
     let thread_comment = forum_thread_comment(&thread, 1_714_124_439, "I can bring greens.");
     let label = listing_label(&listing, 1_714_124_440, "reviewed");
     let report = listing_report(&listing, 1_714_124_441, "spam");
+    let profile = seller_profile(1_714_124_442);
     let auth = build_fixture_event(&auth_event_spec()).expect("auth");
     let seller = FixtureKey::Seller.public_key();
 
@@ -122,6 +123,29 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
         .await
         .expect("auth send");
     assert_ok(&next_json(&mut publisher).await, true);
+
+    publisher
+        .send(Message::Text(
+            serde_json::json!(["EVENT", event_to_value(&profile)])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("profile send");
+    assert_ok(&next_json(&mut publisher).await, true);
+    publisher
+        .send(Message::Text(
+            serde_json::json!(["REQ", "sub-profile", { "ids": [profile.id().as_str()] }])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("profile fetch send");
+    let fetched_profile = next_json(&mut publisher).await;
+    assert_eq!(fetched_profile[0], "EVENT");
+    assert_eq!(fetched_profile[1], "sub-profile");
+    assert_eq!(fetched_profile[2]["id"], profile.id().as_str());
+    assert_eq!(next_label(&mut publisher).await, "EOSE");
 
     publisher
         .send(Message::Text(
@@ -376,6 +400,9 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
     let seller_detail = http_get(port, &format!("/api/sellers/{}", seller.as_str()));
     assert!(seller_detail.contains("200 OK"));
     assert!(seller_detail.contains(seller.as_str()));
+    assert!(seller_detail.contains(profile.id().as_str()));
+    assert!(seller_detail.contains("\"display_name\":\"Radroots Market\""));
+    assert!(seller_detail.contains("\"regions\":[\"cascadia\",\"pnw\"]"));
 
     stop_relay(relay);
 
@@ -397,6 +424,30 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
             .await
             .expect("auth raw row")
             .is_none()
+    );
+    assert!(
+        store
+            .raw_event_row(profile.id())
+            .await
+            .expect("profile raw row")
+            .is_some()
+    );
+    let profile_row = store
+        .seller_profile_row(seller.as_str())
+        .await
+        .expect("profile row")
+        .expect("profile row exists");
+    assert_eq!(profile_row["event_id"], profile.id().as_str());
+    assert_eq!(profile_row["name"], "radroots-market");
+    assert_eq!(profile_row["display_name"], "Radroots Market");
+    assert_eq!(
+        profile_row["regions"],
+        serde_json::json!(["cascadia", "pnw"])
+    );
+    assert_eq!(profile_row["categories"], serde_json::json!(["produce"]));
+    assert_eq!(
+        profile_row["trust_markers"],
+        serde_json::json!(["csa", "regenerative"])
     );
     assert!(
         store
@@ -1044,6 +1095,32 @@ async fn next_label(
 fn assert_ok(message: &Value, accepted: bool) {
     assert_eq!(message[0], "OK");
     assert_eq!(message[2], accepted, "relay OK frame: {message}");
+}
+
+fn seller_profile(created_at: u64) -> tangle_protocol::Event {
+    let content = serde_json::json!({
+        "name": "radroots-market",
+        "display_name": "Radroots Market",
+        "about": "Local food seller profile",
+        "picture": "https://fixtures.radroots.test/seller.png",
+        "website": "https://seller.radroots.test",
+        "nip05": "seller@radroots.test",
+        "lud16": "seller@pay.radroots.test"
+    });
+    build_fixture_event_from_parts(
+        FixtureKey::Seller,
+        created_at,
+        0,
+        vec![
+            vec!["region".to_owned(), "PNW".to_owned()],
+            vec!["region".to_owned(), "Cascadia".to_owned()],
+            vec!["category".to_owned(), "Produce".to_owned()],
+            vec!["trust".to_owned(), "CSA".to_owned()],
+            vec!["trust".to_owned(), "regenerative".to_owned()],
+        ],
+        &content.to_string(),
+    )
+    .expect("seller profile")
 }
 
 fn listing_comment(

@@ -39,7 +39,8 @@ use tangle_store_surreal::{
     ForumThreadProjectionOutcome, ForumThreadProjectionQuery, LabelProjectionOutcome,
     LabelProjectionQuery, ListingProjectionQuery, LongFormProjectionOutcome, MigrationApplyOutcome,
     ReactionProjectionOutcome, ReportProjectionOutcome, ReportProjectionQuery, SearchDocumentQuery,
-    SurrealConnectionConfig, SurrealConnectionMode, SurrealStore, base_migration_plan,
+    SellerProfileProjectionOutcome, SurrealConnectionConfig, SurrealConnectionMode, SurrealStore,
+    base_migration_plan,
 };
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -626,6 +627,13 @@ async fn project_stored_event(
         Ok(ReportProjectionOutcome::NotReport | ReportProjectionOutcome::Ineligible) => false,
         Err(_) => return Err(RuntimeCommandError::store("event projection failed")),
     };
+    let seller_profile_projected = match store.project_seller_profile(event, now).await {
+        Ok(SellerProfileProjectionOutcome::Projected) => true,
+        Ok(
+            SellerProfileProjectionOutcome::NotProfile | SellerProfileProjectionOutcome::Ineligible,
+        ) => false,
+        Err(_) => return Err(RuntimeCommandError::store("event projection failed")),
+    };
     if effect == AdmissionEffect::StoreRawAndProjectPublicListing {
         if store.project_current_listing(event, now).await.is_err()
             || store.project_listing_helpers(event).await.is_err()
@@ -640,7 +648,8 @@ async fn project_stored_event(
         || long_form_projected
         || forum_thread_projected
         || label_projected
-        || report_projected)
+        || report_projected
+        || seller_profile_projected)
 }
 
 fn parse_event_import_document(raw: &str) -> Result<Vec<Event>, RuntimeCommandError> {
@@ -2049,6 +2058,11 @@ impl EventMessageHandler {
             || self.store.project_forum_thread(&event, now).await.is_err()
             || self.store.project_label(&event, now).await.is_err()
             || self.store.project_report(&event, now).await.is_err()
+            || self
+                .store
+                .project_seller_profile(&event, now)
+                .await
+                .is_err()
         {
             return ok_rejected(event_id, "error: projection failed".to_owned());
         }
@@ -2767,6 +2781,17 @@ pub struct ForumThreadDetailDocument {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SellerDocument {
     pub pubkey: String,
+    pub event_id: Option<String>,
+    pub name: Option<String>,
+    pub display_name: Option<String>,
+    pub about: Option<String>,
+    pub picture: Option<String>,
+    pub website: Option<String>,
+    pub nip05: Option<String>,
+    pub lud16: Option<String>,
+    pub regions: Vec<String>,
+    pub categories: Vec<String>,
+    pub trust_markers: Vec<String>,
     pub approved: bool,
     pub blocked: bool,
     pub active_listing_count: u64,
@@ -3324,6 +3349,15 @@ async fn seller_detail(
         .relay_user_row(pubkey.as_str())
         .await
         .map_err(|_| ApiError::internal())?;
+    let profile = state
+        .store
+        .seller_profile_row(pubkey.as_str())
+        .await
+        .map_err(|_| ApiError::internal())?;
+    let visible_profile = match profile.as_ref() {
+        Some(row) if !bool_field(row, "hidden")? && !bool_field(row, "deleted")? => Some(row),
+        _ => None,
+    };
     let listings = state
         .store
         .query_current_listings(
@@ -3335,15 +3369,68 @@ async fn seller_detail(
         .map_err(|_| ApiError::internal())?;
     Ok(Json(SellerDocument {
         pubkey: pubkey.as_str().to_owned(),
+        event_id: visible_profile
+            .map(|row| string_field(row, "event_id"))
+            .transpose()?,
+        name: visible_profile
+            .map(|row| optional_string_field(row, "name"))
+            .transpose()?
+            .flatten(),
+        display_name: visible_profile
+            .map(|row| optional_string_field(row, "display_name"))
+            .transpose()?
+            .flatten(),
+        about: visible_profile
+            .map(|row| optional_string_field(row, "about"))
+            .transpose()?
+            .flatten(),
+        picture: visible_profile
+            .map(|row| optional_string_field(row, "picture"))
+            .transpose()?
+            .flatten(),
+        website: visible_profile
+            .map(|row| optional_string_field(row, "website"))
+            .transpose()?
+            .flatten(),
+        nip05: visible_profile
+            .map(|row| optional_string_field(row, "nip05"))
+            .transpose()?
+            .flatten(),
+        lud16: visible_profile
+            .map(|row| optional_string_field(row, "lud16"))
+            .transpose()?
+            .flatten(),
+        regions: visible_profile
+            .map(|row| string_array_field(row, "regions"))
+            .transpose()?
+            .unwrap_or_default(),
+        categories: visible_profile
+            .map(|row| string_array_field(row, "categories"))
+            .transpose()?
+            .unwrap_or_default(),
+        trust_markers: visible_profile
+            .map(|row| string_array_field(row, "trust_markers"))
+            .transpose()?
+            .unwrap_or_default(),
         approved: seller
             .as_ref()
             .and_then(|row| row.get("seller_approved"))
             .and_then(serde_json::Value::as_bool)
+            .or_else(|| {
+                visible_profile
+                    .and_then(|row| row.get("seller_approved"))
+                    .and_then(serde_json::Value::as_bool)
+            })
             .unwrap_or(false),
         blocked: seller
             .as_ref()
             .and_then(|row| row.get("blocked"))
             .and_then(serde_json::Value::as_bool)
+            .or_else(|| {
+                visible_profile
+                    .and_then(|row| row.get("blocked"))
+                    .and_then(serde_json::Value::as_bool)
+            })
             .unwrap_or(false),
         active_listing_count: listings.len() as u64,
     }))
@@ -4126,7 +4213,9 @@ mod tests {
         AdmissionPolicy, EventValidator, MarketplaceListingStatus, MarketplaceSort,
         NostrFilterCompiler, RateLimitConfig, RuntimeLimits,
     };
-    use tangle_nips::{FulfillmentMethod, ListingUnit, parse_relay_auth_event};
+    use tangle_nips::{
+        FulfillmentMethod, ListingUnit, NIP01_METADATA_KIND, parse_relay_auth_event,
+    };
     use tangle_protocol::{
         ClientMessage, EventId, PublicKeyHex, RelayMessage, SubscriptionId, UnixTimestamp,
         event_to_value, filter_from_value,
@@ -6494,8 +6583,20 @@ mod tests {
     async fn seller_endpoint_returns_policy_state_and_active_listing_count() {
         let store = runtime_memory_store().await;
         let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let profile = seller_profile(1_714_125_300, "radroots-market", Some("Radroots Market"));
         let seller = listing.unsigned().pubkey().as_str().to_owned();
         let listing_key = format!("30402:{seller}:listing-a");
+        store
+            .store_raw_event(&StoredEvent::new(
+                profile.clone(),
+                UnixTimestamp::new(1_714_125_301),
+            ))
+            .await
+            .expect("store profile");
+        store
+            .project_seller_profile(&profile, UnixTimestamp::new(1_714_125_302))
+            .await
+            .expect("project profile");
         store
             .project_current_listing(&listing, UnixTimestamp::new(1_714_125_400))
             .await
@@ -6525,6 +6626,17 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
             serde_json::json!({
                 "pubkey": seller,
+                "event_id": profile.id().as_str(),
+                "name": "radroots-market",
+                "display_name": "Radroots Market",
+                "about": "Local food seller profile",
+                "picture": "https://fixtures.radroots.test/seller.png",
+                "website": "https://seller.radroots.test",
+                "nip05": "seller@radroots.test",
+                "lud16": "seller@pay.radroots.test",
+                "regions": ["cascadia", "pnw"],
+                "categories": ["produce"],
+                "trust_markers": ["csa", "regenerative"],
                 "approved": true,
                 "blocked": false,
                 "active_listing_count": 1
@@ -6539,6 +6651,38 @@ mod tests {
             .expect("hide listing")
             .check()
             .expect("hide check");
+        let response = listings_router(ListingsHttpState::new(
+            store.clone(),
+            RuntimeLimits::default(),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/sellers/{seller}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json")["active_listing_count"],
+            0
+        );
+
+        let admin_pubkey = "a".repeat(PublicKeyHex::HEX_LENGTH);
+        store
+            .hide_event(
+                profile.id(),
+                "profile moderation",
+                "admin_api",
+                admin_pubkey.as_str(),
+                UnixTimestamp::new(1_714_125_600),
+            )
+            .await
+            .expect("hide profile");
         let response = listings_router(ListingsHttpState::new(store, RuntimeLimits::default()))
             .oneshot(
                 Request::builder()
@@ -6552,10 +6696,11 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body");
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&body).expect("json")["active_listing_count"],
-            0
-        );
+        let document = serde_json::from_slice::<serde_json::Value>(&body).expect("json");
+        assert!(document["event_id"].is_null());
+        assert!(document["name"].is_null());
+        assert_eq!(document["regions"], serde_json::json!([]));
+        assert_eq!(document["approved"], true);
     }
 
     #[tokio::test]
@@ -6582,6 +6727,17 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
             serde_json::json!({
                 "pubkey": missing,
+                "event_id": null,
+                "name": null,
+                "display_name": null,
+                "about": null,
+                "picture": null,
+                "website": null,
+                "nip05": null,
+                "lud16": null,
+                "regions": [],
+                "categories": [],
+                "trust_markers": [],
                 "approved": false,
                 "blocked": false,
                 "active_listing_count": 0
@@ -6611,6 +6767,38 @@ mod tests {
             .await
             .expect("apply plan");
         store
+    }
+
+    fn seller_profile(
+        created_at: u64,
+        name: &str,
+        display_name: Option<&str>,
+    ) -> tangle_protocol::Event {
+        let mut content = serde_json::json!({
+            "name": name,
+            "about": "Local food seller profile",
+            "picture": "https://fixtures.radroots.test/seller.png",
+            "website": "https://seller.radroots.test",
+            "nip05": "seller@radroots.test",
+            "lud16": "seller@pay.radroots.test"
+        });
+        if let Some(display_name) = display_name {
+            content["display_name"] = serde_json::Value::String(display_name.to_owned());
+        }
+        build_fixture_event_from_parts(
+            FixtureKey::Seller,
+            created_at,
+            u64::from(NIP01_METADATA_KIND),
+            vec![
+                vec!["region".to_owned(), "PNW".to_owned()],
+                vec!["region".to_owned(), "Cascadia".to_owned()],
+                vec!["category".to_owned(), "Produce".to_owned()],
+                vec!["trust".to_owned(), "CSA".to_owned()],
+                vec!["trust".to_owned(), "regenerative".to_owned()],
+            ],
+            &content.to_string(),
+        )
+        .expect("seller profile")
     }
 
     fn listing_comment(
