@@ -850,16 +850,16 @@ impl SurrealStore {
         &self,
         migration: &SurrealMigration,
     ) -> Result<MigrationApplyOutcome, SurrealStoreError> {
-        if self.has_migration_table().await? {
-            if let Some(applied) = self.applied_migration(migration.name()).await? {
-                if applied.checksum() == migration.checksum() {
-                    return Ok(MigrationApplyOutcome::AlreadyApplied);
-                }
-                return Err(SurrealStoreError::new(&format!(
-                    "surreal migration `{}` checksum changed",
-                    migration.name()
-                )));
+        if self.has_migration_table().await?
+            && let Some(applied) = self.applied_migration(migration.name()).await?
+        {
+            if applied.checksum() == migration.checksum() {
+                return Ok(MigrationApplyOutcome::AlreadyApplied);
             }
+            return Err(SurrealStoreError::new(&format!(
+                "surreal migration `{}` checksum changed",
+                migration.name()
+            )));
         }
         self.db
             .query(migration.surql())
@@ -887,7 +887,7 @@ impl SurrealStore {
         let checksums: Vec<String> = response.take(1).map_err(SurrealStoreError::from)?;
         Ok(names
             .into_iter()
-            .zip(checksums.into_iter())
+            .zip(checksums)
             .map(|(name, checksum)| AppliedMigration { name, checksum })
             .collect())
     }
@@ -1635,14 +1635,17 @@ UPSERT type::record('listing_current', $listing_key) CONTENT {
             .to_owned();
         let updated_at = event.unsigned().created_at().as_u64();
         let event_id = event.id().as_str();
+        let helper_context = ListingHelperProjectionContext {
+            listing_key: &listing_key,
+            effective_status: &effective_status,
+            updated_at,
+            event_id,
+        };
         self.replace_listing_helper_rows(
             "listing_category",
             "category",
-            &listing_key,
             projection.taxonomy().categories(),
-            &effective_status,
-            updated_at,
-            event_id,
+            &helper_context,
         )
         .await?;
         let fulfillment = projection
@@ -1654,41 +1657,29 @@ UPSERT type::record('listing_current', $listing_key) CONTENT {
         self.replace_listing_helper_rows(
             "listing_fulfillment",
             "mode",
-            &listing_key,
             &fulfillment,
-            &effective_status,
-            updated_at,
-            event_id,
+            &helper_context,
         )
         .await?;
         self.replace_listing_helper_rows(
             "listing_tag",
             "tag_value",
-            &listing_key,
             projection.taxonomy().topics(),
-            &effective_status,
-            updated_at,
-            event_id,
+            &helper_context,
         )
         .await?;
         self.replace_listing_helper_rows(
             "listing_practice",
             "practice",
-            &listing_key,
             projection.taxonomy().practices(),
-            &effective_status,
-            updated_at,
-            event_id,
+            &helper_context,
         )
         .await?;
         self.replace_listing_helper_rows(
             "listing_certification",
             "certification",
-            &listing_key,
             projection.taxonomy().certifications(),
-            &effective_status,
-            updated_at,
-            event_id,
+            &helper_context,
         )
         .await?;
         Ok(ListingHelperOutcome::Projected)
@@ -1885,16 +1876,13 @@ UPSERT type::record('search_doc', $doc_key) CONTENT {
         &self,
         table: &str,
         field: &str,
-        listing_key: &str,
         values: &[String],
-        effective_status: &str,
-        updated_at: u64,
-        event_id: &str,
+        context: &ListingHelperProjectionContext<'_>,
     ) -> Result<(), SurrealStoreError> {
         let delete_query = format!("DELETE {table} WHERE listing_key = $listing_key;");
         self.db
             .query(delete_query)
-            .bind(("listing_key", listing_key))
+            .bind(("listing_key", context.listing_key))
             .await
             .map_err(SurrealStoreError::from)?
             .check()
@@ -1905,11 +1893,11 @@ UPSERT type::record('search_doc', $doc_key) CONTENT {
         for value in values {
             self.db
                 .query(create_query.as_str())
-                .bind(("listing_key", listing_key))
+                .bind(("listing_key", context.listing_key))
                 .bind(("value", value.as_str()))
-                .bind(("effective_status", effective_status))
-                .bind(("updated_at", updated_at))
-                .bind(("event_id", event_id))
+                .bind(("effective_status", context.effective_status))
+                .bind(("updated_at", context.updated_at))
+                .bind(("event_id", context.event_id))
                 .await
                 .map_err(SurrealStoreError::from)?
                 .check()
@@ -2208,6 +2196,13 @@ struct ListingCurrentFields {
     delivery_available: bool,
     shipping_available: bool,
     delivery_only: bool,
+}
+
+struct ListingHelperProjectionContext<'a> {
+    listing_key: &'a str,
+    effective_status: &'a str,
+    updated_at: u64,
+    event_id: &'a str,
 }
 
 struct SearchDocumentFields {
