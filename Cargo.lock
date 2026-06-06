@@ -3926,8 +3926,12 @@ dependencies = [
  "http",
  "serde",
  "serde_json",
+ "tangle_core",
+ "tangle_nips",
+ "tangle_protocol",
  "tokio",
  "tower",
+ "url",
 ]
 
 [[package]]

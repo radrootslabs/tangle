@@ -9,6 +9,13 @@ use axum::{
 use core::fmt;
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use serde::{Deserialize, Serialize};
+use tangle_core::{
+    MarketplaceListingStatus, MarketplaceQuery, MarketplaceQueryError, MarketplaceQuerySpec,
+    MarketplaceSort, RuntimeLimits,
+};
+use tangle_nips::{FulfillmentMethod, ListingUnit};
+use tangle_protocol::PublicKeyHex;
+use url::form_urlencoded;
 
 pub const TANGLE_SUPPORTED_NIPS: [u16; 8] = [1, 9, 11, 16, 33, 42, 50, 99];
 pub const TANGLE_RELAY_SOFTWARE: &str = "https://github.com/radrootslabs/tangle";
@@ -270,6 +277,109 @@ pub struct RelayInfoLimitationDocument {
     pub restricted_writes: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListingHttpQuery {
+    marketplace: MarketplaceQuery,
+    geohash: Option<String>,
+}
+
+impl ListingHttpQuery {
+    pub fn marketplace(&self) -> &MarketplaceQuery {
+        &self.marketplace
+    }
+
+    pub fn geohash(&self) -> Option<&str> {
+        self.geohash.as_deref()
+    }
+}
+
+pub fn parse_listing_query(
+    query: &str,
+    limits: RuntimeLimits,
+) -> Result<ListingHttpQuery, ApiError> {
+    let mut spec = MarketplaceQuerySpec {
+        statuses: vec![MarketplaceListingStatus::Active],
+        ..MarketplaceQuerySpec::default()
+    };
+    let mut geohash = None;
+    let mut saw_status = false;
+    let mut saw_sort = false;
+    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+        let value = value.into_owned();
+        match key.as_ref() {
+            "category" => push_text_values("category", &value, &mut spec.categories)?,
+            "seller" => set_once("seller", &mut spec.seller, parse_pubkey("seller", &value)?)?,
+            "status" => {
+                if !saw_status {
+                    spec.statuses.clear();
+                    saw_status = true;
+                }
+                push_status_values(&value, &mut spec.statuses)?;
+            }
+            "currency" => push_text_values("currency", &value, &mut spec.currencies)?,
+            "unit" => push_unit_values(&value, &mut spec.units)?,
+            "min_price" => set_once(
+                "min_price",
+                &mut spec.min_price,
+                required_value("min_price", &value)?,
+            )?,
+            "max_price" => set_once(
+                "max_price",
+                &mut spec.max_price,
+                required_value("max_price", &value)?,
+            )?,
+            "fulfillment" => push_fulfillment_values(&value, &mut spec.fulfillment)?,
+            "delivery_only" => set_once(
+                "delivery_only",
+                &mut spec.delivery_only,
+                parse_bool("delivery_only", &value)?,
+            )?,
+            "pickup" => set_once("pickup", &mut spec.pickup, parse_bool("pickup", &value)?)?,
+            "geohash" => set_once("geohash", &mut geohash, parse_geohash_query_value(&value)?)?,
+            "lat" => set_once(
+                "lat",
+                &mut spec.latitude_microdegrees,
+                parse_microdegrees("lat", &value, -90_000_000, 90_000_000)?,
+            )?,
+            "lon" => set_once(
+                "lon",
+                &mut spec.longitude_microdegrees,
+                parse_microdegrees("lon", &value, -180_000_000, 180_000_000)?,
+            )?,
+            "radius_km" => set_once(
+                "radius_km",
+                &mut spec.radius_meters,
+                parse_radius_meters(&value)?,
+            )?,
+            "near" => set_once("near", &mut spec.near, required_value("near", &value)?)?,
+            "sort" => {
+                if saw_sort {
+                    return Err(invalid_parameter("sort", "must not be repeated"));
+                }
+                saw_sort = true;
+                spec.sort = parse_sort(&value)?;
+            }
+            "limit" => set_once("limit", &mut spec.limit, parse_limit(&value)?)?,
+            "cursor" => {
+                return Err(invalid_parameter(
+                    "cursor",
+                    "signed cursor decoding is not implemented",
+                ));
+            }
+            unsupported => {
+                return Err(ApiError::invalid_request(format!(
+                    "query parameter `{unsupported}` is unsupported"
+                )));
+            }
+        }
+    }
+    let marketplace = MarketplaceQuery::from_spec(spec, limits).map_err(ApiError::from)?;
+    Ok(ListingHttpQuery {
+        marketplace,
+        geohash,
+    })
+}
+
 pub fn health_router(readiness: ReadinessState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -328,15 +438,240 @@ fn accepts_nostr_json(value: Option<&HeaderValue>) -> bool {
         })
 }
 
+impl From<MarketplaceQueryError> for ApiError {
+    fn from(error: MarketplaceQueryError) -> Self {
+        Self::invalid_request(error.message())
+    }
+}
+
+fn set_once<T>(field: &'static str, target: &mut Option<T>, value: T) -> Result<(), ApiError> {
+    if target.replace(value).is_some() {
+        return Err(invalid_parameter(field, "must not be repeated"));
+    }
+    Ok(())
+}
+
+fn push_text_values(
+    field: &'static str,
+    value: &str,
+    target: &mut Vec<String>,
+) -> Result<(), ApiError> {
+    for value in split_query_list(field, value)? {
+        target.push(value);
+    }
+    Ok(())
+}
+
+fn push_status_values(
+    value: &str,
+    target: &mut Vec<MarketplaceListingStatus>,
+) -> Result<(), ApiError> {
+    for value in split_query_list("status", value)? {
+        target.push(parse_status(&value)?);
+    }
+    Ok(())
+}
+
+fn push_unit_values(value: &str, target: &mut Vec<ListingUnit>) -> Result<(), ApiError> {
+    for value in split_query_list("unit", value)? {
+        target.push(parse_unit(&value)?);
+    }
+    Ok(())
+}
+
+fn push_fulfillment_values(
+    value: &str,
+    target: &mut Vec<FulfillmentMethod>,
+) -> Result<(), ApiError> {
+    for value in split_query_list("fulfillment", value)? {
+        target.push(parse_fulfillment(&value)?);
+    }
+    Ok(())
+}
+
+fn split_query_list(field: &'static str, value: &str) -> Result<Vec<String>, ApiError> {
+    value
+        .split(',')
+        .map(|value| required_value(field, value))
+        .collect()
+}
+
+fn required_value(field: &'static str, value: &str) -> Result<String, ApiError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(invalid_parameter(field, "must not be empty"));
+    }
+    Ok(value.to_owned())
+}
+
+fn parse_pubkey(field: &'static str, value: &str) -> Result<PublicKeyHex, ApiError> {
+    let value = required_value(field, value)?;
+    PublicKeyHex::new(&value)
+        .map_err(|_| invalid_parameter(field, "must be a 64-character hex public key"))
+}
+
+fn parse_status(value: &str) -> Result<MarketplaceListingStatus, ApiError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "active" => Ok(MarketplaceListingStatus::Active),
+        "sold" => Ok(MarketplaceListingStatus::Sold),
+        "draft" => Ok(MarketplaceListingStatus::Draft),
+        "inactive" => Ok(MarketplaceListingStatus::Inactive),
+        "expired" => Ok(MarketplaceListingStatus::Expired),
+        "deleted" => Ok(MarketplaceListingStatus::Deleted),
+        "hidden" => Ok(MarketplaceListingStatus::Hidden),
+        "rejected" => Ok(MarketplaceListingStatus::Rejected),
+        _ => Err(invalid_parameter("status", "is unsupported")),
+    }
+}
+
+fn parse_sort(value: &str) -> Result<MarketplaceSort, ApiError> {
+    match required_value("sort", value)?.to_ascii_lowercase().as_str() {
+        "relevance" => Ok(MarketplaceSort::Relevance),
+        "freshness" => Ok(MarketplaceSort::Freshness),
+        "price_asc" => Ok(MarketplaceSort::PriceAsc),
+        "price_desc" => Ok(MarketplaceSort::PriceDesc),
+        "distance" => Ok(MarketplaceSort::Distance),
+        "seller_trust" => Ok(MarketplaceSort::SellerTrust),
+        _ => Err(invalid_parameter("sort", "is unsupported")),
+    }
+}
+
+fn parse_unit(value: &str) -> Result<ListingUnit, ApiError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "lb" | "lbs" | "pound" | "pounds" => Ok(ListingUnit::Lb),
+        "oz" | "ounce" | "ounces" => Ok(ListingUnit::Oz),
+        "each" | "ea" => Ok(ListingUnit::Each),
+        "bunch" | "bunches" => Ok(ListingUnit::Bunch),
+        "dozen" => Ok(ListingUnit::Dozen),
+        "kg" | "kilogram" | "kilograms" => Ok(ListingUnit::Kg),
+        "g" | "gram" | "grams" => Ok(ListingUnit::G),
+        "share" | "shares" => Ok(ListingUnit::Share),
+        "pint" | "pints" => Ok(ListingUnit::Pint),
+        "quart" | "quarts" => Ok(ListingUnit::Quart),
+        "box" | "boxes" => Ok(ListingUnit::Box),
+        "crate" | "crates" => Ok(ListingUnit::Crate),
+        "flat" | "flats" => Ok(ListingUnit::Flat),
+        _ => Err(invalid_parameter("unit", "is unsupported")),
+    }
+}
+
+fn parse_fulfillment(value: &str) -> Result<FulfillmentMethod, ApiError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "pickup" => Ok(FulfillmentMethod::Pickup),
+        "delivery" => Ok(FulfillmentMethod::Delivery),
+        "shipping" => Ok(FulfillmentMethod::Shipping),
+        _ => Err(invalid_parameter("fulfillment", "is unsupported")),
+    }
+}
+
+fn parse_bool(field: &'static str, value: &str) -> Result<bool, ApiError> {
+    match required_value(field, value)?.to_ascii_lowercase().as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(invalid_parameter(field, "must be true or false")),
+    }
+}
+
+fn parse_geohash_query_value(value: &str) -> Result<String, ApiError> {
+    let value = required_value("geohash", value)?.to_ascii_lowercase();
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    {
+        Ok(value)
+    } else {
+        Err(invalid_parameter(
+            "geohash",
+            "must be lowercase alphanumeric",
+        ))
+    }
+}
+
+fn parse_microdegrees(
+    field: &'static str,
+    value: &str,
+    min: i64,
+    max: i64,
+) -> Result<i32, ApiError> {
+    let value = required_value(field, value)?;
+    let (negative, value) = match value.as_bytes().first() {
+        Some(b'-') => (true, &value[1..]),
+        Some(b'+') => (false, &value[1..]),
+        _ => (false, value.as_str()),
+    };
+    let unsigned = parse_unsigned_decimal_scaled(field, value, 6)? as i64;
+    let signed = if negative { -unsigned } else { unsigned };
+    if !(min..=max).contains(&signed) {
+        return Err(invalid_parameter(field, "is out of range"));
+    }
+    Ok(signed as i32)
+}
+
+fn parse_radius_meters(value: &str) -> Result<u64, ApiError> {
+    let kilometers = required_value("radius_km", value)?;
+    let meters = parse_unsigned_decimal_scaled("radius_km", &kilometers, 3)?;
+    if meters == 0 {
+        return Err(invalid_parameter("radius_km", "must be greater than zero"));
+    }
+    Ok(meters)
+}
+
+fn parse_limit(value: &str) -> Result<u64, ApiError> {
+    required_value("limit", value)?
+        .parse::<u64>()
+        .map_err(|_| invalid_parameter("limit", "must be an unsigned integer"))
+}
+
+fn parse_unsigned_decimal_scaled(
+    field: &'static str,
+    value: &str,
+    scale_digits: usize,
+) -> Result<u64, ApiError> {
+    let mut parts = value.split('.');
+    let whole = parts.next().unwrap_or_default();
+    let fraction = parts.next().unwrap_or_default();
+    if parts.next().is_some()
+        || whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.len() > scale_digits
+    {
+        return Err(invalid_parameter(
+            field,
+            "must be an exact unsigned decimal",
+        ));
+    }
+    let whole = whole
+        .parse::<u64>()
+        .map_err(|_| invalid_parameter(field, "must be an exact unsigned decimal"))?;
+    let mut fraction = fraction.to_owned();
+    while fraction.len() < scale_digits {
+        fraction.push('0');
+    }
+    let fraction = fraction
+        .parse::<u64>()
+        .map_err(|_| invalid_parameter(field, "must be an exact unsigned decimal"))?;
+    whole
+        .checked_mul(10_u64.pow(scale_digits as u32))
+        .and_then(|whole| whole.checked_add(fraction))
+        .ok_or_else(|| invalid_parameter(field, "must fit the supported range"))
+}
+
+fn invalid_parameter(field: &'static str, requirement: &str) -> ApiError {
+    ApiError::invalid_request(format!("{field} {requirement}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ApiError, ApiErrorBody, ApiErrorCode, ApiErrorEnvelope, ReadinessCheckStatus,
         ReadinessState, RelayInfoDocument, TANGLE_RELAY_SOFTWARE, TANGLE_SUPPORTED_NIPS,
-        health_router, relay_info_router,
+        health_router, parse_listing_query, relay_info_router,
     };
     use axum::{body::Body, response::IntoResponse};
     use http::{HeaderValue, Request, StatusCode, header};
+    use tangle_core::{MarketplaceListingStatus, MarketplaceSort, RuntimeLimits};
+    use tangle_nips::{FulfillmentMethod, ListingUnit};
     use tower::ServiceExt;
 
     #[test]
@@ -613,5 +948,188 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn listing_query_parser_defaults_to_active_marketplace_query() {
+        let parsed = parse_listing_query("", RuntimeLimits::default()).expect("query");
+        let query = parsed.marketplace();
+
+        assert_eq!(parsed.geohash(), None);
+        assert_eq!(query.statuses, [MarketplaceListingStatus::Active]);
+        assert_eq!(query.limit, 50);
+        assert_eq!(query.sort, MarketplaceSort::Relevance);
+        assert_eq!(query.categories, Vec::<String>::new());
+        assert_eq!(query.currencies, Vec::<String>::new());
+        assert_eq!(query.units, Vec::<ListingUnit>::new());
+        assert_eq!(query.fulfillment, Vec::<FulfillmentMethod>::new());
+    }
+
+    #[test]
+    fn listing_query_parser_reads_supported_parameters() {
+        let seller = "1".repeat(64);
+        let query_string = format!(
+            "category=vegetables,csa&category=roots&seller={seller}&status=active,sold,draft,inactive,expired,deleted,hidden,rejected&currency=usd,cad&unit=lb,oz,each,bunch,dozen,kg,g,share,pint,quart,box,crate,flat&min_price=1.50&max_price=10&fulfillment=pickup,delivery,shipping&delivery_only=false&pickup=true&geohash=C23NB62&lat=47.6062&lon=-122.332100&radius_km=25.5&near=Ballard&sort=distance&limit=25"
+        );
+        let parsed = parse_listing_query(&query_string, RuntimeLimits::default()).expect("query");
+        let query = parsed.marketplace();
+        let point = query.location.point.expect("point");
+
+        assert_eq!(parsed.geohash(), Some("c23nb62"));
+        assert_eq!(
+            query.categories,
+            [
+                "csa".to_owned(),
+                "roots".to_owned(),
+                "vegetables".to_owned()
+            ]
+        );
+        assert_eq!(query.seller.as_ref().expect("seller").as_str(), seller);
+        assert_eq!(
+            query.statuses,
+            [
+                MarketplaceListingStatus::Active,
+                MarketplaceListingStatus::Sold,
+                MarketplaceListingStatus::Draft,
+                MarketplaceListingStatus::Inactive,
+                MarketplaceListingStatus::Expired,
+                MarketplaceListingStatus::Deleted,
+                MarketplaceListingStatus::Hidden,
+                MarketplaceListingStatus::Rejected,
+            ]
+        );
+        assert_eq!(query.currencies, ["CAD".to_owned(), "USD".to_owned()]);
+        assert_eq!(
+            query
+                .units
+                .iter()
+                .map(|unit| unit.canonical())
+                .collect::<Vec<_>>(),
+            [
+                "box", "bunch", "crate", "dozen", "each", "flat", "g", "kg", "lb", "oz", "pint",
+                "quart", "share",
+            ]
+        );
+        assert_eq!(query.min_price.as_ref().expect("min").raw, "1.50");
+        assert_eq!(query.max_price.as_ref().expect("max").raw, "10");
+        assert_eq!(
+            query.fulfillment,
+            [
+                FulfillmentMethod::Pickup,
+                FulfillmentMethod::Delivery,
+                FulfillmentMethod::Shipping,
+            ]
+        );
+        assert_eq!(query.delivery_only, Some(false));
+        assert_eq!(query.pickup, Some(true));
+        assert_eq!(point.latitude_microdegrees, 47_606_200);
+        assert_eq!(point.longitude_microdegrees, -122_332_100);
+        assert_eq!(query.location.radius_meters, Some(25_500));
+        assert_eq!(query.location.near.as_deref(), Some("ballard"));
+        assert_eq!(query.sort, MarketplaceSort::Distance);
+        assert_eq!(query.limit, 25);
+    }
+
+    #[test]
+    fn listing_query_parser_accepts_all_sort_labels() {
+        let cases = [
+            ("relevance", MarketplaceSort::Relevance, ""),
+            ("freshness", MarketplaceSort::Freshness, ""),
+            ("price_asc", MarketplaceSort::PriceAsc, ""),
+            ("price_desc", MarketplaceSort::PriceDesc, ""),
+            ("distance", MarketplaceSort::Distance, "&lat=+0&lon=0"),
+            ("seller_trust", MarketplaceSort::SellerTrust, ""),
+        ];
+        for (label, expected, suffix) in cases {
+            let parsed =
+                parse_listing_query(&format!("sort={label}{suffix}"), RuntimeLimits::default())
+                    .expect("query");
+            assert_eq!(parsed.marketplace().sort, expected);
+        }
+    }
+
+    #[test]
+    fn listing_query_parser_rejects_invalid_parameters() {
+        let seller = "1".repeat(64);
+        let cases = [
+            (
+                "banana=1".to_owned(),
+                "query parameter `banana` is unsupported",
+            ),
+            ("category=,roots".to_owned(), "category must not be empty"),
+            (
+                "seller=bad".to_owned(),
+                "seller must be a 64-character hex public key",
+            ),
+            (
+                format!("seller={seller}&seller={seller}"),
+                "seller must not be repeated",
+            ),
+            ("status=bogus".to_owned(), "status is unsupported"),
+            ("currency=%20".to_owned(), "currency must not be empty"),
+            ("unit=bushel".to_owned(), "unit is unsupported"),
+            ("min_price=".to_owned(), "min_price must not be empty"),
+            (
+                "min_price=2&max_price=1.99".to_owned(),
+                "min_price must not exceed max_price",
+            ),
+            ("fulfillment=drone".to_owned(), "fulfillment is unsupported"),
+            (
+                "delivery_only=yes".to_owned(),
+                "delivery_only must be true or false",
+            ),
+            ("pickup=".to_owned(), "pickup must not be empty"),
+            (
+                "geohash=c23-".to_owned(),
+                "geohash must be lowercase alphanumeric",
+            ),
+            (
+                "geohash=c23&geohash=c24".to_owned(),
+                "geohash must not be repeated",
+            ),
+            ("lat=91".to_owned(), "lat is out of range"),
+            ("lon=181".to_owned(), "lon is out of range"),
+            (
+                "lat=999999999999999999999999&lon=0".to_owned(),
+                "lat must be an exact unsigned decimal",
+            ),
+            (
+                "lat=0&radius_km=1".to_owned(),
+                "lat and lon must be provided together",
+            ),
+            (
+                "radius_km=0".to_owned(),
+                "radius_km must be greater than zero",
+            ),
+            (
+                "radius_km=1.0000".to_owned(),
+                "radius_km must be an exact unsigned decimal",
+            ),
+            (
+                "radius_km=18446744073709551615".to_owned(),
+                "radius_km must fit the supported range",
+            ),
+            ("near=%20".to_owned(), "near must not be empty"),
+            (
+                "sort=relevance&sort=freshness".to_owned(),
+                "sort must not be repeated",
+            ),
+            ("sort=popular".to_owned(), "sort is unsupported"),
+            (
+                "sort=distance".to_owned(),
+                "distance sort requires a point or near filter",
+            ),
+            ("limit=abc".to_owned(), "limit must be an unsigned integer"),
+            ("limit=0".to_owned(), "limit must be between 1 and 100"),
+            (
+                "cursor=opaque".to_owned(),
+                "cursor signed cursor decoding is not implemented",
+            ),
+        ];
+        for (query, expected) in cases {
+            let error = parse_listing_query(&query, RuntimeLimits::default()).expect_err(&query);
+            assert_eq!(error.code(), ApiErrorCode::InvalidRequest);
+            assert_eq!(error.message(), expected);
+        }
     }
 }
