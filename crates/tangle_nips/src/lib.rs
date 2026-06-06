@@ -309,10 +309,8 @@ impl ListingIdentity {
 }
 
 pub fn parse_listing_identity(event: &Event) -> Result<Option<ListingIdentity>, String> {
-    let listing_kind = match event.unsigned().kind().as_u32() {
-        NIP99_PUBLIC_LISTING_KIND => ListingKind::Public,
-        NIP99_DRAFT_LISTING_KIND => ListingKind::Draft,
-        _ => return Ok(None),
+    let Some(listing_kind) = listing_kind_for_event(event) else {
+        return Ok(None);
     };
     let d = required_tag_value(event, "d")?;
     if d.is_empty() {
@@ -331,11 +329,59 @@ pub fn parse_listing_identity(event: &Event) -> Result<Option<ListingIdentity>, 
     }))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListingText {
+    title: String,
+    summary: Option<String>,
+    body: String,
+}
+
+impl ListingText {
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn summary(&self) -> Option<&str> {
+        self.summary.as_deref()
+    }
+
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+}
+
+pub fn parse_listing_text(event: &Event) -> Result<Option<ListingText>, String> {
+    if listing_kind_for_event(event).is_none() {
+        return Ok(None);
+    }
+    let title = required_tag_value(event, "title")?;
+    if title.is_empty() {
+        return Err("listing title tag must not be empty".to_owned());
+    }
+    let summary = optional_tag_value(event, "summary")?;
+    if summary.as_ref().is_some_and(String::is_empty) {
+        return Err("listing summary tag must not be empty".to_owned());
+    }
+    Ok(Some(ListingText {
+        title,
+        summary,
+        body: event.unsigned().content().to_owned(),
+    }))
+}
+
+fn listing_kind_for_event(event: &Event) -> Option<ListingKind> {
+    match event.unsigned().kind().as_u32() {
+        NIP99_PUBLIC_LISTING_KIND => Some(ListingKind::Public),
+        NIP99_DRAFT_LISTING_KIND => Some(ListingKind::Draft),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DeletionTarget, ListingKind, NIP99_PUBLIC_LISTING_KIND, matching_tags, optional_tag_value,
-        optional_tag_values, parse_deletion_request, parse_listing_identity,
+        optional_tag_values, parse_deletion_request, parse_listing_identity, parse_listing_text,
         parse_nip50_filter_search, parse_nip50_search, parse_relay_auth_event,
         parse_required_u64_tag, parse_u64_field, repeated_or_missing_policy_boundary,
         required_tag_value, required_tag_values, single_letter_tag_values,
@@ -772,11 +818,130 @@ mod tests {
         );
     }
 
+    #[test]
+    fn listing_text_parser_extracts_title_summary_and_body() {
+        let event = event_with_kind_tags_and_content(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![
+                Tag::from_parts("title", &["Carrot bunches"]).expect("title"),
+                Tag::from_parts("summary", &["Fresh field bunches"]).expect("summary"),
+            ],
+            "Harvested this morning.",
+        );
+
+        let text = parse_listing_text(&event).expect("parse").expect("text");
+
+        assert_eq!(text.title(), "Carrot bunches");
+        assert_eq!(text.summary(), Some("Fresh field bunches"));
+        assert_eq!(text.body(), "Harvested this morning.");
+    }
+
+    #[test]
+    fn listing_text_parser_parses_draft_text_and_ignores_non_listings() {
+        let draft = event_with_kind_and_tags(
+            30_403,
+            vec![Tag::from_parts("title", &["Draft carrots"]).expect("title")],
+        );
+        let note = event_with_kind_and_tags(
+            1,
+            vec![Tag::from_parts("title", &["Note title"]).expect("title")],
+        );
+
+        assert_eq!(
+            parse_listing_text(&draft)
+                .expect("draft")
+                .expect("text")
+                .title(),
+            "Draft carrots"
+        );
+        assert_eq!(parse_listing_text(&note), Ok(None));
+    }
+
+    #[test]
+    fn listing_text_parser_rejects_missing_repeated_and_empty_titles() {
+        let missing = event_with_kind_and_tags(u64::from(NIP99_PUBLIC_LISTING_KIND), Vec::new());
+        let repeated = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![
+                Tag::from_parts("title", &["Carrots"]).expect("title"),
+                Tag::from_parts("title", &["Greens"]).expect("title"),
+            ],
+        );
+        let missing_value = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("title", &[]).expect("title")],
+        );
+        let empty = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("title", &[""]).expect("title")],
+        );
+
+        assert_eq!(
+            parse_listing_text(&missing).expect_err("missing"),
+            "tag `title` is required"
+        );
+        assert_eq!(
+            parse_listing_text(&repeated).expect_err("repeated"),
+            "tag `title` must not be repeated"
+        );
+        assert_eq!(
+            parse_listing_text(&missing_value).expect_err("value"),
+            "tag `title` must include a value"
+        );
+        assert_eq!(
+            parse_listing_text(&empty).expect_err("empty"),
+            "listing title tag must not be empty"
+        );
+    }
+
+    #[test]
+    fn listing_text_parser_rejects_malformed_summary_tags() {
+        let repeated = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![
+                Tag::from_parts("title", &["Carrots"]).expect("title"),
+                Tag::from_parts("summary", &["Fresh"]).expect("summary"),
+                Tag::from_parts("summary", &["Sweet"]).expect("summary"),
+            ],
+        );
+        let missing_value = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![
+                Tag::from_parts("title", &["Carrots"]).expect("title"),
+                Tag::from_parts("summary", &[]).expect("summary"),
+            ],
+        );
+        let empty = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![
+                Tag::from_parts("title", &["Carrots"]).expect("title"),
+                Tag::from_parts("summary", &[""]).expect("summary"),
+            ],
+        );
+
+        assert_eq!(
+            parse_listing_text(&repeated).expect_err("repeated"),
+            "tag `summary` must not be repeated"
+        );
+        assert_eq!(
+            parse_listing_text(&missing_value).expect_err("value"),
+            "tag `summary` must include a value"
+        );
+        assert_eq!(
+            parse_listing_text(&empty).expect_err("empty"),
+            "listing summary tag must not be empty"
+        );
+    }
+
     fn event_with_tags(tags: Vec<Tag>) -> Event {
         event_with_kind_and_tags(30_402, tags)
     }
 
     fn event_with_kind_and_tags(kind: u64, tags: Vec<Tag>) -> Event {
+        event_with_kind_tags_and_content(kind, tags, "")
+    }
+
+    fn event_with_kind_tags_and_content(kind: u64, tags: Vec<Tag>, content: &str) -> Event {
         Event::new(
             EventId::new(&"a".repeat(EventId::HEX_LENGTH)).expect("id"),
             UnsignedEvent::new(
@@ -784,7 +949,7 @@ mod tests {
                 UnixTimestamp::new(1_714_124_433),
                 Kind::new(kind).expect("kind"),
                 tags,
-                "",
+                content,
             ),
             SignatureHex::new(&"b".repeat(SignatureHex::HEX_LENGTH)).expect("sig"),
         )
