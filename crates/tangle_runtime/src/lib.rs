@@ -367,6 +367,14 @@ pub struct ListingDetailDocument {
     pub raw_event: serde_json::Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SellerDocument {
+    pub pubkey: String,
+    pub approved: bool,
+    pub blocked: bool,
+    pub active_listing_count: u64,
+}
+
 pub fn parse_listing_query(
     query: &str,
     limits: RuntimeLimits,
@@ -535,6 +543,7 @@ pub fn listings_router(state: ListingsHttpState) -> Router {
         .route("/api/listings", get(listings))
         .route("/api/listings/{pubkey}/{d}", get(listing_detail))
         .route("/api/search", get(marketplace_search))
+        .route("/api/sellers/{pubkey}", get(seller_detail))
         .with_state(state)
 }
 
@@ -661,6 +670,37 @@ async fn marketplace_search(
     }))
 }
 
+async fn seller_detail(
+    State(state): State<ListingsHttpState>,
+    Path(pubkey): Path<String>,
+) -> Result<Json<SellerDocument>, ApiError> {
+    let pubkey = parse_pubkey("pubkey", &pubkey)?;
+    let seller = seller_policy_row(&state.store, pubkey.as_str()).await?;
+    let listings = state
+        .store
+        .query_current_listings(
+            &ListingProjectionQuery::new()
+                .with_effective_status("active")
+                .with_seller_pubkey(pubkey.as_str()),
+        )
+        .await
+        .map_err(|_| ApiError::internal())?;
+    Ok(Json(SellerDocument {
+        pubkey: pubkey.as_str().to_owned(),
+        approved: seller
+            .as_ref()
+            .and_then(|row| row.get("seller_approved"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        blocked: seller
+            .as_ref()
+            .and_then(|row| row.get("blocked"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        active_listing_count: listings.len() as u64,
+    }))
+}
+
 fn accepts_nostr_json(value: Option<&HeaderValue>) -> bool {
     value
         .and_then(|value| value.to_str().ok())
@@ -777,6 +817,24 @@ fn search_document_query(parsed: &MarketplaceSearchHttpQuery) -> SearchDocumentQ
         query = query.with_pubkey(seller.as_str());
     }
     query
+}
+
+async fn seller_policy_row(
+    store: &SurrealStore,
+    pubkey: &str,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    let mut response = store
+        .database()
+        .query("SELECT * FROM relay_user WHERE pubkey = $pubkey LIMIT 1;")
+        .bind(("pubkey", pubkey))
+        .await
+        .map_err(|_| ApiError::internal())?
+        .check()
+        .map_err(|_| ApiError::internal())?;
+    let rows = response
+        .take::<Vec<serde_json::Value>>(0)
+        .map_err(|_| ApiError::internal())?;
+    Ok(rows.into_iter().next())
 }
 
 fn listing_item_document(row: &serde_json::Value) -> Result<ListingItemDocument, ApiError> {
@@ -2088,6 +2146,129 @@ mod tests {
                 "next_cursor": null
             })
         );
+    }
+
+    #[tokio::test]
+    async fn seller_endpoint_returns_policy_state_and_active_listing_count() {
+        let store = runtime_memory_store().await;
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let seller = listing.unsigned().pubkey().as_str().to_owned();
+        let listing_key = format!("30402:{seller}:listing-a");
+        store
+            .project_current_listing(&listing, UnixTimestamp::new(1_714_125_400))
+            .await
+            .expect("project listing");
+        store
+            .database()
+            .query(
+                "CREATE relay_user CONTENT {
+                    pubkey: $pubkey,
+                    role: 'seller',
+                    seller_approved: true,
+                    blocked: false,
+                    created_at: 1,
+                    updated_at: 2
+                };",
+            )
+            .bind(("pubkey", seller.as_str()))
+            .await
+            .expect("seller row")
+            .check()
+            .expect("seller check");
+
+        let response = listings_router(ListingsHttpState::new(
+            store.clone(),
+            RuntimeLimits::default(),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/sellers/{seller}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
+            serde_json::json!({
+                "pubkey": seller,
+                "approved": true,
+                "blocked": false,
+                "active_listing_count": 1
+            })
+        );
+
+        store
+            .database()
+            .query("UPDATE listing_current SET hidden = true WHERE listing_key = $listing_key;")
+            .bind(("listing_key", listing_key.as_str()))
+            .await
+            .expect("hide listing")
+            .check()
+            .expect("hide check");
+        let response = listings_router(ListingsHttpState::new(store, RuntimeLimits::default()))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sellers/{seller}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json")["active_listing_count"],
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn seller_endpoint_defaults_missing_seller_and_rejects_invalid_pubkey() {
+        let store = runtime_memory_store().await;
+        let missing = "1".repeat(64);
+        let response = listings_router(ListingsHttpState::new(
+            store.clone(),
+            RuntimeLimits::default(),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/sellers/{missing}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
+            serde_json::json!({
+                "pubkey": missing,
+                "approved": false,
+                "blocked": false,
+                "active_listing_count": 0
+            })
+        );
+
+        let response = listings_router(ListingsHttpState::new(store, RuntimeLimits::default()))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sellers/not-a-pubkey")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     async fn runtime_memory_store() -> SurrealStore {
