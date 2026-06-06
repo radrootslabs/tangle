@@ -1,0 +1,57 @@
+#![forbid(unsafe_code)]
+
+use std::fs;
+use std::path::Path;
+
+#[test]
+fn release_acceptance_script_covers_release_candidate_validation_ladder() {
+    let script_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root")
+        .join("scripts/release_acceptance.sh");
+    let script = fs::read_to_string(&script_path).expect("release acceptance script");
+
+    for required in [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "scripts/check.sh",
+        "scripts/test.sh",
+        "cargo nextest run --workspace",
+        "cargo test -p tangle --test nip01_conformance",
+        "cargo test -p tangle --test nip09_conformance",
+        "cargo test -p tangle --test nip42_conformance",
+        "cargo test -p tangle --test nip50_conformance",
+        "cargo test -p tangle --test nip99_conformance",
+        "cargo test -p tangle --test discussion_conformance",
+        "cargo test -p tangle --test moderation_conformance",
+        "cargo test -p tangle --test commerce_privacy_conformance",
+        "cargo test -p tangle --test abuse_conformance",
+        "cargo test -p tangle --test run_integration",
+        "cargo test -p tangle_runtime runtime_restore_command_imports_backup_and_rebuilds_projection_state",
+        "cargo test -p tangle_bench",
+        "cargo test -p tangle --test source_comments",
+        "cargo test -p tangle --test unsafe_code",
+        "scripts/coverage.sh",
+    ] {
+        assert!(
+            script.contains(required),
+            "release acceptance script is missing `{required}`"
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = fs::metadata(&script_path)
+            .expect("script metadata")
+            .permissions()
+            .mode();
+        assert_ne!(
+            mode & 0o111,
+            0,
+            "release acceptance script must be executable"
+        );
+    }
+}
