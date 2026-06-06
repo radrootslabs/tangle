@@ -47,7 +47,7 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use url::form_urlencoded;
 
-pub const TANGLE_SUPPORTED_NIPS: [u16; 8] = [1, 9, 11, 16, 33, 42, 50, 99];
+pub const TANGLE_SUPPORTED_NIPS: [u16; 13] = [1, 9, 11, 16, 22, 23, 25, 32, 33, 42, 50, 56, 99];
 pub const TANGLE_RELAY_SOFTWARE: &str = "https://github.com/radrootslabs/tangle";
 pub const TANGLE_RELAY_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -6667,7 +6667,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_info_default_matches_mvp_protocol_claims() {
+    fn relay_info_default_matches_production_v1_protocol_claims() {
         let relay_info = RelayInfoDocument::tangle_default();
         assert_eq!(relay_info.name, "tangle");
         assert_eq!(relay_info.supported_nips, TANGLE_SUPPORTED_NIPS);
@@ -6680,7 +6680,7 @@ mod tests {
             serde_json::json!({
                 "name": "tangle",
                 "description": "SurrealDB-backed Nostr relay for NIP-99 marketplaces",
-                "supported_nips": [1, 9, 11, 16, 33, 42, 50, 99],
+                "supported_nips": [1, 9, 11, 16, 22, 23, 25, 32, 33, 42, 50, 56, 99],
                 "software": "https://github.com/radrootslabs/tangle",
                 "version": "0.1.0",
                 "limitation": {
@@ -6748,7 +6748,7 @@ mod tests {
             serde_json::json!({
                 "name": "tangle",
                 "description": "SurrealDB-backed Nostr relay for NIP-99 marketplaces",
-                "supported_nips": [1, 9, 11, 16, 33, 42, 50, 99],
+                "supported_nips": [1, 9, 11, 16, 22, 23, 25, 32, 33, 42, 50, 56, 99],
                 "software": "https://github.com/radrootslabs/tangle",
                 "version": "0.1.0",
                 "limitation": {
