@@ -35,8 +35,9 @@ use tangle_protocol::{
 };
 use tangle_store::{StoreEventOutcome, StoredEvent};
 use tangle_store_surreal::{
-    DurableRateLimitDecision, ListingProjectionQuery, MigrationApplyOutcome, SearchDocumentQuery,
-    SurrealConnectionConfig, SurrealConnectionMode, SurrealStore, base_migration_plan,
+    CommentProjectionOutcome, CommentProjectionQuery, DurableRateLimitDecision,
+    ListingProjectionQuery, MigrationApplyOutcome, SearchDocumentQuery, SurrealConnectionConfig,
+    SurrealConnectionMode, SurrealStore, base_migration_plan,
 };
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -591,6 +592,11 @@ async fn project_stored_event(
     {
         return Err(RuntimeCommandError::store("event projection failed"));
     }
+    let comment_projected = match store.project_comment(event, now).await {
+        Ok(CommentProjectionOutcome::Projected) => true,
+        Ok(CommentProjectionOutcome::NotComment | CommentProjectionOutcome::Ineligible) => false,
+        Err(_) => return Err(RuntimeCommandError::store("event projection failed")),
+    };
     if effect == AdmissionEffect::StoreRawAndProjectPublicListing {
         if store.project_current_listing(event, now).await.is_err()
             || store.project_listing_helpers(event).await.is_err()
@@ -600,7 +606,7 @@ async fn project_stored_event(
         }
         return Ok(true);
     }
-    Ok(false)
+    Ok(comment_projected)
 }
 
 fn parse_event_import_document(raw: &str) -> Result<Vec<Event>, RuntimeCommandError> {
@@ -953,6 +959,10 @@ fn runtime_router(
         .route("/readyz", get(runtime_readyz))
         .route("/api/listings", get(runtime_listings))
         .route("/api/listings/{pubkey}/{d}", get(runtime_listing_detail))
+        .route(
+            "/api/listings/{pubkey}/{d}/comments",
+            get(runtime_listing_comments),
+        )
         .route("/api/search", get(runtime_marketplace_search))
         .route("/api/sellers/{pubkey}", get(runtime_seller_detail))
         .route(
@@ -1025,6 +1035,22 @@ async fn runtime_listing_detail(
             state.config.limits(),
         )),
         Path((pubkey, d)),
+    )
+    .await
+}
+
+async fn runtime_listing_comments(
+    State(state): State<RuntimeRelayState>,
+    Path((pubkey, d)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<ListingCommentsDocument>, ApiError> {
+    listing_comments(
+        State(ListingsHttpState::new(
+            state.store.clone(),
+            state.config.limits(),
+        )),
+        Path((pubkey, d)),
+        RawQuery(query),
     )
     .await
 }
@@ -1860,6 +1886,7 @@ impl EventMessageHandler {
                 .store_listing_revision(&event, now)
                 .await
                 .is_err()
+            || self.store.project_comment(&event, now).await.is_err()
         {
             return ok_rejected(event_id, "error: projection failed".to_owned());
         }
@@ -2517,6 +2544,30 @@ pub struct ListingDetailDocument {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListingCommentsDocument {
+    pub items: Vec<CommentItemDocument>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommentItemDocument {
+    pub event_id: String,
+    pub pubkey: String,
+    pub created_at: u64,
+    pub content: String,
+    pub root: CommentReferenceDocument,
+    pub parent: CommentReferenceDocument,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommentReferenceDocument {
+    pub target_type: String,
+    pub target_ref: String,
+    pub kind: String,
+    pub author: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SellerDocument {
     pub pubkey: String,
     pub approved: bool,
@@ -2719,6 +2770,7 @@ pub fn listings_router(state: ListingsHttpState) -> Router {
     Router::new()
         .route("/api/listings", get(listings))
         .route("/api/listings/{pubkey}/{d}", get(listing_detail))
+        .route("/api/listings/{pubkey}/{d}/comments", get(listing_comments))
         .route("/api/search", get(marketplace_search))
         .route("/api/sellers/{pubkey}", get(seller_detail))
         .with_state(state)
@@ -2820,6 +2872,43 @@ async fn listing_detail(
     Ok(Json(ListingDetailDocument {
         listing: listing_item_document(&row)?,
         raw_event,
+    }))
+}
+
+async fn listing_comments(
+    State(state): State<ListingsHttpState>,
+    Path((pubkey, d)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<ListingCommentsDocument>, ApiError> {
+    let pubkey = parse_pubkey("pubkey", &pubkey)?;
+    let d = required_value("d", &d)?;
+    let limit = parse_comment_query(query.as_deref().unwrap_or_default())?;
+    let listing_key = format!("30402:{}:{d}", pubkey.as_str());
+    let listing = state
+        .store
+        .listing_current_row(&listing_key)
+        .await
+        .map_err(|_| ApiError::internal())?
+        .ok_or_else(|| ApiError::not_found("listing not found"))?;
+    if bool_field(&listing, "hidden")? || bool_field(&listing, "deleted")? {
+        return Err(ApiError::not_found("listing not found"));
+    }
+    let rows = state
+        .store
+        .query_comment_projections(
+            &CommentProjectionQuery::new()
+                .with_root("address", &listing_key)
+                .with_limit(limit),
+        )
+        .await
+        .map_err(|_| ApiError::internal())?;
+    let items = rows
+        .iter()
+        .map(comment_item_document)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(ListingCommentsDocument {
+        items,
+        next_cursor: None,
     }))
 }
 
@@ -3039,6 +3128,23 @@ fn search_document_query(parsed: &MarketplaceSearchHttpQuery) -> SearchDocumentQ
     query
 }
 
+fn parse_comment_query(raw: &str) -> Result<u64, ApiError> {
+    let mut limit = None;
+    for (key, value) in form_urlencoded::parse(raw.as_bytes()) {
+        match key.as_ref() {
+            "limit" => set_once("limit", &mut limit, parse_limit(value.as_ref())?)?,
+            "" => {}
+            _ => {
+                return Err(ApiError::invalid_request(format!(
+                    "{} is not supported by the listing comments endpoint",
+                    key
+                )));
+            }
+        }
+    }
+    Ok(limit.unwrap_or(50))
+}
+
 fn listing_item_document(row: &serde_json::Value) -> Result<ListingItemDocument, ApiError> {
     Ok(ListingItemDocument {
         listing_key: string_field(row, "listing_key")?,
@@ -3059,6 +3165,27 @@ fn listing_item_document(row: &serde_json::Value) -> Result<ListingItemDocument,
         fulfillment: fulfillment_document(row)?,
         status: string_field(row, "effective_status")?,
         updated_at: u64_field(row, "updated_at")?,
+    })
+}
+
+fn comment_item_document(row: &serde_json::Value) -> Result<CommentItemDocument, ApiError> {
+    Ok(CommentItemDocument {
+        event_id: string_field(row, "event_id")?,
+        pubkey: string_field(row, "pubkey")?,
+        created_at: u64_field(row, "created_at")?,
+        content: string_field(row, "content")?,
+        root: CommentReferenceDocument {
+            target_type: string_field(row, "root_target_type")?,
+            target_ref: string_field(row, "root_ref")?,
+            kind: string_field(row, "root_kind")?,
+            author: optional_string_field(row, "root_author")?,
+        },
+        parent: CommentReferenceDocument {
+            target_type: string_field(row, "parent_target_type")?,
+            target_ref: string_field(row, "parent_ref")?,
+            kind: string_field(row, "parent_kind")?,
+            author: optional_string_field(row, "parent_author")?,
+        },
     })
 }
 
@@ -3392,7 +3519,10 @@ mod tests {
     use tangle_store_surreal::{
         SurrealConnectionConfig, SurrealConnectionMode, SurrealStore, base_migration_plan,
     };
-    use tangle_test_support::{auth_event_spec, build_fixture_event, valid_public_listing_spec};
+    use tangle_test_support::{
+        FixtureKey, auth_event_spec, build_fixture_event, build_fixture_event_from_parts,
+        valid_public_listing_spec,
+    };
     use tower::ServiceExt;
 
     #[test]
@@ -5312,6 +5442,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn listing_comments_endpoint_returns_visible_projected_comments() {
+        let store = runtime_memory_store().await;
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let listing_key = format!("30402:{}:listing-a", listing.unsigned().pubkey().as_str());
+        let comment = listing_comment(&listing, 1_714_125_410, "Can I pickup Saturday?");
+        store
+            .project_current_listing(&listing, UnixTimestamp::new(1_714_125_409))
+            .await
+            .expect("project listing");
+        store
+            .project_comment(&comment, UnixTimestamp::new(1_714_125_411))
+            .await
+            .expect("project comment");
+
+        let uri = format!(
+            "/api/listings/{}/listing-a/comments?limit=5",
+            listing.unsigned().pubkey().as_str()
+        );
+        let response = listings_router(ListingsHttpState::new(
+            store.clone(),
+            RuntimeLimits::default(),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri(uri.as_str())
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
+            serde_json::json!({
+                "items": [{
+                    "event_id": comment.id().as_str(),
+                    "pubkey": FixtureKey::Buyer.public_key().as_str(),
+                    "created_at": 1714125410_u64,
+                    "content": "Can I pickup Saturday?",
+                    "root": {
+                        "target_type": "address",
+                        "target_ref": listing_key,
+                        "kind": "30402",
+                        "author": listing.unsigned().pubkey().as_str()
+                    },
+                    "parent": {
+                        "target_type": "address",
+                        "target_ref": listing_key,
+                        "kind": "30402",
+                        "author": listing.unsigned().pubkey().as_str()
+                    }
+                }],
+                "next_cursor": null
+            })
+        );
+
+        store
+            .database()
+            .query("UPDATE comment_projection SET hidden = true WHERE event_id = $event_id;")
+            .bind(("event_id", comment.id().as_str()))
+            .await
+            .expect("hide comment")
+            .check()
+            .expect("hide comment check");
+        let response = listings_router(ListingsHttpState::new(store, RuntimeLimits::default()))
+            .oneshot(
+                Request::builder()
+                    .uri(uri.as_str())
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
+            serde_json::json!({
+                "items": [],
+                "next_cursor": null
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn listing_detail_endpoint_rejects_invalid_or_missing_listing() {
         let store = runtime_memory_store().await;
         let response = listings_router(ListingsHttpState::new(
@@ -5542,6 +5762,35 @@ mod tests {
             .await
             .expect("apply plan");
         store
+    }
+
+    fn listing_comment(
+        listing: &tangle_protocol::Event,
+        created_at: u64,
+        content: &str,
+    ) -> tangle_protocol::Event {
+        let listing_key = format!("30402:{}:listing-a", listing.unsigned().pubkey().as_str());
+        build_fixture_event_from_parts(
+            FixtureKey::Buyer,
+            created_at,
+            1_111,
+            vec![
+                vec!["A".to_owned(), listing_key.clone()],
+                vec!["K".to_owned(), "30402".to_owned()],
+                vec![
+                    "P".to_owned(),
+                    listing.unsigned().pubkey().as_str().to_owned(),
+                ],
+                vec!["a".to_owned(), listing_key],
+                vec!["k".to_owned(), "30402".to_owned()],
+                vec![
+                    "p".to_owned(),
+                    listing.unsigned().pubkey().as_str().to_owned(),
+                ],
+            ],
+            content,
+        )
+        .expect("comment event")
     }
 
     fn runtime_client_message_loop() -> ClientMessageLoop {

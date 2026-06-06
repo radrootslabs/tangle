@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use tangle_protocol::event_to_value;
 use tangle_store_surreal::{SurrealConnectionConfig, SurrealStore};
 use tangle_test_support::{
-    FixtureKey, auth_event_spec, build_fixture_event, valid_public_listing_spec,
+    FixtureKey, auth_event_spec, build_fixture_event, build_fixture_event_from_parts,
+    valid_public_listing_spec,
 };
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -51,6 +52,7 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
     assert!(nip11.contains("\"supported_nips\""));
 
     let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+    let comment = listing_comment(&listing, 1_714_124_436, "Can I pickup Saturday?");
     let auth = build_fixture_event(&auth_event_spec()).expect("auth");
     let seller = FixtureKey::Seller.public_key();
 
@@ -138,6 +140,29 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
     assert_eq!(fetched[2]["id"], listing.id().as_str());
     assert_eq!(next_label(&mut publisher).await, "EOSE");
 
+    publisher
+        .send(Message::Text(
+            serde_json::json!(["EVENT", event_to_value(&comment)])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("comment send");
+    assert_ok(&next_json(&mut publisher).await, true);
+    publisher
+        .send(Message::Text(
+            serde_json::json!(["REQ", "sub-comment", { "ids": [comment.id().as_str()] }])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("comment fetch send");
+    let fetched_comment = next_json(&mut publisher).await;
+    assert_eq!(fetched_comment[0], "EVENT");
+    assert_eq!(fetched_comment[1], "sub-comment");
+    assert_eq!(fetched_comment[2]["id"], comment.id().as_str());
+    assert_eq!(next_label(&mut publisher).await, "EOSE");
+
     subscriber
         .send(Message::Text(
             serde_json::json!(["CLOSE", "sub-live"]).to_string().into(),
@@ -156,6 +181,16 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
     assert!(detail.contains("200 OK"));
     assert!(detail.contains("listing-a"));
     assert!(detail.contains("Carrot bunches"));
+    let comments = http_get(
+        port,
+        &format!(
+            "/api/listings/{}/listing-a/comments?limit=5",
+            seller.as_str()
+        ),
+    );
+    assert!(comments.contains("200 OK"));
+    assert!(comments.contains(comment.id().as_str()));
+    assert!(comments.contains("Can I pickup Saturday?"));
     let search = http_get(port, "/api/search?q=carrots&limit=5");
     assert!(search.contains("200 OK"));
     assert!(search.contains(listing.id().as_str()));
@@ -191,6 +226,14 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
             .expect("listing row")
             .is_some()
     );
+    let comment_row = store
+        .comment_projection_row(comment.id())
+        .await
+        .expect("comment row")
+        .expect("comment row exists");
+    assert_eq!(comment_row["event_id"], comment.id().as_str());
+    assert_eq!(comment_row["root_ref"], listing_key);
+    assert_eq!(comment_row["content"], "Can I pickup Saturday?");
     assert!(
         store
             .search_document_row(&listing_key)
@@ -749,6 +792,35 @@ async fn next_label(
 fn assert_ok(message: &Value, accepted: bool) {
     assert_eq!(message[0], "OK");
     assert_eq!(message[2], accepted);
+}
+
+fn listing_comment(
+    listing: &tangle_protocol::Event,
+    created_at: u64,
+    content: &str,
+) -> tangle_protocol::Event {
+    let listing_key = format!("30402:{}:listing-a", listing.unsigned().pubkey().as_str());
+    build_fixture_event_from_parts(
+        FixtureKey::Seller,
+        created_at,
+        1_111,
+        vec![
+            vec!["A".to_owned(), listing_key.clone()],
+            vec!["K".to_owned(), "30402".to_owned()],
+            vec![
+                "P".to_owned(),
+                listing.unsigned().pubkey().as_str().to_owned(),
+            ],
+            vec!["a".to_owned(), listing_key],
+            vec!["k".to_owned(), "30402".to_owned()],
+            vec![
+                "p".to_owned(),
+                listing.unsigned().pubkey().as_str().to_owned(),
+            ],
+        ],
+        content,
+    )
+    .expect("comment event")
 }
 
 fn stop_relay(mut relay: Child) {
