@@ -283,6 +283,7 @@ pub fn base_migration_plan() -> SurrealMigrationPlan {
         event_tag_index_schema(),
         current_event_schema(),
         deletion_marker_schema(),
+        listing_revision_schema(),
     ])
     .expect("base migration plan is strictly ordered")
 }
@@ -377,6 +378,36 @@ DEFINE INDEX IF NOT EXISTS deletion_author_target ON TABLE deletion_marker COLUM
 "#,
     )
     .expect("deletion marker schema is valid")
+}
+
+pub fn listing_revision_schema() -> SurrealMigration {
+    SurrealMigration::new(
+        "0006_listing_revision",
+        r#"
+DEFINE TABLE IF NOT EXISTS listing_revision SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS revision_key ON TABLE listing_revision TYPE string;
+DEFINE FIELD IF NOT EXISTS listing_key ON TABLE listing_revision TYPE string;
+DEFINE FIELD IF NOT EXISTS event_id ON TABLE listing_revision TYPE string;
+DEFINE FIELD IF NOT EXISTS seller_pubkey ON TABLE listing_revision TYPE string;
+DEFINE FIELD IF NOT EXISTS d ON TABLE listing_revision TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON TABLE listing_revision TYPE int;
+DEFINE FIELD IF NOT EXISTS parsed_ok ON TABLE listing_revision TYPE bool;
+DEFINE FIELD IF NOT EXISTS parse_errors ON TABLE listing_revision TYPE array;
+DEFINE FIELD IF NOT EXISTS title ON TABLE listing_revision TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS summary ON TABLE listing_revision TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS price_decimal ON TABLE listing_revision TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS price_minor ON TABLE listing_revision TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS currency_raw ON TABLE listing_revision TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS currency_norm ON TABLE listing_revision TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS unit ON TABLE listing_revision TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS status_tag ON TABLE listing_revision TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS projected_at ON TABLE listing_revision TYPE int;
+DEFINE INDEX IF NOT EXISTS listing_revision_event_uid ON TABLE listing_revision COLUMNS event_id UNIQUE;
+DEFINE INDEX IF NOT EXISTS listing_revision_listing_created ON TABLE listing_revision COLUMNS listing_key, created_at, event_id;
+DEFINE INDEX IF NOT EXISTS listing_revision_seller_created ON TABLE listing_revision COLUMNS seller_pubkey, created_at, event_id;
+"#,
+    )
+    .expect("listing revision schema is valid")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -932,6 +963,44 @@ mod tests {
             "deletion_created_at",
             "deletion_target",
             "deletion_author_target",
+        ] {
+            assert!(info.contains(expected), "missing {expected} in {info}");
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_revision_schema_defines_parse_audit_table() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let info = store
+            .table_info("listing_revision")
+            .await
+            .expect("table info");
+
+        for expected in [
+            "revision_key",
+            "listing_key",
+            "event_id",
+            "seller_pubkey",
+            "d",
+            "created_at",
+            "parsed_ok",
+            "parse_errors",
+            "title",
+            "summary",
+            "price_decimal",
+            "price_minor",
+            "currency_raw",
+            "currency_norm",
+            "unit",
+            "status_tag",
+            "projected_at",
+            "listing_revision_event_uid",
+            "listing_revision_listing_created",
+            "listing_revision_seller_created",
         ] {
             assert!(info.contains(expected), "missing {expected} in {info}");
         }
