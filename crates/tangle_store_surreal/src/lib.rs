@@ -285,6 +285,7 @@ pub fn base_migration_plan() -> SurrealMigrationPlan {
         deletion_marker_schema(),
         listing_revision_schema(),
         listing_current_schema(),
+        listing_helper_schemas(),
     ])
     .expect("base migration plan is strictly ordered")
 }
@@ -467,6 +468,59 @@ DEFINE INDEX IF NOT EXISTS listing_geo6_status ON TABLE listing_current COLUMNS 
 "#,
     )
     .expect("listing current schema is valid")
+}
+
+pub fn listing_helper_schemas() -> SurrealMigration {
+    SurrealMigration::new(
+        "0008_listing_helpers",
+        r#"
+DEFINE TABLE IF NOT EXISTS listing_category SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS listing_key ON TABLE listing_category TYPE string;
+DEFINE FIELD IF NOT EXISTS category ON TABLE listing_category TYPE string;
+DEFINE FIELD IF NOT EXISTS effective_status ON TABLE listing_category TYPE string;
+DEFINE FIELD IF NOT EXISTS updated_at ON TABLE listing_category TYPE int;
+DEFINE FIELD IF NOT EXISTS event_id ON TABLE listing_category TYPE string;
+DEFINE INDEX IF NOT EXISTS listing_category_lookup ON TABLE listing_category COLUMNS category, effective_status, updated_at, listing_key;
+DEFINE INDEX IF NOT EXISTS listing_category_listing ON TABLE listing_category COLUMNS listing_key;
+
+DEFINE TABLE IF NOT EXISTS listing_fulfillment SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS listing_key ON TABLE listing_fulfillment TYPE string;
+DEFINE FIELD IF NOT EXISTS mode ON TABLE listing_fulfillment TYPE string;
+DEFINE FIELD IF NOT EXISTS effective_status ON TABLE listing_fulfillment TYPE string;
+DEFINE FIELD IF NOT EXISTS updated_at ON TABLE listing_fulfillment TYPE int;
+DEFINE FIELD IF NOT EXISTS event_id ON TABLE listing_fulfillment TYPE string;
+DEFINE INDEX IF NOT EXISTS listing_fulfillment_lookup ON TABLE listing_fulfillment COLUMNS mode, effective_status, updated_at, listing_key;
+DEFINE INDEX IF NOT EXISTS listing_fulfillment_listing ON TABLE listing_fulfillment COLUMNS listing_key;
+
+DEFINE TABLE IF NOT EXISTS listing_tag SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS listing_key ON TABLE listing_tag TYPE string;
+DEFINE FIELD IF NOT EXISTS tag_value ON TABLE listing_tag TYPE string;
+DEFINE FIELD IF NOT EXISTS effective_status ON TABLE listing_tag TYPE string;
+DEFINE FIELD IF NOT EXISTS updated_at ON TABLE listing_tag TYPE int;
+DEFINE FIELD IF NOT EXISTS event_id ON TABLE listing_tag TYPE string;
+DEFINE INDEX IF NOT EXISTS listing_tag_lookup ON TABLE listing_tag COLUMNS tag_value, effective_status, updated_at, listing_key;
+DEFINE INDEX IF NOT EXISTS listing_tag_listing ON TABLE listing_tag COLUMNS listing_key;
+
+DEFINE TABLE IF NOT EXISTS listing_practice SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS listing_key ON TABLE listing_practice TYPE string;
+DEFINE FIELD IF NOT EXISTS practice ON TABLE listing_practice TYPE string;
+DEFINE FIELD IF NOT EXISTS effective_status ON TABLE listing_practice TYPE string;
+DEFINE FIELD IF NOT EXISTS updated_at ON TABLE listing_practice TYPE int;
+DEFINE FIELD IF NOT EXISTS event_id ON TABLE listing_practice TYPE string;
+DEFINE INDEX IF NOT EXISTS listing_practice_lookup ON TABLE listing_practice COLUMNS practice, effective_status, updated_at, listing_key;
+DEFINE INDEX IF NOT EXISTS listing_practice_listing ON TABLE listing_practice COLUMNS listing_key;
+
+DEFINE TABLE IF NOT EXISTS listing_certification SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS listing_key ON TABLE listing_certification TYPE string;
+DEFINE FIELD IF NOT EXISTS certification ON TABLE listing_certification TYPE string;
+DEFINE FIELD IF NOT EXISTS effective_status ON TABLE listing_certification TYPE string;
+DEFINE FIELD IF NOT EXISTS updated_at ON TABLE listing_certification TYPE int;
+DEFINE FIELD IF NOT EXISTS event_id ON TABLE listing_certification TYPE string;
+DEFINE INDEX IF NOT EXISTS listing_certification_lookup ON TABLE listing_certification COLUMNS certification, effective_status, updated_at, listing_key;
+DEFINE INDEX IF NOT EXISTS listing_certification_listing ON TABLE listing_certification COLUMNS listing_key;
+"#,
+    )
+    .expect("listing helper schemas are valid")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1124,6 +1178,64 @@ mod tests {
             "listing_geo6_status",
         ] {
             assert!(info.contains(expected), "missing {expected} in {info}");
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_helper_schemas_define_discovery_tables() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+
+        for (table, value_field, lookup_index, listing_index) in [
+            (
+                "listing_category",
+                "category",
+                "listing_category_lookup",
+                "listing_category_listing",
+            ),
+            (
+                "listing_fulfillment",
+                "mode",
+                "listing_fulfillment_lookup",
+                "listing_fulfillment_listing",
+            ),
+            (
+                "listing_tag",
+                "tag_value",
+                "listing_tag_lookup",
+                "listing_tag_listing",
+            ),
+            (
+                "listing_practice",
+                "practice",
+                "listing_practice_lookup",
+                "listing_practice_listing",
+            ),
+            (
+                "listing_certification",
+                "certification",
+                "listing_certification_lookup",
+                "listing_certification_listing",
+            ),
+        ] {
+            let info = store.table_info(table).await.expect("table info");
+            for expected in [
+                "listing_key",
+                value_field,
+                "effective_status",
+                "updated_at",
+                "event_id",
+                lookup_index,
+                listing_index,
+            ] {
+                assert!(
+                    info.contains(expected),
+                    "missing {expected} in {table} info {info}"
+                );
+            }
         }
     }
 }
