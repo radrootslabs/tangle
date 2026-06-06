@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 use core::str::FromStr;
-use tangle_protocol::{AddressCoordinate, Event, EventId, PublicKeyHex, TagName, UnixTimestamp};
+use tangle_protocol::{
+    AddressCoordinate, Event, EventId, Filter, PublicKeyHex, TagName, UnixTimestamp,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedTag {
@@ -230,16 +232,56 @@ pub fn parse_relay_auth_event(event: &Event) -> Result<Option<RelayAuthEvent>, S
     }))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Nip50SearchQuery {
+    text: String,
+    terms: Vec<String>,
+}
+
+impl Nip50SearchQuery {
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn terms(&self) -> &[String] {
+        &self.terms
+    }
+}
+
+pub fn parse_nip50_search(search: &str) -> Result<Option<Nip50SearchQuery>, String> {
+    let terms = search
+        .split_whitespace()
+        .filter(|term| !term.contains(':'))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Nip50SearchQuery {
+        text: terms.join(" "),
+        terms,
+    }))
+}
+
+pub fn parse_nip50_filter_search(filter: &Filter) -> Result<Option<Nip50SearchQuery>, String> {
+    match filter.search() {
+        Some(search) => parse_nip50_search(search),
+        None => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DeletionTarget, matching_tags, optional_tag_value, optional_tag_values,
-        parse_deletion_request, parse_relay_auth_event, parse_required_u64_tag, parse_u64_field,
+        parse_deletion_request, parse_nip50_filter_search, parse_nip50_search,
+        parse_relay_auth_event, parse_required_u64_tag, parse_u64_field,
         repeated_or_missing_policy_boundary, required_tag_value, required_tag_values,
         single_letter_tag_values, single_letter_values_for, tag_count,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
+        filter_from_value,
     };
 
     #[test]
@@ -548,6 +590,54 @@ mod tests {
             parse_relay_auth_event(&empty_challenge).expect_err("empty challenge"),
             "relay auth challenge tag must not be empty"
         );
+    }
+
+    #[test]
+    fn nip50_search_parser_extracts_plain_terms_and_ignores_extensions() {
+        let query = parse_nip50_search("  fresh seller:ignored carrots status:ignored greens  ")
+            .expect("parse")
+            .expect("query");
+
+        assert_eq!(query.text(), "fresh carrots greens");
+        assert_eq!(
+            query.terms(),
+            &[
+                "fresh".to_owned(),
+                "carrots".to_owned(),
+                "greens".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn nip50_search_parser_treats_empty_and_extension_only_queries_as_absent() {
+        assert_eq!(parse_nip50_search("   "), Ok(None));
+        assert_eq!(
+            parse_nip50_search("seller:ignored status:ignored"),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn nip50_search_parser_reads_filter_search_field() {
+        let filter = filter_from_value(&serde_json::json!({
+            "search": "farmstand tomatoes",
+            "kinds": [1]
+        }))
+        .expect("filter");
+        let missing = filter_from_value(&serde_json::json!({
+            "kinds": [1]
+        }))
+        .expect("missing");
+
+        assert_eq!(
+            parse_nip50_filter_search(&filter)
+                .expect("filter")
+                .expect("query")
+                .text(),
+            "farmstand tomatoes"
+        );
+        assert_eq!(parse_nip50_filter_search(&missing), Ok(None));
     }
 
     fn event_with_tags(tags: Vec<Tag>) -> Event {

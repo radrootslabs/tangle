@@ -10,5 +10,8 @@ description = "MVP NIP parsers and projection contracts for tangle"
 [dependencies]
 tangle_protocol = { path = "../tangle_protocol" }
 
+[dev-dependencies]
+serde_json = "1"
+
 [lints]
 workspace = true
