@@ -4040,6 +4040,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tangle_bench"
+version = "0.1.0"
+dependencies = [
+ "tangle_nips",
+ "tangle_protocol",
+ "tangle_test_support",
+]
+
+[[package]]
 name = "tangle_core"
 version = "0.1.0"
 dependencies = [

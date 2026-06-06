@@ -126,15 +126,30 @@ pub fn fixture_spec_from_json(raw: &str) -> Result<FixtureEventSpec, String> {
 
 pub fn build_fixture_event(spec: &FixtureEventSpec) -> Result<Event, String> {
     let fixture_key = spec.fixture_key()?;
+    build_fixture_event_from_parts(
+        fixture_key,
+        spec.created_at,
+        spec.kind,
+        spec.tags.clone(),
+        &spec.content,
+    )
+}
+
+pub fn build_fixture_event_from_parts(
+    fixture_key: FixtureKey,
+    created_at: u64,
+    kind: u64,
+    tags: Vec<Vec<String>>,
+    content: &str,
+) -> Result<Event, String> {
     let unsigned = UnsignedEvent::new(
         fixture_key.public_key(),
-        UnixTimestamp::new(spec.created_at),
-        Kind::new(spec.kind)?,
-        spec.tags
-            .iter()
-            .map(|values| Tag::new(values.clone()))
+        UnixTimestamp::new(created_at),
+        Kind::new(kind)?,
+        tags.into_iter()
+            .map(Tag::new)
             .collect::<Result<Vec<_>, _>>()?,
-        &spec.content,
+        content,
     );
     sign_unsigned_event(fixture_key, unsigned)
 }

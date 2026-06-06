@@ -1,0 +1,16 @@
+[package]
+name = "tangle_bench"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Benchmark suite for the Tangle relay"
+
+[dependencies]
+tangle_nips = { path = "../tangle_nips" }
+tangle_protocol = { path = "../tangle_protocol" }
+tangle_test_support = { path = "../tangle_test_support" }
+
+[lints]
+workspace = true
