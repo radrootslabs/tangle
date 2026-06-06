@@ -67,6 +67,27 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
         .expect("subscribe");
     assert_eq!(next_label(&mut subscriber).await, "EOSE");
 
+    let (mut unauthenticated, _) = connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("unauthenticated connect");
+    assert_eq!(next_label(&mut unauthenticated).await, "AUTH");
+    unauthenticated
+        .send(Message::Text(
+            serde_json::json!(["EVENT", event_to_value(&listing)])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("unauthenticated event send");
+    let unauthenticated_rejection = next_json(&mut unauthenticated).await;
+    assert_ok(&unauthenticated_rejection, false);
+    assert!(
+        unauthenticated_rejection[3]
+            .as_str()
+            .expect("rejection message")
+            .contains("write authentication required")
+    );
+
     let (mut publisher, _) = connect_async(format!("ws://127.0.0.1:{port}/ws"))
         .await
         .expect("publisher connect");
@@ -147,6 +168,13 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
             .await
             .expect("raw row")
             .is_some()
+    );
+    assert!(
+        store
+            .raw_event_row(auth.id())
+            .await
+            .expect("auth raw row")
+            .is_none()
     );
     assert!(
         store
