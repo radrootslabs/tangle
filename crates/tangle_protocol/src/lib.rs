@@ -419,6 +419,36 @@ impl fmt::Debug for EventShapeError {
 
 impl std::error::Error for EventShapeError {}
 
+pub fn canonical_event_json(event: &UnsignedEvent) -> String {
+    let tags: Vec<serde_json::Value> = event
+        .tags()
+        .iter()
+        .map(|tag| {
+            serde_json::Value::Array(
+                tag.values()
+                    .iter()
+                    .map(|value| serde_json::Value::String(value.clone()))
+                    .collect(),
+            )
+        })
+        .collect();
+    serde_json::json!([
+        0,
+        event.pubkey().as_str(),
+        event.created_at().as_u64(),
+        event.kind().as_u32(),
+        tags,
+        event.content()
+    ])
+    .to_string()
+}
+
+impl UnsignedEvent {
+    pub fn canonical_json(&self) -> String {
+        canonical_event_json(self)
+    }
+}
+
 fn require_lowercase_hex(scalar: &'static str, value: &str, expected: usize) -> Result<(), String> {
     let actual = value.chars().count();
     if actual != expected {
@@ -457,8 +487,9 @@ fn kind_out_of_range_error(value: u64) -> String {
 mod tests {
     use super::{
         Event, EventId, EventShapeError, Kind, PublicKeyHex, RawEventJson, SignatureHex,
-        SubscriptionId, Tag, TagName, TagValue, UnixTimestamp, UnsignedEvent, empty_error,
-        invalid_length_error, kind_out_of_range_error, non_lowercase_hex_error, too_long_error,
+        SubscriptionId, Tag, TagName, TagValue, UnixTimestamp, UnsignedEvent, canonical_event_json,
+        empty_error, invalid_length_error, kind_out_of_range_error, non_lowercase_hex_error,
+        too_long_error,
     };
     use core::str::FromStr;
     use std::collections::hash_map::DefaultHasher;
@@ -703,5 +734,69 @@ mod tests {
             format!("{missing:?}"),
             "EventShapeError { message: \"event field `pubkey` is missing\" }"
         );
+    }
+
+    #[test]
+    fn canonical_event_json_serializes_empty_content_and_tags() {
+        let event = unsigned_event(Vec::new(), "");
+
+        assert_eq!(
+            event.canonical_json(),
+            include_str!("../tests/fixtures/canonical_empty_event.json").trim_end()
+        );
+        assert_eq!(canonical_event_json(&event), event.canonical_json());
+    }
+
+    #[test]
+    fn canonical_event_json_serializes_escaped_content() {
+        let event = unsigned_event(
+            vec![Tag::from_parts("alt", &["quote"]).expect("tag")],
+            "quote \" slash \\ newline\n",
+        );
+
+        assert_eq!(
+            event.canonical_json(),
+            include_str!("../tests/fixtures/canonical_escaped_event.json").trim_end()
+        );
+    }
+
+    #[test]
+    fn canonical_event_json_serializes_unicode_content() {
+        let event = unsigned_event(
+            vec![Tag::from_parts("t", &["radroots"]).expect("tag")],
+            "radroots 🌱 café",
+        );
+
+        assert_eq!(
+            event.canonical_json(),
+            include_str!("../tests/fixtures/canonical_unicode_event.json").trim_end()
+        );
+    }
+
+    #[test]
+    fn canonical_event_json_preserves_repeated_tags() {
+        let event = unsigned_event(
+            vec![
+                Tag::from_parts("e", &["one"]).expect("first e"),
+                Tag::from_parts("e", &["two"]).expect("second e"),
+                Tag::from_parts("p", &["peer", "wss://relay.example"]).expect("p"),
+            ],
+            "with repeated tags",
+        );
+
+        assert_eq!(
+            event.canonical_json(),
+            include_str!("../tests/fixtures/canonical_repeated_tags_event.json").trim_end()
+        );
+    }
+
+    fn unsigned_event(tags: Vec<Tag>, content: &str) -> UnsignedEvent {
+        UnsignedEvent::new(
+            PublicKeyHex::new(&"1".repeat(PublicKeyHex::HEX_LENGTH)).expect("pubkey"),
+            UnixTimestamp::new(1_714_124_433),
+            Kind::new(1).expect("kind"),
+            tags,
+            content,
+        )
     }
 }

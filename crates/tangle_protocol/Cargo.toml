@@ -7,5 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 description = "Protocol types and wire contracts for Tangle"
 
+[dependencies]
+serde_json = "1"
+
 [lints]
 workspace = true
