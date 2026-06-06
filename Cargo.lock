@@ -416,6 +416,7 @@ dependencies = [
  "tangle_crypto",
  "tangle_nips",
  "tangle_protocol",
+ "tangle_store",
 ]
 
 [[package]]

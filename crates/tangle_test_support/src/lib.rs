@@ -4,9 +4,16 @@ use core::fmt;
 use k256::schnorr::signature::Signer;
 use k256::schnorr::{Signature, SigningKey};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use tangle_crypto::compute_event_id;
+use tangle_nips::ListingProjection;
 use tangle_protocol::{
-    Event, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent, event_to_value,
+    AddressCoordinate, Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp,
+    UnsignedEvent, event_to_value,
+};
+use tangle_store::{
+    DeletionMarker, DeletionMarkerRepository, ListingProjectionRepository, RawEventRepository,
+    RepositoryError, StoreEventOutcome, StoreProjectionOutcome, StoredEvent,
 };
 
 const VALID_PUBLIC_LISTING_JSON: &str =
@@ -136,6 +143,69 @@ pub fn fixture_event_json(event: &Event) -> serde_json::Value {
     event_to_value(event)
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InMemoryRepository {
+    events: BTreeMap<EventId, StoredEvent>,
+    listing_projections: BTreeMap<AddressCoordinate, ListingProjection>,
+    deletion_markers: Vec<DeletionMarker>,
+}
+
+impl InMemoryRepository {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl RawEventRepository for InMemoryRepository {
+    fn put_event(&mut self, record: StoredEvent) -> Result<StoreEventOutcome, RepositoryError> {
+        let event_id = record.event().id().clone();
+        if self.events.contains_key(&event_id) {
+            return Ok(StoreEventOutcome::Duplicate);
+        }
+        self.events.insert(event_id, record);
+        Ok(StoreEventOutcome::Inserted)
+    }
+
+    fn event_by_id(&self, event_id: &EventId) -> Result<Option<StoredEvent>, RepositoryError> {
+        Ok(self.events.get(event_id).cloned())
+    }
+
+    fn events(&self) -> Result<Vec<StoredEvent>, RepositoryError> {
+        Ok(self.events.values().cloned().collect())
+    }
+}
+
+impl ListingProjectionRepository for InMemoryRepository {
+    fn put_listing_projection(
+        &mut self,
+        projection: ListingProjection,
+    ) -> Result<StoreProjectionOutcome, RepositoryError> {
+        let address = projection.identity().address().clone();
+        match self.listing_projections.insert(address, projection) {
+            Some(_) => Ok(StoreProjectionOutcome::Replaced),
+            None => Ok(StoreProjectionOutcome::Inserted),
+        }
+    }
+
+    fn listing_projection(
+        &self,
+        address: &AddressCoordinate,
+    ) -> Result<Option<ListingProjection>, RepositoryError> {
+        Ok(self.listing_projections.get(address).cloned())
+    }
+}
+
+impl DeletionMarkerRepository for InMemoryRepository {
+    fn put_deletion_marker(&mut self, marker: DeletionMarker) -> Result<(), RepositoryError> {
+        self.deletion_markers.push(marker);
+        Ok(())
+    }
+
+    fn deletion_markers(&self) -> Result<Vec<DeletionMarker>, RepositoryError> {
+        Ok(self.deletion_markers.clone())
+    }
+}
+
 fn sign_unsigned_event(fixture_key: FixtureKey, unsigned: UnsignedEvent) -> Result<Event, String> {
     let signing_key = fixture_key.signing_key();
     let event_id = compute_event_id(&unsigned);
@@ -182,16 +252,21 @@ fn lower_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        FixtureKey, auth_event_spec, build_fixture_event, deletion_event_spec, fixed_hex_bytes,
-        fixture_event_json, fixture_spec_from_json, projection_ineligible_listing_spec,
-        valid_public_listing_spec,
+        FixtureKey, InMemoryRepository, auth_event_spec, build_fixture_event, deletion_event_spec,
+        fixed_hex_bytes, fixture_event_json, fixture_spec_from_json,
+        projection_ineligible_listing_spec, valid_public_listing_spec,
     };
     use tangle_crypto::{event_id_matches, verify_event_signature};
     use tangle_nips::{
         DeletionTarget, ListingProjectionEvaluation, evaluate_listing_projection,
         parse_deletion_request, parse_relay_auth_event,
     };
+    use tangle_protocol::UnixTimestamp;
     use tangle_protocol::{EventId, PublicKeyHex};
+    use tangle_store::{
+        DeletionMarker, DeletionMarkerRepository, ListingProjectionRepository, RawEventRepository,
+        StoreEventOutcome, StoreProjectionOutcome, StoredEvent,
+    };
 
     #[test]
     fn fixture_specs_load_from_canonical_json() {
@@ -354,6 +429,87 @@ mod tests {
         assert_eq!(
             fixed_hex_bytes("G0", 1, "fixture").expect_err("high"),
             "fixture must be lowercase hex"
+        );
+    }
+
+    #[test]
+    fn in_memory_repository_stores_raw_events_by_id_and_preserves_first_insert() {
+        let mut repository = InMemoryRepository::new();
+        let event = build_fixture_event(&valid_public_listing_spec()).expect("event");
+        let stored = StoredEvent::new(event.clone(), UnixTimestamp::new(100));
+        let duplicate = StoredEvent::new(event.clone(), UnixTimestamp::new(200));
+        let missing = EventId::new(&"f".repeat(EventId::HEX_LENGTH)).expect("missing");
+
+        assert_eq!(
+            repository.put_event(stored.clone()).expect("insert"),
+            StoreEventOutcome::Inserted
+        );
+        assert_eq!(
+            repository.put_event(duplicate).expect("duplicate"),
+            StoreEventOutcome::Duplicate
+        );
+        assert_eq!(
+            repository.event_by_id(event.id()).expect("lookup"),
+            Some(stored.clone())
+        );
+        assert_eq!(repository.event_by_id(&missing).expect("missing"), None);
+        assert_eq!(repository.events().expect("events"), vec![stored]);
+    }
+
+    #[test]
+    fn in_memory_repository_stores_listing_projections_by_address() {
+        let mut repository = InMemoryRepository::new();
+        let event = build_fixture_event(&valid_public_listing_spec()).expect("event");
+        let projection = evaluate_listing_projection(&event)
+            .projection()
+            .expect("projection")
+            .clone();
+        let address = projection.identity().address().clone();
+
+        assert_eq!(
+            repository
+                .put_listing_projection(projection.clone())
+                .expect("insert"),
+            StoreProjectionOutcome::Inserted
+        );
+        assert_eq!(
+            repository
+                .listing_projection(&address)
+                .expect("projection lookup"),
+            Some(projection.clone())
+        );
+        assert_eq!(
+            repository
+                .put_listing_projection(projection)
+                .expect("replace"),
+            StoreProjectionOutcome::Replaced
+        );
+    }
+
+    #[test]
+    fn in_memory_repository_appends_deletion_markers() {
+        let mut repository = InMemoryRepository::new();
+        let deletion = build_fixture_event(&deletion_event_spec()).expect("deletion");
+        let request = parse_deletion_request(&deletion)
+            .expect("deletion parse")
+            .expect("deletion request");
+        let marker = DeletionMarker::new(
+            deletion.id().clone(),
+            deletion.unsigned().pubkey().clone(),
+            request.targets()[0].clone(),
+            UnixTimestamp::new(300),
+        );
+
+        repository
+            .put_deletion_marker(marker.clone())
+            .expect("marker");
+        repository
+            .put_deletion_marker(marker.clone())
+            .expect("marker again");
+
+        assert_eq!(
+            repository.deletion_markers().expect("markers"),
+            vec![marker.clone(), marker]
         );
     }
 }
