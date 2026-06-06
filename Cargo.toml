@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/tangle",
+    "crates/tangle_core",
     "crates/tangle_crypto",
     "crates/tangle_nips",
     "crates/tangle_protocol",

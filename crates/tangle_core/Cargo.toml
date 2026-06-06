@@ -1,0 +1,17 @@
+[package]
+name = "tangle_core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Transport-independent relay core policy for tangle"
+
+[dependencies]
+tangle_protocol = { path = "../tangle_protocol" }
+
+[dev-dependencies]
+tangle_test_support = { path = "../tangle_test_support" }
+
+[lints]
+workspace = true
