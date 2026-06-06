@@ -1,9 +1,12 @@
 #![forbid(unsafe_code)]
 
+use std::sync::Arc;
+
 use k256::schnorr::signature::Verifier;
 use k256::schnorr::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 use tangle_protocol::{Event, EventId, UnsignedEvent, canonical_event_json};
+use tokio::sync::Semaphore;
 
 pub fn compute_event_id(event: &UnsignedEvent) -> EventId {
     let event_id = compute_event_id_hex(event);
@@ -54,6 +57,61 @@ pub fn verify_event_signature(event: &Event) -> Result<(), String> {
         .map_err(|_| "event signature verification failed".to_owned())
 }
 
+#[derive(Clone, Debug)]
+pub struct VerificationService {
+    semaphore: Arc<Semaphore>,
+    max_concurrent: usize,
+}
+
+impl VerificationService {
+    pub fn new(max_concurrent: usize) -> Result<Self, String> {
+        if max_concurrent == 0 {
+            return Err("verification concurrency limit must be greater than zero".to_owned());
+        }
+        Ok(Self {
+            semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            max_concurrent,
+        })
+    }
+
+    pub fn max_concurrent(&self) -> usize {
+        self.max_concurrent
+    }
+
+    pub fn available_permits(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+
+    pub fn close(&self) {
+        self.semaphore.close();
+    }
+
+    pub async fn verify_event(&self, event: &Event) -> Result<VerificationOutcome, String> {
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| "verification service is closed".to_owned())?;
+        let result = verify_event_signature(event);
+        drop(permit);
+        result.map(|_| VerificationOutcome {
+            event_id: event.id().clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationOutcome {
+    event_id: EventId,
+}
+
+impl VerificationOutcome {
+    pub fn event_id(&self) -> &EventId {
+        &self.event_id
+    }
+}
+
 fn lower_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -95,14 +153,16 @@ fn hex_value(value: u8, scalar: &str) -> Result<u8, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_event_id, compute_event_id_hex, event_id_matches, fixed_hex_bytes, lower_hex,
-        verify_event_id, verify_event_signature,
+        VerificationService, compute_event_id, compute_event_id_hex, event_id_matches,
+        fixed_hex_bytes, lower_hex, verify_event_id, verify_event_signature,
     };
     use k256::schnorr::signature::Signer;
     use k256::schnorr::{Signature, SigningKey};
+    use std::time::Duration;
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
     };
+    use tokio::time::timeout;
 
     #[test]
     fn event_id_hashes_canonical_event_bytes() {
@@ -226,6 +286,69 @@ mod tests {
         assert_eq!(
             fixed_hex_bytes("G0", 1, "sample").expect_err("hex"),
             "sample must be lowercase hex"
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_service_accepts_valid_events_and_rejects_invalid_events() {
+        let event = signed_event();
+        let invalid = Event::new(
+            EventId::new(&"f".repeat(EventId::HEX_LENGTH)).expect("id"),
+            event.unsigned().clone(),
+            event.sig().clone(),
+        );
+        let service = VerificationService::new(2).expect("service");
+
+        let outcome = service.verify_event(&event).await.expect("verified");
+
+        assert_eq!(service.max_concurrent(), 2);
+        assert_eq!(service.available_permits(), 2);
+        assert_eq!(outcome.event_id(), event.id());
+        assert!(
+            service
+                .verify_event(&invalid)
+                .await
+                .expect_err("invalid")
+                .starts_with("event id mismatch")
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_service_enforces_limit_and_reports_closed_state() {
+        let event = signed_event();
+        let service = VerificationService::new(1).expect("service");
+        let permit = service
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("permit");
+
+        assert_eq!(service.available_permits(), 0);
+        assert!(
+            timeout(Duration::from_millis(20), service.verify_event(&event))
+                .await
+                .is_err()
+        );
+        drop(permit);
+        assert!(
+            timeout(Duration::from_secs(1), service.verify_event(&event))
+                .await
+                .expect("timeout")
+                .is_ok()
+        );
+        service.close();
+        assert_eq!(
+            service.verify_event(&event).await.expect_err("closed"),
+            "verification service is closed"
+        );
+    }
+
+    #[test]
+    fn verification_service_rejects_zero_limit() {
+        assert_eq!(
+            VerificationService::new(0).expect_err("zero"),
+            "verification concurrency limit must be greater than zero"
         );
     }
 

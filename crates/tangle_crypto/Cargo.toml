@@ -11,6 +11,7 @@ description = "Cryptographic verification utilities for Tangle"
 k256 = { version = "0.13", features = ["schnorr"] }
 sha2 = "0.10"
 tangle_protocol = { path = "../tangle_protocol" }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 
 [lints]
 workspace = true
