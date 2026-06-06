@@ -4044,6 +4044,7 @@ name = "tangle_bench"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "sha2",
  "tangle_nips",
  "tangle_protocol",
  "tangle_store",
