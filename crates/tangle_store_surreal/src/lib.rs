@@ -903,11 +903,8 @@ impl SurrealStore {
             .map_err(SurrealStoreError::from)?
             .check()
             .map_err(SurrealStoreError::from)?;
-        let info: Option<surrealdb::types::Value> =
-            response.take(0).map_err(SurrealStoreError::from)?;
-        Ok(info
-            .map(|value| format!("{value:?}"))
-            .unwrap_or_else(|| "None".to_owned()))
+        let info: surrealdb::types::Value = response.take(0).map_err(SurrealStoreError::from)?;
+        Ok(format!("{info:?}"))
     }
 
     pub async fn store_raw_event(
@@ -1136,9 +1133,7 @@ CREATE event_tag_index CONTENT {
                 None => current,
             });
         }
-        let Some(intersection) = intersection else {
-            return Ok(Vec::new());
-        };
+        let intersection = intersection.unwrap_or_default();
         let mut result = first_order
             .into_iter()
             .filter(|event_id| intersection.contains(event_id))
@@ -1322,16 +1317,12 @@ UPSERT type::record('deletion_marker', $marker_id) CONTENT {
                 .map_err(SurrealStoreError::from)?
                 .check()
                 .map_err(SurrealStoreError::from)?;
-            match target_type {
-                "event" => {
-                    self.mark_raw_event_deleted(&target_ref, event.unsigned().pubkey().as_str())
-                        .await?;
-                }
-                "address" => {
-                    self.mark_address_deleted(&target_ref, event.unsigned().pubkey().as_str())
-                        .await?;
-                }
-                _ => {}
+            if target_type == "event" {
+                self.mark_raw_event_deleted(&target_ref, event.unsigned().pubkey().as_str())
+                    .await?;
+            } else {
+                self.mark_address_deleted(&target_ref, event.unsigned().pubkey().as_str())
+                    .await?;
             }
         }
         Ok(DeletionMarkerOutcome::Applied {
@@ -2434,8 +2425,9 @@ mod tests {
         ListingProjectionQuery, ListingRevisionOutcome, MigrationApplyOutcome,
         SearchDocumentOutcome, SearchDocumentQuery, SurrealConfigError, SurrealConnectionConfig,
         SurrealConnectionMode, SurrealMigration, SurrealMigrationError, SurrealMigrationPlan,
-        SurrealStore, base_migration_plan, migration_tracking_schema,
+        SurrealStore, SurrealStoreError, base_migration_plan, migration_tracking_schema,
     };
+    use tangle_nips::ListingProjectionEvaluation;
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
         filter_from_value,
@@ -3295,6 +3287,7 @@ mod tests {
         let intersection = filter_from_value(&serde_json::json!({
             "#e": [target_event],
             "#p": [pubkey_a],
+            "authors": [pubkey_a],
             "kinds": [1],
             "since": 100,
             "until": 102
@@ -3876,6 +3869,48 @@ mod tests {
         assert_eq!(row["deleted"], false);
         assert_eq!(row["projected_at"], projected_at.as_u64());
 
+        let media_listing = synthetic_event(
+            "6",
+            "8",
+            listing.unsigned().pubkey().as_str(),
+            1_714_125_101,
+            30_402,
+            vec![
+                Tag::from_parts("d", &["listing-media"]).expect("d tag"),
+                Tag::from_parts("title", &["Media carrots"]).expect("title"),
+                Tag::from_parts("price", &["7.25", "USD"]).expect("price"),
+                Tag::from_parts("unit", &["lb"]).expect("unit"),
+                Tag::from_parts("fulfillment", &["pickup"]).expect("fulfillment"),
+                Tag::from_parts("published_at", &["1714125100"]).expect("published"),
+                Tag::from_parts(
+                    "image",
+                    &["https://fixtures.radroots.test/listing-media.png"],
+                )
+                .expect("image"),
+            ],
+            "media listing",
+        );
+        assert_eq!(
+            store
+                .project_current_listing(&media_listing, projected_at)
+                .await
+                .expect("media current"),
+            ListingCurrentOutcome::Projected
+        );
+        let media_row = store
+            .listing_current_row(&format!(
+                "30402:{}:listing-media",
+                media_listing.unsigned().pubkey().as_str()
+            ))
+            .await
+            .expect("media row")
+            .expect("media row exists");
+        assert_eq!(media_row["published_at"], 1_714_125_100_u64);
+        assert_eq!(
+            media_row["image_urls"][0],
+            "https://fixtures.radroots.test/listing-media.png"
+        );
+
         let pubkey = "d".repeat(PublicKeyHex::HEX_LENGTH);
         let invalid = synthetic_event(
             "e",
@@ -4248,6 +4283,144 @@ mod tests {
                 .await
                 .expect("hidden rows")
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn private_helpers_cover_debug_errors_and_decimal_edges() {
+        let store = memory_store().await;
+        assert!(format!("{store:?}").contains("SurrealStore"));
+        let source = store
+            .database()
+            .query("THIS IS NOT VALID SURQL")
+            .await
+            .expect_err("surreal error");
+        assert!(!SurrealStoreError::from(source).message().is_empty());
+        let note = synthetic_event(
+            "1",
+            "b",
+            &"1".repeat(PublicKeyHex::HEX_LENGTH),
+            1,
+            1,
+            Vec::new(),
+            "note",
+        );
+        let fields =
+            super::listing_revision_fields(&note, &ListingProjectionEvaluation::NotListing)
+                .expect("not listing fields");
+        assert_eq!(fields.revision_key, note.id().as_str());
+        assert!(!fields.parsed_ok);
+        let pubkey = "2".repeat(PublicKeyHex::HEX_LENGTH);
+        let addressable_without_d =
+            synthetic_event("2", "c", &pubkey, 2, 30_402, Vec::new(), "addressless");
+        assert_eq!(
+            super::address_key_value(&addressable_without_d)
+                .expect_err("address key error")
+                .message(),
+            "addressable event must include a d tag"
+        );
+        assert_eq!(
+            store
+                .maintain_current_event(&addressable_without_d)
+                .await
+                .expect_err("current key error")
+                .message(),
+            "addressable event must include a d tag"
+        );
+        let malformed_deletion = synthetic_event(
+            "3",
+            "d",
+            &pubkey,
+            3,
+            5,
+            vec![Tag::from_parts("e", &["not-hex"]).expect("e tag")],
+            "bad deletion",
+        );
+        assert_eq!(
+            store
+                .apply_deletion_markers(&malformed_deletion)
+                .await
+                .expect_err("malformed deletion")
+                .message(),
+            "event id must be 64 characters, got 7"
+        );
+        assert_eq!(
+            super::tag_values(
+                &synthetic_event(
+                    "4",
+                    "e",
+                    &pubkey,
+                    4,
+                    1,
+                    vec![
+                        Tag::from_parts("image", &["https://fixtures.radroots.test/helper.png"])
+                            .expect("image tag")
+                    ],
+                    "image helper",
+                ),
+                "image"
+            ),
+            vec!["https://fixtures.radroots.test/helper.png".to_owned()]
+        );
+        assert_eq!(
+            super::unique_in_order(vec![
+                "first".to_owned(),
+                "first".to_owned(),
+                "second".to_owned()
+            ]),
+            vec!["first".to_owned(), "second".to_owned()]
+        );
+        assert_eq!(super::price_minor("12"), Some(1_200));
+        assert_eq!(super::price_minor("1.2.3"), None);
+        assert_eq!(super::price_minor("1.234"), None);
+    }
+
+    #[tokio::test]
+    async fn project_current_listing_rejects_prices_without_minor_unit_representation() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let pubkey = "1".repeat(PublicKeyHex::HEX_LENGTH);
+        let listing = synthetic_event(
+            "2",
+            "c",
+            &pubkey,
+            1_714_125_500,
+            30_402,
+            vec![
+                Tag::from_parts("d", &["listing-fractional"]).expect("d tag"),
+                Tag::from_parts("title", &["Fractional carrots"]).expect("title"),
+                Tag::from_parts("price", &["1.234", "USD"]).expect("price"),
+                Tag::from_parts("unit", &["lb"]).expect("unit"),
+                Tag::from_parts("fulfillment", &["pickup"]).expect("fulfillment"),
+            ],
+            "fractional listing",
+        );
+
+        assert_eq!(
+            store
+                .store_listing_revision(&listing, UnixTimestamp::new(1_714_125_501))
+                .await
+                .expect("revision"),
+            ListingRevisionOutcome::Stored { parsed_ok: true }
+        );
+        assert_eq!(
+            store
+                .listing_revision_row(listing.id())
+                .await
+                .expect("revision row")
+                .expect("revision exists")["price_minor"],
+            serde_json::Value::Null
+        );
+        let error = store
+            .project_current_listing(&listing, UnixTimestamp::new(1_714_125_501))
+            .await
+            .expect_err("minor unit error");
+        assert_eq!(
+            error.message(),
+            "listing price amount must fit two decimal minor units"
         );
     }
 
