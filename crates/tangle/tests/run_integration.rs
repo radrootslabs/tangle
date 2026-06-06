@@ -27,12 +27,14 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
     let db_path = root.join("surrealdb");
     let config_path = root.join("runtime.json");
     fs::create_dir_all(&root).expect("runtime root");
+    let admin = FixtureKey::Relay.public_key();
     write_runtime_config(
         &config_path,
         &db_path,
         port,
         "tangle_it",
         serde_json::json!({
+            "admin_pubkeys": [admin.as_str()],
             "approved_sellers": [FixtureKey::Seller.public_key().as_str()],
             "write_rate_limit": {
                 "limit": 10,
@@ -60,6 +62,8 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
     let reaction = listing_reaction(&listing, 1_714_124_437, "+");
     let thread = forum_thread(1_714_124_438, Some("Market day thread"), &["market", "csa"]);
     let thread_comment = forum_thread_comment(&thread, 1_714_124_439, "I can bring greens.");
+    let label = listing_label(&listing, 1_714_124_440, "reviewed");
+    let report = listing_report(&listing, 1_714_124_441, "spam");
     let auth = build_fixture_event(&auth_event_spec()).expect("auth");
     let seller = FixtureKey::Seller.public_key();
 
@@ -242,6 +246,52 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
     );
     assert_eq!(next_label(&mut publisher).await, "EOSE");
 
+    publisher
+        .send(Message::Text(
+            serde_json::json!(["EVENT", event_to_value(&label)])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("label send");
+    assert_ok(&next_json(&mut publisher).await, true);
+    publisher
+        .send(Message::Text(
+            serde_json::json!(["REQ", "sub-label", { "ids": [label.id().as_str()] }])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("label fetch send");
+    let fetched_label = next_json(&mut publisher).await;
+    assert_eq!(fetched_label[0], "EVENT");
+    assert_eq!(fetched_label[1], "sub-label");
+    assert_eq!(fetched_label[2]["id"], label.id().as_str());
+    assert_eq!(next_label(&mut publisher).await, "EOSE");
+
+    publisher
+        .send(Message::Text(
+            serde_json::json!(["EVENT", event_to_value(&report)])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("report send");
+    assert_ok(&next_json(&mut publisher).await, true);
+    publisher
+        .send(Message::Text(
+            serde_json::json!(["REQ", "sub-report", { "ids": [report.id().as_str()] }])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("report fetch send");
+    let fetched_report = next_json(&mut publisher).await;
+    assert_eq!(fetched_report[0], "EVENT");
+    assert_eq!(fetched_report[1], "sub-report");
+    assert_eq!(fetched_report[2]["id"], report.id().as_str());
+    assert_eq!(next_label(&mut publisher).await, "EOSE");
+
     subscriber
         .send(Message::Text(
             serde_json::json!(["CLOSE", "sub-live"]).to_string().into(),
@@ -298,6 +348,28 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
     assert!(forum_comments.contains("200 OK"));
     assert!(forum_comments.contains(thread_comment.id().as_str()));
     assert!(forum_comments.contains("I can bring greens."));
+    let moderation_labels = http_get_admin(
+        port,
+        &format!(
+            "/api/admin/moderation/labels?target_type=event&target_ref={}&namespace=com.radroots.moderation&label=reviewed&limit=5",
+            listing.id().as_str()
+        ),
+        Some(admin.as_str()),
+    );
+    assert!(moderation_labels.contains("200 OK"));
+    assert!(moderation_labels.contains(label.id().as_str()));
+    assert!(moderation_labels.contains("\"label\":\"reviewed\""));
+    let moderation_reports = http_get_admin(
+        port,
+        &format!(
+            "/api/admin/moderation/reports?target_type=event&target_ref={}&report_type=spam&limit=5",
+            listing.id().as_str()
+        ),
+        Some(admin.as_str()),
+    );
+    assert!(moderation_reports.contains("200 OK"));
+    assert!(moderation_reports.contains(report.id().as_str()));
+    assert!(moderation_reports.contains("\"report_type\":\"spam\""));
     let search = http_get(port, "/api/search?q=carrots&limit=5");
     assert!(search.contains("200 OK"));
     assert!(search.contains(listing.id().as_str()));
@@ -370,6 +442,29 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
             .expect("thread search row")
             .is_some()
     );
+    let label_rows = store
+        .label_projection_rows(label.id())
+        .await
+        .expect("label rows");
+    assert_eq!(label_rows.len(), 2);
+    let event_label = label_rows
+        .iter()
+        .find(|row| row["target_type"] == "event")
+        .expect("event label row");
+    assert_eq!(event_label["event_id"], label.id().as_str());
+    assert_eq!(event_label["target_ref"], listing.id().as_str());
+    assert_eq!(event_label["namespace"], "com.radroots.moderation");
+    assert_eq!(event_label["label"], "reviewed");
+    let report_rows = store
+        .report_projection_rows(report.id())
+        .await
+        .expect("report rows");
+    assert_eq!(report_rows.len(), 1);
+    assert_eq!(report_rows[0]["event_id"], report.id().as_str());
+    assert_eq!(report_rows[0]["target_type"], "event");
+    assert_eq!(report_rows[0]["target_ref"], listing.id().as_str());
+    assert_eq!(report_rows[0]["report_type"], "spam");
+    assert_eq!(report_rows[0]["reported_pubkeys"][0], seller.as_str());
     assert!(
         store
             .search_document_row(&listing_key)
@@ -850,6 +945,27 @@ fn http_get(port: u16, path: &str) -> String {
     try_http_get(port, path).expect("http get")
 }
 
+fn http_get_admin(port: u16, path: &str, admin_pubkey: Option<&str>) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("http connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .expect("write timeout");
+    let admin_header = admin_pubkey
+        .map(|pubkey| format!("x-tangle-admin-pubkey: {pubkey}\r\n"))
+        .unwrap_or_default();
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: application/json\r\n{admin_header}Connection: close\r\n\r\n"
+    )
+    .expect("http get");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("http read");
+    response
+}
+
 fn http_post_json(port: u16, path: &str, admin_pubkey: Option<&str>, body: Value) -> String {
     let body = body.to_string();
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("http connect");
@@ -986,6 +1102,53 @@ fn listing_reaction(
         content,
     )
     .expect("reaction event")
+}
+
+fn listing_label(
+    listing: &tangle_protocol::Event,
+    created_at: u64,
+    label: &str,
+) -> tangle_protocol::Event {
+    let listing_key = format!("30402:{}:listing-a", listing.unsigned().pubkey().as_str());
+    let namespace = "com.radroots.moderation";
+    build_fixture_event_from_parts(
+        FixtureKey::Seller,
+        created_at,
+        1_985,
+        vec![
+            vec!["L".to_owned(), namespace.to_owned()],
+            vec!["l".to_owned(), label.to_owned(), namespace.to_owned()],
+            vec!["e".to_owned(), listing.id().as_str().to_owned()],
+            vec!["a".to_owned(), listing_key],
+        ],
+        "moderator label",
+    )
+    .expect("label event")
+}
+
+fn listing_report(
+    listing: &tangle_protocol::Event,
+    created_at: u64,
+    report_type: &str,
+) -> tangle_protocol::Event {
+    build_fixture_event_from_parts(
+        FixtureKey::Seller,
+        created_at,
+        1_984,
+        vec![
+            vec![
+                "p".to_owned(),
+                listing.unsigned().pubkey().as_str().to_owned(),
+            ],
+            vec![
+                "e".to_owned(),
+                listing.id().as_str().to_owned(),
+                report_type.to_owned(),
+            ],
+        ],
+        "moderator report",
+    )
+    .expect("report event")
 }
 
 fn forum_thread(created_at: u64, title: Option<&str>, topics: &[&str]) -> tangle_protocol::Event {

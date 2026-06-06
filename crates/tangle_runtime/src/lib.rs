@@ -36,10 +36,10 @@ use tangle_protocol::{
 use tangle_store::{StoreEventOutcome, StoredEvent};
 use tangle_store_surreal::{
     CommentProjectionOutcome, CommentProjectionQuery, DurableRateLimitDecision,
-    ForumThreadProjectionOutcome, ForumThreadProjectionQuery, ListingProjectionQuery,
-    LongFormProjectionOutcome, MigrationApplyOutcome, ReactionProjectionOutcome,
-    SearchDocumentQuery, SurrealConnectionConfig, SurrealConnectionMode, SurrealStore,
-    base_migration_plan,
+    ForumThreadProjectionOutcome, ForumThreadProjectionQuery, LabelProjectionOutcome,
+    LabelProjectionQuery, ListingProjectionQuery, LongFormProjectionOutcome, MigrationApplyOutcome,
+    ReactionProjectionOutcome, ReportProjectionOutcome, ReportProjectionQuery, SearchDocumentQuery,
+    SurrealConnectionConfig, SurrealConnectionMode, SurrealStore, base_migration_plan,
 };
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -616,6 +616,16 @@ async fn project_stored_event(
         ) => false,
         Err(_) => return Err(RuntimeCommandError::store("event projection failed")),
     };
+    let label_projected = match store.project_label(event, now).await {
+        Ok(LabelProjectionOutcome::Projected) => true,
+        Ok(LabelProjectionOutcome::NotLabel | LabelProjectionOutcome::Ineligible) => false,
+        Err(_) => return Err(RuntimeCommandError::store("event projection failed")),
+    };
+    let report_projected = match store.project_report(event, now).await {
+        Ok(ReportProjectionOutcome::Projected) => true,
+        Ok(ReportProjectionOutcome::NotReport | ReportProjectionOutcome::Ineligible) => false,
+        Err(_) => return Err(RuntimeCommandError::store("event projection failed")),
+    };
     if effect == AdmissionEffect::StoreRawAndProjectPublicListing {
         if store.project_current_listing(event, now).await.is_err()
             || store.project_listing_helpers(event).await.is_err()
@@ -625,7 +635,12 @@ async fn project_stored_event(
         }
         return Ok(true);
     }
-    Ok(comment_projected || reaction_projected || long_form_projected || forum_thread_projected)
+    Ok(comment_projected
+        || reaction_projected
+        || long_form_projected
+        || forum_thread_projected
+        || label_projected
+        || report_projected)
 }
 
 fn parse_event_import_document(raw: &str) -> Result<Vec<Event>, RuntimeCommandError> {
@@ -1013,6 +1028,14 @@ fn runtime_router(
             "/api/admin/events/{event_id}/unhide",
             post(runtime_admin_unhide_event),
         )
+        .route(
+            "/api/admin/moderation/labels",
+            get(runtime_admin_moderation_labels),
+        )
+        .route(
+            "/api/admin/moderation/reports",
+            get(runtime_admin_moderation_reports),
+        )
         .with_state(state)
 }
 
@@ -1271,6 +1294,50 @@ async fn runtime_admin_unhide_event(
         }
         tangle_store_surreal::HiddenEventOutcome::Hidden => Err(ApiError::internal()),
     }
+}
+
+async fn runtime_admin_moderation_labels(
+    State(state): State<RuntimeRelayState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Result<Json<ModerationLabelsDocument>, ApiError> {
+    let _admin = require_admin_pubkey(&state.config, &headers)?;
+    let query = label_projection_query(query.as_deref().unwrap_or_default())?;
+    let rows = state
+        .store
+        .query_label_projections(&query)
+        .await
+        .map_err(|_| ApiError::internal())?;
+    let items = rows
+        .iter()
+        .map(moderation_label_document)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(ModerationLabelsDocument {
+        items,
+        next_cursor: None,
+    }))
+}
+
+async fn runtime_admin_moderation_reports(
+    State(state): State<RuntimeRelayState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Result<Json<ModerationReportsDocument>, ApiError> {
+    let _admin = require_admin_pubkey(&state.config, &headers)?;
+    let query = report_projection_query(query.as_deref().unwrap_or_default())?;
+    let rows = state
+        .store
+        .query_report_projections(&query)
+        .await
+        .map_err(|_| ApiError::internal())?;
+    let items = rows
+        .iter()
+        .map(moderation_report_document)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(ModerationReportsDocument {
+        items,
+        next_cursor: None,
+    }))
 }
 
 async fn handle_websocket(mut socket: WebSocket, state: RuntimeRelayState) {
@@ -1980,6 +2047,8 @@ impl EventMessageHandler {
             || self.store.project_reaction(&event, now).await.is_err()
             || self.store.project_long_form(&event, now).await.is_err()
             || self.store.project_forum_thread(&event, now).await.is_err()
+            || self.store.project_label(&event, now).await.is_err()
+            || self.store.project_report(&event, now).await.is_err()
         {
             return ok_rejected(event_id, "error: projection failed".to_owned());
         }
@@ -2720,6 +2789,47 @@ impl AdminPolicyDocument {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModerationLabelsDocument {
+    pub items: Vec<ModerationLabelDocument>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModerationLabelDocument {
+    pub label_id: String,
+    pub event_id: String,
+    pub pubkey: String,
+    pub created_at: u64,
+    pub content: String,
+    pub namespace: String,
+    pub label: String,
+    pub target_type: String,
+    pub target_ref: String,
+    pub projected_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModerationReportsDocument {
+    pub items: Vec<ModerationReportDocument>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModerationReportDocument {
+    pub report_id: String,
+    pub event_id: String,
+    pub pubkey: String,
+    pub created_at: u64,
+    pub content: String,
+    pub target_type: String,
+    pub target_ref: String,
+    pub report_type: String,
+    pub reported_pubkeys: Vec<String>,
+    pub server_urls: Vec<String>,
+    pub projected_at: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct AdminEventPolicyRequest {
     pub reason: Option<String>,
@@ -3418,6 +3528,129 @@ fn forum_thread_query(raw: &str) -> Result<ForumThreadProjectionQuery, ApiError>
     Ok(query)
 }
 
+fn label_projection_query(raw: &str) -> Result<LabelProjectionQuery, ApiError> {
+    let mut target_type = None;
+    let mut target_ref = None;
+    let mut namespace = None;
+    let mut label = None;
+    let mut pubkey = None;
+    let mut limit = None;
+    for (key, value) in form_urlencoded::parse(raw.as_bytes()) {
+        let value = value.into_owned();
+        match key.as_ref() {
+            "target_type" => set_once(
+                "target_type",
+                &mut target_type,
+                required_value("target_type", &value)?,
+            )?,
+            "target_ref" => set_once(
+                "target_ref",
+                &mut target_ref,
+                required_value("target_ref", &value)?,
+            )?,
+            "namespace" => set_once(
+                "namespace",
+                &mut namespace,
+                required_value("namespace", &value)?,
+            )?,
+            "label" => set_once("label", &mut label, required_value("label", &value)?)?,
+            "pubkey" => set_once("pubkey", &mut pubkey, parse_pubkey("pubkey", &value)?)?,
+            "limit" => set_once("limit", &mut limit, parse_limit(&value)?)?,
+            "cursor" => {
+                return Err(invalid_parameter(
+                    "cursor",
+                    "signed cursor decoding is not implemented",
+                ));
+            }
+            "" => {}
+            unsupported => {
+                return Err(ApiError::invalid_request(format!(
+                    "query parameter `{unsupported}` is unsupported"
+                )));
+            }
+        }
+    }
+    if target_type.is_some() != target_ref.is_some() {
+        return Err(invalid_parameter(
+            "target",
+            "target_type and target_ref must be provided together",
+        ));
+    }
+    let mut query = LabelProjectionQuery::new().with_limit(limit.unwrap_or(50));
+    if let (Some(target_type), Some(target_ref)) = (target_type, target_ref) {
+        query = query.with_target(&target_type, &target_ref);
+    }
+    if let Some(namespace) = namespace {
+        query = query.with_namespace(&namespace);
+    }
+    if let Some(label) = label {
+        query = query.with_label(&label);
+    }
+    if let Some(pubkey) = pubkey {
+        query = query.with_pubkey(pubkey.as_str());
+    }
+    Ok(query)
+}
+
+fn report_projection_query(raw: &str) -> Result<ReportProjectionQuery, ApiError> {
+    let mut target_type = None;
+    let mut target_ref = None;
+    let mut report_type = None;
+    let mut pubkey = None;
+    let mut limit = None;
+    for (key, value) in form_urlencoded::parse(raw.as_bytes()) {
+        let value = value.into_owned();
+        match key.as_ref() {
+            "target_type" => set_once(
+                "target_type",
+                &mut target_type,
+                required_value("target_type", &value)?,
+            )?,
+            "target_ref" => set_once(
+                "target_ref",
+                &mut target_ref,
+                required_value("target_ref", &value)?,
+            )?,
+            "report_type" => set_once(
+                "report_type",
+                &mut report_type,
+                required_value("report_type", &value)?,
+            )?,
+            "pubkey" => set_once("pubkey", &mut pubkey, parse_pubkey("pubkey", &value)?)?,
+            "limit" => set_once("limit", &mut limit, parse_limit(&value)?)?,
+            "cursor" => {
+                return Err(invalid_parameter(
+                    "cursor",
+                    "signed cursor decoding is not implemented",
+                ));
+            }
+            "" => {}
+            unsupported => {
+                return Err(ApiError::invalid_request(format!(
+                    "query parameter `{unsupported}` is unsupported"
+                )));
+            }
+        }
+    }
+    if target_type.is_some() != target_ref.is_some() {
+        return Err(invalid_parameter(
+            "target",
+            "target_type and target_ref must be provided together",
+        ));
+    }
+    let mut query = ReportProjectionQuery::new().with_limit(limit.unwrap_or(50));
+    if let (Some(target_type), Some(target_ref)) = (target_type, target_ref) {
+        query = query.with_target(&target_type, &target_ref);
+    }
+    if let Some(report_type) = report_type {
+        query = query.with_report_type(&report_type);
+    }
+    if let Some(pubkey) = pubkey {
+        query = query.with_pubkey(pubkey.as_str());
+    }
+    Ok(query)
+}
+
 fn parse_comment_query(raw: &str) -> Result<u64, ApiError> {
     let mut limit = None;
     for (key, value) in form_urlencoded::parse(raw.as_bytes()) {
@@ -3490,6 +3723,39 @@ fn comment_item_document(row: &serde_json::Value) -> Result<CommentItemDocument,
             kind: string_field(row, "parent_kind")?,
             author: optional_string_field(row, "parent_author")?,
         },
+    })
+}
+
+fn moderation_label_document(row: &serde_json::Value) -> Result<ModerationLabelDocument, ApiError> {
+    Ok(ModerationLabelDocument {
+        label_id: string_field(row, "label_id")?,
+        event_id: string_field(row, "event_id")?,
+        pubkey: string_field(row, "pubkey")?,
+        created_at: u64_field(row, "created_at")?,
+        content: string_field(row, "content")?,
+        namespace: string_field(row, "namespace")?,
+        label: string_field(row, "label")?,
+        target_type: string_field(row, "target_type")?,
+        target_ref: string_field(row, "target_ref")?,
+        projected_at: u64_field(row, "projected_at")?,
+    })
+}
+
+fn moderation_report_document(
+    row: &serde_json::Value,
+) -> Result<ModerationReportDocument, ApiError> {
+    Ok(ModerationReportDocument {
+        report_id: string_field(row, "report_id")?,
+        event_id: string_field(row, "event_id")?,
+        pubkey: string_field(row, "pubkey")?,
+        created_at: u64_field(row, "created_at")?,
+        content: string_field(row, "content")?,
+        target_type: string_field(row, "target_type")?,
+        target_ref: string_field(row, "target_ref")?,
+        report_type: string_field(row, "report_type")?,
+        reported_pubkeys: string_array_field(row, "reported_pubkeys")?,
+        server_urls: string_array_field(row, "server_urls")?,
+        projected_at: u64_field(row, "projected_at")?,
     })
 }
 
