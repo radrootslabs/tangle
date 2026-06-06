@@ -7,8 +7,11 @@ use axum::{
     routing::get,
 };
 use core::fmt;
-use http::StatusCode;
+use http::{HeaderMap, HeaderValue, StatusCode, header};
 use serde::{Deserialize, Serialize};
+
+pub const TANGLE_SUPPORTED_NIPS: [u16; 8] = [1, 9, 11, 16, 33, 42, 50, 99];
+pub const TANGLE_RELAY_SOFTWARE: &str = "https://github.com/radrootslabs/tangle";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiErrorCode {
@@ -222,11 +225,62 @@ pub struct ReadinessChecksDocument {
     pub repository: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayInfoDocument {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pubkey: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contact: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    pub supported_nips: Vec<u16>,
+    pub software: String,
+    pub version: String,
+    pub limitation: RelayInfoLimitationDocument,
+}
+
+impl RelayInfoDocument {
+    pub fn tangle_default() -> Self {
+        Self {
+            id: None,
+            name: "tangle".to_owned(),
+            description: Some("SurrealDB-backed Nostr relay for NIP-99 marketplaces".to_owned()),
+            pubkey: None,
+            contact: None,
+            icon: None,
+            supported_nips: TANGLE_SUPPORTED_NIPS.to_vec(),
+            software: TANGLE_RELAY_SOFTWARE.to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            limitation: RelayInfoLimitationDocument {
+                payment_required: false,
+                restricted_writes: true,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayInfoLimitationDocument {
+    pub payment_required: bool,
+    pub restricted_writes: bool,
+}
+
 pub fn health_router(readiness: ReadinessState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .with_state(readiness)
+}
+
+pub fn relay_info_router(document: RelayInfoDocument) -> Router {
+    Router::new()
+        .route("/", get(relay_info))
+        .with_state(document)
 }
 
 async fn healthz() -> Json<HealthDocument> {
@@ -244,14 +298,45 @@ async fn readyz(State(readiness): State<ReadinessState>) -> (StatusCode, Json<Re
     (status, Json(readiness.response()))
 }
 
+async fn relay_info(State(relay_info): State<RelayInfoDocument>, headers: HeaderMap) -> Response {
+    if !accepts_nostr_json(headers.get(header::ACCEPT)) {
+        return ApiError::not_found("relay information requires application/nostr+json")
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/nostr+json"),
+        )],
+        Json(relay_info),
+    )
+        .into_response()
+}
+
+fn accepts_nostr_json(value: Option<&HeaderValue>) -> bool {
+    value
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').any(|part| {
+                part.split(';').next().is_some_and(|media_type| {
+                    media_type
+                        .trim()
+                        .eq_ignore_ascii_case("application/nostr+json")
+                })
+            })
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ApiError, ApiErrorBody, ApiErrorCode, ApiErrorEnvelope, ReadinessCheckStatus,
-        ReadinessState, health_router,
+        ReadinessState, RelayInfoDocument, TANGLE_RELAY_SOFTWARE, TANGLE_SUPPORTED_NIPS,
+        health_router, relay_info_router,
     };
     use axum::{body::Body, response::IntoResponse};
-    use http::{Request, StatusCode};
+    use http::{HeaderValue, Request, StatusCode, header};
     use tower::ServiceExt;
 
     #[test]
@@ -417,5 +502,116 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn relay_info_default_matches_mvp_protocol_claims() {
+        let relay_info = RelayInfoDocument::tangle_default();
+        assert_eq!(relay_info.name, "tangle");
+        assert_eq!(relay_info.supported_nips, TANGLE_SUPPORTED_NIPS);
+        assert_eq!(relay_info.software, TANGLE_RELAY_SOFTWARE);
+        assert_eq!(relay_info.version, "0.1.0");
+        assert_eq!(relay_info.limitation.payment_required, false);
+        assert_eq!(relay_info.limitation.restricted_writes, true);
+        assert_eq!(
+            serde_json::to_value(relay_info).expect("json"),
+            serde_json::json!({
+                "name": "tangle",
+                "description": "SurrealDB-backed Nostr relay for NIP-99 marketplaces",
+                "supported_nips": [1, 9, 11, 16, 33, 42, 50, 99],
+                "software": "https://github.com/radrootslabs/tangle",
+                "version": "0.1.0",
+                "limitation": {
+                    "payment_required": false,
+                    "restricted_writes": true
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_info_endpoint_requires_nostr_accept_header() {
+        let response = relay_info_router(RelayInfoDocument::tangle_default())
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
+            serde_json::json!({
+                "error": {
+                    "code": "not_found",
+                    "message": "relay information requires application/nostr+json"
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_info_endpoint_serves_nip11_document_for_nostr_accept() {
+        let response = relay_info_router(RelayInfoDocument::tangle_default())
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(
+                        header::ACCEPT,
+                        "text/plain, APPLICATION/NOSTR+JSON; charset=utf-8",
+                    )
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .expect("content-type"),
+            HeaderValue::from_static("application/nostr+json")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
+            serde_json::json!({
+                "name": "tangle",
+                "description": "SurrealDB-backed Nostr relay for NIP-99 marketplaces",
+                "supported_nips": [1, 9, 11, 16, 33, 42, 50, 99],
+                "software": "https://github.com/radrootslabs/tangle",
+                "version": "0.1.0",
+                "limitation": {
+                    "payment_required": false,
+                    "restricted_writes": true
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_info_endpoint_rejects_invalid_accept_header() {
+        let response = relay_info_router(RelayInfoDocument::tangle_default())
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(
+                        header::ACCEPT,
+                        HeaderValue::from_bytes(b"\xff").expect("header"),
+                    )
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
