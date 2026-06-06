@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use core::str::FromStr;
-use tangle_protocol::{AddressCoordinate, Event, EventId, TagName};
+use tangle_protocol::{AddressCoordinate, Event, EventId, PublicKeyHex, TagName, UnixTimestamp};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedTag {
@@ -178,11 +178,63 @@ pub fn parse_deletion_request(event: &Event) -> Result<Option<DeletionRequest>, 
     }))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayAuthEvent {
+    event_id: EventId,
+    pubkey: PublicKeyHex,
+    created_at: UnixTimestamp,
+    relay: String,
+    challenge: String,
+}
+
+impl RelayAuthEvent {
+    pub fn event_id(&self) -> &EventId {
+        &self.event_id
+    }
+
+    pub fn pubkey(&self) -> &PublicKeyHex {
+        &self.pubkey
+    }
+
+    pub fn created_at(&self) -> UnixTimestamp {
+        self.created_at
+    }
+
+    pub fn relay(&self) -> &str {
+        &self.relay
+    }
+
+    pub fn challenge(&self) -> &str {
+        &self.challenge
+    }
+}
+
+pub fn parse_relay_auth_event(event: &Event) -> Result<Option<RelayAuthEvent>, String> {
+    if event.unsigned().kind().as_u32() != 22_242 {
+        return Ok(None);
+    }
+    let relay = required_tag_value(event, "relay")?;
+    let challenge = required_tag_value(event, "challenge")?;
+    if relay.is_empty() {
+        return Err("relay auth relay tag must not be empty".to_owned());
+    }
+    if challenge.is_empty() {
+        return Err("relay auth challenge tag must not be empty".to_owned());
+    }
+    Ok(Some(RelayAuthEvent {
+        event_id: event.id().clone(),
+        pubkey: event.unsigned().pubkey().clone(),
+        created_at: event.unsigned().created_at(),
+        relay,
+        challenge,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DeletionTarget, matching_tags, optional_tag_value, optional_tag_values,
-        parse_deletion_request, parse_required_u64_tag, parse_u64_field,
+        parse_deletion_request, parse_relay_auth_event, parse_required_u64_tag, parse_u64_field,
         repeated_or_missing_policy_boundary, required_tag_value, required_tag_values,
         single_letter_tag_values, single_letter_values_for, tag_count,
     };
@@ -404,6 +456,97 @@ mod tests {
                 DeletionTarget::Event(EventId::new(&first).expect("first")),
                 DeletionTarget::Event(EventId::new(&second).expect("second")),
             ]
+        );
+    }
+
+    #[test]
+    fn relay_auth_parser_extracts_mandatory_fields() {
+        let event = event_with_kind_and_tags(
+            22_242,
+            vec![
+                Tag::from_parts("relay", &["wss://relay.radroots.test"]).expect("relay"),
+                Tag::from_parts("challenge", &["auth-challenge-001"]).expect("challenge"),
+            ],
+        );
+
+        let auth = parse_relay_auth_event(&event)
+            .expect("parse")
+            .expect("auth");
+
+        assert_eq!(auth.event_id(), event.id());
+        assert_eq!(auth.pubkey(), event.unsigned().pubkey());
+        assert_eq!(auth.created_at(), event.unsigned().created_at());
+        assert_eq!(auth.relay(), "wss://relay.radroots.test");
+        assert_eq!(auth.challenge(), "auth-challenge-001");
+    }
+
+    #[test]
+    fn relay_auth_parser_ignores_non_auth_kinds() {
+        let event = event_with_tags(vec![
+            Tag::from_parts("relay", &["wss://relay.radroots.test"]).expect("relay"),
+            Tag::from_parts("challenge", &["auth-challenge-001"]).expect("challenge"),
+        ]);
+
+        assert_eq!(parse_relay_auth_event(&event), Ok(None));
+    }
+
+    #[test]
+    fn relay_auth_parser_rejects_missing_and_repeated_fields() {
+        let missing_relay = event_with_kind_and_tags(
+            22_242,
+            vec![Tag::from_parts("challenge", &["challenge"]).expect("challenge")],
+        );
+        let missing_challenge = event_with_kind_and_tags(
+            22_242,
+            vec![Tag::from_parts("relay", &["wss://relay.radroots.test"]).expect("relay")],
+        );
+        let repeated_relay = event_with_kind_and_tags(
+            22_242,
+            vec![
+                Tag::from_parts("relay", &["wss://relay-a.radroots.test"]).expect("relay"),
+                Tag::from_parts("relay", &["wss://relay-b.radroots.test"]).expect("relay"),
+                Tag::from_parts("challenge", &["challenge"]).expect("challenge"),
+            ],
+        );
+
+        assert_eq!(
+            parse_relay_auth_event(&missing_relay).expect_err("relay"),
+            "tag `relay` is required"
+        );
+        assert_eq!(
+            parse_relay_auth_event(&missing_challenge).expect_err("challenge"),
+            "tag `challenge` is required"
+        );
+        assert_eq!(
+            parse_relay_auth_event(&repeated_relay).expect_err("repeated"),
+            "tag `relay` must not be repeated"
+        );
+    }
+
+    #[test]
+    fn relay_auth_parser_rejects_empty_fields() {
+        let empty_relay = event_with_kind_and_tags(
+            22_242,
+            vec![
+                Tag::from_parts("relay", &[""]).expect("relay"),
+                Tag::from_parts("challenge", &["challenge"]).expect("challenge"),
+            ],
+        );
+        let empty_challenge = event_with_kind_and_tags(
+            22_242,
+            vec![
+                Tag::from_parts("relay", &["wss://relay.radroots.test"]).expect("relay"),
+                Tag::from_parts("challenge", &[""]).expect("challenge"),
+            ],
+        );
+
+        assert_eq!(
+            parse_relay_auth_event(&empty_relay).expect_err("empty relay"),
+            "relay auth relay tag must not be empty"
+        );
+        assert_eq!(
+            parse_relay_auth_event(&empty_challenge).expect_err("empty challenge"),
+            "relay auth challenge tag must not be empty"
         );
     }
 
