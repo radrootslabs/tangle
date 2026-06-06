@@ -4,6 +4,7 @@ members = [
     "crates/tangle_crypto",
     "crates/tangle_nips",
     "crates/tangle_protocol",
+    "crates/tangle_store",
 ]
 resolver = "2"
 

@@ -1,0 +1,15 @@
+[package]
+name = "tangle_store"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Repository traits for tangle storage backends"
+
+[dependencies]
+tangle_nips = { path = "../tangle_nips" }
+tangle_protocol = { path = "../tangle_protocol" }
+
+[lints]
+workspace = true
