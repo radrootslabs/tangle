@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 use core::fmt;
-use tangle_protocol::{Event, UnixTimestamp, event_to_value};
+use std::collections::BTreeSet;
+use tangle_protocol::{Event, PublicKeyHex, UnixTimestamp, event_to_value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeLimitValues {
@@ -348,6 +349,391 @@ impl fmt::Display for RuntimeLimitKind {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionPolicy {
+    require_write_auth: bool,
+    unapproved_seller_action: UnapprovedSellerAction,
+    approved_sellers: BTreeSet<PublicKeyHex>,
+    blocked_pubkeys: BTreeSet<PublicKeyHex>,
+}
+
+impl Default for AdmissionPolicy {
+    fn default() -> Self {
+        Self {
+            require_write_auth: true,
+            unapproved_seller_action: UnapprovedSellerAction::StoreRawOnly,
+            approved_sellers: BTreeSet::new(),
+            blocked_pubkeys: BTreeSet::new(),
+        }
+    }
+}
+
+impl AdmissionPolicy {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn require_write_auth(&self) -> bool {
+        self.require_write_auth
+    }
+
+    pub fn unapproved_seller_action(&self) -> UnapprovedSellerAction {
+        self.unapproved_seller_action
+    }
+
+    pub fn approved_sellers(&self) -> &BTreeSet<PublicKeyHex> {
+        &self.approved_sellers
+    }
+
+    pub fn blocked_pubkeys(&self) -> &BTreeSet<PublicKeyHex> {
+        &self.blocked_pubkeys
+    }
+
+    pub fn with_write_auth_required(mut self, required: bool) -> Self {
+        self.require_write_auth = required;
+        self
+    }
+
+    pub fn with_unapproved_seller_action(mut self, action: UnapprovedSellerAction) -> Self {
+        self.unapproved_seller_action = action;
+        self
+    }
+
+    pub fn approve_seller(mut self, pubkey: PublicKeyHex) -> Self {
+        self.approved_sellers.insert(pubkey);
+        self
+    }
+
+    pub fn block_pubkey(mut self, pubkey: PublicKeyHex) -> Self {
+        self.blocked_pubkeys.insert(pubkey);
+        self
+    }
+
+    pub fn is_seller_approved(&self, pubkey: &PublicKeyHex) -> bool {
+        self.approved_sellers.contains(pubkey)
+    }
+
+    pub fn is_pubkey_blocked(&self, pubkey: &PublicKeyHex) -> bool {
+        self.blocked_pubkeys.contains(pubkey)
+    }
+
+    pub fn admit(&self, event: &AdmissionEvent, context: &AdmissionContext) -> AdmissionDecision {
+        if event.kind() == AdmissionEventKind::RelayAuth {
+            return AdmissionDecision::Accepted(AdmissionAcceptance::new(
+                AdmissionEffect::AuthenticateOnly,
+                None,
+            ));
+        }
+        if let Some(rejection) = self.write_auth_rejection(event.author_pubkey(), context) {
+            return AdmissionDecision::Rejected(rejection);
+        }
+        if self.is_pubkey_blocked(event.author_pubkey()) {
+            if event.kind() == AdmissionEventKind::PublicListing {
+                return AdmissionDecision::Accepted(AdmissionAcceptance::new(
+                    AdmissionEffect::StoreRawWithoutPublicListingProjection,
+                    Some(ProjectionExclusionReason::BlockedSeller),
+                ));
+            }
+            return AdmissionDecision::Rejected(AdmissionRejection::new(
+                AdmissionRejectionKind::BlockedPubkey,
+                "blocked pubkey",
+            ));
+        }
+        if event.kind() == AdmissionEventKind::PublicListing {
+            return self.admit_public_listing(event.author_pubkey());
+        }
+        AdmissionDecision::Accepted(AdmissionAcceptance::new(AdmissionEffect::StoreRaw, None))
+    }
+
+    fn write_auth_rejection(
+        &self,
+        author_pubkey: &PublicKeyHex,
+        context: &AdmissionContext,
+    ) -> Option<AdmissionRejection> {
+        if !self.require_write_auth {
+            return None;
+        }
+        match context.authenticated_pubkey() {
+            Some(authenticated_pubkey) if authenticated_pubkey == author_pubkey => None,
+            Some(_) => Some(AdmissionRejection::new(
+                AdmissionRejectionKind::AuthenticatedPubkeyMismatch,
+                "authenticated pubkey does not match event author",
+            )),
+            None => Some(AdmissionRejection::new(
+                AdmissionRejectionKind::AuthenticationRequired,
+                "write authentication required",
+            )),
+        }
+    }
+
+    fn admit_public_listing(&self, seller_pubkey: &PublicKeyHex) -> AdmissionDecision {
+        if self.is_seller_approved(seller_pubkey) {
+            return AdmissionDecision::Accepted(AdmissionAcceptance::new(
+                AdmissionEffect::StoreRawAndProjectPublicListing,
+                None,
+            ));
+        }
+        match self.unapproved_seller_action {
+            UnapprovedSellerAction::StoreRawOnly => {
+                AdmissionDecision::Accepted(AdmissionAcceptance::new(
+                    AdmissionEffect::StoreRawWithoutPublicListingProjection,
+                    Some(ProjectionExclusionReason::UnapprovedSeller),
+                ))
+            }
+            UnapprovedSellerAction::RejectWrite => {
+                AdmissionDecision::Rejected(AdmissionRejection::new(
+                    AdmissionRejectionKind::UnapprovedSeller,
+                    "seller is not approved",
+                ))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionContext {
+    authenticated_pubkey: Option<PublicKeyHex>,
+}
+
+impl AdmissionContext {
+    pub fn unauthenticated() -> Self {
+        Self {
+            authenticated_pubkey: None,
+        }
+    }
+
+    pub fn authenticated(pubkey: PublicKeyHex) -> Self {
+        Self {
+            authenticated_pubkey: Some(pubkey),
+        }
+    }
+
+    pub fn authenticated_pubkey(&self) -> Option<&PublicKeyHex> {
+        self.authenticated_pubkey.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionEvent {
+    author_pubkey: PublicKeyHex,
+    kind: AdmissionEventKind,
+}
+
+impl AdmissionEvent {
+    pub fn new(author_pubkey: PublicKeyHex, kind: AdmissionEventKind) -> Self {
+        Self {
+            author_pubkey,
+            kind,
+        }
+    }
+
+    pub fn author_pubkey(&self) -> &PublicKeyHex {
+        &self.author_pubkey
+    }
+
+    pub fn kind(&self) -> AdmissionEventKind {
+        self.kind
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionEventKind {
+    RelayAuth,
+    Write,
+    PublicListing,
+    DraftListing,
+}
+
+impl AdmissionEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RelayAuth => "relay auth",
+            Self::Write => "write",
+            Self::PublicListing => "public listing",
+            Self::DraftListing => "draft listing",
+        }
+    }
+}
+
+impl fmt::Display for AdmissionEventKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnapprovedSellerAction {
+    StoreRawOnly,
+    RejectWrite,
+}
+
+impl UnapprovedSellerAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StoreRawOnly => "store raw only",
+            Self::RejectWrite => "reject write",
+        }
+    }
+}
+
+impl fmt::Display for UnapprovedSellerAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmissionDecision {
+    Accepted(AdmissionAcceptance),
+    Rejected(AdmissionRejection),
+}
+
+impl AdmissionDecision {
+    pub fn accepted(&self) -> Option<&AdmissionAcceptance> {
+        match self {
+            Self::Accepted(acceptance) => Some(acceptance),
+            Self::Rejected(_) => None,
+        }
+    }
+
+    pub fn rejection(&self) -> Option<&AdmissionRejection> {
+        match self {
+            Self::Accepted(_) => None,
+            Self::Rejected(rejection) => Some(rejection),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionAcceptance {
+    effect: AdmissionEffect,
+    projection_exclusion: Option<ProjectionExclusionReason>,
+}
+
+impl AdmissionAcceptance {
+    pub fn new(
+        effect: AdmissionEffect,
+        projection_exclusion: Option<ProjectionExclusionReason>,
+    ) -> Self {
+        Self {
+            effect,
+            projection_exclusion,
+        }
+    }
+
+    pub fn effect(&self) -> AdmissionEffect {
+        self.effect
+    }
+
+    pub fn projection_exclusion(&self) -> Option<ProjectionExclusionReason> {
+        self.projection_exclusion
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionEffect {
+    AuthenticateOnly,
+    StoreRaw,
+    StoreRawAndProjectPublicListing,
+    StoreRawWithoutPublicListingProjection,
+}
+
+impl AdmissionEffect {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthenticateOnly => "authenticate only",
+            Self::StoreRaw => "store raw",
+            Self::StoreRawAndProjectPublicListing => "store raw and project public listing",
+            Self::StoreRawWithoutPublicListingProjection => {
+                "store raw without public listing projection"
+            }
+        }
+    }
+}
+
+impl fmt::Display for AdmissionEffect {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionExclusionReason {
+    UnapprovedSeller,
+    BlockedSeller,
+}
+
+impl ProjectionExclusionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnapprovedSeller => "unapproved seller",
+            Self::BlockedSeller => "blocked seller",
+        }
+    }
+}
+
+impl fmt::Display for ProjectionExclusionReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionRejection {
+    kind: AdmissionRejectionKind,
+    message: String,
+}
+
+impl AdmissionRejection {
+    pub fn new(kind: AdmissionRejectionKind, message: &str) -> Self {
+        Self {
+            kind,
+            message: message.to_owned(),
+        }
+    }
+
+    pub fn kind(&self) -> AdmissionRejectionKind {
+        self.kind
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for AdmissionRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.kind, self.message)
+    }
+}
+
+impl std::error::Error for AdmissionRejection {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionRejectionKind {
+    AuthenticationRequired,
+    AuthenticatedPubkeyMismatch,
+    BlockedPubkey,
+    UnapprovedSeller,
+}
+
+impl AdmissionRejectionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthenticationRequired => "authentication required",
+            Self::AuthenticatedPubkeyMismatch => "authenticated pubkey mismatch",
+            Self::BlockedPubkey => "blocked pubkey",
+            Self::UnapprovedSeller => "unapproved seller",
+        }
+    }
+}
+
+impl fmt::Display for AdmissionRejectionKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 fn require_positive(field: &'static str, value: u64) -> Result<(), RuntimeLimitConfigError> {
     if value == 0 {
         Err(RuntimeLimitConfigError::Zero { field })
@@ -370,7 +756,11 @@ fn require_within(
 
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeLimitConfigError, RuntimeLimitKind, RuntimeLimitValues, RuntimeLimits};
+    use super::{
+        AdmissionContext, AdmissionEffect, AdmissionEvent, AdmissionEventKind, AdmissionPolicy,
+        AdmissionRejectionKind, ProjectionExclusionReason, RuntimeLimitConfigError,
+        RuntimeLimitKind, RuntimeLimitValues, RuntimeLimits, UnapprovedSellerAction,
+    };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
     };
@@ -698,6 +1088,253 @@ mod tests {
         );
     }
 
+    #[test]
+    fn admission_policy_defaults_require_matching_write_auth() {
+        let author = pubkey("1");
+        let other = pubkey("2");
+        let event = AdmissionEvent::new(author.clone(), AdmissionEventKind::Write);
+        let policy = AdmissionPolicy::new();
+
+        assert!(policy.require_write_auth());
+        assert_eq!(
+            policy.unapproved_seller_action(),
+            UnapprovedSellerAction::StoreRawOnly
+        );
+        assert!(policy.approved_sellers().is_empty());
+        assert!(policy.blocked_pubkeys().is_empty());
+        assert_eq!(
+            policy
+                .admit(&event, &AdmissionContext::unauthenticated())
+                .rejection()
+                .expect("unauthenticated")
+                .kind(),
+            AdmissionRejectionKind::AuthenticationRequired
+        );
+        assert_eq!(
+            policy
+                .admit(&event, &AdmissionContext::authenticated(other))
+                .rejection()
+                .expect("mismatch")
+                .kind(),
+            AdmissionRejectionKind::AuthenticatedPubkeyMismatch
+        );
+        assert_eq!(
+            policy
+                .admit(&event, &AdmissionContext::authenticated(author.clone()))
+                .accepted()
+                .expect("accepted")
+                .effect(),
+            AdmissionEffect::StoreRaw
+        );
+        assert_eq!(event.author_pubkey(), &author);
+        assert_eq!(event.kind(), AdmissionEventKind::Write);
+    }
+
+    #[test]
+    fn admission_policy_accepts_auth_events_without_prior_authentication() {
+        let event = AdmissionEvent::new(pubkey("1"), AdmissionEventKind::RelayAuth);
+        let decision = AdmissionPolicy::new().admit(&event, &AdmissionContext::unauthenticated());
+
+        assert_eq!(
+            decision.accepted().expect("accepted").effect(),
+            AdmissionEffect::AuthenticateOnly
+        );
+        assert_eq!(
+            decision
+                .accepted()
+                .expect("accepted")
+                .projection_exclusion(),
+            None
+        );
+        assert!(decision.rejection().is_none());
+    }
+
+    #[test]
+    fn admission_policy_projects_public_listings_for_approved_sellers() {
+        let seller = pubkey("3");
+        let event = AdmissionEvent::new(seller.clone(), AdmissionEventKind::PublicListing);
+        let policy = AdmissionPolicy::new().approve_seller(seller.clone());
+        let decision = policy.admit(&event, &AdmissionContext::authenticated(seller.clone()));
+
+        assert!(policy.is_seller_approved(&seller));
+        assert_eq!(
+            decision.accepted().expect("accepted").effect(),
+            AdmissionEffect::StoreRawAndProjectPublicListing
+        );
+        assert_eq!(
+            decision
+                .accepted()
+                .expect("accepted")
+                .projection_exclusion(),
+            None
+        );
+    }
+
+    #[test]
+    fn admission_policy_handles_unapproved_sellers_by_configured_action() {
+        let seller = pubkey("4");
+        let event = AdmissionEvent::new(seller.clone(), AdmissionEventKind::PublicListing);
+        let context = AdmissionContext::authenticated(seller.clone());
+        let raw_only = AdmissionPolicy::new().admit(&event, &context);
+        let reject = AdmissionPolicy::new()
+            .with_unapproved_seller_action(UnapprovedSellerAction::RejectWrite)
+            .admit(&event, &context);
+
+        assert_eq!(
+            raw_only.accepted().expect("raw only").effect(),
+            AdmissionEffect::StoreRawWithoutPublicListingProjection
+        );
+        assert_eq!(
+            raw_only
+                .accepted()
+                .expect("raw only")
+                .projection_exclusion(),
+            Some(ProjectionExclusionReason::UnapprovedSeller)
+        );
+        assert_eq!(
+            reject.rejection().expect("reject").kind(),
+            AdmissionRejectionKind::UnapprovedSeller
+        );
+        assert!(reject.accepted().is_none());
+        assert_eq!(
+            reject.rejection().expect("reject").message(),
+            "seller is not approved"
+        );
+    }
+
+    #[test]
+    fn admission_policy_applies_blocked_pubkey_policy() {
+        let seller = pubkey("5");
+        let write = AdmissionEvent::new(seller.clone(), AdmissionEventKind::Write);
+        let listing = AdmissionEvent::new(seller.clone(), AdmissionEventKind::PublicListing);
+        let context = AdmissionContext::authenticated(seller.clone());
+        let policy = AdmissionPolicy::new()
+            .approve_seller(seller.clone())
+            .block_pubkey(seller.clone());
+
+        assert!(policy.is_pubkey_blocked(&seller));
+        assert_eq!(policy.blocked_pubkeys().len(), 1);
+        assert_eq!(
+            policy
+                .admit(&write, &context)
+                .rejection()
+                .expect("blocked")
+                .kind(),
+            AdmissionRejectionKind::BlockedPubkey
+        );
+        assert_eq!(
+            policy
+                .admit(&listing, &context)
+                .accepted()
+                .expect("listing")
+                .effect(),
+            AdmissionEffect::StoreRawWithoutPublicListingProjection
+        );
+        assert_eq!(
+            policy
+                .admit(&listing, &context)
+                .accepted()
+                .expect("listing")
+                .projection_exclusion(),
+            Some(ProjectionExclusionReason::BlockedSeller)
+        );
+    }
+
+    #[test]
+    fn admission_policy_can_disable_write_auth_for_internal_tests() {
+        let event = AdmissionEvent::new(pubkey("6"), AdmissionEventKind::DraftListing);
+        let decision = AdmissionPolicy::new()
+            .with_write_auth_required(false)
+            .admit(&event, &AdmissionContext::unauthenticated());
+
+        assert_eq!(
+            decision.accepted().expect("accepted").effect(),
+            AdmissionEffect::StoreRaw
+        );
+    }
+
+    #[test]
+    fn admission_policy_labels_and_rejections_are_stable() {
+        let rejection = AdmissionPolicy::new()
+            .admit(
+                &AdmissionEvent::new(pubkey("7"), AdmissionEventKind::Write),
+                &AdmissionContext::unauthenticated(),
+            )
+            .rejection()
+            .expect("rejection")
+            .clone();
+
+        assert_eq!(
+            [
+                AdmissionEventKind::RelayAuth.as_str(),
+                AdmissionEventKind::Write.as_str(),
+                AdmissionEventKind::PublicListing.as_str(),
+                AdmissionEventKind::DraftListing.as_str(),
+            ],
+            ["relay auth", "write", "public listing", "draft listing"]
+        );
+        assert_eq!(
+            [
+                UnapprovedSellerAction::StoreRawOnly.as_str(),
+                UnapprovedSellerAction::RejectWrite.as_str(),
+            ],
+            ["store raw only", "reject write"]
+        );
+        assert_eq!(
+            [
+                AdmissionEffect::AuthenticateOnly.as_str(),
+                AdmissionEffect::StoreRaw.as_str(),
+                AdmissionEffect::StoreRawAndProjectPublicListing.as_str(),
+                AdmissionEffect::StoreRawWithoutPublicListingProjection.as_str(),
+            ],
+            [
+                "authenticate only",
+                "store raw",
+                "store raw and project public listing",
+                "store raw without public listing projection",
+            ]
+        );
+        assert_eq!(
+            [
+                ProjectionExclusionReason::UnapprovedSeller.as_str(),
+                ProjectionExclusionReason::BlockedSeller.as_str(),
+            ],
+            ["unapproved seller", "blocked seller"]
+        );
+        assert_eq!(
+            [
+                AdmissionRejectionKind::AuthenticationRequired.as_str(),
+                AdmissionRejectionKind::AuthenticatedPubkeyMismatch.as_str(),
+                AdmissionRejectionKind::BlockedPubkey.as_str(),
+                AdmissionRejectionKind::UnapprovedSeller.as_str(),
+            ],
+            [
+                "authentication required",
+                "authenticated pubkey mismatch",
+                "blocked pubkey",
+                "unapproved seller",
+            ]
+        );
+        assert_eq!(AdmissionEventKind::Write.to_string(), "write");
+        assert_eq!(
+            UnapprovedSellerAction::RejectWrite.to_string(),
+            "reject write"
+        );
+        assert_eq!(AdmissionEffect::StoreRaw.to_string(), "store raw");
+        assert_eq!(
+            ProjectionExclusionReason::BlockedSeller.to_string(),
+            "blocked seller"
+        );
+        assert_eq!(
+            AdmissionRejectionKind::BlockedPubkey.to_string(),
+            "blocked pubkey"
+        );
+        assert_eq!(
+            rejection.to_string(),
+            "authentication required: write authentication required"
+        );
+    }
+
     fn limits_with(update: impl FnOnce(&mut RuntimeLimitValues)) -> RuntimeLimits {
         let mut values = RuntimeLimitValues::default();
         update(&mut values);
@@ -716,5 +1353,9 @@ mod tests {
             ),
             SignatureHex::new(&"b".repeat(SignatureHex::HEX_LENGTH)).expect("sig"),
         )
+    }
+
+    fn pubkey(hex: &str) -> PublicKeyHex {
+        PublicKeyHex::new(&hex.repeat(PublicKeyHex::HEX_LENGTH)).expect("pubkey")
     }
 }
