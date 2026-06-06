@@ -2,6 +2,8 @@
 
 use core::fmt;
 use sha2::{Digest, Sha256};
+use surrealdb::Surreal;
+use surrealdb::engine::local::{Db, Mem};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SurrealConnectionMode {
@@ -260,11 +262,221 @@ fn lower_hex(bytes: &[u8]) -> String {
     output
 }
 
+pub fn migration_tracking_schema() -> SurrealMigration {
+    SurrealMigration::new(
+        "0001_migration_tracking",
+        r#"
+DEFINE TABLE IF NOT EXISTS migration SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS name ON TABLE migration TYPE string;
+DEFINE FIELD IF NOT EXISTS checksum ON TABLE migration TYPE string;
+DEFINE FIELD IF NOT EXISTS applied_at ON TABLE migration TYPE datetime;
+DEFINE INDEX IF NOT EXISTS migration_name_uid ON TABLE migration COLUMNS name UNIQUE;
+"#,
+    )
+    .expect("migration tracking schema is valid")
+}
+
+pub fn base_migration_plan() -> SurrealMigrationPlan {
+    SurrealMigrationPlan::new(vec![migration_tracking_schema()])
+        .expect("base migration plan is strictly ordered")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedMigration {
+    name: String,
+    checksum: String,
+}
+
+impl AppliedMigration {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn checksum(&self) -> &str {
+        &self.checksum
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationApplyOutcome {
+    Applied,
+    AlreadyApplied,
+}
+
+#[derive(Clone)]
+pub struct SurrealStore {
+    db: Surreal<Db>,
+}
+
+impl fmt::Debug for SurrealStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SurrealStore")
+            .finish_non_exhaustive()
+    }
+}
+
+impl SurrealStore {
+    pub async fn connect_memory(
+        config: &SurrealConnectionConfig,
+    ) -> Result<Self, SurrealStoreError> {
+        if config.mode() != &SurrealConnectionMode::Memory {
+            return Err(SurrealStoreError::new(
+                "surreal memory connection requires memory mode config",
+            ));
+        }
+        let db = Surreal::new::<Mem>(())
+            .await
+            .map_err(SurrealStoreError::from)?;
+        db.use_ns(config.namespace())
+            .use_db(config.database())
+            .await
+            .map_err(SurrealStoreError::from)?;
+        Ok(Self { db })
+    }
+
+    pub fn database(&self) -> &Surreal<Db> {
+        &self.db
+    }
+
+    pub async fn apply_plan(
+        &self,
+        plan: &SurrealMigrationPlan,
+    ) -> Result<Vec<MigrationApplyOutcome>, SurrealStoreError> {
+        let mut outcomes = Vec::with_capacity(plan.migrations().len());
+        for migration in plan.migrations() {
+            outcomes.push(self.apply_migration(migration).await?);
+        }
+        Ok(outcomes)
+    }
+
+    pub async fn apply_migration(
+        &self,
+        migration: &SurrealMigration,
+    ) -> Result<MigrationApplyOutcome, SurrealStoreError> {
+        if self.has_migration_table().await? {
+            if let Some(applied) = self.applied_migration(migration.name()).await? {
+                if applied.checksum() == migration.checksum() {
+                    return Ok(MigrationApplyOutcome::AlreadyApplied);
+                }
+                return Err(SurrealStoreError::new(&format!(
+                    "surreal migration `{}` checksum changed",
+                    migration.name()
+                )));
+            }
+        }
+        self.db
+            .query(migration.surql())
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        self.record_migration(migration).await?;
+        Ok(MigrationApplyOutcome::Applied)
+    }
+
+    pub async fn applied_migrations(&self) -> Result<Vec<AppliedMigration>, SurrealStoreError> {
+        if !self.has_migration_table().await? {
+            return Ok(Vec::new());
+        }
+        let mut response = self
+            .db
+            .query("SELECT VALUE name FROM migration ORDER BY name ASC;")
+            .query("SELECT VALUE checksum FROM migration ORDER BY name ASC;")
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        let names: Vec<String> = response.take(0).map_err(SurrealStoreError::from)?;
+        let checksums: Vec<String> = response.take(1).map_err(SurrealStoreError::from)?;
+        Ok(names
+            .into_iter()
+            .zip(checksums.into_iter())
+            .map(|(name, checksum)| AppliedMigration { name, checksum })
+            .collect())
+    }
+
+    async fn applied_migration(
+        &self,
+        name: &str,
+    ) -> Result<Option<AppliedMigration>, SurrealStoreError> {
+        Ok(self
+            .applied_migrations()
+            .await?
+            .into_iter()
+            .find(|migration| migration.name() == name))
+    }
+
+    async fn has_migration_table(&self) -> Result<bool, SurrealStoreError> {
+        let mut response = self
+            .db
+            .query("INFO FOR DB;")
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        let info: Option<surrealdb::types::Value> =
+            response.take(0).map_err(SurrealStoreError::from)?;
+        Ok(info
+            .map(|value| format!("{value:?}").contains("migration"))
+            .unwrap_or(false))
+    }
+
+    async fn record_migration(
+        &self,
+        migration: &SurrealMigration,
+    ) -> Result<(), SurrealStoreError> {
+        self.db
+            .query(
+                "CREATE migration CONTENT { name: $name, checksum: $checksum, applied_at: time::now() };",
+            )
+            .bind(("name", migration.name()))
+            .bind(("checksum", migration.checksum()))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurrealStoreError {
+    message: String,
+}
+
+impl SurrealStoreError {
+    fn new(message: &str) -> Self {
+        Self {
+            message: message.to_owned(),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for SurrealStoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SurrealStoreError {}
+
+impl From<surrealdb::Error> for SurrealStoreError {
+    fn from(source: surrealdb::Error) -> Self {
+        Self::new(&source.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        SurrealConfigError, SurrealConnectionConfig, SurrealConnectionMode, SurrealMigration,
-        SurrealMigrationError, SurrealMigrationPlan,
+        MigrationApplyOutcome, SurrealConfigError, SurrealConnectionConfig, SurrealConnectionMode,
+        SurrealMigration, SurrealMigrationError, SurrealMigrationPlan, SurrealStore,
+        base_migration_plan, migration_tracking_schema,
     };
 
     #[test]
@@ -418,5 +630,73 @@ mod tests {
                 message: "surreal migrations must be strictly ordered by name".to_owned()
             }
         );
+    }
+
+    #[tokio::test]
+    async fn memory_store_rejects_remote_config() {
+        let config =
+            SurrealConnectionConfig::websocket("ws://127.0.0.1:8000", "ns", "db").expect("config");
+        let error = SurrealStore::connect_memory(&config)
+            .await
+            .expect_err("memory mismatch");
+
+        assert_eq!(
+            error.message(),
+            "surreal memory connection requires memory mode config"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_tracking_schema_applies_idempotently() {
+        let store = memory_store().await;
+        let plan = base_migration_plan();
+
+        assert_eq!(
+            store.applied_migrations().await.expect("no table yet"),
+            Vec::new()
+        );
+        assert_eq!(
+            store.apply_plan(&plan).await.expect("apply"),
+            vec![MigrationApplyOutcome::Applied]
+        );
+        assert_eq!(
+            store.apply_plan(&plan).await.expect("reapply"),
+            vec![MigrationApplyOutcome::AlreadyApplied]
+        );
+
+        let migrations = store.applied_migrations().await.expect("applied rows");
+        assert_eq!(migrations.len(), 1);
+        assert_eq!(migrations[0].name(), "0001_migration_tracking");
+        assert_eq!(
+            migrations[0].checksum(),
+            migration_tracking_schema().checksum()
+        );
+        assert!(format!("{:?}", store.database()).contains("Surreal"));
+    }
+
+    #[tokio::test]
+    async fn migration_tracking_detects_checksum_changes() {
+        let store = memory_store().await;
+        let original = migration_tracking_schema();
+        let changed = SurrealMigration::new(original.name(), "DEFINE TABLE migration SCHEMALESS;")
+            .expect("changed");
+
+        assert_eq!(
+            store.apply_migration(&original).await.expect("apply"),
+            MigrationApplyOutcome::Applied
+        );
+        assert_eq!(
+            store
+                .apply_migration(&changed)
+                .await
+                .expect_err("checksum changed")
+                .to_string(),
+            "surreal migration `0001_migration_tracking` checksum changed"
+        );
+    }
+
+    async fn memory_store() -> SurrealStore {
+        let config = SurrealConnectionConfig::memory("tangle_test", "relay").expect("config");
+        SurrealStore::connect_memory(&config).await.expect("store")
     }
 }
