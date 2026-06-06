@@ -167,6 +167,39 @@ impl Kind {
     pub fn as_u32(self) -> u32 {
         self.0
     }
+
+    pub fn class(self) -> KindClass {
+        match self.0 {
+            0 | 3 | 10_000..=19_999 => KindClass::Replaceable,
+            20_000..=29_999 => KindClass::Ephemeral,
+            30_000..=39_999 => KindClass::Addressable,
+            _ => KindClass::Regular,
+        }
+    }
+
+    pub fn is_regular(self) -> bool {
+        self.class() == KindClass::Regular
+    }
+
+    pub fn is_replaceable(self) -> bool {
+        self.class() == KindClass::Replaceable
+    }
+
+    pub fn is_ephemeral(self) -> bool {
+        self.class() == KindClass::Ephemeral
+    }
+
+    pub fn is_addressable(self) -> bool {
+        self.class() == KindClass::Addressable
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KindClass {
+    Regular,
+    Replaceable,
+    Ephemeral,
+    Addressable,
 }
 
 impl fmt::Display for Kind {
@@ -961,12 +994,12 @@ fn kind_out_of_range_error(value: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientMessage, Event, EventId, EventShapeError, Filter, Kind, PublicKeyHex, RawEventJson,
-        RelayMessage, SignatureHex, SubscriptionId, Tag, TagName, TagValue, UnixTimestamp,
-        UnsignedEvent, canonical_event_json, empty_error, encode_relay_message, event_from_value,
-        event_to_value, filter_from_value, invalid_length_error, kind_out_of_range_error,
-        non_lowercase_hex_error, parse_client_message, parse_event_json, relay_message_to_value,
-        too_long_error,
+        ClientMessage, Event, EventId, EventShapeError, Filter, Kind, KindClass, PublicKeyHex,
+        RawEventJson, RelayMessage, SignatureHex, SubscriptionId, Tag, TagName, TagValue,
+        UnixTimestamp, UnsignedEvent, canonical_event_json, empty_error, encode_relay_message,
+        event_from_value, event_to_value, filter_from_value, invalid_length_error,
+        kind_out_of_range_error, non_lowercase_hex_error, parse_client_message, parse_event_json,
+        relay_message_to_value, too_long_error,
     };
     use core::str::FromStr;
     use std::collections::hash_map::DefaultHasher;
@@ -1074,6 +1107,39 @@ mod tests {
             kind_out_of_range_error(value),
             format!("kind must fit in u32, got {value}")
         );
+    }
+
+    #[test]
+    fn event_kind_classification_matches_nip01_ranges() {
+        for value in [1, 2, 4, 44, 1_000, 9_999, 45, 40_000] {
+            let kind = Kind::new(value).expect("regular");
+            assert_eq!(kind.class(), KindClass::Regular);
+            assert!(kind.is_regular());
+            assert!(!kind.is_replaceable());
+            assert!(!kind.is_ephemeral());
+            assert!(!kind.is_addressable());
+        }
+
+        for value in [0, 3, 10_000, 19_999] {
+            let kind = Kind::new(value).expect("replaceable");
+            assert_eq!(kind.class(), KindClass::Replaceable);
+            assert!(kind.is_replaceable());
+        }
+
+        for value in [20_000, 29_999] {
+            let kind = Kind::new(value).expect("ephemeral");
+            assert_eq!(kind.class(), KindClass::Ephemeral);
+            assert!(kind.is_ephemeral());
+        }
+
+        for value in [30_000, 39_999] {
+            let kind = Kind::new(value).expect("addressable");
+            assert_eq!(kind.class(), KindClass::Addressable);
+            assert!(kind.is_addressable());
+        }
+
+        assert_eq!(format!("{:?}", KindClass::Regular), "Regular");
+        assert_eq!(KindClass::Regular, KindClass::Regular);
     }
 
     #[test]
