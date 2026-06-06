@@ -281,6 +281,7 @@ pub fn base_migration_plan() -> SurrealMigrationPlan {
         migration_tracking_schema(),
         raw_event_schema(),
         event_tag_index_schema(),
+        current_event_schema(),
     ])
     .expect("base migration plan is strictly ordered")
 }
@@ -335,6 +336,29 @@ DEFINE INDEX IF NOT EXISTS event_tag_event ON TABLE event_tag_index COLUMNS even
 "#,
     )
     .expect("event tag index schema is valid")
+}
+
+pub fn current_event_schema() -> SurrealMigration {
+    SurrealMigration::new(
+        "0004_current_event",
+        r#"
+DEFINE TABLE IF NOT EXISTS event_current SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS address_key ON TABLE event_current TYPE string;
+DEFINE FIELD IF NOT EXISTS kind ON TABLE event_current TYPE int;
+DEFINE FIELD IF NOT EXISTS pubkey ON TABLE event_current TYPE string;
+DEFINE FIELD IF NOT EXISTS d ON TABLE event_current TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS event_id ON TABLE event_current TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON TABLE event_current TYPE int;
+DEFINE FIELD IF NOT EXISTS tie_break_id ON TABLE event_current TYPE string;
+DEFINE FIELD IF NOT EXISTS deleted ON TABLE event_current TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS hidden ON TABLE event_current TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS updated_at ON TABLE event_current TYPE int;
+DEFINE INDEX IF NOT EXISTS event_current_address_uid ON TABLE event_current COLUMNS address_key UNIQUE;
+DEFINE INDEX IF NOT EXISTS event_current_kind_pubkey ON TABLE event_current COLUMNS kind, pubkey;
+DEFINE INDEX IF NOT EXISTS event_current_event ON TABLE event_current COLUMNS event_id;
+"#,
+    )
+    .expect("current event schema is valid")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -837,6 +861,34 @@ mod tests {
             "event_tag_lookup",
             "event_tag_kind_lookup",
             "event_tag_event",
+        ] {
+            assert!(info.contains(expected), "missing {expected} in {info}");
+        }
+    }
+
+    #[tokio::test]
+    async fn current_event_schema_defines_replaceable_pointer_table() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let info = store.table_info("event_current").await.expect("table info");
+
+        for expected in [
+            "address_key",
+            "kind",
+            "pubkey",
+            "d",
+            "event_id",
+            "created_at",
+            "tie_break_id",
+            "deleted",
+            "hidden",
+            "updated_at",
+            "event_current_address_uid",
+            "event_current_kind_pubkey",
+            "event_current_event",
         ] {
             assert!(info.contains(expected), "missing {expected} in {info}");
         }
