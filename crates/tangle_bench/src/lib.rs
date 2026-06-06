@@ -3,8 +3,8 @@
 use tangle_protocol::Event;
 use tangle_store::{StoreEventOutcome, StoredEvent};
 use tangle_store_surreal::{
-    ListingCurrentOutcome, ListingProjectionQuery, SurrealConnectionConfig, SurrealStore,
-    base_migration_plan,
+    ListingCurrentOutcome, ListingProjectionQuery, SearchDocumentOutcome, SearchDocumentQuery,
+    SurrealConnectionConfig, SurrealStore, base_migration_plan,
 };
 use tangle_test_support::{FixtureKey, build_fixture_event_from_parts};
 
@@ -137,6 +137,54 @@ pub async fn materialize_listing_workload(
             projected,
             listing_rows,
         },
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchWorkloadReport {
+    pub indexed: u64,
+    pub carrot_results: u64,
+    pub browse_results: u64,
+}
+
+pub async fn run_search_workload(dataset: &BenchDataset) -> Result<SearchWorkloadReport, String> {
+    let materialized = materialize_listing_workload(dataset).await?;
+    let store = materialized.store();
+    let mut indexed = 0;
+    for event in dataset.listings() {
+        if store
+            .index_listing_search_document(event)
+            .await
+            .map_err(|error| error.to_string())?
+            == SearchDocumentOutcome::Indexed
+        {
+            indexed += 1;
+        }
+    }
+    let carrot_results = store
+        .query_search_documents(
+            &SearchDocumentQuery::new()
+                .with_text("carrots")
+                .with_doc_type("listing")
+                .with_visible(true),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .len() as u64;
+    let browse_results = store
+        .query_search_documents(
+            &SearchDocumentQuery::new()
+                .with_doc_type("listing")
+                .with_visible(true)
+                .with_limit(5),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .len() as u64;
+    Ok(SearchWorkloadReport {
+        indexed,
+        carrot_results,
+        browse_results,
     })
 }
 
@@ -289,6 +337,23 @@ mod tests {
                 .expect("listing rows")
                 .len(),
             3
+        );
+    }
+
+    #[tokio::test]
+    async fn search_workload_indexes_and_queries_listing_documents() {
+        let dataset = BenchDataset::generate(BenchDatasetConfig::new(12, 2)).expect("dataset");
+        let report = super::run_search_workload(&dataset)
+            .await
+            .expect("search workload");
+
+        assert_eq!(
+            report,
+            super::SearchWorkloadReport {
+                indexed: 12,
+                carrot_results: 12,
+                browse_results: 5
+            }
         );
     }
 }
