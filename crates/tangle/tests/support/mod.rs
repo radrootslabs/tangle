@@ -108,9 +108,18 @@ pub async fn request_event_by_id(
     subscription: &str,
     event: &Event,
 ) -> Value {
+    send_req(
+        client,
+        subscription,
+        serde_json::json!({ "ids": [event.id().as_str()] }),
+    )
+    .await
+}
+
+pub async fn send_req(client: &mut RelayClient, subscription: &str, filter: Value) -> Value {
     client
         .send(Message::Text(
-            serde_json::json!(["REQ", subscription, { "ids": [event.id().as_str()] }])
+            serde_json::json!(["REQ", subscription, filter])
                 .to_string()
                 .into(),
         ))
