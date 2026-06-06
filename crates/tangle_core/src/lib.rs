@@ -2678,6 +2678,222 @@ pub enum AuthChallengeStateErrorKind {
     CreatedBeforeChallenge,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitConfig {
+    pub limit: u64,
+    pub window_seconds: u64,
+}
+
+impl RateLimitConfig {
+    pub fn new(limit: u64, window_seconds: u64) -> Result<Self, RateLimitConfigError> {
+        if limit == 0 {
+            return Err(RateLimitConfigError::ZeroLimit);
+        }
+        if window_seconds == 0 {
+            return Err(RateLimitConfigError::ZeroWindowSeconds);
+        }
+        Ok(Self {
+            limit,
+            window_seconds,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitConfigError {
+    ZeroLimit,
+    ZeroWindowSeconds,
+}
+
+impl fmt::Display for RateLimitConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroLimit => formatter.write_str("rate limit must be greater than zero"),
+            Self::ZeroWindowSeconds => {
+                formatter.write_str("rate limit window must be greater than zero seconds")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RateLimitConfigError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitDecision {
+    Accepted {
+        remaining: u64,
+        reset_at: UnixTimestamp,
+    },
+    Rejected {
+        retry_after_seconds: u64,
+        reset_at: UnixTimestamp,
+    },
+}
+
+impl RateLimitDecision {
+    pub fn allowed(self) -> bool {
+        matches!(self, Self::Accepted { .. })
+    }
+
+    pub fn remaining(self) -> u64 {
+        match self {
+            Self::Accepted { remaining, .. } => remaining,
+            Self::Rejected { .. } => 0,
+        }
+    }
+
+    pub fn reset_at(self) -> UnixTimestamp {
+        match self {
+            Self::Accepted { reset_at, .. } | Self::Rejected { reset_at, .. } => reset_at,
+        }
+    }
+
+    pub fn retry_after_seconds(self) -> Option<u64> {
+        match self {
+            Self::Accepted { .. } => None,
+            Self::Rejected {
+                retry_after_seconds,
+                ..
+            } => Some(retry_after_seconds),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedWindowRateLimiter {
+    config: RateLimitConfig,
+    windows: BTreeMap<String, RateLimitWindow>,
+}
+
+impl FixedWindowRateLimiter {
+    pub fn new(config: RateLimitConfig) -> Self {
+        Self {
+            config,
+            windows: BTreeMap::new(),
+        }
+    }
+
+    pub fn config(&self) -> RateLimitConfig {
+        self.config
+    }
+
+    pub fn tracked_key_count(&self) -> usize {
+        self.windows.len()
+    }
+
+    pub fn check(
+        &mut self,
+        key: &str,
+        now: UnixTimestamp,
+        cost: u64,
+    ) -> Result<RateLimitDecision, RateLimitError> {
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(RateLimitError::EmptyKey);
+        }
+        if cost == 0 {
+            return Err(RateLimitError::ZeroCost);
+        }
+        if cost > self.config.limit {
+            return Err(RateLimitError::CostExceedsLimit {
+                cost,
+                limit: self.config.limit,
+            });
+        }
+        let limit = self.config.limit;
+        let window_seconds = self.config.window_seconds;
+        let window = self
+            .windows
+            .entry(key.to_owned())
+            .and_modify(|window| window.reset_if_elapsed(now, window_seconds))
+            .or_insert_with(|| RateLimitWindow::new(now));
+        let reset_at = window.reset_at(window_seconds);
+        if window.used + cost > limit {
+            return Ok(RateLimitDecision::Rejected {
+                retry_after_seconds: reset_at.as_u64().saturating_sub(now.as_u64()),
+                reset_at,
+            });
+        }
+        window.used += cost;
+        Ok(RateLimitDecision::Accepted {
+            remaining: limit - window.used,
+            reset_at,
+        })
+    }
+
+    pub fn prune_expired(&mut self, now: UnixTimestamp) -> usize {
+        let before = self.windows.len();
+        let window_seconds = self.config.window_seconds;
+        self.windows
+            .retain(|_, window| window.reset_at(window_seconds) > now);
+        before - self.windows.len()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RateLimitWindow {
+    started_at: UnixTimestamp,
+    used: u64,
+}
+
+impl RateLimitWindow {
+    fn new(started_at: UnixTimestamp) -> Self {
+        Self {
+            started_at,
+            used: 0,
+        }
+    }
+
+    fn reset_at(self, window_seconds: u64) -> UnixTimestamp {
+        UnixTimestamp::new(self.started_at.as_u64().saturating_add(window_seconds))
+    }
+
+    fn reset_if_elapsed(&mut self, now: UnixTimestamp, window_seconds: u64) {
+        if now >= self.reset_at(window_seconds) || now < self.started_at {
+            self.started_at = now;
+            self.used = 0;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitError {
+    EmptyKey,
+    ZeroCost,
+    CostExceedsLimit { cost: u64, limit: u64 },
+}
+
+impl RateLimitError {
+    pub fn kind(self) -> RateLimitErrorKind {
+        match self {
+            Self::EmptyKey => RateLimitErrorKind::EmptyKey,
+            Self::ZeroCost => RateLimitErrorKind::ZeroCost,
+            Self::CostExceedsLimit { .. } => RateLimitErrorKind::CostExceedsLimit,
+        }
+    }
+}
+
+impl fmt::Display for RateLimitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyKey => formatter.write_str("rate limit key must not be empty"),
+            Self::ZeroCost => formatter.write_str("rate limit cost must be greater than zero"),
+            Self::CostExceedsLimit { cost, limit } => {
+                write!(formatter, "rate limit cost {cost} exceeds limit {limit}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RateLimitError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitErrorKind {
+    EmptyKey,
+    ZeroCost,
+    CostExceedsLimit,
+}
+
 fn compile_filter_branch(filter: &Filter) -> Result<QueryPlanBranch, NostrFilterCompileError> {
     let tag_filters =
         compile_filter_tag_constraints(filter).map_err(NostrFilterCompileError::QueryPlan)?;
@@ -2894,16 +3110,17 @@ mod tests {
         AdmissionContext, AdmissionEffect, AdmissionEvent, AdmissionEventKind, AdmissionPolicy,
         AdmissionRejectionKind, AuthChallengeState, AuthChallengeStateErrorKind,
         EventIngestionEffect, EventIngestionRejectionKind, EventIngestor, EventParser,
-        EventValidationRejection, EventValidationRejectionKind, EventValidator, LiveSearchPolicy,
-        MarketplaceCursor, MarketplaceCursorSpec, MarketplaceDecimal, MarketplaceGeoPoint,
-        MarketplaceListingStatus, MarketplaceLocationFilter, MarketplaceQuery,
-        MarketplaceQueryErrorKind, MarketplaceQuerySpec, MarketplaceSort,
-        Nip50QueryCompileErrorKind, Nip50QueryCompiler, NostrFilterCompileErrorKind,
-        NostrFilterCompiler, ProjectionExclusionReason, QueryExecutionMode, QueryPlan,
-        QueryPlanBranch, QueryPlanBranchSpec, QueryPlanError, QuerySearch, QuerySort, QuerySource,
-        QueryTagFilter, RuntimeLimitConfigError, RuntimeLimitKind, RuntimeLimitValues,
-        RuntimeLimits, SubscriptionAddOutcome, SubscriptionCloseOutcome, SubscriptionManager,
-        SubscriptionManagerErrorKind, SubscriptionMatch, SubscriptionMatcher,
+        EventValidationRejection, EventValidationRejectionKind, EventValidator,
+        FixedWindowRateLimiter, LiveSearchPolicy, MarketplaceCursor, MarketplaceCursorSpec,
+        MarketplaceDecimal, MarketplaceGeoPoint, MarketplaceListingStatus,
+        MarketplaceLocationFilter, MarketplaceQuery, MarketplaceQueryErrorKind,
+        MarketplaceQuerySpec, MarketplaceSort, Nip50QueryCompileErrorKind, Nip50QueryCompiler,
+        NostrFilterCompileErrorKind, NostrFilterCompiler, ProjectionExclusionReason,
+        QueryExecutionMode, QueryPlan, QueryPlanBranch, QueryPlanBranchSpec, QueryPlanError,
+        QuerySearch, QuerySort, QuerySource, QueryTagFilter, RateLimitConfig, RateLimitConfigError,
+        RateLimitDecision, RateLimitErrorKind, RuntimeLimitConfigError, RuntimeLimitKind,
+        RuntimeLimitValues, RuntimeLimits, SubscriptionAddOutcome, SubscriptionCloseOutcome,
+        SubscriptionManager, SubscriptionManagerErrorKind, SubscriptionMatch, SubscriptionMatcher,
         UnapprovedSellerAction,
     };
     use tangle_nips::{
@@ -5493,6 +5710,100 @@ mod tests {
             created_before.to_string(),
             "auth event created_at 19 is before challenge issued_at 20"
         );
+    }
+
+    #[test]
+    fn fixed_window_rate_limiter_accepts_rejects_resets_and_prunes() {
+        let config = RateLimitConfig::new(3, 60).expect("config");
+        let mut limiter = FixedWindowRateLimiter::new(config);
+        let first = limiter
+            .check(" ip:1 ", UnixTimestamp::new(100), 1)
+            .expect("first");
+        let second = limiter
+            .check("ip:1", UnixTimestamp::new(110), 2)
+            .expect("second");
+        let rejected = limiter
+            .check("ip:1", UnixTimestamp::new(110), 1)
+            .expect("rejected");
+        let other_key = limiter
+            .check("ip:2", UnixTimestamp::new(110), 1)
+            .expect("other");
+        let reset = limiter
+            .check("ip:1", UnixTimestamp::new(160), 1)
+            .expect("reset");
+        let rewind = limiter
+            .check("ip:1", UnixTimestamp::new(150), 1)
+            .expect("rewind");
+        let pruned = limiter.prune_expired(UnixTimestamp::new(170));
+
+        assert_eq!(limiter.config(), config);
+        assert!(first.allowed());
+        assert_eq!(first.remaining(), 2);
+        assert_eq!(first.reset_at(), UnixTimestamp::new(160));
+        assert_eq!(first.retry_after_seconds(), None);
+        assert!(second.allowed());
+        assert_eq!(second.remaining(), 0);
+        assert!(!rejected.allowed());
+        assert_eq!(rejected.remaining(), 0);
+        assert_eq!(rejected.reset_at(), UnixTimestamp::new(160));
+        assert_eq!(rejected.retry_after_seconds(), Some(50));
+        assert_eq!(
+            rejected,
+            RateLimitDecision::Rejected {
+                retry_after_seconds: 50,
+                reset_at: UnixTimestamp::new(160),
+            }
+        );
+        assert_eq!(other_key.remaining(), 2);
+        assert_eq!(reset.remaining(), 2);
+        assert_eq!(reset.reset_at(), UnixTimestamp::new(220));
+        assert_eq!(rewind.remaining(), 2);
+        assert_eq!(rewind.reset_at(), UnixTimestamp::new(210));
+        assert_eq!(pruned, 1);
+        assert_eq!(limiter.tracked_key_count(), 1);
+    }
+
+    #[test]
+    fn fixed_window_rate_limiter_rejects_invalid_config_keys_and_costs() {
+        let zero_limit = RateLimitConfig::new(0, 60).expect_err("limit");
+        let zero_window = RateLimitConfig::new(1, 0).expect_err("window");
+        let mut limiter = FixedWindowRateLimiter::new(RateLimitConfig::new(2, 60).expect("config"));
+        let empty_key = limiter
+            .check(" ", UnixTimestamp::new(1), 1)
+            .expect_err("key");
+        let zero_cost = limiter
+            .check("ip:1", UnixTimestamp::new(1), 0)
+            .expect_err("cost");
+        let cost_exceeds_limit = limiter
+            .check("ip:1", UnixTimestamp::new(1), 3)
+            .expect_err("limit");
+
+        assert_eq!(zero_limit, RateLimitConfigError::ZeroLimit);
+        assert_eq!(
+            zero_limit.to_string(),
+            "rate limit must be greater than zero"
+        );
+        assert_eq!(zero_window, RateLimitConfigError::ZeroWindowSeconds);
+        assert_eq!(
+            zero_window.to_string(),
+            "rate limit window must be greater than zero seconds"
+        );
+        assert_eq!(empty_key.kind(), RateLimitErrorKind::EmptyKey);
+        assert_eq!(empty_key.to_string(), "rate limit key must not be empty");
+        assert_eq!(zero_cost.kind(), RateLimitErrorKind::ZeroCost);
+        assert_eq!(
+            zero_cost.to_string(),
+            "rate limit cost must be greater than zero"
+        );
+        assert_eq!(
+            cost_exceeds_limit.kind(),
+            RateLimitErrorKind::CostExceedsLimit
+        );
+        assert_eq!(
+            cost_exceeds_limit.to_string(),
+            "rate limit cost 3 exceeds limit 2"
+        );
+        assert_eq!(limiter.tracked_key_count(), 0);
     }
 
     fn limits_with(update: impl FnOnce(&mut RuntimeLimitValues)) -> RuntimeLimits {
