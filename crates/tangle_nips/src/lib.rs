@@ -459,6 +459,96 @@ fn is_exact_unsigned_decimal(value: &str) -> bool {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListingUnit {
+    Lb,
+    Oz,
+    Each,
+    Bunch,
+    Dozen,
+    Kg,
+    G,
+    Share,
+    Pint,
+    Quart,
+    Box,
+    Crate,
+    Flat,
+}
+
+impl ListingUnit {
+    pub fn canonical(self) -> &'static str {
+        match self {
+            Self::Lb => "lb",
+            Self::Oz => "oz",
+            Self::Each => "each",
+            Self::Bunch => "bunch",
+            Self::Dozen => "dozen",
+            Self::Kg => "kg",
+            Self::G => "g",
+            Self::Share => "share",
+            Self::Pint => "pint",
+            Self::Quart => "quart",
+            Self::Box => "box",
+            Self::Crate => "crate",
+            Self::Flat => "flat",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListingUnitTag {
+    raw: String,
+    unit: ListingUnit,
+}
+
+impl ListingUnitTag {
+    pub fn raw(&self) -> &str {
+        &self.raw
+    }
+
+    pub fn unit(&self) -> ListingUnit {
+        self.unit
+    }
+
+    pub fn canonical(&self) -> &'static str {
+        self.unit.canonical()
+    }
+}
+
+pub fn parse_listing_unit(event: &Event) -> Result<Option<ListingUnitTag>, String> {
+    if listing_kind_for_event(event).is_none() {
+        return Ok(None);
+    }
+    let raw = required_tag_value(event, "unit")?;
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Err("listing unit tag must not be empty".to_owned());
+    }
+    let unit = parse_unit_value(&normalized)
+        .ok_or_else(|| format!("listing unit `{raw}` is unsupported"))?;
+    Ok(Some(ListingUnitTag { raw, unit }))
+}
+
+fn parse_unit_value(value: &str) -> Option<ListingUnit> {
+    match value {
+        "lb" | "lbs" | "pound" | "pounds" => Some(ListingUnit::Lb),
+        "oz" | "ounce" | "ounces" => Some(ListingUnit::Oz),
+        "each" | "ea" => Some(ListingUnit::Each),
+        "bunch" | "bunches" => Some(ListingUnit::Bunch),
+        "dozen" => Some(ListingUnit::Dozen),
+        "kg" | "kilogram" | "kilograms" => Some(ListingUnit::Kg),
+        "g" | "gram" | "grams" => Some(ListingUnit::G),
+        "share" | "shares" => Some(ListingUnit::Share),
+        "pint" | "pints" => Some(ListingUnit::Pint),
+        "quart" | "quarts" => Some(ListingUnit::Quart),
+        "box" | "boxes" => Some(ListingUnit::Box),
+        "crate" | "crates" => Some(ListingUnit::Crate),
+        "flat" | "flats" => Some(ListingUnit::Flat),
+        _ => None,
+    }
+}
+
 fn listing_kind_for_event(event: &Event) -> Option<ListingKind> {
     match event.unsigned().kind().as_u32() {
         NIP99_PUBLIC_LISTING_KIND => Some(ListingKind::Public),
@@ -470,12 +560,12 @@ fn listing_kind_for_event(event: &Event) -> Option<ListingKind> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeletionTarget, ListingKind, NIP99_PUBLIC_LISTING_KIND, matching_tags, optional_tag_value,
-        optional_tag_values, parse_deletion_request, parse_listing_identity, parse_listing_price,
-        parse_listing_text, parse_nip50_filter_search, parse_nip50_search, parse_relay_auth_event,
-        parse_required_u64_tag, parse_u64_field, repeated_or_missing_policy_boundary,
-        required_tag_value, required_tag_values, single_letter_tag_values,
-        single_letter_values_for, tag_count,
+        DeletionTarget, ListingKind, ListingUnit, NIP99_PUBLIC_LISTING_KIND, matching_tags,
+        optional_tag_value, optional_tag_values, parse_deletion_request, parse_listing_identity,
+        parse_listing_price, parse_listing_text, parse_listing_unit, parse_nip50_filter_search,
+        parse_nip50_search, parse_relay_auth_event, parse_required_u64_tag, parse_u64_field,
+        repeated_or_missing_policy_boundary, required_tag_value, required_tag_values,
+        single_letter_tag_values, single_letter_values_for, tag_count,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -1135,6 +1225,107 @@ mod tests {
         assert_eq!(
             parse_listing_price(&empty_frequency).expect_err("frequency"),
             "price frequency must not be empty"
+        );
+    }
+
+    #[test]
+    fn listing_unit_parser_normalizes_supported_units_and_aliases() {
+        let cases = [
+            ("LB", ListingUnit::Lb, "lb"),
+            ("ounces", ListingUnit::Oz, "oz"),
+            ("ea", ListingUnit::Each, "each"),
+            ("bunches", ListingUnit::Bunch, "bunch"),
+            ("dozen", ListingUnit::Dozen, "dozen"),
+            ("kilograms", ListingUnit::Kg, "kg"),
+            ("grams", ListingUnit::G, "g"),
+            ("shares", ListingUnit::Share, "share"),
+            ("pints", ListingUnit::Pint, "pint"),
+            ("quarts", ListingUnit::Quart, "quart"),
+            ("boxes", ListingUnit::Box, "box"),
+            ("crates", ListingUnit::Crate, "crate"),
+            ("flats", ListingUnit::Flat, "flat"),
+        ];
+
+        for (raw, unit, canonical) in cases {
+            let event = event_with_kind_and_tags(
+                u64::from(NIP99_PUBLIC_LISTING_KIND),
+                vec![Tag::from_parts("unit", &[raw]).expect("unit")],
+            );
+            let parsed = parse_listing_unit(&event).expect("parse").expect("unit");
+
+            assert_eq!(parsed.raw(), raw);
+            assert_eq!(parsed.unit(), unit);
+            assert_eq!(parsed.canonical(), canonical);
+            assert_eq!(unit.canonical(), canonical);
+        }
+    }
+
+    #[test]
+    fn listing_unit_parser_trims_input_and_ignores_non_listing_kinds() {
+        let listing = event_with_kind_and_tags(
+            30_403,
+            vec![Tag::from_parts("unit", &[" pound "]).expect("unit")],
+        );
+        let note =
+            event_with_kind_and_tags(1, vec![Tag::from_parts("unit", &["lb"]).expect("unit")]);
+
+        assert_eq!(
+            parse_listing_unit(&listing)
+                .expect("listing")
+                .expect("unit")
+                .canonical(),
+            "lb"
+        );
+        assert_eq!(parse_listing_unit(&note), Ok(None));
+    }
+
+    #[test]
+    fn listing_unit_parser_rejects_missing_repeated_and_empty_units() {
+        let missing = event_with_kind_and_tags(u64::from(NIP99_PUBLIC_LISTING_KIND), Vec::new());
+        let repeated = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![
+                Tag::from_parts("unit", &["lb"]).expect("unit"),
+                Tag::from_parts("unit", &["kg"]).expect("unit"),
+            ],
+        );
+        let missing_value = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("unit", &[]).expect("unit")],
+        );
+        let empty = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("unit", &["  "]).expect("unit")],
+        );
+
+        assert_eq!(
+            parse_listing_unit(&missing).expect_err("missing"),
+            "tag `unit` is required"
+        );
+        assert_eq!(
+            parse_listing_unit(&repeated).expect_err("repeated"),
+            "tag `unit` must not be repeated"
+        );
+        assert_eq!(
+            parse_listing_unit(&missing_value).expect_err("value"),
+            "tag `unit` must include a value"
+        );
+        assert_eq!(
+            parse_listing_unit(&empty).expect_err("empty"),
+            "listing unit tag must not be empty"
+        );
+    }
+
+    #[test]
+    fn listing_unit_parser_rejects_unsupported_units() {
+        let event = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("unit", &["bushel"]).expect("unit")],
+        );
+
+        assert_eq!(
+            parse_listing_unit(&event).expect_err("unsupported"),
+            "listing unit `bushel` is unsupported"
         );
     }
 
