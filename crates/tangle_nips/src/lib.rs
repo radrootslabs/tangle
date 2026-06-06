@@ -11,6 +11,7 @@ pub const NIP22_COMMENT_KIND: u32 = 1_111;
 pub const NIP25_REACTION_KIND: u32 = 7;
 pub const NIP23_LONG_FORM_KIND: u32 = 30_023;
 pub const NIP23_LONG_FORM_DRAFT_KIND: u32 = 30_024;
+pub const NIP7D_THREAD_KIND: u32 = 11;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedTag {
@@ -886,6 +887,71 @@ fn collect_normalized_tag_values(
     Ok(values)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForumThreadEvent {
+    event_id: EventId,
+    pubkey: PublicKeyHex,
+    created_at: UnixTimestamp,
+    title: Option<String>,
+    content: String,
+    topics: Vec<String>,
+    referenced_events: Vec<EventId>,
+    referenced_pubkeys: Vec<PublicKeyHex>,
+}
+
+impl ForumThreadEvent {
+    pub fn event_id(&self) -> &EventId {
+        &self.event_id
+    }
+
+    pub fn pubkey(&self) -> &PublicKeyHex {
+        &self.pubkey
+    }
+
+    pub fn created_at(&self) -> UnixTimestamp {
+        self.created_at
+    }
+
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
+    pub fn topics(&self) -> &[String] {
+        &self.topics
+    }
+
+    pub fn referenced_events(&self) -> &[EventId] {
+        &self.referenced_events
+    }
+
+    pub fn referenced_pubkeys(&self) -> &[PublicKeyHex] {
+        &self.referenced_pubkeys
+    }
+}
+
+pub fn parse_forum_thread_event(event: &Event) -> Result<Option<ForumThreadEvent>, String> {
+    if event.unsigned().kind().as_u32() != NIP7D_THREAD_KIND {
+        return Ok(None);
+    }
+    Ok(Some(ForumThreadEvent {
+        event_id: event.id().clone(),
+        pubkey: event.unsigned().pubkey().clone(),
+        created_at: event.unsigned().created_at(),
+        title: optional_non_empty_tag_value(event, "title", "forum thread title")?,
+        content: event.unsigned().content().to_owned(),
+        topics: collect_normalized_tag_values(event, "t", "forum thread topic")?,
+        referenced_events: single_letter_values_for(event, "e")?
+            .into_iter()
+            .map(|value| EventId::new(&value))
+            .collect::<Result<Vec<_>, _>>()?,
+        referenced_pubkeys: parse_pubkey_values(event, "p", "forum thread reference")?,
+    }))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListingKind {
     Public,
@@ -1640,16 +1706,16 @@ fn listing_kind_for_event(event: &Event) -> Option<ListingKind> {
 mod tests {
     use super::{
         CommentTarget, DeletionTarget, FulfillmentMethod, ListingEffectiveStatus, ListingKind,
-        ListingProjectionEvaluation, ListingUnit, LongFormKind, NIP22_COMMENT_KIND,
-        NIP23_LONG_FORM_DRAFT_KIND, NIP23_LONG_FORM_KIND, NIP25_REACTION_KIND,
+        ListingProjectionEvaluation, ListingUnit, LongFormKind, NIP7D_THREAD_KIND,
+        NIP22_COMMENT_KIND, NIP23_LONG_FORM_DRAFT_KIND, NIP23_LONG_FORM_KIND, NIP25_REACTION_KIND,
         NIP99_PUBLIC_LISTING_KIND, ReactionValue, evaluate_listing_projection, matching_tags,
         optional_tag_value, optional_tag_values, parse_comment_event, parse_deletion_request,
-        parse_listing_fulfillment, parse_listing_identity, parse_listing_location,
-        parse_listing_price, parse_listing_status, parse_listing_taxonomy, parse_listing_text,
-        parse_listing_unit, parse_long_form_event, parse_nip50_filter_search, parse_nip50_search,
-        parse_reaction_event, parse_relay_auth_event, parse_required_u64_tag, parse_u64_field,
-        repeated_or_missing_policy_boundary, required_tag_value, required_tag_values,
-        single_letter_tag_values, single_letter_values_for, tag_count,
+        parse_forum_thread_event, parse_listing_fulfillment, parse_listing_identity,
+        parse_listing_location, parse_listing_price, parse_listing_status, parse_listing_taxonomy,
+        parse_listing_text, parse_listing_unit, parse_long_form_event, parse_nip50_filter_search,
+        parse_nip50_search, parse_reaction_event, parse_relay_auth_event, parse_required_u64_tag,
+        parse_u64_field, repeated_or_missing_policy_boundary, required_tag_value,
+        required_tag_values, single_letter_tag_values, single_letter_values_for, tag_count,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -2207,6 +2273,106 @@ mod tests {
         assert_eq!(
             parse_long_form_event(&bad_reference).expect_err("bad reference"),
             "event id must be 64 characters, got 3"
+        );
+    }
+
+    #[test]
+    fn forum_thread_parser_extracts_title_topics_and_references() {
+        let referenced_event = "6".repeat(EventId::HEX_LENGTH);
+        let referenced_pubkey = "7".repeat(PublicKeyHex::HEX_LENGTH);
+        let event = event_with_kind_tags_and_content(
+            NIP7D_THREAD_KIND.into(),
+            vec![
+                Tag::from_parts("title", &["Market day thread"]).expect("title"),
+                Tag::from_parts("t", &["Market"]).expect("topic"),
+                Tag::from_parts("t", &[" market "]).expect("topic duplicate"),
+                Tag::from_parts("t", &["Carrots"]).expect("topic carrots"),
+                Tag::from_parts("e", &[&referenced_event]).expect("e"),
+                Tag::from_parts("p", &[&referenced_pubkey]).expect("p"),
+            ],
+            "What is everyone bringing this weekend?",
+        );
+
+        let thread = parse_forum_thread_event(&event)
+            .expect("parse")
+            .expect("thread");
+
+        assert_eq!(thread.event_id(), event.id());
+        assert_eq!(thread.pubkey(), event.unsigned().pubkey());
+        assert_eq!(thread.created_at(), event.unsigned().created_at());
+        assert_eq!(thread.title(), Some("Market day thread"));
+        assert_eq!(thread.content(), "What is everyone bringing this weekend?");
+        assert_eq!(
+            thread.topics(),
+            &["carrots".to_owned(), "market".to_owned()]
+        );
+        assert_eq!(thread.referenced_events()[0].as_str(), referenced_event);
+        assert_eq!(thread.referenced_pubkeys()[0].as_str(), referenced_pubkey);
+    }
+
+    #[test]
+    fn forum_thread_parser_allows_missing_title_and_ignores_other_kinds() {
+        let thread = event_with_kind_tags_and_content(
+            NIP7D_THREAD_KIND.into(),
+            vec![Tag::from_parts("t", &["market"]).expect("topic")],
+            "Open thread.",
+        );
+        let note = event_with_kind_and_tags(1, vec![Tag::from_parts("title", &["GM"]).expect("t")]);
+
+        let thread = parse_forum_thread_event(&thread)
+            .expect("parse")
+            .expect("thread");
+
+        assert_eq!(thread.title(), None);
+        assert_eq!(thread.topics(), &["market".to_owned()]);
+        assert_eq!(parse_forum_thread_event(&note), Ok(None));
+    }
+
+    #[test]
+    fn forum_thread_parser_rejects_malformed_title_topics_and_references() {
+        let empty_title = event_with_kind_and_tags(
+            NIP7D_THREAD_KIND.into(),
+            vec![Tag::from_parts("title", &[""]).expect("title")],
+        );
+        let repeated_title = event_with_kind_and_tags(
+            NIP7D_THREAD_KIND.into(),
+            vec![
+                Tag::from_parts("title", &["one"]).expect("title"),
+                Tag::from_parts("title", &["two"]).expect("title"),
+            ],
+        );
+        let empty_topic = event_with_kind_and_tags(
+            NIP7D_THREAD_KIND.into(),
+            vec![Tag::from_parts("t", &[" "]).expect("topic")],
+        );
+        let bad_event_reference = event_with_kind_and_tags(
+            NIP7D_THREAD_KIND.into(),
+            vec![Tag::from_parts("e", &["bad"]).expect("e")],
+        );
+        let bad_pubkey_reference = event_with_kind_and_tags(
+            NIP7D_THREAD_KIND.into(),
+            vec![Tag::from_parts("p", &["bad"]).expect("p")],
+        );
+
+        assert_eq!(
+            parse_forum_thread_event(&empty_title).expect_err("empty title"),
+            "forum thread title tag must not be empty"
+        );
+        assert_eq!(
+            parse_forum_thread_event(&repeated_title).expect_err("repeated title"),
+            "tag `title` must not be repeated"
+        );
+        assert_eq!(
+            parse_forum_thread_event(&empty_topic).expect_err("empty topic"),
+            "forum thread topic value must not be empty"
+        );
+        assert_eq!(
+            parse_forum_thread_event(&bad_event_reference).expect_err("bad event"),
+            "event id must be 64 characters, got 3"
+        );
+        assert_eq!(
+            parse_forum_thread_event(&bad_pubkey_reference).expect_err("bad pubkey"),
+            "forum thread reference pubkey is invalid: public key must be 64 characters, got 3"
         );
     }
 
