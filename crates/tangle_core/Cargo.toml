@@ -11,6 +11,7 @@ description = "Transport-independent relay core policy for tangle"
 tangle_crypto = { path = "../tangle_crypto" }
 tangle_nips = { path = "../tangle_nips" }
 tangle_protocol = { path = "../tangle_protocol" }
+tangle_store = { path = "../tangle_store" }
 
 [dev-dependencies]
 tangle_test_support = { path = "../tangle_test_support" }
