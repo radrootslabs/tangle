@@ -5331,6 +5331,39 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_loader_parses_production_config_example() {
+        let config = parse_runtime_config_json(include_str!(
+            "../../../ops/production/tangle-runtime.example.json"
+        ))
+        .expect("production example config");
+
+        assert_eq!(config.listen_addr().to_string(), "0.0.0.0:7000");
+        assert_eq!(
+            config.database_config().mode(),
+            &SurrealConnectionMode::Http {
+                endpoint: "http://surrealdb:8000".to_owned()
+            }
+        );
+        let credentials = config
+            .database_config()
+            .root_credentials()
+            .expect("root credentials");
+        assert_eq!(credentials.username(), "replace_with_surreal_root_user");
+        assert_eq!(credentials.password(), "replace_with_surreal_root_password");
+        assert_eq!(config.database_config().namespace(), "tangle");
+        assert_eq!(config.database_config().database(), "relay");
+        assert_eq!(config.tracing_config().format(), RuntimeTracingFormat::Json);
+        assert_eq!(
+            config.durable_write_rate_limit(),
+            Some(RateLimitConfig::new(300, 60).expect("write limit"))
+        );
+        assert!(config.admission_policy().require_write_auth());
+        assert!(config.admin_pubkeys().contains(
+            &PublicKeyHex::new(&"a".repeat(PublicKeyHex::HEX_LENGTH)).expect("admin pubkey")
+        ));
+    }
+
+    #[test]
     fn runtime_config_loader_parses_observability_tracing_config() {
         let config = parse_runtime_config_json(
             r#"{
