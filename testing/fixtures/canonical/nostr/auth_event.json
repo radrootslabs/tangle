@@ -1,0 +1,11 @@
+{
+  "name": "auth_event",
+  "key": "seller",
+  "created_at": 1714124435,
+  "kind": 22242,
+  "tags": [
+    ["relay", "wss://relay.radroots.test"],
+    ["challenge", "challenge-001"]
+  ],
+  "content": ""
+}
