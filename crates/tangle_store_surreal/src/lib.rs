@@ -687,6 +687,13 @@ pub enum ListingHelperOutcome {
     Projected,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchDocumentOutcome {
+    NotListing,
+    Ineligible,
+    Indexed,
+}
+
 #[derive(Clone)]
 pub struct SurrealStore {
     db: Surreal<Db>,
@@ -1372,6 +1379,87 @@ UPSERT type::record('listing_current', $listing_key) CONTENT {
             .await
     }
 
+    pub async fn index_listing_search_document(
+        &self,
+        event: &Event,
+    ) -> Result<SearchDocumentOutcome, SurrealStoreError> {
+        let evaluation = evaluate_listing_projection(event);
+        let ListingProjectionEvaluation::Eligible(projection) = evaluation else {
+            return Ok(
+                if matches!(evaluation, ListingProjectionEvaluation::NotListing) {
+                    SearchDocumentOutcome::NotListing
+                } else {
+                    SearchDocumentOutcome::Ineligible
+                },
+            );
+        };
+        let fields = search_document_fields(&projection, event);
+        self.db
+            .query(
+                r#"
+UPSERT type::record('search_doc', $doc_key) CONTENT {
+    doc_key: $doc_key,
+    event_id: $event_id,
+    current_event_id: $current_event_id,
+    doc_type: "listing",
+    kind: $kind,
+    pubkey: $pubkey,
+    address_key: $address_key,
+    title: $title,
+    summary: $summary,
+    body: $body,
+    category_text: $category_text,
+    location_text: $location_text,
+    tags: $tags,
+    categories: $categories,
+    created_at: $created_at,
+    updated_at: $updated_at,
+    visible: $visible,
+    status: $status,
+    seller_trust_score: $seller_trust_score
+};
+"#,
+            )
+            .bind(("doc_key", fields.doc_key))
+            .bind(("event_id", event.id().as_str()))
+            .bind(("current_event_id", event.id().as_str()))
+            .bind(("kind", event.unsigned().kind().as_u32()))
+            .bind(("pubkey", event.unsigned().pubkey().as_str()))
+            .bind(("address_key", fields.address_key))
+            .bind(("title", fields.title))
+            .bind(("summary", fields.summary))
+            .bind(("body", fields.body))
+            .bind(("category_text", fields.category_text))
+            .bind(("location_text", fields.location_text))
+            .bind(("tags", fields.tags))
+            .bind(("categories", fields.categories))
+            .bind(("created_at", event.unsigned().created_at().as_u64()))
+            .bind(("updated_at", event.unsigned().created_at().as_u64()))
+            .bind(("visible", fields.visible))
+            .bind(("status", fields.status))
+            .bind(("seller_trust_score", Option::<i64>::None))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        Ok(SearchDocumentOutcome::Indexed)
+    }
+
+    pub async fn search_document_row(
+        &self,
+        doc_key: &str,
+    ) -> Result<Option<serde_json::Value>, SurrealStoreError> {
+        let mut response = self
+            .db
+            .query("SELECT * FROM ONLY type::record('search_doc', $doc_key);")
+            .bind(("doc_key", doc_key))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
     async fn replace_listing_helper_rows(
         &self,
         table: &str,
@@ -1640,6 +1728,43 @@ struct ListingCurrentFields {
     delivery_only: bool,
 }
 
+struct SearchDocumentFields {
+    doc_key: String,
+    address_key: Option<String>,
+    title: String,
+    summary: Option<String>,
+    body: String,
+    category_text: String,
+    location_text: Option<String>,
+    tags: Vec<String>,
+    categories: Vec<String>,
+    visible: bool,
+    status: String,
+}
+
+fn search_document_fields(projection: &ListingProjection, _event: &Event) -> SearchDocumentFields {
+    let doc_key = projection.identity().address().key().to_string();
+    let status = projection
+        .status()
+        .effective_status()
+        .canonical()
+        .to_owned();
+    let categories = projection.taxonomy().categories().to_vec();
+    SearchDocumentFields {
+        address_key: Some(doc_key.clone()),
+        doc_key,
+        title: projection.text().title().to_owned(),
+        summary: projection.text().summary().map(str::to_owned),
+        body: projection.text().body().to_owned(),
+        category_text: categories.join(" "),
+        location_text: projection.location().location_text().map(str::to_owned),
+        tags: projection.taxonomy().topics().to_vec(),
+        categories,
+        visible: status == "active",
+        status,
+    }
+}
+
 fn listing_current_fields(
     projection: &ListingProjection,
     event: &Event,
@@ -1818,9 +1943,9 @@ impl From<surrealdb::Error> for SurrealStoreError {
 mod tests {
     use super::{
         CurrentEventOutcome, DeletionMarkerOutcome, ListingCurrentOutcome, ListingHelperOutcome,
-        ListingRevisionOutcome, MigrationApplyOutcome, SurrealConfigError, SurrealConnectionConfig,
-        SurrealConnectionMode, SurrealMigration, SurrealMigrationError, SurrealMigrationPlan,
-        SurrealStore, base_migration_plan, migration_tracking_schema,
+        ListingRevisionOutcome, MigrationApplyOutcome, SearchDocumentOutcome, SurrealConfigError,
+        SurrealConnectionConfig, SurrealConnectionMode, SurrealMigration, SurrealMigrationError,
+        SurrealMigrationPlan, SurrealStore, base_migration_plan, migration_tracking_schema,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -3177,6 +3302,101 @@ mod tests {
                 .await
                 .expect("invalid categories")
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn index_listing_search_documents_persists_listing_search_rows() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let doc_key = format!("30402:{}:listing-a", listing.unsigned().pubkey().as_str());
+
+        assert_eq!(
+            store
+                .index_listing_search_document(&listing)
+                .await
+                .expect("search document"),
+            SearchDocumentOutcome::Indexed
+        );
+        assert_eq!(
+            store
+                .index_listing_search_document(&listing)
+                .await
+                .expect("search document again"),
+            SearchDocumentOutcome::Indexed
+        );
+
+        let row = store
+            .search_document_row(&doc_key)
+            .await
+            .expect("search row")
+            .expect("search row exists");
+        assert_eq!(row["doc_key"], doc_key);
+        assert_eq!(row["event_id"], listing.id().as_str());
+        assert_eq!(row["current_event_id"], listing.id().as_str());
+        assert_eq!(row["doc_type"], "listing");
+        assert_eq!(row["kind"], 30_402_u64);
+        assert_eq!(row["pubkey"], listing.unsigned().pubkey().as_str());
+        assert_eq!(row["address_key"], doc_key);
+        assert_eq!(row["title"], "Carrot bunches");
+        assert!(row["summary"].is_null());
+        assert_eq!(row["body"], "Sweet storage carrots.");
+        assert_eq!(row["category_text"], "vegetables");
+        assert!(row["location_text"].is_null());
+        assert_eq!(row["tags"].as_array().expect("tags").len(), 1);
+        assert_eq!(row["tags"][0], "carrots");
+        assert_eq!(row["categories"].as_array().expect("categories").len(), 1);
+        assert_eq!(row["categories"][0], "vegetables");
+        assert_eq!(row["created_at"], 1_714_124_433_u64);
+        assert_eq!(row["updated_at"], 1_714_124_433_u64);
+        assert_eq!(row["visible"], true);
+        assert_eq!(row["status"], "active");
+        assert!(row["seller_trust_score"].is_null());
+
+        let pubkey = "f".repeat(PublicKeyHex::HEX_LENGTH);
+        let invalid = synthetic_event(
+            "e",
+            "9",
+            &pubkey,
+            1_714_125_310,
+            30_402,
+            vec![Tag::from_parts("d", &["listing-invalid"]).expect("d tag")],
+            "",
+        );
+        let note = synthetic_event(
+            "f",
+            "a",
+            &pubkey,
+            1_714_125_311,
+            1,
+            Vec::new(),
+            "not a listing",
+        );
+
+        assert_eq!(
+            store
+                .index_listing_search_document(&invalid)
+                .await
+                .expect("invalid search"),
+            SearchDocumentOutcome::Ineligible
+        );
+        assert_eq!(
+            store
+                .index_listing_search_document(&note)
+                .await
+                .expect("note search"),
+            SearchDocumentOutcome::NotListing
+        );
+        assert!(
+            store
+                .search_document_row(&format!("30402:{pubkey}:listing-invalid"))
+                .await
+                .expect("invalid row")
+                .is_none()
         );
     }
 
