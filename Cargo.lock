@@ -3881,6 +3881,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tangle_runtime"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "tangle_store"
 version = "0.1.0"
 dependencies = [
