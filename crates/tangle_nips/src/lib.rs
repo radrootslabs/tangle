@@ -782,6 +782,69 @@ fn geohash_prefix(geohash: &Option<String>, length: usize) -> Option<String> {
         .map(|value| value[..length].to_owned())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListingTaxonomy {
+    categories: Vec<String>,
+    topics: Vec<String>,
+    practices: Vec<String>,
+    certifications: Vec<String>,
+}
+
+impl ListingTaxonomy {
+    pub fn categories(&self) -> &[String] {
+        &self.categories
+    }
+
+    pub fn topics(&self) -> &[String] {
+        &self.topics
+    }
+
+    pub fn practices(&self) -> &[String] {
+        &self.practices
+    }
+
+    pub fn certifications(&self) -> &[String] {
+        &self.certifications
+    }
+}
+
+pub fn parse_listing_taxonomy(event: &Event) -> Result<Option<ListingTaxonomy>, String> {
+    if listing_kind_for_event(event).is_none() {
+        return Ok(None);
+    }
+    Ok(Some(ListingTaxonomy {
+        categories: collect_taxonomy_values(event, "category")?,
+        topics: collect_taxonomy_values(event, "t")?,
+        practices: collect_taxonomy_values(event, "practice")?,
+        certifications: collect_taxonomy_values(event, "certification")?,
+    }))
+}
+
+fn collect_taxonomy_values(event: &Event, name: &str) -> Result<Vec<String>, String> {
+    let mut values = Vec::new();
+    for tag in matching_tags(event, name) {
+        match tag.values() {
+            [] => return Err(format!("tag `{name}` must include a value")),
+            [value] => {
+                let normalized = normalize_taxonomy_value(name, value)?;
+                values.push(normalized);
+            }
+            _ => return Err(format!("tag `{name}` must include exactly one value")),
+        }
+    }
+    values.sort();
+    values.dedup();
+    Ok(values)
+}
+
+fn normalize_taxonomy_value(name: &str, value: &str) -> Result<String, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Err(format!("listing taxonomy `{name}` value must not be empty"));
+    }
+    Ok(normalized)
+}
+
 fn listing_kind_for_event(event: &Event) -> Option<ListingKind> {
     match event.unsigned().kind().as_u32() {
         NIP99_PUBLIC_LISTING_KIND => Some(ListingKind::Public),
@@ -796,11 +859,11 @@ mod tests {
         DeletionTarget, FulfillmentMethod, ListingEffectiveStatus, ListingKind, ListingUnit,
         NIP99_PUBLIC_LISTING_KIND, matching_tags, optional_tag_value, optional_tag_values,
         parse_deletion_request, parse_listing_fulfillment, parse_listing_identity,
-        parse_listing_location, parse_listing_price, parse_listing_status, parse_listing_text,
-        parse_listing_unit, parse_nip50_filter_search, parse_nip50_search, parse_relay_auth_event,
-        parse_required_u64_tag, parse_u64_field, repeated_or_missing_policy_boundary,
-        required_tag_value, required_tag_values, single_letter_tag_values,
-        single_letter_values_for, tag_count,
+        parse_listing_location, parse_listing_price, parse_listing_status, parse_listing_taxonomy,
+        parse_listing_text, parse_listing_unit, parse_nip50_filter_search, parse_nip50_search,
+        parse_relay_auth_event, parse_required_u64_tag, parse_u64_field,
+        repeated_or_missing_policy_boundary, required_tag_value, required_tag_values,
+        single_letter_tag_values, single_letter_values_for, tag_count,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -1881,6 +1944,99 @@ mod tests {
         assert_eq!(
             parse_listing_location(&too_short).expect_err("short"),
             "geohash must be 4 to 12 geohash characters"
+        );
+    }
+
+    #[test]
+    fn listing_taxonomy_parser_extracts_normalized_distinct_values() {
+        let event = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![
+                Tag::from_parts("category", &["Vegetables"]).expect("category"),
+                Tag::from_parts("category", &[" vegetables "]).expect("category"),
+                Tag::from_parts("t", &["Carrots"]).expect("topic"),
+                Tag::from_parts("t", &["CSA"]).expect("topic"),
+                Tag::from_parts("practice", &["No Spray"]).expect("practice"),
+                Tag::from_parts("certification", &["Organic"]).expect("certification"),
+            ],
+        );
+
+        let taxonomy = parse_listing_taxonomy(&event)
+            .expect("parse")
+            .expect("taxonomy");
+
+        assert_eq!(taxonomy.categories(), &["vegetables".to_owned()]);
+        assert_eq!(taxonomy.topics(), &["carrots".to_owned(), "csa".to_owned()]);
+        assert_eq!(taxonomy.practices(), &["no spray".to_owned()]);
+        assert_eq!(taxonomy.certifications(), &["organic".to_owned()]);
+    }
+
+    #[test]
+    fn listing_taxonomy_parser_allows_missing_taxonomy_and_ignores_non_listings() {
+        let listing = event_with_kind_and_tags(30_403, Vec::new());
+        let note = event_with_kind_and_tags(
+            1,
+            vec![Tag::from_parts("category", &["vegetables"]).expect("category")],
+        );
+
+        let taxonomy = parse_listing_taxonomy(&listing)
+            .expect("listing")
+            .expect("taxonomy");
+
+        assert_eq!(taxonomy.categories(), &[] as &[String]);
+        assert_eq!(taxonomy.topics(), &[] as &[String]);
+        assert_eq!(taxonomy.practices(), &[] as &[String]);
+        assert_eq!(taxonomy.certifications(), &[] as &[String]);
+        assert_eq!(parse_listing_taxonomy(&note), Ok(None));
+    }
+
+    #[test]
+    fn listing_taxonomy_parser_rejects_malformed_category_and_topic_tags() {
+        let category_missing_value = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("category", &[]).expect("category")],
+        );
+        let category_extra = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("category", &["vegetables", "extra"]).expect("category")],
+        );
+        let topic_empty = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("t", &["  "]).expect("topic")],
+        );
+
+        assert_eq!(
+            parse_listing_taxonomy(&category_missing_value).expect_err("value"),
+            "tag `category` must include a value"
+        );
+        assert_eq!(
+            parse_listing_taxonomy(&category_extra).expect_err("extra"),
+            "tag `category` must include exactly one value"
+        );
+        assert_eq!(
+            parse_listing_taxonomy(&topic_empty).expect_err("empty"),
+            "listing taxonomy `t` value must not be empty"
+        );
+    }
+
+    #[test]
+    fn listing_taxonomy_parser_rejects_malformed_practice_and_certification_tags() {
+        let practice_empty = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("practice", &[""]).expect("practice")],
+        );
+        let certification_extra = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("certification", &["organic", "extra"]).expect("certification")],
+        );
+
+        assert_eq!(
+            parse_listing_taxonomy(&practice_empty).expect_err("practice"),
+            "listing taxonomy `practice` value must not be empty"
+        );
+        assert_eq!(
+            parse_listing_taxonomy(&certification_extra).expect_err("certification"),
+            "tag `certification` must include exactly one value"
         );
     }
 
