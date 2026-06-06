@@ -9,6 +9,8 @@ pub const NIP99_PUBLIC_LISTING_KIND: u32 = 30_402;
 pub const NIP99_DRAFT_LISTING_KIND: u32 = 30_403;
 pub const NIP22_COMMENT_KIND: u32 = 1_111;
 pub const NIP25_REACTION_KIND: u32 = 7;
+pub const NIP23_LONG_FORM_KIND: u32 = 30_023;
+pub const NIP23_LONG_FORM_DRAFT_KIND: u32 = 30_024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedTag {
@@ -698,6 +700,190 @@ fn looks_like_single_emoji(value: &str) -> bool {
 
 fn last_matching_tag(event: &Event, name: &str) -> Option<ParsedTag> {
     matching_tags(event, name).into_iter().last()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LongFormKind {
+    Published,
+    Draft,
+}
+
+impl LongFormKind {
+    pub fn canonical(self) -> &'static str {
+        match self {
+            Self::Published => "published",
+            Self::Draft => "draft",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LongFormEvent {
+    event_id: EventId,
+    pubkey: PublicKeyHex,
+    created_at: UnixTimestamp,
+    content: String,
+    long_form_kind: LongFormKind,
+    address: AddressCoordinate,
+    d: DTag,
+    title: Option<String>,
+    image: Option<String>,
+    summary: Option<String>,
+    published_at: Option<u64>,
+    topics: Vec<String>,
+    referenced_events: Vec<EventId>,
+    referenced_addresses: Vec<AddressCoordinate>,
+    referenced_pubkeys: Vec<PublicKeyHex>,
+}
+
+impl LongFormEvent {
+    pub fn event_id(&self) -> &EventId {
+        &self.event_id
+    }
+
+    pub fn pubkey(&self) -> &PublicKeyHex {
+        &self.pubkey
+    }
+
+    pub fn created_at(&self) -> UnixTimestamp {
+        self.created_at
+    }
+
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
+    pub fn long_form_kind(&self) -> LongFormKind {
+        self.long_form_kind
+    }
+
+    pub fn address(&self) -> &AddressCoordinate {
+        &self.address
+    }
+
+    pub fn d(&self) -> &DTag {
+        &self.d
+    }
+
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    pub fn image(&self) -> Option<&str> {
+        self.image.as_deref()
+    }
+
+    pub fn summary(&self) -> Option<&str> {
+        self.summary.as_deref()
+    }
+
+    pub fn published_at(&self) -> Option<u64> {
+        self.published_at
+    }
+
+    pub fn topics(&self) -> &[String] {
+        &self.topics
+    }
+
+    pub fn referenced_events(&self) -> &[EventId] {
+        &self.referenced_events
+    }
+
+    pub fn referenced_addresses(&self) -> &[AddressCoordinate] {
+        &self.referenced_addresses
+    }
+
+    pub fn referenced_pubkeys(&self) -> &[PublicKeyHex] {
+        &self.referenced_pubkeys
+    }
+}
+
+pub fn parse_long_form_event(event: &Event) -> Result<Option<LongFormEvent>, String> {
+    let Some(long_form_kind) = long_form_kind_for_event(event) else {
+        return Ok(None);
+    };
+    let d = required_tag_value(event, "d")?;
+    if d.is_empty() {
+        return Err("long-form d tag must not be empty".to_owned());
+    }
+    let title = optional_non_empty_tag_value(event, "title", "long-form title")?;
+    let image = optional_non_empty_tag_value(event, "image", "long-form image")?;
+    let summary = optional_non_empty_tag_value(event, "summary", "long-form summary")?;
+    let published_at = optional_tag_value(event, "published_at")?
+        .map(|value| parse_u64_field("published_at", &value))
+        .transpose()?;
+    Ok(Some(LongFormEvent {
+        event_id: event.id().clone(),
+        pubkey: event.unsigned().pubkey().clone(),
+        created_at: event.unsigned().created_at(),
+        content: event.unsigned().content().to_owned(),
+        long_form_kind,
+        address: AddressCoordinate::new(
+            event.unsigned().kind(),
+            event.unsigned().pubkey().clone(),
+            DTag::new(&d),
+        )
+        .expect("long-form kind must be addressable"),
+        d: DTag::new(&d),
+        title,
+        image,
+        summary,
+        published_at,
+        topics: collect_normalized_tag_values(event, "t", "long-form topic")?,
+        referenced_events: single_letter_values_for(event, "e")?
+            .into_iter()
+            .map(|value| EventId::new(&value))
+            .collect::<Result<Vec<_>, _>>()?,
+        referenced_addresses: single_letter_values_for(event, "a")?
+            .into_iter()
+            .map(|value| AddressCoordinate::from_str(&value))
+            .collect::<Result<Vec<_>, _>>()?,
+        referenced_pubkeys: parse_pubkey_values(event, "p", "long-form reference")?,
+    }))
+}
+
+fn long_form_kind_for_event(event: &Event) -> Option<LongFormKind> {
+    match event.unsigned().kind().as_u32() {
+        NIP23_LONG_FORM_KIND => Some(LongFormKind::Published),
+        NIP23_LONG_FORM_DRAFT_KIND => Some(LongFormKind::Draft),
+        _ => None,
+    }
+}
+
+fn optional_non_empty_tag_value(
+    event: &Event,
+    name: &str,
+    description: &str,
+) -> Result<Option<String>, String> {
+    let value = optional_tag_value(event, name)?;
+    if value.as_ref().is_some_and(String::is_empty) {
+        return Err(format!("{description} tag must not be empty"));
+    }
+    Ok(value)
+}
+
+fn collect_normalized_tag_values(
+    event: &Event,
+    name: &str,
+    description: &str,
+) -> Result<Vec<String>, String> {
+    let mut values = Vec::new();
+    for tag in matching_tags(event, name) {
+        match tag.values() {
+            [] => return Err(format!("{description} tag must include a value")),
+            [value] => {
+                let normalized = value.trim().to_ascii_lowercase();
+                if normalized.is_empty() {
+                    return Err(format!("{description} value must not be empty"));
+                }
+                values.push(normalized);
+            }
+            _ => return Err(format!("{description} tag must include exactly one value")),
+        }
+    }
+    values.sort();
+    values.dedup();
+    Ok(values)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1454,13 +1640,14 @@ fn listing_kind_for_event(event: &Event) -> Option<ListingKind> {
 mod tests {
     use super::{
         CommentTarget, DeletionTarget, FulfillmentMethod, ListingEffectiveStatus, ListingKind,
-        ListingProjectionEvaluation, ListingUnit, NIP22_COMMENT_KIND, NIP25_REACTION_KIND,
+        ListingProjectionEvaluation, ListingUnit, LongFormKind, NIP22_COMMENT_KIND,
+        NIP23_LONG_FORM_DRAFT_KIND, NIP23_LONG_FORM_KIND, NIP25_REACTION_KIND,
         NIP99_PUBLIC_LISTING_KIND, ReactionValue, evaluate_listing_projection, matching_tags,
         optional_tag_value, optional_tag_values, parse_comment_event, parse_deletion_request,
         parse_listing_fulfillment, parse_listing_identity, parse_listing_location,
         parse_listing_price, parse_listing_status, parse_listing_taxonomy, parse_listing_text,
-        parse_listing_unit, parse_nip50_filter_search, parse_nip50_search, parse_reaction_event,
-        parse_relay_auth_event, parse_required_u64_tag, parse_u64_field,
+        parse_listing_unit, parse_long_form_event, parse_nip50_filter_search, parse_nip50_search,
+        parse_reaction_event, parse_relay_auth_event, parse_required_u64_tag, parse_u64_field,
         repeated_or_missing_policy_boundary, required_tag_value, required_tag_values,
         single_letter_tag_values, single_letter_values_for, tag_count,
     };
@@ -1880,6 +2067,146 @@ mod tests {
         assert_eq!(
             parse_reaction_event(&empty_kind).expect_err("empty kind"),
             "reaction k tag must not be empty"
+        );
+    }
+
+    #[test]
+    fn long_form_parser_extracts_metadata_topics_and_references() {
+        let referenced_event = "2".repeat(EventId::HEX_LENGTH);
+        let referenced_pubkey = "3".repeat(PublicKeyHex::HEX_LENGTH);
+        let referenced_address = format!("30023:{referenced_pubkey}:soil-notes");
+        let event = event_with_kind_tags_and_content(
+            NIP23_LONG_FORM_KIND.into(),
+            vec![
+                Tag::from_parts("d", &["harvest-notes"]).expect("d"),
+                Tag::from_parts("title", &["Harvest notes"]).expect("title"),
+                Tag::from_parts("summary", &["What changed this week."]).expect("summary"),
+                Tag::from_parts("image", &["https://radroots.test/harvest.jpg"]).expect("image"),
+                Tag::from_parts("published_at", &["1714124400"]).expect("published_at"),
+                Tag::from_parts("t", &["Carrots"]).expect("topic"),
+                Tag::from_parts("t", &[" carrots "]).expect("topic duplicate"),
+                Tag::from_parts("t", &["CSA"]).expect("topic csa"),
+                Tag::from_parts("e", &[&referenced_event]).expect("e"),
+                Tag::from_parts("a", &[&referenced_address]).expect("a"),
+                Tag::from_parts("p", &[&referenced_pubkey]).expect("p"),
+            ],
+            "## Harvest notes\n\nThe storage carrots held well.",
+        );
+
+        let article = parse_long_form_event(&event)
+            .expect("parse")
+            .expect("article");
+
+        assert_eq!(article.event_id(), event.id());
+        assert_eq!(article.pubkey(), event.unsigned().pubkey());
+        assert_eq!(article.created_at(), event.unsigned().created_at());
+        assert_eq!(
+            article.content(),
+            "## Harvest notes\n\nThe storage carrots held well."
+        );
+        assert_eq!(article.long_form_kind(), LongFormKind::Published);
+        assert_eq!(article.long_form_kind().canonical(), "published");
+        assert_eq!(
+            article.address().key().to_string(),
+            format!("30023:{}:harvest-notes", event.unsigned().pubkey())
+        );
+        assert_eq!(article.d().as_str(), "harvest-notes");
+        assert_eq!(article.title(), Some("Harvest notes"));
+        assert_eq!(article.summary(), Some("What changed this week."));
+        assert_eq!(article.image(), Some("https://radroots.test/harvest.jpg"));
+        assert_eq!(article.published_at(), Some(1_714_124_400));
+        assert_eq!(article.topics(), &["carrots".to_owned(), "csa".to_owned()]);
+        assert_eq!(article.referenced_events()[0].as_str(), referenced_event);
+        assert_eq!(
+            article.referenced_addresses()[0].key().to_string(),
+            referenced_address
+        );
+        assert_eq!(article.referenced_pubkeys()[0].as_str(), referenced_pubkey);
+    }
+
+    #[test]
+    fn long_form_parser_extracts_drafts_and_ignores_other_kinds() {
+        let draft = event_with_kind_tags_and_content(
+            NIP23_LONG_FORM_DRAFT_KIND.into(),
+            vec![Tag::from_parts("d", &["draft-a"]).expect("d")],
+            "Draft body.",
+        );
+        let note = event_with_kind_and_tags(1, vec![Tag::from_parts("d", &["note"]).expect("d")]);
+
+        let article = parse_long_form_event(&draft)
+            .expect("parse")
+            .expect("draft");
+
+        assert_eq!(article.long_form_kind(), LongFormKind::Draft);
+        assert_eq!(article.long_form_kind().canonical(), "draft");
+        assert_eq!(article.title(), None);
+        assert_eq!(article.published_at(), None);
+        assert_eq!(article.topics(), &[] as &[String]);
+        assert_eq!(parse_long_form_event(&note), Ok(None));
+    }
+
+    #[test]
+    fn long_form_parser_rejects_malformed_metadata_and_references() {
+        let repeated_d = event_with_kind_and_tags(
+            NIP23_LONG_FORM_KIND.into(),
+            vec![
+                Tag::from_parts("d", &["one"]).expect("d"),
+                Tag::from_parts("d", &["two"]).expect("d"),
+            ],
+        );
+        let missing_d = event_with_kind_and_tags(NIP23_LONG_FORM_KIND.into(), Vec::new());
+        let empty_title = event_with_kind_and_tags(
+            NIP23_LONG_FORM_KIND.into(),
+            vec![
+                Tag::from_parts("d", &["article"]).expect("d"),
+                Tag::from_parts("title", &[""]).expect("title"),
+            ],
+        );
+        let bad_published_at = event_with_kind_and_tags(
+            NIP23_LONG_FORM_KIND.into(),
+            vec![
+                Tag::from_parts("d", &["article"]).expect("d"),
+                Tag::from_parts("published_at", &["now"]).expect("published_at"),
+            ],
+        );
+        let empty_topic = event_with_kind_and_tags(
+            NIP23_LONG_FORM_KIND.into(),
+            vec![
+                Tag::from_parts("d", &["article"]).expect("d"),
+                Tag::from_parts("t", &[" "]).expect("topic"),
+            ],
+        );
+        let bad_reference = event_with_kind_and_tags(
+            NIP23_LONG_FORM_KIND.into(),
+            vec![
+                Tag::from_parts("d", &["article"]).expect("d"),
+                Tag::from_parts("e", &["bad"]).expect("e"),
+            ],
+        );
+
+        assert_eq!(
+            parse_long_form_event(&repeated_d).expect_err("repeated"),
+            "tag `d` must not be repeated"
+        );
+        assert_eq!(
+            parse_long_form_event(&missing_d).expect_err("missing"),
+            "tag `d` is required"
+        );
+        assert_eq!(
+            parse_long_form_event(&empty_title).expect_err("empty title"),
+            "long-form title tag must not be empty"
+        );
+        assert_eq!(
+            parse_long_form_event(&bad_published_at).expect_err("published_at"),
+            "field `published_at` must be an unsigned integer"
+        );
+        assert_eq!(
+            parse_long_form_event(&empty_topic).expect_err("empty topic"),
+            "long-form topic value must not be empty"
+        );
+        assert_eq!(
+            parse_long_form_event(&bad_reference).expect_err("bad reference"),
+            "event id must be 64 characters, got 3"
         );
     }
 
