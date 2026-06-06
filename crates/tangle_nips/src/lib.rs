@@ -12,6 +12,7 @@ pub const NIP25_REACTION_KIND: u32 = 7;
 pub const NIP23_LONG_FORM_KIND: u32 = 30_023;
 pub const NIP23_LONG_FORM_DRAFT_KIND: u32 = 30_024;
 pub const NIP7D_THREAD_KIND: u32 = 11;
+pub const NIP56_REPORT_KIND: u32 = 1_984;
 pub const NIP32_LABEL_KIND: u32 = 1_985;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -951,6 +952,229 @@ pub fn parse_forum_thread_event(event: &Event) -> Result<Option<ForumThreadEvent
             .collect::<Result<Vec<_>, _>>()?,
         referenced_pubkeys: parse_pubkey_values(event, "p", "forum thread reference")?,
     }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportType {
+    Nudity,
+    Malware,
+    Profanity,
+    Illegal,
+    Spam,
+    Impersonation,
+    Other,
+}
+
+impl ReportType {
+    pub fn canonical(self) -> &'static str {
+        match self {
+            Self::Nudity => "nudity",
+            Self::Malware => "malware",
+            Self::Profanity => "profanity",
+            Self::Illegal => "illegal",
+            Self::Spam => "spam",
+            Self::Impersonation => "impersonation",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReportTarget {
+    Pubkey {
+        pubkey: PublicKeyHex,
+        report_type: ReportType,
+    },
+    Event {
+        event_id: EventId,
+        report_type: ReportType,
+    },
+    Blob {
+        hash: String,
+        report_type: ReportType,
+    },
+}
+
+impl ReportTarget {
+    pub fn target_type(&self) -> &'static str {
+        match self {
+            Self::Pubkey { .. } => "pubkey",
+            Self::Event { .. } => "event",
+            Self::Blob { .. } => "blob",
+        }
+    }
+
+    pub fn target_ref(&self) -> &str {
+        match self {
+            Self::Pubkey { pubkey, .. } => pubkey.as_str(),
+            Self::Event { event_id, .. } => event_id.as_str(),
+            Self::Blob { hash, .. } => hash,
+        }
+    }
+
+    pub fn report_type(&self) -> ReportType {
+        match self {
+            Self::Pubkey { report_type, .. }
+            | Self::Event { report_type, .. }
+            | Self::Blob { report_type, .. } => *report_type,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportEvent {
+    event_id: EventId,
+    pubkey: PublicKeyHex,
+    created_at: UnixTimestamp,
+    content: String,
+    reported_pubkeys: Vec<PublicKeyHex>,
+    targets: Vec<ReportTarget>,
+    server_urls: Vec<String>,
+}
+
+impl ReportEvent {
+    pub fn event_id(&self) -> &EventId {
+        &self.event_id
+    }
+
+    pub fn pubkey(&self) -> &PublicKeyHex {
+        &self.pubkey
+    }
+
+    pub fn created_at(&self) -> UnixTimestamp {
+        self.created_at
+    }
+
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
+    pub fn reported_pubkeys(&self) -> &[PublicKeyHex] {
+        &self.reported_pubkeys
+    }
+
+    pub fn targets(&self) -> &[ReportTarget] {
+        &self.targets
+    }
+
+    pub fn server_urls(&self) -> &[String] {
+        &self.server_urls
+    }
+}
+
+pub fn parse_report_event(event: &Event) -> Result<Option<ReportEvent>, String> {
+    if event.unsigned().kind().as_u32() != NIP56_REPORT_KIND {
+        return Ok(None);
+    }
+    let mut reported_pubkeys = Vec::new();
+    let mut targets = Vec::new();
+    for tag in matching_tags(event, "p") {
+        let pubkey = tag
+            .first_value()
+            .ok_or_else(|| "report p tag must include a pubkey".to_owned())
+            .and_then(|value| parse_pubkey_value(value, "report p target", "pubkey"))?;
+        if let Some(report_type) = optional_report_type(&tag)? {
+            targets.push(ReportTarget::Pubkey {
+                pubkey: pubkey.clone(),
+                report_type,
+            });
+        }
+        reported_pubkeys.push(pubkey);
+    }
+    if reported_pubkeys.is_empty() {
+        return Err("report event must include at least one p tag".to_owned());
+    }
+    let mut event_context_count = 0;
+    for tag in matching_tags(event, "e") {
+        let event_id = tag
+            .first_value()
+            .ok_or_else(|| "report e tag must include an event id".to_owned())
+            .and_then(EventId::new)?;
+        event_context_count += 1;
+        if let Some(report_type) = optional_report_type(&tag)? {
+            targets.push(ReportTarget::Event {
+                event_id,
+                report_type,
+            });
+        }
+    }
+    let mut blob_count = 0;
+    for tag in matching_tags(event, "x") {
+        let hash = tag
+            .first_value()
+            .ok_or_else(|| "report x tag must include a hash".to_owned())?;
+        if hash.is_empty() {
+            return Err("report x hash must not be empty".to_owned());
+        }
+        blob_count += 1;
+        targets.push(ReportTarget::Blob {
+            hash: hash.to_owned(),
+            report_type: required_report_type(&tag, "x")?,
+        });
+    }
+    if blob_count > 0 && event_context_count == 0 {
+        return Err("report x target requires an e tag context".to_owned());
+    }
+    if targets.is_empty() {
+        return Err(
+            "report event must include at least one p e or x tag with a report type".to_owned(),
+        );
+    }
+    let mut server_urls = parse_report_server_urls(event)?;
+    reported_pubkeys.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    reported_pubkeys.dedup();
+    server_urls.sort();
+    server_urls.dedup();
+    Ok(Some(ReportEvent {
+        event_id: event.id().clone(),
+        pubkey: event.unsigned().pubkey().clone(),
+        created_at: event.unsigned().created_at(),
+        content: event.unsigned().content().to_owned(),
+        reported_pubkeys,
+        targets,
+        server_urls,
+    }))
+}
+
+fn optional_report_type(tag: &ParsedTag) -> Result<Option<ReportType>, String> {
+    tag.values()
+        .get(1)
+        .map(|value| parse_report_type(value))
+        .transpose()
+}
+
+fn required_report_type(tag: &ParsedTag, name: &str) -> Result<ReportType, String> {
+    match optional_report_type(tag)? {
+        Some(report_type) => Ok(report_type),
+        None => Err(format!("report {name} tag must include a report type")),
+    }
+}
+
+fn parse_report_type(value: &str) -> Result<ReportType, String> {
+    match value {
+        "nudity" => Ok(ReportType::Nudity),
+        "malware" => Ok(ReportType::Malware),
+        "profanity" => Ok(ReportType::Profanity),
+        "illegal" => Ok(ReportType::Illegal),
+        "spam" => Ok(ReportType::Spam),
+        "impersonation" => Ok(ReportType::Impersonation),
+        "other" => Ok(ReportType::Other),
+        "" => Err("report type must not be empty".to_owned()),
+        _ => Err(format!("report type `{value}` is unsupported")),
+    }
+}
+
+fn parse_report_server_urls(event: &Event) -> Result<Vec<String>, String> {
+    let mut urls = Vec::new();
+    for tag in matching_tags(event, "server") {
+        match tag.values() {
+            [value] if !value.is_empty() => urls.push(value.clone()),
+            [..] => {
+                return Err("report server tag must include exactly one non-empty URL".to_owned());
+            }
+        }
+    }
+    Ok(urls)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1899,15 +2123,16 @@ mod tests {
         CommentTarget, DeletionTarget, FulfillmentMethod, LabelTarget, ListingEffectiveStatus,
         ListingKind, ListingProjectionEvaluation, ListingUnit, LongFormKind, NIP7D_THREAD_KIND,
         NIP22_COMMENT_KIND, NIP23_LONG_FORM_DRAFT_KIND, NIP23_LONG_FORM_KIND, NIP25_REACTION_KIND,
-        NIP32_LABEL_KIND, NIP99_PUBLIC_LISTING_KIND, ReactionValue, evaluate_listing_projection,
-        matching_tags, optional_tag_value, optional_tag_values, parse_comment_event,
-        parse_deletion_request, parse_forum_thread_event, parse_label_event,
-        parse_listing_fulfillment, parse_listing_identity, parse_listing_location,
-        parse_listing_price, parse_listing_status, parse_listing_taxonomy, parse_listing_text,
-        parse_listing_unit, parse_long_form_event, parse_nip50_filter_search, parse_nip50_search,
-        parse_reaction_event, parse_relay_auth_event, parse_required_u64_tag, parse_u64_field,
-        repeated_or_missing_policy_boundary, required_tag_value, required_tag_values,
-        single_letter_tag_values, single_letter_values_for, tag_count,
+        NIP32_LABEL_KIND, NIP56_REPORT_KIND, NIP99_PUBLIC_LISTING_KIND, ReactionValue,
+        ReportTarget, ReportType, evaluate_listing_projection, matching_tags, optional_tag_value,
+        optional_tag_values, parse_comment_event, parse_deletion_request, parse_forum_thread_event,
+        parse_label_event, parse_listing_fulfillment, parse_listing_identity,
+        parse_listing_location, parse_listing_price, parse_listing_status, parse_listing_taxonomy,
+        parse_listing_text, parse_listing_unit, parse_long_form_event, parse_nip50_filter_search,
+        parse_nip50_search, parse_reaction_event, parse_relay_auth_event, parse_report_event,
+        parse_required_u64_tag, parse_u64_field, repeated_or_missing_policy_boundary,
+        required_tag_value, required_tag_values, single_letter_tag_values,
+        single_letter_values_for, tag_count,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -2565,6 +2790,136 @@ mod tests {
         assert_eq!(
             parse_forum_thread_event(&bad_pubkey_reference).expect_err("bad pubkey"),
             "forum thread reference pubkey is invalid: public key must be 64 characters, got 3"
+        );
+    }
+
+    #[test]
+    fn report_parser_extracts_pubkey_event_blob_targets_and_servers() {
+        let reported_pubkey = "7".repeat(PublicKeyHex::HEX_LENGTH);
+        let reported_event = "8".repeat(EventId::HEX_LENGTH);
+        let blob_hash = "9".repeat(64);
+        let event = event_with_kind_tags_and_content(
+            NIP56_REPORT_KIND.into(),
+            vec![
+                Tag::from_parts("p", &[&reported_pubkey, "spam"]).expect("p"),
+                Tag::from_parts("e", &[&reported_event, "illegal"]).expect("e"),
+                Tag::from_parts("x", &[&blob_hash, "malware"]).expect("x"),
+                Tag::from_parts("server", &["https://media.radroots.test/blob.jpg"])
+                    .expect("server"),
+            ],
+            "moderator report",
+        );
+
+        let report = parse_report_event(&event).expect("parse").expect("report");
+
+        assert_eq!(report.event_id(), event.id());
+        assert_eq!(report.pubkey(), event.unsigned().pubkey());
+        assert_eq!(report.created_at(), event.unsigned().created_at());
+        assert_eq!(report.content(), "moderator report");
+        assert_eq!(report.reported_pubkeys()[0].as_str(), reported_pubkey);
+        assert_eq!(
+            report.server_urls(),
+            &["https://media.radroots.test/blob.jpg".to_owned()]
+        );
+        assert_eq!(report.targets().len(), 3);
+        assert_eq!(report.targets()[0].target_type(), "pubkey");
+        assert_eq!(report.targets()[0].target_ref(), reported_pubkey);
+        assert_eq!(report.targets()[0].report_type(), ReportType::Spam);
+        assert_eq!(ReportType::Spam.canonical(), "spam");
+        assert_eq!(report.targets()[1].target_type(), "event");
+        assert_eq!(report.targets()[1].target_ref(), reported_event);
+        assert_eq!(report.targets()[1].report_type(), ReportType::Illegal);
+        assert!(
+            matches!(&report.targets()[2], ReportTarget::Blob { hash, report_type } if hash == &blob_hash && *report_type == ReportType::Malware)
+        );
+    }
+
+    #[test]
+    fn report_parser_accepts_note_report_pubkey_context_and_ignores_other_kinds() {
+        let reported_pubkey = "7".repeat(PublicKeyHex::HEX_LENGTH);
+        let reported_event = "8".repeat(EventId::HEX_LENGTH);
+        let event = event_with_kind_tags_and_content(
+            NIP56_REPORT_KIND.into(),
+            vec![
+                Tag::from_parts("p", &[&reported_pubkey]).expect("p"),
+                Tag::from_parts("e", &[&reported_event, "profanity"]).expect("e"),
+            ],
+            "note report",
+        );
+        let note = event_with_kind_and_tags(
+            1,
+            vec![Tag::from_parts("p", &[&reported_pubkey, "spam"]).expect("p")],
+        );
+
+        let report = parse_report_event(&event).expect("parse").expect("report");
+
+        assert_eq!(report.reported_pubkeys()[0].as_str(), reported_pubkey);
+        assert_eq!(report.targets().len(), 1);
+        assert_eq!(report.targets()[0].target_type(), "event");
+        assert_eq!(report.targets()[0].target_ref(), reported_event);
+        assert_eq!(report.targets()[0].report_type(), ReportType::Profanity);
+        assert_eq!(parse_report_event(&note), Ok(None));
+    }
+
+    #[test]
+    fn report_parser_rejects_missing_context_type_and_bad_tags() {
+        let reported_pubkey = "7".repeat(PublicKeyHex::HEX_LENGTH);
+        let reported_event = "8".repeat(EventId::HEX_LENGTH);
+        let blob_hash = "9".repeat(64);
+        let missing_pubkey = event_with_kind_and_tags(
+            NIP56_REPORT_KIND.into(),
+            vec![Tag::from_parts("e", &[&reported_event, "spam"]).expect("e")],
+        );
+        let missing_report_type = event_with_kind_and_tags(
+            NIP56_REPORT_KIND.into(),
+            vec![Tag::from_parts("p", &[&reported_pubkey]).expect("p")],
+        );
+        let unsupported_report_type = event_with_kind_and_tags(
+            NIP56_REPORT_KIND.into(),
+            vec![Tag::from_parts("p", &[&reported_pubkey, "scam"]).expect("p")],
+        );
+        let x_without_event = event_with_kind_and_tags(
+            NIP56_REPORT_KIND.into(),
+            vec![
+                Tag::from_parts("p", &[&reported_pubkey]).expect("p"),
+                Tag::from_parts("x", &[&blob_hash, "malware"]).expect("x"),
+            ],
+        );
+        let malformed_pubkey = event_with_kind_and_tags(
+            NIP56_REPORT_KIND.into(),
+            vec![Tag::from_parts("p", &["bad", "spam"]).expect("p")],
+        );
+        let empty_server = event_with_kind_and_tags(
+            NIP56_REPORT_KIND.into(),
+            vec![
+                Tag::from_parts("p", &[&reported_pubkey, "spam"]).expect("p"),
+                Tag::from_parts("server", &[""]).expect("server"),
+            ],
+        );
+
+        assert_eq!(
+            parse_report_event(&missing_pubkey).expect_err("missing p"),
+            "report event must include at least one p tag"
+        );
+        assert_eq!(
+            parse_report_event(&missing_report_type).expect_err("missing type"),
+            "report event must include at least one p e or x tag with a report type"
+        );
+        assert_eq!(
+            parse_report_event(&unsupported_report_type).expect_err("bad type"),
+            "report type `scam` is unsupported"
+        );
+        assert_eq!(
+            parse_report_event(&x_without_event).expect_err("x context"),
+            "report x target requires an e tag context"
+        );
+        assert_eq!(
+            parse_report_event(&malformed_pubkey).expect_err("bad pubkey"),
+            "report p target pubkey is invalid: public key must be 64 characters, got 3"
+        );
+        assert_eq!(
+            parse_report_event(&empty_server).expect_err("empty server"),
+            "report server tag must include exactly one non-empty URL"
         );
     }
 
