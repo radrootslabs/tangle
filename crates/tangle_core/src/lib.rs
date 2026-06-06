@@ -2472,6 +2472,212 @@ pub enum SubscriptionManagerErrorKind {
     RuntimeLimit,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthChallengeState {
+    relay_url: String,
+    ttl_seconds: u64,
+    active_challenge: Option<AuthChallenge>,
+    authenticated_pubkey: Option<PublicKeyHex>,
+}
+
+impl AuthChallengeState {
+    pub fn new(relay_url: &str, ttl_seconds: u64) -> Result<Self, AuthChallengeStateError> {
+        let relay_url = relay_url.trim();
+        if relay_url.is_empty() {
+            return Err(AuthChallengeStateError::InvalidRelayUrl);
+        }
+        if ttl_seconds == 0 {
+            return Err(AuthChallengeStateError::InvalidTtl);
+        }
+        Ok(Self {
+            relay_url: relay_url.to_owned(),
+            ttl_seconds,
+            active_challenge: None,
+            authenticated_pubkey: None,
+        })
+    }
+
+    pub fn relay_url(&self) -> &str {
+        &self.relay_url
+    }
+
+    pub fn ttl_seconds(&self) -> u64 {
+        self.ttl_seconds
+    }
+
+    pub fn active_challenge(&self) -> Option<&AuthChallenge> {
+        self.active_challenge.as_ref()
+    }
+
+    pub fn authenticated_pubkey(&self) -> Option<&PublicKeyHex> {
+        self.authenticated_pubkey.as_ref()
+    }
+
+    pub fn issue_challenge(
+        &mut self,
+        challenge: &str,
+        issued_at: UnixTimestamp,
+    ) -> Result<AuthChallenge, AuthChallengeStateError> {
+        let challenge = challenge.trim();
+        if challenge.is_empty() {
+            return Err(AuthChallengeStateError::EmptyChallenge);
+        }
+        let challenge = AuthChallenge {
+            value: challenge.to_owned(),
+            relay_url: self.relay_url.clone(),
+            issued_at,
+            expires_at: UnixTimestamp::new(issued_at.as_u64().saturating_add(self.ttl_seconds)),
+        };
+        self.active_challenge = Some(challenge.clone());
+        self.authenticated_pubkey = None;
+        Ok(challenge)
+    }
+
+    pub fn authenticate(
+        &mut self,
+        auth: &RelayAuthEvent,
+        now: UnixTimestamp,
+    ) -> Result<AuthChallengeAuthentication, AuthChallengeStateError> {
+        let challenge = self
+            .active_challenge
+            .as_ref()
+            .ok_or(AuthChallengeStateError::MissingChallenge)?;
+        if now > challenge.expires_at {
+            return Err(AuthChallengeStateError::Expired {
+                expired_at: challenge.expires_at,
+                now,
+            });
+        }
+        if auth.relay() != challenge.relay_url {
+            return Err(AuthChallengeStateError::RelayMismatch {
+                expected: challenge.relay_url.clone(),
+                actual: auth.relay().to_owned(),
+            });
+        }
+        if auth.challenge() != challenge.value {
+            return Err(AuthChallengeStateError::ChallengeMismatch);
+        }
+        if auth.created_at() < challenge.issued_at {
+            return Err(AuthChallengeStateError::CreatedBeforeChallenge {
+                created_at: auth.created_at(),
+                issued_at: challenge.issued_at,
+            });
+        }
+        let authentication = AuthChallengeAuthentication {
+            pubkey: auth.pubkey().clone(),
+        };
+        self.authenticated_pubkey = Some(authentication.pubkey.clone());
+        self.active_challenge = None;
+        Ok(authentication)
+    }
+
+    pub fn clear_authentication(&mut self) {
+        self.authenticated_pubkey = None;
+    }
+}
+
+impl Default for AuthChallengeState {
+    fn default() -> Self {
+        Self::new("wss://relay.radroots.test", 300).expect("default auth challenge state")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthChallenge {
+    pub value: String,
+    pub relay_url: String,
+    pub issued_at: UnixTimestamp,
+    pub expires_at: UnixTimestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthChallengeAuthentication {
+    pub pubkey: PublicKeyHex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthChallengeStateError {
+    InvalidRelayUrl,
+    InvalidTtl,
+    EmptyChallenge,
+    MissingChallenge,
+    Expired {
+        expired_at: UnixTimestamp,
+        now: UnixTimestamp,
+    },
+    RelayMismatch {
+        expected: String,
+        actual: String,
+    },
+    ChallengeMismatch,
+    CreatedBeforeChallenge {
+        created_at: UnixTimestamp,
+        issued_at: UnixTimestamp,
+    },
+}
+
+impl AuthChallengeStateError {
+    pub fn kind(&self) -> AuthChallengeStateErrorKind {
+        match self {
+            Self::InvalidRelayUrl => AuthChallengeStateErrorKind::InvalidRelayUrl,
+            Self::InvalidTtl => AuthChallengeStateErrorKind::InvalidTtl,
+            Self::EmptyChallenge => AuthChallengeStateErrorKind::EmptyChallenge,
+            Self::MissingChallenge => AuthChallengeStateErrorKind::MissingChallenge,
+            Self::Expired { .. } => AuthChallengeStateErrorKind::Expired,
+            Self::RelayMismatch { .. } => AuthChallengeStateErrorKind::RelayMismatch,
+            Self::ChallengeMismatch => AuthChallengeStateErrorKind::ChallengeMismatch,
+            Self::CreatedBeforeChallenge { .. } => {
+                AuthChallengeStateErrorKind::CreatedBeforeChallenge
+            }
+        }
+    }
+}
+
+impl fmt::Display for AuthChallengeStateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRelayUrl => formatter.write_str("relay url must not be empty"),
+            Self::InvalidTtl => formatter.write_str("auth challenge ttl must be greater than zero"),
+            Self::EmptyChallenge => formatter.write_str("auth challenge must not be empty"),
+            Self::MissingChallenge => formatter.write_str("auth challenge is missing"),
+            Self::Expired { expired_at, now } => {
+                write!(
+                    formatter,
+                    "auth challenge expired at {expired_at}, now {now}"
+                )
+            }
+            Self::RelayMismatch { expected, actual } => {
+                write!(
+                    formatter,
+                    "auth relay mismatch: expected {expected}, got {actual}"
+                )
+            }
+            Self::ChallengeMismatch => formatter.write_str("auth challenge mismatch"),
+            Self::CreatedBeforeChallenge {
+                created_at,
+                issued_at,
+            } => write!(
+                formatter,
+                "auth event created_at {created_at} is before challenge issued_at {issued_at}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AuthChallengeStateError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthChallengeStateErrorKind {
+    InvalidRelayUrl,
+    InvalidTtl,
+    EmptyChallenge,
+    MissingChallenge,
+    Expired,
+    RelayMismatch,
+    ChallengeMismatch,
+    CreatedBeforeChallenge,
+}
+
 fn compile_filter_branch(filter: &Filter) -> Result<QueryPlanBranch, NostrFilterCompileError> {
     let tag_filters =
         compile_filter_tag_constraints(filter).map_err(NostrFilterCompileError::QueryPlan)?;
@@ -2686,10 +2892,11 @@ fn require_within(
 mod tests {
     use super::{
         AdmissionContext, AdmissionEffect, AdmissionEvent, AdmissionEventKind, AdmissionPolicy,
-        AdmissionRejectionKind, EventIngestionEffect, EventIngestionRejectionKind, EventIngestor,
-        EventParser, EventValidationRejection, EventValidationRejectionKind, EventValidator,
-        LiveSearchPolicy, MarketplaceCursor, MarketplaceCursorSpec, MarketplaceDecimal,
-        MarketplaceGeoPoint, MarketplaceListingStatus, MarketplaceLocationFilter, MarketplaceQuery,
+        AdmissionRejectionKind, AuthChallengeState, AuthChallengeStateErrorKind,
+        EventIngestionEffect, EventIngestionRejectionKind, EventIngestor, EventParser,
+        EventValidationRejection, EventValidationRejectionKind, EventValidator, LiveSearchPolicy,
+        MarketplaceCursor, MarketplaceCursorSpec, MarketplaceDecimal, MarketplaceGeoPoint,
+        MarketplaceListingStatus, MarketplaceLocationFilter, MarketplaceQuery,
         MarketplaceQueryErrorKind, MarketplaceQuerySpec, MarketplaceSort,
         Nip50QueryCompileErrorKind, Nip50QueryCompiler, NostrFilterCompileErrorKind,
         NostrFilterCompiler, ProjectionExclusionReason, QueryExecutionMode, QueryPlan,
@@ -2700,8 +2907,8 @@ mod tests {
         UnapprovedSellerAction,
     };
     use tangle_nips::{
-        FulfillmentMethod, ListingProjection, ListingUnit, evaluate_listing_projection,
-        parse_deletion_request,
+        FulfillmentMethod, ListingProjection, ListingUnit, RelayAuthEvent,
+        evaluate_listing_projection, parse_deletion_request, parse_relay_auth_event,
     };
     use tangle_protocol::{
         AddressCoordinate, Event, EventId, Kind, PublicKeyHex, SignatureHex, SubscriptionId, Tag,
@@ -5143,6 +5350,151 @@ mod tests {
         );
     }
 
+    #[test]
+    fn auth_challenge_state_issues_and_authenticates_nip42_events() {
+        let mut state =
+            AuthChallengeState::new(" wss://relay.radroots.test ", 10).expect("auth state");
+        let default_state = AuthChallengeState::default();
+        let challenge = state
+            .issue_challenge(" challenge-001 ", UnixTimestamp::new(100))
+            .expect("challenge");
+        let auth = relay_auth_event("wss://relay.radroots.test", "challenge-001", 105);
+        let authenticated = state
+            .authenticate(&auth, UnixTimestamp::new(105))
+            .expect("authenticated");
+
+        assert_eq!(default_state.relay_url(), "wss://relay.radroots.test");
+        assert_eq!(default_state.ttl_seconds(), 300);
+        assert_eq!(state.relay_url(), "wss://relay.radroots.test");
+        assert_eq!(state.ttl_seconds(), 10);
+        assert_eq!(challenge.value, "challenge-001");
+        assert_eq!(challenge.relay_url, "wss://relay.radroots.test");
+        assert_eq!(challenge.issued_at, UnixTimestamp::new(100));
+        assert_eq!(challenge.expires_at, UnixTimestamp::new(110));
+        assert_eq!(authenticated.pubkey, FixtureKey::Seller.public_key());
+        assert_eq!(state.authenticated_pubkey(), Some(auth.pubkey()));
+        assert_eq!(state.active_challenge(), None);
+
+        state.clear_authentication();
+        assert_eq!(state.authenticated_pubkey(), None);
+        state
+            .issue_challenge("challenge-002", UnixTimestamp::new(120))
+            .expect("challenge");
+        assert_eq!(state.authenticated_pubkey(), None);
+        assert_eq!(
+            state.active_challenge().expect("active").expires_at,
+            UnixTimestamp::new(130)
+        );
+    }
+
+    #[test]
+    fn auth_challenge_state_rejects_invalid_and_mismatched_auth() {
+        let invalid_relay = AuthChallengeState::new(" ", 10).expect_err("relay");
+        let invalid_ttl = AuthChallengeState::new("wss://relay.radroots.test", 0).expect_err("ttl");
+        let mut empty_challenge =
+            AuthChallengeState::new("wss://relay.radroots.test", 10).expect("state");
+        let empty_challenge = empty_challenge
+            .issue_challenge(" ", UnixTimestamp::new(1))
+            .expect_err("challenge");
+        let missing_challenge = AuthChallengeState::new("wss://relay.radroots.test", 10)
+            .expect("state")
+            .authenticate(
+                &relay_auth_event("wss://relay.radroots.test", "challenge-001", 10),
+                UnixTimestamp::new(10),
+            )
+            .expect_err("missing");
+        let mut expired = AuthChallengeState::new("wss://relay.radroots.test", 5).expect("state");
+        expired
+            .issue_challenge("challenge-001", UnixTimestamp::new(10))
+            .expect("challenge");
+        let expired = expired
+            .authenticate(
+                &relay_auth_event("wss://relay.radroots.test", "challenge-001", 11),
+                UnixTimestamp::new(16),
+            )
+            .expect_err("expired");
+        let mut relay_mismatch =
+            AuthChallengeState::new("wss://relay.radroots.test", 10).expect("state");
+        relay_mismatch
+            .issue_challenge("challenge-001", UnixTimestamp::new(10))
+            .expect("challenge");
+        let relay_mismatch = relay_mismatch
+            .authenticate(
+                &relay_auth_event("wss://other.radroots.test", "challenge-001", 11),
+                UnixTimestamp::new(11),
+            )
+            .expect_err("relay");
+        let mut challenge_mismatch =
+            AuthChallengeState::new("wss://relay.radroots.test", 10).expect("state");
+        challenge_mismatch
+            .issue_challenge("challenge-001", UnixTimestamp::new(10))
+            .expect("challenge");
+        let challenge_mismatch = challenge_mismatch
+            .authenticate(
+                &relay_auth_event("wss://relay.radroots.test", "challenge-002", 11),
+                UnixTimestamp::new(11),
+            )
+            .expect_err("challenge");
+        let mut created_before =
+            AuthChallengeState::new("wss://relay.radroots.test", 10).expect("state");
+        created_before
+            .issue_challenge("challenge-001", UnixTimestamp::new(20))
+            .expect("challenge");
+        let created_before = created_before
+            .authenticate(
+                &relay_auth_event("wss://relay.radroots.test", "challenge-001", 19),
+                UnixTimestamp::new(21),
+            )
+            .expect_err("created before");
+
+        assert_eq!(
+            invalid_relay.kind(),
+            AuthChallengeStateErrorKind::InvalidRelayUrl
+        );
+        assert_eq!(invalid_relay.to_string(), "relay url must not be empty");
+        assert_eq!(invalid_ttl.kind(), AuthChallengeStateErrorKind::InvalidTtl);
+        assert_eq!(
+            invalid_ttl.to_string(),
+            "auth challenge ttl must be greater than zero"
+        );
+        assert_eq!(
+            empty_challenge.kind(),
+            AuthChallengeStateErrorKind::EmptyChallenge
+        );
+        assert_eq!(
+            empty_challenge.to_string(),
+            "auth challenge must not be empty"
+        );
+        assert_eq!(
+            missing_challenge.kind(),
+            AuthChallengeStateErrorKind::MissingChallenge
+        );
+        assert_eq!(missing_challenge.to_string(), "auth challenge is missing");
+        assert_eq!(expired.kind(), AuthChallengeStateErrorKind::Expired);
+        assert_eq!(expired.to_string(), "auth challenge expired at 15, now 16");
+        assert_eq!(
+            relay_mismatch.kind(),
+            AuthChallengeStateErrorKind::RelayMismatch
+        );
+        assert_eq!(
+            relay_mismatch.to_string(),
+            "auth relay mismatch: expected wss://relay.radroots.test, got wss://other.radroots.test"
+        );
+        assert_eq!(
+            challenge_mismatch.kind(),
+            AuthChallengeStateErrorKind::ChallengeMismatch
+        );
+        assert_eq!(challenge_mismatch.to_string(), "auth challenge mismatch");
+        assert_eq!(
+            created_before.kind(),
+            AuthChallengeStateErrorKind::CreatedBeforeChallenge
+        );
+        assert_eq!(
+            created_before.to_string(),
+            "auth event created_at 19 is before challenge issued_at 20"
+        );
+    }
+
     fn limits_with(update: impl FnOnce(&mut RuntimeLimitValues)) -> RuntimeLimits {
         let mut values = RuntimeLimitValues::default();
         update(&mut values);
@@ -5161,6 +5513,17 @@ mod tests {
             ),
             SignatureHex::new(&"b".repeat(SignatureHex::HEX_LENGTH)).expect("sig"),
         )
+    }
+
+    fn relay_auth_event(relay: &str, challenge: &str, created_at: u64) -> RelayAuthEvent {
+        let spec = fixture_spec_from_json(&format!(
+            r#"{{"name":"auth","key":"seller","created_at":{created_at},"kind":22242,"tags":[["relay","{relay}"],["challenge","{challenge}"]],"content":""}}"#
+        ))
+        .expect("auth spec");
+        let event = build_fixture_event(&spec).expect("auth event");
+        parse_relay_auth_event(&event)
+            .expect("auth parse")
+            .expect("auth event")
     }
 
     struct RawFailingRepository;
