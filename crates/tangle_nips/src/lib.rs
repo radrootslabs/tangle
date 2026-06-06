@@ -688,6 +688,100 @@ pub fn parse_listing_status(event: &Event) -> Result<Option<ListingStatus>, Stri
     }))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListingLocation {
+    location_text: Option<String>,
+    geohash: Option<String>,
+    geohash4: Option<String>,
+    geohash5: Option<String>,
+    geohash6: Option<String>,
+    geohash7: Option<String>,
+}
+
+impl ListingLocation {
+    pub fn location_text(&self) -> Option<&str> {
+        self.location_text.as_deref()
+    }
+
+    pub fn geohash(&self) -> Option<&str> {
+        self.geohash.as_deref()
+    }
+
+    pub fn geohash4(&self) -> Option<&str> {
+        self.geohash4.as_deref()
+    }
+
+    pub fn geohash5(&self) -> Option<&str> {
+        self.geohash5.as_deref()
+    }
+
+    pub fn geohash6(&self) -> Option<&str> {
+        self.geohash6.as_deref()
+    }
+
+    pub fn geohash7(&self) -> Option<&str> {
+        self.geohash7.as_deref()
+    }
+
+    pub fn location_precision(&self) -> Option<usize> {
+        self.geohash.as_ref().map(String::len)
+    }
+}
+
+pub fn parse_listing_location(event: &Event) -> Result<Option<ListingLocation>, String> {
+    if listing_kind_for_event(event).is_none() {
+        return Ok(None);
+    }
+    let location_text = optional_tag_value(event, "location")?;
+    if location_text.as_ref().is_some_and(String::is_empty) {
+        return Err("listing location tag must not be empty".to_owned());
+    }
+    let geohash = optional_exact_tag_value(event, "g")?
+        .map(|value| parse_geohash(&value))
+        .transpose()?;
+    Ok(Some(ListingLocation {
+        location_text,
+        geohash4: geohash_prefix(&geohash, 4),
+        geohash5: geohash_prefix(&geohash, 5),
+        geohash6: geohash_prefix(&geohash, 6),
+        geohash7: geohash_prefix(&geohash, 7),
+        geohash,
+    }))
+}
+
+fn optional_exact_tag_value(event: &Event, name: &str) -> Result<Option<String>, String> {
+    let tags = matching_tags(event, name);
+    match tags.as_slice() {
+        [] => Ok(None),
+        [tag] => match tag.values() {
+            [] => Err(format!("tag `{name}` must include a value")),
+            [value] => Ok(Some(value.clone())),
+            _ => Err(format!("tag `{name}` must include exactly one value")),
+        },
+        _ => Err(format!("tag `{name}` must not be repeated")),
+    }
+}
+
+fn parse_geohash(value: &str) -> Result<String, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.len() < 4
+        || normalized.len() > 12
+        || !normalized
+            .bytes()
+            .all(|byte| b"0123456789bcdefghjkmnpqrstuvwxyz".contains(&byte))
+    {
+        return Err("geohash must be 4 to 12 geohash characters".to_owned());
+    }
+    Ok(normalized)
+}
+
+fn geohash_prefix(geohash: &Option<String>, length: usize) -> Option<String> {
+    geohash
+        .as_ref()
+        .filter(|value| value.len() >= length)
+        .map(|value| value[..length].to_owned())
+}
+
 fn listing_kind_for_event(event: &Event) -> Option<ListingKind> {
     match event.unsigned().kind().as_u32() {
         NIP99_PUBLIC_LISTING_KIND => Some(ListingKind::Public),
@@ -702,8 +796,8 @@ mod tests {
         DeletionTarget, FulfillmentMethod, ListingEffectiveStatus, ListingKind, ListingUnit,
         NIP99_PUBLIC_LISTING_KIND, matching_tags, optional_tag_value, optional_tag_values,
         parse_deletion_request, parse_listing_fulfillment, parse_listing_identity,
-        parse_listing_price, parse_listing_status, parse_listing_text, parse_listing_unit,
-        parse_nip50_filter_search, parse_nip50_search, parse_relay_auth_event,
+        parse_listing_location, parse_listing_price, parse_listing_status, parse_listing_text,
+        parse_listing_unit, parse_nip50_filter_search, parse_nip50_search, parse_relay_auth_event,
         parse_required_u64_tag, parse_u64_field, repeated_or_missing_policy_boundary,
         required_tag_value, required_tag_values, single_letter_tag_values,
         single_letter_values_for, tag_count,
@@ -1665,6 +1759,128 @@ mod tests {
         assert_eq!(
             parse_listing_status(&unsupported).expect_err("unsupported"),
             "listing status `inactive` is unsupported"
+        );
+    }
+
+    #[test]
+    fn listing_location_parser_extracts_text_geohash_and_prefixes() {
+        let event = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![
+                Tag::from_parts("location", &["Olympia Farmers Market"]).expect("location"),
+                Tag::from_parts("g", &[" C22YZUG "]).expect("g"),
+            ],
+        );
+
+        let location = parse_listing_location(&event)
+            .expect("parse")
+            .expect("location");
+
+        assert_eq!(location.location_text(), Some("Olympia Farmers Market"));
+        assert_eq!(location.geohash(), Some("c22yzug"));
+        assert_eq!(location.geohash4(), Some("c22y"));
+        assert_eq!(location.geohash5(), Some("c22yz"));
+        assert_eq!(location.geohash6(), Some("c22yzu"));
+        assert_eq!(location.geohash7(), Some("c22yzug"));
+        assert_eq!(location.location_precision(), Some(7));
+    }
+
+    #[test]
+    fn listing_location_parser_allows_missing_location_fields_and_ignores_non_listings() {
+        let listing = event_with_kind_and_tags(u64::from(NIP99_PUBLIC_LISTING_KIND), Vec::new());
+        let note = event_with_kind_and_tags(
+            1,
+            vec![Tag::from_parts("location", &["Somewhere"]).expect("location")],
+        );
+
+        let location = parse_listing_location(&listing)
+            .expect("listing")
+            .expect("location");
+
+        assert_eq!(location.location_text(), None);
+        assert_eq!(location.geohash(), None);
+        assert_eq!(location.geohash4(), None);
+        assert_eq!(location.location_precision(), None);
+        assert_eq!(parse_listing_location(&note), Ok(None));
+    }
+
+    #[test]
+    fn listing_location_parser_rejects_malformed_location_tags() {
+        let repeated = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![
+                Tag::from_parts("location", &["A"]).expect("location"),
+                Tag::from_parts("location", &["B"]).expect("location"),
+            ],
+        );
+        let missing_value = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("location", &[]).expect("location")],
+        );
+        let empty = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("location", &[""]).expect("location")],
+        );
+
+        assert_eq!(
+            parse_listing_location(&repeated).expect_err("repeated"),
+            "tag `location` must not be repeated"
+        );
+        assert_eq!(
+            parse_listing_location(&missing_value).expect_err("value"),
+            "tag `location` must include a value"
+        );
+        assert_eq!(
+            parse_listing_location(&empty).expect_err("empty"),
+            "listing location tag must not be empty"
+        );
+    }
+
+    #[test]
+    fn listing_location_parser_rejects_malformed_geohash_tags() {
+        let repeated = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![
+                Tag::from_parts("g", &["c22y"]).expect("g"),
+                Tag::from_parts("g", &["c23n"]).expect("g"),
+            ],
+        );
+        let missing_value = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("g", &[]).expect("g")],
+        );
+        let extra_value = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("g", &["c22y", "extra"]).expect("g")],
+        );
+        let invalid = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("g", &["c22a"]).expect("g")],
+        );
+        let too_short = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("g", &["c22"]).expect("g")],
+        );
+
+        assert_eq!(
+            parse_listing_location(&repeated).expect_err("repeated"),
+            "tag `g` must not be repeated"
+        );
+        assert_eq!(
+            parse_listing_location(&missing_value).expect_err("value"),
+            "tag `g` must include a value"
+        );
+        assert_eq!(
+            parse_listing_location(&extra_value).expect_err("extra"),
+            "tag `g` must include exactly one value"
+        );
+        assert_eq!(
+            parse_listing_location(&invalid).expect_err("invalid"),
+            "geohash must be 4 to 12 geohash characters"
+        );
+        assert_eq!(
+            parse_listing_location(&too_short).expect_err("short"),
+            "geohash must be 4 to 12 geohash characters"
         );
     }
 
