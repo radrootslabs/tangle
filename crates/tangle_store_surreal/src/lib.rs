@@ -308,6 +308,7 @@ pub fn base_migration_plan() -> SurrealMigrationPlan {
         policy_schemas(),
         comment_projection_schema(),
         reaction_projection_schema(),
+        long_form_projection_schema(),
     ])
     .expect("base migration plan is strictly ordered")
 }
@@ -713,6 +714,49 @@ DEFINE INDEX IF NOT EXISTS reaction_count_kind_target ON TABLE reaction_count CO
 "#,
     )
     .expect("reaction projection schema is valid")
+}
+
+pub fn long_form_projection_schema() -> SurrealMigration {
+    SurrealMigration::new(
+        "0013_long_form_projection",
+        r#"
+DEFINE TABLE IF NOT EXISTS long_form_current SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS long_form_key ON TABLE long_form_current TYPE string;
+DEFINE FIELD IF NOT EXISTS event_id ON TABLE long_form_current TYPE string;
+DEFINE FIELD IF NOT EXISTS author_pubkey ON TABLE long_form_current TYPE string;
+DEFINE FIELD IF NOT EXISTS d ON TABLE long_form_current TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON TABLE long_form_current TYPE int;
+DEFINE FIELD IF NOT EXISTS updated_at ON TABLE long_form_current TYPE int;
+DEFINE FIELD IF NOT EXISTS published_at ON TABLE long_form_current TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS title ON TABLE long_form_current TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS image ON TABLE long_form_current TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS summary ON TABLE long_form_current TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS content ON TABLE long_form_current TYPE string;
+DEFINE FIELD IF NOT EXISTS tags ON TABLE long_form_current TYPE array;
+DEFINE FIELD IF NOT EXISTS referenced_events ON TABLE long_form_current TYPE array;
+DEFINE FIELD IF NOT EXISTS referenced_addresses ON TABLE long_form_current TYPE array;
+DEFINE FIELD IF NOT EXISTS referenced_pubkeys ON TABLE long_form_current TYPE array;
+DEFINE FIELD IF NOT EXISTS hidden ON TABLE long_form_current TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS deleted ON TABLE long_form_current TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS projected_at ON TABLE long_form_current TYPE int;
+DEFINE INDEX IF NOT EXISTS long_form_current_key_uid ON TABLE long_form_current COLUMNS long_form_key UNIQUE;
+DEFINE INDEX IF NOT EXISTS long_form_current_event_uid ON TABLE long_form_current COLUMNS event_id UNIQUE;
+DEFINE INDEX IF NOT EXISTS long_form_current_author_updated ON TABLE long_form_current COLUMNS author_pubkey, updated_at, event_id;
+DEFINE INDEX IF NOT EXISTS long_form_current_published_updated ON TABLE long_form_current COLUMNS published_at, updated_at, event_id;
+DEFINE INDEX IF NOT EXISTS long_form_current_visibility ON TABLE long_form_current COLUMNS hidden, deleted, updated_at, event_id;
+
+DEFINE TABLE IF NOT EXISTS long_form_topic SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS long_form_key ON TABLE long_form_topic TYPE string;
+DEFINE FIELD IF NOT EXISTS topic ON TABLE long_form_topic TYPE string;
+DEFINE FIELD IF NOT EXISTS updated_at ON TABLE long_form_topic TYPE int;
+DEFINE FIELD IF NOT EXISTS event_id ON TABLE long_form_topic TYPE string;
+DEFINE FIELD IF NOT EXISTS hidden ON TABLE long_form_topic TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS deleted ON TABLE long_form_topic TYPE bool DEFAULT false;
+DEFINE INDEX IF NOT EXISTS long_form_topic_lookup ON TABLE long_form_topic COLUMNS topic, hidden, deleted, updated_at, long_form_key;
+DEFINE INDEX IF NOT EXISTS long_form_topic_long_form ON TABLE long_form_topic COLUMNS long_form_key;
+"#,
+    )
+    .expect("long-form projection schema is valid")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4006,6 +4050,66 @@ mod tests {
             "reaction_count_kind_target",
         ] {
             assert!(count.contains(expected), "missing {expected} in {count}");
+        }
+    }
+
+    #[tokio::test]
+    async fn long_form_projection_schema_defines_current_and_topic_tables() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let current = store
+            .table_info("long_form_current")
+            .await
+            .expect("current info");
+        let topic = store
+            .table_info("long_form_topic")
+            .await
+            .expect("topic info");
+
+        for expected in [
+            "long_form_key",
+            "event_id",
+            "author_pubkey",
+            "d",
+            "created_at",
+            "updated_at",
+            "published_at",
+            "title",
+            "image",
+            "summary",
+            "content",
+            "tags",
+            "referenced_events",
+            "referenced_addresses",
+            "referenced_pubkeys",
+            "hidden",
+            "deleted",
+            "projected_at",
+            "long_form_current_key_uid",
+            "long_form_current_event_uid",
+            "long_form_current_author_updated",
+            "long_form_current_published_updated",
+            "long_form_current_visibility",
+        ] {
+            assert!(
+                current.contains(expected),
+                "missing {expected} in {current}"
+            );
+        }
+        for expected in [
+            "long_form_key",
+            "topic",
+            "updated_at",
+            "event_id",
+            "hidden",
+            "deleted",
+            "long_form_topic_lookup",
+            "long_form_topic_long_form",
+        ] {
+            assert!(topic.contains(expected), "missing {expected} in {topic}");
         }
     }
 
