@@ -4,8 +4,11 @@ use core::fmt;
 use sha2::{Digest, Sha256};
 use surrealdb::Surreal;
 use surrealdb::engine::local::{Db, Mem};
-use tangle_nips::{DeletionTarget, parse_deletion_request};
-use tangle_protocol::{AddressCoordinate, Event, EventId, event_to_value};
+use tangle_nips::{
+    DeletionTarget, ListingProjectionEvaluation, NIP99_DRAFT_LISTING_KIND,
+    NIP99_PUBLIC_LISTING_KIND, evaluate_listing_projection, parse_deletion_request,
+};
+use tangle_protocol::{AddressCoordinate, Event, EventId, UnixTimestamp, event_to_value};
 use tangle_store::{StoreEventOutcome, StoredEvent};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -664,6 +667,12 @@ pub enum DeletionMarkerOutcome {
     Applied { targets: usize },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListingRevisionOutcome {
+    NotListing,
+    Stored { parsed_ok: bool },
+}
+
 #[derive(Clone)]
 pub struct SurrealStore {
     db: Surreal<Db>,
@@ -1030,6 +1039,81 @@ UPSERT type::record('deletion_marker', $marker_id) CONTENT {
         response.take(0).map_err(SurrealStoreError::from)
     }
 
+    pub async fn store_listing_revision(
+        &self,
+        event: &Event,
+        projected_at: UnixTimestamp,
+    ) -> Result<ListingRevisionOutcome, SurrealStoreError> {
+        if !is_listing_event(event) {
+            return Ok(ListingRevisionOutcome::NotListing);
+        }
+        let evaluation = evaluate_listing_projection(event);
+        let fields = listing_revision_fields(event, &evaluation)?;
+        self.db
+            .query(
+                r#"
+UPSERT type::record('listing_revision', $event_id) CONTENT {
+    revision_key: $revision_key,
+    listing_key: $listing_key,
+    event_id: $event_id,
+    seller_pubkey: $seller_pubkey,
+    d: $d,
+    created_at: $created_at,
+    parsed_ok: $parsed_ok,
+    parse_errors: $parse_errors,
+    title: $title,
+    summary: $summary,
+    price_decimal: $price_decimal,
+    price_minor: $price_minor,
+    currency_raw: $currency_raw,
+    currency_norm: $currency_norm,
+    unit: $unit,
+    status_tag: $status_tag,
+    projected_at: $projected_at
+};
+"#,
+            )
+            .bind(("event_id", event.id().as_str()))
+            .bind(("revision_key", fields.revision_key))
+            .bind(("listing_key", fields.listing_key))
+            .bind(("seller_pubkey", fields.seller_pubkey))
+            .bind(("d", fields.d))
+            .bind(("created_at", event.unsigned().created_at().as_u64()))
+            .bind(("parsed_ok", fields.parsed_ok))
+            .bind(("parse_errors", fields.parse_errors))
+            .bind(("title", fields.title))
+            .bind(("summary", fields.summary))
+            .bind(("price_decimal", fields.price_decimal))
+            .bind(("price_minor", fields.price_minor))
+            .bind(("currency_raw", fields.currency_raw))
+            .bind(("currency_norm", fields.currency_norm))
+            .bind(("unit", fields.unit))
+            .bind(("status_tag", fields.status_tag))
+            .bind(("projected_at", projected_at.as_u64()))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        Ok(ListingRevisionOutcome::Stored {
+            parsed_ok: fields.parsed_ok,
+        })
+    }
+
+    pub async fn listing_revision_row(
+        &self,
+        event_id: &EventId,
+    ) -> Result<Option<serde_json::Value>, SurrealStoreError> {
+        let mut response = self
+            .db
+            .query("SELECT * FROM ONLY type::record('listing_revision', $event_id);")
+            .bind(("event_id", event_id.as_str()))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
     async fn applied_migration(
         &self,
         name: &str,
@@ -1191,6 +1275,106 @@ fn deletion_target_parts(target: &DeletionTarget) -> (&'static str, String) {
     }
 }
 
+struct ListingRevisionFields {
+    revision_key: String,
+    listing_key: String,
+    seller_pubkey: String,
+    d: String,
+    parsed_ok: bool,
+    parse_errors: Vec<String>,
+    title: Option<String>,
+    summary: Option<String>,
+    price_decimal: Option<String>,
+    price_minor: Option<i64>,
+    currency_raw: Option<String>,
+    currency_norm: Option<String>,
+    unit: Option<String>,
+    status_tag: Option<String>,
+}
+
+fn listing_revision_fields(
+    event: &Event,
+    evaluation: &ListingProjectionEvaluation,
+) -> Result<ListingRevisionFields, SurrealStoreError> {
+    let d = d_tag_value(event).unwrap_or_default();
+    let fallback_listing_key = format!(
+        "{}:{}:{}",
+        event.unsigned().kind().as_u32(),
+        event.unsigned().pubkey().as_str(),
+        d
+    );
+    let listing_key = address_key_value(event)?.unwrap_or(fallback_listing_key);
+    let base = ListingRevisionFields {
+        revision_key: event.id().as_str().to_owned(),
+        listing_key,
+        seller_pubkey: event.unsigned().pubkey().as_str().to_owned(),
+        d,
+        parsed_ok: false,
+        parse_errors: Vec::new(),
+        title: first_tag_value(event, "title"),
+        summary: first_tag_value(event, "summary"),
+        price_decimal: None,
+        price_minor: None,
+        currency_raw: None,
+        currency_norm: None,
+        unit: None,
+        status_tag: first_tag_value(event, "status"),
+    };
+    match evaluation {
+        ListingProjectionEvaluation::Eligible(projection) => Ok(ListingRevisionFields {
+            parsed_ok: true,
+            title: Some(projection.text().title().to_owned()),
+            summary: projection.text().summary().map(str::to_owned),
+            price_decimal: Some(projection.price().amount().raw().to_owned()),
+            price_minor: price_minor(projection.price().amount().raw()),
+            currency_raw: Some(projection.price().currency().to_owned()),
+            currency_norm: Some(projection.price().display_currency().to_owned()),
+            unit: Some(projection.unit().canonical().to_owned()),
+            status_tag: projection.status().raw_status().map(str::to_owned),
+            ..base
+        }),
+        ListingProjectionEvaluation::Ineligible(rejection) => Ok(ListingRevisionFields {
+            parse_errors: rejection.reasons().to_vec(),
+            ..base
+        }),
+        ListingProjectionEvaluation::NotListing => Ok(base),
+    }
+}
+
+fn is_listing_event(event: &Event) -> bool {
+    matches!(
+        event.unsigned().kind().as_u32(),
+        NIP99_PUBLIC_LISTING_KIND | NIP99_DRAFT_LISTING_KIND
+    )
+}
+
+fn first_tag_value(event: &Event, name: &str) -> Option<String> {
+    event
+        .unsigned()
+        .tags()
+        .iter()
+        .find(|tag| tag.name().as_str() == name)
+        .and_then(|tag| tag.value())
+        .map(|value| value.as_str().to_owned())
+}
+
+fn price_minor(raw: &str) -> Option<i64> {
+    let mut parts = raw.split('.');
+    let whole = parts.next()?.parse::<i64>().ok()?;
+    let fraction = parts.next();
+    if parts.next().is_some() {
+        return None;
+    }
+    match fraction {
+        Some(value) if value.len() <= 2 => {
+            let padded = format!("{value:0<2}");
+            Some(whole * 100 + padded.parse::<i64>().ok()?)
+        }
+        Some(_) => None,
+        None => Some(whole * 100),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SurrealStoreError {
     message: String,
@@ -1225,9 +1409,10 @@ impl From<surrealdb::Error> for SurrealStoreError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CurrentEventOutcome, DeletionMarkerOutcome, MigrationApplyOutcome, SurrealConfigError,
-        SurrealConnectionConfig, SurrealConnectionMode, SurrealMigration, SurrealMigrationError,
-        SurrealMigrationPlan, SurrealStore, base_migration_plan, migration_tracking_schema,
+        CurrentEventOutcome, DeletionMarkerOutcome, ListingRevisionOutcome, MigrationApplyOutcome,
+        SurrealConfigError, SurrealConnectionConfig, SurrealConnectionMode, SurrealMigration,
+        SurrealMigrationError, SurrealMigrationPlan, SurrealStore, base_migration_plan,
+        migration_tracking_schema,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -2256,6 +2441,113 @@ mod tests {
                 .expect("foreign row")
                 .expect("foreign exists")["deleted"],
             false
+        );
+    }
+
+    #[tokio::test]
+    async fn store_listing_revisions_persists_projection_audit_rows() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let projected_at = UnixTimestamp::new(1_714_125_000);
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+
+        assert_eq!(
+            store
+                .store_listing_revision(&listing, projected_at)
+                .await
+                .expect("valid revision"),
+            ListingRevisionOutcome::Stored { parsed_ok: true }
+        );
+
+        let row = store
+            .listing_revision_row(listing.id())
+            .await
+            .expect("valid row")
+            .expect("valid row exists");
+        assert_eq!(row["revision_key"], listing.id().as_str());
+        assert_eq!(
+            row["listing_key"],
+            format!("30402:{}:listing-a", listing.unsigned().pubkey().as_str())
+        );
+        assert_eq!(row["event_id"], listing.id().as_str());
+        assert_eq!(row["seller_pubkey"], listing.unsigned().pubkey().as_str());
+        assert_eq!(row["d"], "listing-a");
+        assert_eq!(row["created_at"], 1_714_124_433_u64);
+        assert_eq!(row["parsed_ok"], true);
+        assert_eq!(row["parse_errors"].as_array().expect("errors").len(), 0);
+        assert_eq!(row["title"], "Carrot bunches");
+        assert!(row["summary"].is_null());
+        assert_eq!(row["price_decimal"], "12.50");
+        assert_eq!(row["price_minor"], 1_250_u64);
+        assert_eq!(row["currency_raw"], "USD");
+        assert_eq!(row["currency_norm"], "USD");
+        assert_eq!(row["unit"], "lb");
+        assert!(row["status_tag"].is_null());
+        assert_eq!(row["projected_at"], projected_at.as_u64());
+
+        let pubkey = "c".repeat(PublicKeyHex::HEX_LENGTH);
+        let invalid = synthetic_event(
+            "e",
+            "9",
+            &pubkey,
+            1_714_125_010,
+            30_402,
+            vec![Tag::from_parts("d", &["listing-invalid"]).expect("d tag")],
+            "",
+        );
+        let note = synthetic_event(
+            "f",
+            "a",
+            &pubkey,
+            1_714_125_011,
+            1,
+            Vec::new(),
+            "not a listing",
+        );
+
+        assert_eq!(
+            store
+                .store_listing_revision(&invalid, projected_at)
+                .await
+                .expect("invalid revision"),
+            ListingRevisionOutcome::Stored { parsed_ok: false }
+        );
+        assert_eq!(
+            store
+                .store_listing_revision(&note, projected_at)
+                .await
+                .expect("note revision"),
+            ListingRevisionOutcome::NotListing
+        );
+
+        let invalid_row = store
+            .listing_revision_row(invalid.id())
+            .await
+            .expect("invalid row")
+            .expect("invalid row exists");
+        let errors = invalid_row["parse_errors"].as_array().expect("errors");
+        assert_eq!(
+            invalid_row["listing_key"],
+            format!("30402:{pubkey}:listing-invalid")
+        );
+        assert_eq!(invalid_row["parsed_ok"], false);
+        assert!(errors.contains(&serde_json::Value::String(
+            "tag `title` is required".to_owned()
+        )));
+        assert!(errors.contains(&serde_json::Value::String(
+            "tag `price` is required".to_owned()
+        )));
+        assert!(invalid_row["price_decimal"].is_null());
+        assert!(invalid_row["unit"].is_null());
+        assert!(
+            store
+                .listing_revision_row(note.id())
+                .await
+                .expect("note row")
+                .is_none()
         );
     }
 
