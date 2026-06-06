@@ -2,6 +2,7 @@
 
 use core::fmt;
 use core::str::FromStr;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EventId(String);
@@ -225,7 +226,7 @@ impl Tag {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TagName(String);
 
 impl TagName {
@@ -267,7 +268,7 @@ impl FromStr for TagName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TagValue(String);
 
 impl TagValue {
@@ -454,10 +455,113 @@ pub enum ClientMessage {
     Event(Event),
     Req {
         subscription_id: SubscriptionId,
-        filters: Vec<serde_json::Value>,
+        filters: Vec<Filter>,
     },
     Close(SubscriptionId),
     Auth(Event),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Filter {
+    ids: Vec<EventId>,
+    authors: Vec<PublicKeyHex>,
+    kinds: Vec<Kind>,
+    tag_filters: BTreeMap<TagName, Vec<TagValue>>,
+    since: Option<UnixTimestamp>,
+    until: Option<UnixTimestamp>,
+    limit: Option<u64>,
+    search: Option<String>,
+}
+
+impl Filter {
+    pub fn empty() -> Self {
+        Self {
+            ids: Vec::new(),
+            authors: Vec::new(),
+            kinds: Vec::new(),
+            tag_filters: BTreeMap::new(),
+            since: None,
+            until: None,
+            limit: None,
+            search: None,
+        }
+    }
+
+    pub fn ids(&self) -> &[EventId] {
+        &self.ids
+    }
+
+    pub fn authors(&self) -> &[PublicKeyHex] {
+        &self.authors
+    }
+
+    pub fn kinds(&self) -> &[Kind] {
+        &self.kinds
+    }
+
+    pub fn tag_filters(&self) -> &BTreeMap<TagName, Vec<TagValue>> {
+        &self.tag_filters
+    }
+
+    pub fn since(&self) -> Option<UnixTimestamp> {
+        self.since
+    }
+
+    pub fn until(&self) -> Option<UnixTimestamp> {
+        self.until
+    }
+
+    pub fn limit(&self) -> Option<u64> {
+        self.limit
+    }
+
+    pub fn search(&self) -> Option<&str> {
+        self.search.as_deref()
+    }
+
+    pub fn matches(&self, event: &Event) -> bool {
+        if !self.ids.is_empty() && !self.ids.iter().any(|id| id == event.id()) {
+            return false;
+        }
+        if !self.authors.is_empty()
+            && !self
+                .authors
+                .iter()
+                .any(|author| author == event.unsigned().pubkey())
+        {
+            return false;
+        }
+        if !self.kinds.is_empty()
+            && !self
+                .kinds
+                .iter()
+                .any(|kind| *kind == event.unsigned().kind())
+        {
+            return false;
+        }
+        if let Some(since) = self.since
+            && event.unsigned().created_at().as_u64() < since.as_u64()
+        {
+            return false;
+        }
+        if let Some(until) = self.until
+            && event.unsigned().created_at().as_u64() > until.as_u64()
+        {
+            return false;
+        }
+        for (name, values) in &self.tag_filters {
+            let matched = event.unsigned().tags().iter().any(|tag| {
+                tag.indexed_pair().is_some_and(|(tag_name, tag_value)| {
+                    tag_name == name.as_str()
+                        && values.iter().any(|value| value.as_str() == tag_value)
+                })
+            });
+            if !matched {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -536,6 +640,30 @@ pub fn event_to_value(event: &Event) -> serde_json::Value {
         "content": event.unsigned().content(),
         "sig": event.sig().as_str()
     })
+}
+
+pub fn filter_from_value(value: &serde_json::Value) -> Result<Filter, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "filter must be a JSON object".to_owned())?;
+    let mut filter = Filter::empty();
+    for (field, raw) in object {
+        match field.as_str() {
+            "ids" => filter.ids = parse_event_id_filter_array(field, raw)?,
+            "authors" => filter.authors = parse_pubkey_filter_array(field, raw)?,
+            "kinds" => filter.kinds = parse_kind_filter_array(field, raw)?,
+            "since" => filter.since = Some(UnixTimestamp::new(parse_u64_filter_field(field, raw)?)),
+            "until" => filter.until = Some(UnixTimestamp::new(parse_u64_filter_field(field, raw)?)),
+            "limit" => filter.limit = Some(parse_u64_filter_field(field, raw)?),
+            "search" => filter.search = Some(parse_string_filter_field(field, raw)?.to_owned()),
+            tag_field if tag_field.starts_with('#') => {
+                let (name, values) = parse_tag_filter_field(tag_field, raw)?;
+                filter.tag_filters.insert(name, values);
+            }
+            unsupported => return Err(format!("filter field `{unsupported}` is unsupported")),
+        }
+    }
+    Ok(filter)
 }
 
 pub fn parse_client_message(raw: &str) -> Result<ClientMessage, String> {
@@ -618,13 +746,7 @@ fn parse_req_client_message(array: &[serde_json::Value]) -> Result<ClientMessage
         .and_then(SubscriptionId::new)?;
     let filters = array[2..]
         .iter()
-        .map(|filter| {
-            if filter.is_object() {
-                Ok(filter.clone())
-            } else {
-                Err("REQ filters must be JSON objects".to_owned())
-            }
-        })
+        .map(filter_from_value)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ClientMessage::Req {
         subscription_id,
@@ -692,6 +814,116 @@ fn tags_from_value(value: &serde_json::Value) -> Result<Vec<Tag>, EventShapeErro
         .collect()
 }
 
+fn parse_event_id_filter_array(
+    field: &str,
+    value: &serde_json::Value,
+) -> Result<Vec<EventId>, String> {
+    parse_string_filter_array(field, value, |item| {
+        EventId::new(item).map_err(|reason| format!("filter field `{field}` is invalid: {reason}"))
+    })
+}
+
+fn parse_pubkey_filter_array(
+    field: &str,
+    value: &serde_json::Value,
+) -> Result<Vec<PublicKeyHex>, String> {
+    parse_string_filter_array(field, value, |item| {
+        PublicKeyHex::new(item)
+            .map_err(|reason| format!("filter field `{field}` is invalid: {reason}"))
+    })
+}
+
+fn parse_kind_filter_array(field: &str, value: &serde_json::Value) -> Result<Vec<Kind>, String> {
+    parse_u64_filter_array(field, value, |item| {
+        Kind::new(item).map_err(|reason| format!("filter field `{field}` is invalid: {reason}"))
+    })
+}
+
+fn parse_tag_filter_field(
+    field: &str,
+    value: &serde_json::Value,
+) -> Result<(TagName, Vec<TagValue>), String> {
+    let name = &field[1..];
+    let tag_name = TagName::new(name)
+        .map_err(|reason| format!("filter field `{field}` is invalid: {reason}"))?;
+    if !tag_name.is_indexable() {
+        return Err(format!(
+            "filter field `{field}` is invalid: tag name must be a single ASCII letter"
+        ));
+    }
+    let values = parse_string_filter_array(field, value, |item| {
+        if name == "e" {
+            EventId::new(item)
+                .map(|_| TagValue::new(item))
+                .map_err(|reason| format!("filter field `{field}` is invalid: {reason}"))
+        } else if name == "p" {
+            PublicKeyHex::new(item)
+                .map(|_| TagValue::new(item))
+                .map_err(|reason| format!("filter field `{field}` is invalid: {reason}"))
+        } else {
+            Ok(TagValue::new(item))
+        }
+    })?;
+    Ok((tag_name, values))
+}
+
+fn parse_string_filter_array<T>(
+    field: &str,
+    value: &serde_json::Value,
+    parse_item: impl Fn(&str) -> Result<T, String>,
+) -> Result<Vec<T>, String> {
+    let array = value.as_array().ok_or_else(|| filter_array_error(field))?;
+    if array.is_empty() {
+        return Err(filter_array_error(field));
+    }
+    array
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .ok_or_else(|| format!("filter field `{field}` values must be strings"))
+                .and_then(&parse_item)
+        })
+        .collect()
+}
+
+fn parse_u64_filter_array<T>(
+    field: &str,
+    value: &serde_json::Value,
+    parse_item: impl Fn(u64) -> Result<T, String>,
+) -> Result<Vec<T>, String> {
+    let array = value.as_array().ok_or_else(|| filter_array_error(field))?;
+    if array.is_empty() {
+        return Err(filter_array_error(field));
+    }
+    array
+        .iter()
+        .map(|item| {
+            item.as_u64()
+                .ok_or_else(|| format!("filter field `{field}` values must be unsigned integers"))
+                .and_then(&parse_item)
+        })
+        .collect()
+}
+
+fn parse_u64_filter_field(field: &str, value: &serde_json::Value) -> Result<u64, String> {
+    value
+        .as_u64()
+        .ok_or_else(|| format!("filter field `{field}` must be an unsigned integer"))
+}
+
+fn parse_string_filter_field<'a>(
+    field: &str,
+    value: &'a serde_json::Value,
+) -> Result<&'a str, String> {
+    value
+        .as_str()
+        .ok_or_else(|| format!("filter field `{field}` must be a string"))
+}
+
+fn filter_array_error(field: &str) -> String {
+    format!("filter field `{field}` must be a non-empty array")
+}
+
 fn require_lowercase_hex(scalar: &'static str, value: &str, expected: usize) -> Result<(), String> {
     let actual = value.chars().count();
     if actual != expected {
@@ -729,11 +961,12 @@ fn kind_out_of_range_error(value: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientMessage, Event, EventId, EventShapeError, Kind, PublicKeyHex, RawEventJson,
+        ClientMessage, Event, EventId, EventShapeError, Filter, Kind, PublicKeyHex, RawEventJson,
         RelayMessage, SignatureHex, SubscriptionId, Tag, TagName, TagValue, UnixTimestamp,
         UnsignedEvent, canonical_event_json, empty_error, encode_relay_message, event_from_value,
-        event_to_value, invalid_length_error, kind_out_of_range_error, non_lowercase_hex_error,
-        parse_client_message, parse_event_json, relay_message_to_value, too_long_error,
+        event_to_value, filter_from_value, invalid_length_error, kind_out_of_range_error,
+        non_lowercase_hex_error, parse_client_message, parse_event_json, relay_message_to_value,
+        too_long_error,
     };
     use core::str::FromStr;
     use std::collections::hash_map::DefaultHasher;
@@ -1003,7 +1236,7 @@ mod tests {
         let auth_event_json = event_json("c", "d", 22242, "[]");
         let event_message = format!("[\"EVENT\",{event_payload}]");
         let auth_message = format!("[\"AUTH\",{auth_event_json}]");
-        let req_message = "[\"REQ\",\"sub-a\",{\"ids\":[\"a\"]},{\"kinds\":[1]}]";
+        let req_message = "[\"REQ\",\"sub-a\",{\"ids\":[\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]},{\"kinds\":[1]}]";
         let close_message = "[\"CLOSE\",\"sub-a\"]";
         let event =
             parse_event_json(&RawEventJson::new(&event_payload).expect("raw")).expect("event");
@@ -1023,8 +1256,8 @@ mod tests {
             Ok(ClientMessage::Req {
                 subscription_id: SubscriptionId::new("sub-a").expect("sub"),
                 filters: vec![
-                    serde_json::json!({"ids":["a"]}),
-                    serde_json::json!({"kinds":[1]})
+                    filter_from_value(&serde_json::json!({"ids":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]})).expect("ids"),
+                    filter_from_value(&serde_json::json!({"kinds":[1]})).expect("kinds")
                 ]
             })
         );
@@ -1087,7 +1320,7 @@ mod tests {
         );
         assert_eq!(
             parse_client_message("[\"REQ\",\"sub-a\",1]").expect_err("req filter"),
-            "REQ filters must be JSON objects"
+            "filter must be a JSON object"
         );
         assert_eq!(
             parse_client_message("[\"CLOSE\"]").expect_err("close length"),
@@ -1196,6 +1429,199 @@ mod tests {
                 .expect_err("sig scalar")
                 .to_string(),
             "event field `sig` is invalid: signature must be 128 characters, got 3"
+        );
+    }
+
+    #[test]
+    fn filter_model_parses_core_fields_and_matches_events() {
+        let event_tag = "e".repeat(EventId::HEX_LENGTH);
+        let event = event_for_filter(&event_tag, 50, 1);
+        let filter = filter_from_value(&serde_json::json!({
+            "ids": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+            "authors": ["1111111111111111111111111111111111111111111111111111111111111111"],
+            "kinds": [1],
+            "#e": [event_tag],
+            "#p": ["1111111111111111111111111111111111111111111111111111111111111111"],
+            "#t": ["radroots"],
+            "since": 40,
+            "until": 60,
+            "limit": 5,
+            "search": "fresh carrots"
+        }))
+        .expect("filter");
+
+        assert_eq!(filter.ids()[0].as_str(), "a".repeat(EventId::HEX_LENGTH));
+        assert_eq!(
+            filter.authors()[0].as_str(),
+            "1".repeat(PublicKeyHex::HEX_LENGTH)
+        );
+        assert_eq!(filter.kinds()[0].as_u32(), 1);
+        assert_eq!(filter.since().expect("since").as_u64(), 40);
+        assert_eq!(filter.until().expect("until").as_u64(), 60);
+        assert_eq!(filter.limit(), Some(5));
+        assert_eq!(filter.search(), Some("fresh carrots"));
+        assert_eq!(
+            filter
+                .tag_filters()
+                .get(&TagName::new("t").expect("tag"))
+                .expect("tag")[0]
+                .as_str(),
+            "radroots"
+        );
+        assert!(filter.matches(&event));
+        assert!(Filter::empty().matches(&event));
+        assert_eq!(Filter::empty().limit(), None);
+        assert_eq!(Filter::empty().search(), None);
+    }
+
+    #[test]
+    fn filter_model_rejects_non_matching_events() {
+        let event_tag = "e".repeat(EventId::HEX_LENGTH);
+        let event = event_for_filter(&event_tag, 50, 1);
+
+        assert!(
+            !filter_from_value(&serde_json::json!({
+                "ids": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+            }))
+            .expect("id filter")
+            .matches(&event)
+        );
+        assert!(
+            !filter_from_value(&serde_json::json!({
+                "authors": ["2222222222222222222222222222222222222222222222222222222222222222"]
+            }))
+            .expect("author filter")
+            .matches(&event)
+        );
+        assert!(
+            !filter_from_value(&serde_json::json!({"kinds": [2]}))
+                .expect("kind filter")
+                .matches(&event)
+        );
+        assert!(
+            !filter_from_value(&serde_json::json!({"since": 51}))
+                .expect("since filter")
+                .matches(&event)
+        );
+        assert!(
+            !filter_from_value(&serde_json::json!({"until": 49}))
+                .expect("until filter")
+                .matches(&event)
+        );
+        assert!(
+            !filter_from_value(&serde_json::json!({"#e": [
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            ]}))
+            .expect("tag filter")
+            .matches(&event)
+        );
+    }
+
+    #[test]
+    fn filter_model_rejects_invalid_filter_shapes() {
+        assert_eq!(
+            filter_from_value(&serde_json::json!(1)).expect_err("object"),
+            "filter must be a JSON object"
+        );
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"ids": 1})).expect_err("ids array"),
+            "filter field `ids` must be a non-empty array"
+        );
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"ids": []})).expect_err("ids empty"),
+            "filter field `ids` must be a non-empty array"
+        );
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"ids": [1]})).expect_err("ids string"),
+            "filter field `ids` values must be strings"
+        );
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"ids": ["bad"]})).expect_err("ids hex"),
+            "filter field `ids` is invalid: event id must be 64 characters, got 3"
+        );
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"authors": ["bad"]})).expect_err("author hex"),
+            "filter field `authors` is invalid: public key must be 64 characters, got 3"
+        );
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"authors": 1})).expect_err("authors array"),
+            "filter field `authors` must be a non-empty array"
+        );
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"authors": []})).expect_err("authors empty"),
+            "filter field `authors` must be a non-empty array"
+        );
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"authors": [1]})).expect_err("authors string"),
+            "filter field `authors` values must be strings"
+        );
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"kinds": 1})).expect_err("kinds array"),
+            "filter field `kinds` must be a non-empty array"
+        );
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"kinds": []})).expect_err("kinds empty"),
+            "filter field `kinds` must be a non-empty array"
+        );
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"kinds": ["one"]})).expect_err("kind integer"),
+            "filter field `kinds` values must be unsigned integers"
+        );
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"kinds": [u64::from(u32::MAX) + 1]}))
+                .expect_err("kind range"),
+            format!(
+                "filter field `kinds` is invalid: kind must fit in u32, got {}",
+                u64::from(u32::MAX) + 1
+            )
+        );
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"since": "now"})).expect_err("since"),
+            "filter field `since` must be an unsigned integer"
+        );
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"until": "then"})).expect_err("until"),
+            "filter field `until` must be an unsigned integer"
+        );
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"limit": "ten"})).expect_err("limit"),
+            "filter field `limit` must be an unsigned integer"
+        );
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"search": 1})).expect_err("search"),
+            "filter field `search` must be a string"
+        );
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"#": ["value"]})).expect_err("tag empty"),
+            "filter field `#` is invalid: tag name must not be empty"
+        );
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"#aa": ["value"]})).expect_err("tag long"),
+            "filter field `#aa` is invalid: tag name must be a single ASCII letter"
+        );
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"#t": 1})).expect_err("tag array"),
+            "filter field `#t` must be a non-empty array"
+        );
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"#t": []})).expect_err("tag empty array"),
+            "filter field `#t` must be a non-empty array"
+        );
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"#t": [1]})).expect_err("tag string"),
+            "filter field `#t` values must be strings"
+        );
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"#e": ["bad"]})).expect_err("tag event id"),
+            "filter field `#e` is invalid: event id must be 64 characters, got 3"
+        );
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"#p": ["bad"]})).expect_err("tag pubkey"),
+            "filter field `#p` is invalid: public key must be 64 characters, got 3"
+        );
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"unknown": true})).expect_err("unknown"),
+            "filter field `unknown` is unsupported"
         );
     }
 
@@ -1346,6 +1772,28 @@ mod tests {
             Kind::new(1).expect("kind"),
             tags,
             content,
+        )
+    }
+
+    fn event_for_filter(event_tag: &str, created_at: u64, kind: u64) -> Event {
+        Event::new(
+            EventId::new(&"a".repeat(EventId::HEX_LENGTH)).expect("id"),
+            UnsignedEvent::new(
+                PublicKeyHex::new(&"1".repeat(PublicKeyHex::HEX_LENGTH)).expect("pubkey"),
+                UnixTimestamp::new(created_at),
+                Kind::new(kind).expect("kind"),
+                vec![
+                    Tag::from_parts("e", &[event_tag]).expect("event tag"),
+                    Tag::from_parts(
+                        "p",
+                        &["1111111111111111111111111111111111111111111111111111111111111111"],
+                    )
+                    .expect("pubkey tag"),
+                    Tag::from_parts("t", &["radroots"]).expect("topic tag"),
+                ],
+                "hello",
+            ),
+            SignatureHex::new(&"b".repeat(SignatureHex::HEX_LENGTH)).expect("sig"),
         )
     }
 
