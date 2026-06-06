@@ -8,6 +8,7 @@ use tangle_protocol::{
 pub const NIP99_PUBLIC_LISTING_KIND: u32 = 30_402;
 pub const NIP99_DRAFT_LISTING_KIND: u32 = 30_403;
 pub const NIP22_COMMENT_KIND: u32 = 1_111;
+pub const NIP25_REACTION_KIND: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedTag {
@@ -553,6 +554,150 @@ fn normalized_optional_hint(
         Some(value) => Ok(Some(value.clone())),
         None => Ok(None),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReactionValue {
+    Like,
+    Dislike,
+    Emoji(String),
+    Text(String),
+}
+
+impl ReactionValue {
+    pub fn canonical(&self) -> &str {
+        match self {
+            Self::Like => "like",
+            Self::Dislike => "dislike",
+            Self::Emoji(_) => "emoji",
+            Self::Text(_) => "text",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReactionEvent {
+    event_id: EventId,
+    pubkey: PublicKeyHex,
+    created_at: UnixTimestamp,
+    content: String,
+    value: ReactionValue,
+    target_event_id: EventId,
+    target_relay_hint: Option<String>,
+    target_pubkey_hint: Option<PublicKeyHex>,
+    target_pubkey: Option<PublicKeyHex>,
+    target_address: Option<AddressCoordinate>,
+    target_kind: Option<String>,
+}
+
+impl ReactionEvent {
+    pub fn event_id(&self) -> &EventId {
+        &self.event_id
+    }
+
+    pub fn pubkey(&self) -> &PublicKeyHex {
+        &self.pubkey
+    }
+
+    pub fn created_at(&self) -> UnixTimestamp {
+        self.created_at
+    }
+
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
+    pub fn value(&self) -> &ReactionValue {
+        &self.value
+    }
+
+    pub fn target_event_id(&self) -> &EventId {
+        &self.target_event_id
+    }
+
+    pub fn target_relay_hint(&self) -> Option<&str> {
+        self.target_relay_hint.as_deref()
+    }
+
+    pub fn target_pubkey_hint(&self) -> Option<&PublicKeyHex> {
+        self.target_pubkey_hint.as_ref()
+    }
+
+    pub fn target_pubkey(&self) -> Option<&PublicKeyHex> {
+        self.target_pubkey.as_ref()
+    }
+
+    pub fn target_address(&self) -> Option<&AddressCoordinate> {
+        self.target_address.as_ref()
+    }
+
+    pub fn target_kind(&self) -> Option<&str> {
+        self.target_kind.as_deref()
+    }
+}
+
+pub fn parse_reaction_event(event: &Event) -> Result<Option<ReactionEvent>, String> {
+    if event.unsigned().kind().as_u32() != NIP25_REACTION_KIND {
+        return Ok(None);
+    }
+    let target = last_matching_tag(event, "e")
+        .ok_or_else(|| "reaction event must include an e target tag".to_owned())?;
+    let target_event_id = target
+        .first_value()
+        .ok_or_else(|| "reaction e target tag must include an event id".to_owned())
+        .and_then(EventId::new)?;
+    let target_relay_hint = normalized_optional_hint(target.values().get(1), "reaction", "relay")?;
+    let target_pubkey_hint = target
+        .values()
+        .get(2)
+        .map(|value| parse_pubkey_value(value, "reaction target hint", "pubkey"))
+        .transpose()?;
+    let target_pubkey = last_matching_tag(event, "p")
+        .and_then(|tag| tag.first_value().map(str::to_owned))
+        .map(|value| parse_pubkey_value(&value, "reaction target", "pubkey"))
+        .transpose()?;
+    let target_address = last_matching_tag(event, "a")
+        .and_then(|tag| tag.first_value().map(str::to_owned))
+        .map(|value| AddressCoordinate::from_str(&value))
+        .transpose()?;
+    let target_kind = optional_tag_value(event, "k")?;
+    if target_kind.as_ref().is_some_and(String::is_empty) {
+        return Err("reaction k tag must not be empty".to_owned());
+    }
+    Ok(Some(ReactionEvent {
+        event_id: event.id().clone(),
+        pubkey: event.unsigned().pubkey().clone(),
+        created_at: event.unsigned().created_at(),
+        content: event.unsigned().content().to_owned(),
+        value: reaction_value(event.unsigned().content()),
+        target_event_id,
+        target_relay_hint,
+        target_pubkey_hint,
+        target_pubkey,
+        target_address,
+        target_kind,
+    }))
+}
+
+fn reaction_value(content: &str) -> ReactionValue {
+    match content {
+        "" | "+" => ReactionValue::Like,
+        "-" => ReactionValue::Dislike,
+        value if looks_like_single_emoji(value) => ReactionValue::Emoji(value.to_owned()),
+        value => ReactionValue::Text(value.to_owned()),
+    }
+}
+
+fn looks_like_single_emoji(value: &str) -> bool {
+    let mut chars = value.chars();
+    match (chars.next(), chars.next()) {
+        (Some(character), None) => !character.is_ascii() && !character.is_alphanumeric(),
+        _ => false,
+    }
+}
+
+fn last_matching_tag(event: &Event, name: &str) -> Option<ParsedTag> {
+    matching_tags(event, name).into_iter().last()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1309,12 +1454,13 @@ fn listing_kind_for_event(event: &Event) -> Option<ListingKind> {
 mod tests {
     use super::{
         CommentTarget, DeletionTarget, FulfillmentMethod, ListingEffectiveStatus, ListingKind,
-        ListingProjectionEvaluation, ListingUnit, NIP22_COMMENT_KIND, NIP99_PUBLIC_LISTING_KIND,
-        evaluate_listing_projection, matching_tags, optional_tag_value, optional_tag_values,
-        parse_comment_event, parse_deletion_request, parse_listing_fulfillment,
-        parse_listing_identity, parse_listing_location, parse_listing_price, parse_listing_status,
-        parse_listing_taxonomy, parse_listing_text, parse_listing_unit, parse_nip50_filter_search,
-        parse_nip50_search, parse_relay_auth_event, parse_required_u64_tag, parse_u64_field,
+        ListingProjectionEvaluation, ListingUnit, NIP22_COMMENT_KIND, NIP25_REACTION_KIND,
+        NIP99_PUBLIC_LISTING_KIND, ReactionValue, evaluate_listing_projection, matching_tags,
+        optional_tag_value, optional_tag_values, parse_comment_event, parse_deletion_request,
+        parse_listing_fulfillment, parse_listing_identity, parse_listing_location,
+        parse_listing_price, parse_listing_status, parse_listing_taxonomy, parse_listing_text,
+        parse_listing_unit, parse_nip50_filter_search, parse_nip50_search, parse_reaction_event,
+        parse_relay_auth_event, parse_required_u64_tag, parse_u64_field,
         repeated_or_missing_policy_boundary, required_tag_value, required_tag_values,
         single_letter_tag_values, single_letter_values_for, tag_count,
     };
@@ -1612,6 +1758,128 @@ mod tests {
         assert_eq!(
             parse_comment_event(&kind_one).expect_err("kind one"),
             "NIP-22 comments must not reply to kind 1 notes"
+        );
+    }
+
+    #[test]
+    fn reaction_parser_extracts_addressable_target_and_like_reaction() {
+        let target_event = "2".repeat(EventId::HEX_LENGTH);
+        let previous_event = "3".repeat(EventId::HEX_LENGTH);
+        let target_pubkey = "4".repeat(PublicKeyHex::HEX_LENGTH);
+        let address = format!("30023:{target_pubkey}:article-a");
+        let event = event_with_kind_tags_and_content(
+            NIP25_REACTION_KIND.into(),
+            vec![
+                Tag::from_parts("e", &[&previous_event]).expect("old e"),
+                Tag::from_parts(
+                    "e",
+                    &[&target_event, "wss://relay.radroots.test", &target_pubkey],
+                )
+                .expect("e"),
+                Tag::from_parts("p", &[&target_pubkey]).expect("p"),
+                Tag::from_parts("a", &[&address]).expect("a"),
+                Tag::from_parts("k", &["30023"]).expect("k"),
+            ],
+            "+",
+        );
+
+        let reaction = parse_reaction_event(&event)
+            .expect("parse")
+            .expect("reaction");
+
+        assert_eq!(reaction.event_id(), event.id());
+        assert_eq!(reaction.pubkey(), event.unsigned().pubkey());
+        assert_eq!(reaction.created_at(), event.unsigned().created_at());
+        assert_eq!(reaction.content(), "+");
+        assert_eq!(reaction.value(), &ReactionValue::Like);
+        assert_eq!(reaction.value().canonical(), "like");
+        assert_eq!(reaction.target_event_id().as_str(), target_event);
+        assert_eq!(
+            reaction.target_relay_hint(),
+            Some("wss://relay.radroots.test")
+        );
+        assert_eq!(
+            reaction.target_pubkey_hint().expect("pubkey hint").as_str(),
+            target_pubkey
+        );
+        assert_eq!(
+            reaction.target_pubkey().expect("target pubkey").as_str(),
+            target_pubkey
+        );
+        assert_eq!(
+            reaction
+                .target_address()
+                .expect("target address")
+                .key()
+                .to_string(),
+            address
+        );
+        assert_eq!(reaction.target_kind(), Some("30023"));
+    }
+
+    #[test]
+    fn reaction_parser_classifies_empty_dislike_emoji_and_text_reactions() {
+        let target_event = "2".repeat(EventId::HEX_LENGTH);
+        let cases = [
+            ("", ReactionValue::Like),
+            ("-", ReactionValue::Dislike),
+            ("⭐", ReactionValue::Emoji("⭐".to_owned())),
+            ("agree", ReactionValue::Text("agree".to_owned())),
+        ];
+        for (content, expected) in cases {
+            let event = event_with_kind_tags_and_content(
+                NIP25_REACTION_KIND.into(),
+                vec![Tag::from_parts("e", &[&target_event]).expect("e")],
+                content,
+            );
+            let reaction = parse_reaction_event(&event)
+                .expect("parse")
+                .expect("reaction");
+
+            assert_eq!(reaction.value(), &expected);
+        }
+        let note = event_with_kind_and_tags(1, Vec::new());
+        assert_eq!(parse_reaction_event(&note), Ok(None));
+    }
+
+    #[test]
+    fn reaction_parser_rejects_missing_and_malformed_targets() {
+        let bad_event_id = event_with_kind_tags_and_content(
+            NIP25_REACTION_KIND.into(),
+            vec![Tag::from_parts("e", &["bad"]).expect("e")],
+            "+",
+        );
+        let missing_event_id = event_with_kind_tags_and_content(
+            NIP25_REACTION_KIND.into(),
+            vec![Tag::from_parts("e", &[]).expect("e")],
+            "+",
+        );
+        let missing_target = event_with_kind_and_tags(NIP25_REACTION_KIND.into(), Vec::new());
+        let empty_kind = event_with_kind_tags_and_content(
+            NIP25_REACTION_KIND.into(),
+            vec![
+                Tag::from_parts("e", &[&"2".repeat(EventId::HEX_LENGTH)]).expect("e"),
+                Tag::from_parts("k", &[""]).expect("k"),
+            ],
+            "+",
+        );
+
+        assert_eq!(
+            parse_reaction_event(&missing_target).expect_err("missing target"),
+            "reaction event must include an e target tag"
+        );
+        assert!(
+            parse_reaction_event(&bad_event_id)
+                .expect_err("bad event id")
+                .contains("event id")
+        );
+        assert_eq!(
+            parse_reaction_event(&missing_event_id).expect_err("missing event id"),
+            "reaction e target tag must include an event id"
+        );
+        assert_eq!(
+            parse_reaction_event(&empty_kind).expect_err("empty kind"),
+            "reaction k tag must not be empty"
         );
     }
 
