@@ -17,7 +17,7 @@ tangle_nips = { path = "../tangle_nips" }
 tangle_protocol = { path = "../tangle_protocol" }
 tangle_store = { path = "../tangle_store" }
 tangle_store_surreal = { path = "../tangle_store_surreal" }
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["net", "sync"] }
 url = "2"
 
 [dev-dependencies]

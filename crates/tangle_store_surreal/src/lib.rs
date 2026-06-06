@@ -4,7 +4,7 @@ use core::fmt;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use surrealdb::Surreal;
-use surrealdb::engine::local::{Db, Mem};
+use surrealdb::engine::local::{Db, Mem, RocksDb};
 use tangle_nips::{
     DeletionTarget, ListingProjection, ListingProjectionEvaluation, NIP99_DRAFT_LISTING_KIND,
     NIP99_PUBLIC_LISTING_KIND, evaluate_listing_projection, parse_deletion_request,
@@ -15,6 +15,7 @@ use tangle_store::{StoreEventOutcome, StoredEvent};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SurrealConnectionMode {
     Memory,
+    RocksDb { path: String },
     Http { endpoint: String },
     WebSocket { endpoint: String },
 }
@@ -29,6 +30,15 @@ pub struct SurrealConnectionConfig {
 impl SurrealConnectionConfig {
     pub fn memory(namespace: &str, database: &str) -> Result<Self, SurrealConfigError> {
         Self::new(SurrealConnectionMode::Memory, namespace, database)
+    }
+
+    pub fn rocksdb(
+        path: &str,
+        namespace: &str,
+        database: &str,
+    ) -> Result<Self, SurrealConfigError> {
+        let path = normalized_endpoint(path, "rocksdb path")?;
+        Self::new(SurrealConnectionMode::RocksDb { path }, namespace, database)
     }
 
     pub fn http(
@@ -813,6 +823,29 @@ impl fmt::Debug for SurrealStore {
 }
 
 impl SurrealStore {
+    pub async fn connect_local(
+        config: &SurrealConnectionConfig,
+    ) -> Result<Self, SurrealStoreError> {
+        match config.mode() {
+            SurrealConnectionMode::Memory => Self::connect_memory(config).await,
+            SurrealConnectionMode::RocksDb { path } => {
+                let db = Surreal::new::<RocksDb>(path)
+                    .await
+                    .map_err(SurrealStoreError::from)?;
+                db.use_ns(config.namespace())
+                    .use_db(config.database())
+                    .await
+                    .map_err(SurrealStoreError::from)?;
+                Ok(Self { db })
+            }
+            SurrealConnectionMode::Http { .. } | SurrealConnectionMode::WebSocket { .. } => {
+                Err(SurrealStoreError::new(
+                    "surreal local connection requires memory or rocksdb mode config",
+                ))
+            }
+        }
+    }
+
     pub async fn connect_memory(
         config: &SurrealConnectionConfig,
     ) -> Result<Self, SurrealStoreError> {
@@ -2447,11 +2480,19 @@ mod tests {
 
     #[test]
     fn remote_config_preserves_trimmed_endpoints() {
+        let rocksdb = SurrealConnectionConfig::rocksdb(" /tmp/tangle-rocksdb ", "ns", "db")
+            .expect("rocksdb config");
         let http = SurrealConnectionConfig::http(" http://127.0.0.1:8000 ", "ns", "db")
             .expect("http config");
         let websocket = SurrealConnectionConfig::websocket(" ws://127.0.0.1:8000 ", "ns", "db")
             .expect("websocket config");
 
+        assert_eq!(
+            rocksdb.mode(),
+            &SurrealConnectionMode::RocksDb {
+                path: "/tmp/tangle-rocksdb".to_owned()
+            }
+        );
         assert_eq!(
             http.mode(),
             &SurrealConnectionMode::Http {
@@ -2484,6 +2525,12 @@ mod tests {
             SurrealConnectionConfig::http("", "ns", "db").expect_err("endpoint error"),
             SurrealConfigError {
                 message: "surreal http endpoint must not be empty".to_owned()
+            }
+        );
+        assert_eq!(
+            SurrealConnectionConfig::rocksdb("", "ns", "db").expect_err("path error"),
+            SurrealConfigError {
+                message: "surreal rocksdb path must not be empty".to_owned()
             }
         );
         assert_eq!(
@@ -2599,6 +2646,13 @@ mod tests {
         assert_eq!(
             error.message(),
             "surreal memory connection requires memory mode config"
+        );
+        let local_error = SurrealStore::connect_local(&config)
+            .await
+            .expect_err("remote local mismatch");
+        assert_eq!(
+            local_error.message(),
+            "surreal local connection requires memory or rocksdb mode config"
         );
     }
 

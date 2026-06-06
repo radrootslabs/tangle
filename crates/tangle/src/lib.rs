@@ -39,7 +39,7 @@ impl TangleCommand {
     }
 
     pub fn implemented(self) -> bool {
-        matches!(self, Self::Version | Self::Help | Self::Migrate)
+        matches!(self, Self::Version | Self::Help | Self::Migrate | Self::Run)
     }
 }
 
@@ -201,6 +201,21 @@ pub async fn migrate_with_config(path: &str) -> Result<String, String> {
     Ok(migrate_output(report))
 }
 
+pub async fn run_with_config(path: &str) -> Result<(), String> {
+    let config = tangle_runtime::load_runtime_config(path).map_err(|error| error.to_string())?;
+    let (shutdown, _) = tangle_runtime::GracefulShutdownSignal::new();
+    let signal = shutdown.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal.request_shutdown();
+        }
+    });
+    tangle_runtime::run_runtime_server(config, shutdown)
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -257,7 +272,10 @@ mod tests {
                 expected.implemented(),
                 matches!(
                     expected,
-                    TangleCommand::Version | TangleCommand::Help | TangleCommand::Migrate
+                    TangleCommand::Version
+                        | TangleCommand::Help
+                        | TangleCommand::Migrate
+                        | TangleCommand::Run
                 )
             );
         }

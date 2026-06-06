@@ -2,7 +2,7 @@
 
 use axum::{
     Json, Router,
-    extract::ws::WebSocketUpgrade,
+    extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::{Path, RawQuery, State},
     response::{IntoResponse, Response},
     routing::get,
@@ -10,13 +10,23 @@ use axum::{
 use core::fmt;
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, fs, net::SocketAddr, path::Path as FsPath};
+use std::{
+    collections::BTreeSet,
+    fs,
+    net::SocketAddr,
+    path::Path as FsPath,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tangle_core::{
-    AdmissionContext, AdmissionEffect, AuthChallengeState, EventValidator, FixedWindowRateLimiter,
-    MarketplaceListingStatus, MarketplaceQuery, MarketplaceQueryError, MarketplaceQuerySpec,
-    MarketplaceSort, NostrFilterCompiler, QueryExecutionMode, RateLimitConfig, RateLimitDecision,
-    RuntimeLimitValues, RuntimeLimits, SubscriptionCloseOutcome, SubscriptionManager,
-    SubscriptionMatcher,
+    AdmissionContext, AdmissionEffect, AdmissionPolicy, AuthChallengeState, EventValidator,
+    FixedWindowRateLimiter, MarketplaceListingStatus, MarketplaceQuery, MarketplaceQueryError,
+    MarketplaceQuerySpec, MarketplaceSort, NostrFilterCompiler, QueryExecutionMode,
+    RateLimitConfig, RateLimitDecision, RuntimeLimitValues, RuntimeLimits,
+    SubscriptionCloseOutcome, SubscriptionManager, SubscriptionMatcher, UnapprovedSellerAction,
 };
 use tangle_nips::{FulfillmentMethod, ListingUnit, parse_relay_auth_event};
 use tangle_protocol::{
@@ -28,6 +38,8 @@ use tangle_store_surreal::{
     ListingProjectionQuery, MigrationApplyOutcome, SearchDocumentQuery, SurrealConnectionConfig,
     SurrealConnectionMode, SurrealStore, base_migration_plan,
 };
+use tokio::net::TcpListener;
+use tokio::sync::broadcast;
 use url::form_urlencoded;
 
 pub const TANGLE_SUPPORTED_NIPS: [u16; 8] = [1, 9, 11, 16, 33, 42, 50, 99];
@@ -223,6 +235,7 @@ pub struct TangleRuntimeConfig {
     listen_addr: SocketAddr,
     relay_connection: RelayConnectionConfig,
     database: SurrealConnectionConfig,
+    admission_policy: AdmissionPolicy,
     limits: RuntimeLimits,
 }
 
@@ -237,6 +250,10 @@ impl TangleRuntimeConfig {
 
     pub fn database_config(&self) -> &SurrealConnectionConfig {
         &self.database
+    }
+
+    pub fn admission_policy(&self) -> &AdmissionPolicy {
+        &self.admission_policy
     }
 
     pub fn limits(&self) -> RuntimeLimits {
@@ -399,14 +416,7 @@ impl std::error::Error for RuntimeCommandError {}
 pub async fn migrate_runtime_database(
     config: &TangleRuntimeConfig,
 ) -> Result<RuntimeMigrationReport, RuntimeCommandError> {
-    if config.database_config().mode() != &SurrealConnectionMode::Memory {
-        return Err(RuntimeCommandError::unsupported(
-            "migrate currently supports memory SurrealDB configs only",
-        ));
-    }
-    let store = SurrealStore::connect_memory(config.database_config())
-        .await
-        .map_err(|error| RuntimeCommandError::store(error.to_string()))?;
+    let store = connect_runtime_store(config).await?;
     let outcomes = store
         .apply_plan(&base_migration_plan())
         .await
@@ -426,12 +436,384 @@ pub async fn migrate_runtime_database(
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeServerReport {
+    listen_addr: SocketAddr,
+}
+
+impl RuntimeServerReport {
+    pub fn new(listen_addr: SocketAddr) -> Self {
+        Self { listen_addr }
+    }
+
+    pub fn listen_addr(self) -> SocketAddr {
+        self.listen_addr
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeServer {
+    config: TangleRuntimeConfig,
+    shutdown_signal: GracefulShutdownSignal,
+}
+
+impl RuntimeServer {
+    pub fn new(config: TangleRuntimeConfig, shutdown_signal: GracefulShutdownSignal) -> Self {
+        Self {
+            config,
+            shutdown_signal,
+        }
+    }
+
+    pub async fn run(&self) -> Result<RuntimeServerReport, RuntimeCommandError> {
+        let store = connect_runtime_store(&self.config).await?;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .map_err(|error| RuntimeCommandError::store(error.to_string()))?;
+        let listener = TcpListener::bind(self.config.listen_addr())
+            .await
+            .map_err(|error| RuntimeCommandError::store(format!("listen failed: {error}")))?;
+        let listen_addr = listener
+            .local_addr()
+            .map_err(|error| RuntimeCommandError::store(format!("listen addr failed: {error}")))?;
+        let mut shutdown = self.shutdown_signal.subscribe();
+        let app = runtime_router(self.config.clone(), store, self.shutdown_signal.clone());
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                shutdown.wait_for_shutdown().await;
+            })
+            .await
+            .map_err(|error| RuntimeCommandError::store(format!("server failed: {error}")))?;
+        Ok(RuntimeServerReport::new(listen_addr))
+    }
+}
+
+pub async fn run_runtime_server(
+    config: TangleRuntimeConfig,
+    shutdown_signal: GracefulShutdownSignal,
+) -> Result<RuntimeServerReport, RuntimeCommandError> {
+    RuntimeServer::new(config, shutdown_signal).run().await
+}
+
+async fn connect_runtime_store(
+    config: &TangleRuntimeConfig,
+) -> Result<SurrealStore, RuntimeCommandError> {
+    match config.database_config().mode() {
+        SurrealConnectionMode::Memory | SurrealConnectionMode::RocksDb { .. } => {
+            SurrealStore::connect_local(config.database_config())
+                .await
+                .map_err(|error| RuntimeCommandError::store(error.to_string()))
+        }
+        SurrealConnectionMode::Http { .. } | SurrealConnectionMode::WebSocket { .. } => {
+            Err(RuntimeCommandError::unsupported(
+                "runtime commands currently support memory or rocksdb SurrealDB configs only",
+            ))
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeRelayState {
+    config: TangleRuntimeConfig,
+    store: SurrealStore,
+    shutdown_signal: GracefulShutdownSignal,
+    event_tx: broadcast::Sender<Event>,
+    next_connection_id: Arc<AtomicU64>,
+}
+
+impl RuntimeRelayState {
+    fn new(
+        config: TangleRuntimeConfig,
+        store: SurrealStore,
+        shutdown_signal: GracefulShutdownSignal,
+    ) -> Self {
+        let (event_tx, _) = broadcast::channel(config.limits().values().live_event_buffer as usize);
+        Self {
+            config,
+            store,
+            shutdown_signal,
+            event_tx,
+            next_connection_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    fn next_connection(&self) -> RelayConnection {
+        let id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
+        RelayConnection::new(
+            RelayConnectionId::new(&format!("conn-{id}"))
+                .expect("generated connection id is valid"),
+            self.config.relay_connection_config().clone(),
+        )
+    }
+
+    fn validator(&self) -> EventValidator {
+        EventValidator::new(self.config.limits(), self.config.admission_policy().clone())
+    }
+}
+
+fn runtime_router(
+    config: TangleRuntimeConfig,
+    store: SurrealStore,
+    shutdown_signal: GracefulShutdownSignal,
+) -> Router {
+    let state = RuntimeRelayState::new(config, store, shutdown_signal);
+    Router::new()
+        .route("/", get(runtime_relay_info))
+        .route("/ws", get(runtime_websocket_upgrade))
+        .route("/healthz", get(runtime_healthz))
+        .route("/readyz", get(runtime_readyz))
+        .route("/api/listings", get(runtime_listings))
+        .route("/api/listings/{pubkey}/{d}", get(runtime_listing_detail))
+        .route("/api/search", get(runtime_marketplace_search))
+        .route("/api/sellers/{pubkey}", get(runtime_seller_detail))
+        .with_state(state)
+}
+
+async fn runtime_relay_info(headers: HeaderMap) -> Response {
+    relay_info(State(RelayInfoDocument::tangle_default()), headers).await
+}
+
+async fn runtime_websocket_upgrade(
+    State(state): State<RuntimeRelayState>,
+    headers: HeaderMap,
+    websocket: WebSocketUpgrade,
+) -> Response {
+    if !is_websocket_upgrade(&headers) {
+        return ApiError::invalid_request("websocket upgrade required").into_response();
+    }
+    websocket
+        .on_upgrade(move |socket| async move {
+            handle_websocket(socket, state).await;
+        })
+        .into_response()
+}
+
+async fn runtime_healthz() -> Json<HealthDocument> {
+    healthz().await
+}
+
+async fn runtime_readyz() -> (StatusCode, Json<ReadinessDocument>) {
+    readyz(State(ReadinessState::ready())).await
+}
+
+async fn runtime_listings(
+    State(state): State<RuntimeRelayState>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<ListingsDocument>, ApiError> {
+    listings(
+        State(ListingsHttpState::new(
+            state.store.clone(),
+            state.config.limits(),
+        )),
+        RawQuery(query),
+    )
+    .await
+}
+
+async fn runtime_listing_detail(
+    State(state): State<RuntimeRelayState>,
+    Path((pubkey, d)): Path<(String, String)>,
+) -> Result<Json<ListingDetailDocument>, ApiError> {
+    listing_detail(
+        State(ListingsHttpState::new(
+            state.store.clone(),
+            state.config.limits(),
+        )),
+        Path((pubkey, d)),
+    )
+    .await
+}
+
+async fn runtime_marketplace_search(
+    State(state): State<RuntimeRelayState>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<ListingsDocument>, ApiError> {
+    marketplace_search(
+        State(ListingsHttpState::new(
+            state.store.clone(),
+            state.config.limits(),
+        )),
+        RawQuery(query),
+    )
+    .await
+}
+
+async fn runtime_seller_detail(
+    State(state): State<RuntimeRelayState>,
+    Path(pubkey): Path<String>,
+) -> Result<Json<SellerDocument>, ApiError> {
+    seller_detail(
+        State(ListingsHttpState::new(
+            state.store.clone(),
+            state.config.limits(),
+        )),
+        Path(pubkey),
+    )
+    .await
+}
+
+async fn handle_websocket(mut socket: WebSocket, state: RuntimeRelayState) {
+    let mut shutdown = state.shutdown_signal.subscribe();
+    let mut event_rx = state.event_tx.subscribe();
+    let mut loop_state = ClientMessageLoop::new(state.next_connection());
+    let event_handler = EventMessageHandler::new(state.store.clone(), state.validator());
+    let auth_handler = AuthMessageHandler;
+    let req_handler = ReqMessageHandler::new(state.store.clone(), NostrFilterCompiler::default());
+    let close_handler = CloseMessageHandler;
+    let fanout = LiveEventFanout;
+    let challenge = auth_handler.issue_challenge(
+        loop_state.connection_mut(),
+        "challenge-001",
+        UnixTimestamp::new(1_714_124_430),
+    );
+    if send_relay_message(&mut socket, &challenge).await.is_err() {
+        return;
+    }
+    loop {
+        tokio::select! {
+            _ = shutdown.wait_for_shutdown() => {
+                let _ = socket.send(Message::Close(None)).await;
+                break;
+            }
+            event = event_rx.recv() => {
+                match event {
+                    Ok(event) => {
+                        for message in fanout.fanout(loop_state.connection(), &event) {
+                            if send_relay_message(&mut socket, &message).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            frame = socket.recv() => {
+                let Some(frame) = frame else {
+                    break;
+                };
+                let Ok(frame) = frame else {
+                    break;
+                };
+                match loop_state.handle_frame_at(client_frame_from_message(frame), now_timestamp()) {
+                    ClientFrameOutcome::Message(message) => {
+                        if handle_client_message(
+                            &mut socket,
+                            &mut loop_state,
+                            &event_handler,
+                            &auth_handler,
+                            &req_handler,
+                            &close_handler,
+                            &state.event_tx,
+                            message,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    ClientFrameOutcome::Reject(message) => {
+                        if send_relay_message(&mut socket, &message).await.is_err() {
+                            break;
+                        }
+                    }
+                    ClientFrameOutcome::Ignore => {}
+                    ClientFrameOutcome::Close => break,
+                }
+            }
+        }
+    }
+}
+
+async fn handle_client_message(
+    socket: &mut WebSocket,
+    loop_state: &mut ClientMessageLoop,
+    event_handler: &EventMessageHandler,
+    auth_handler: &AuthMessageHandler,
+    req_handler: &ReqMessageHandler,
+    close_handler: &CloseMessageHandler,
+    event_tx: &broadcast::Sender<Event>,
+    message: ClientMessage,
+) -> Result<(), axum::Error> {
+    match message {
+        ClientMessage::Event(event) => {
+            let accepted_event = event.clone();
+            let response = event_handler
+                .handle_event(
+                    loop_state.connection(),
+                    event,
+                    now_timestamp(),
+                    now_timestamp(),
+                )
+                .await;
+            let accepted = matches!(response, RelayMessage::Ok { accepted: true, .. });
+            send_relay_message(socket, &response).await?;
+            if accepted {
+                let _ = event_tx.send(accepted_event);
+            }
+        }
+        ClientMessage::Auth(event) => {
+            let response = auth_handler.handle_auth(
+                loop_state.connection_mut(),
+                event.clone(),
+                event.unsigned().created_at(),
+            );
+            send_relay_message(socket, &response).await?;
+        }
+        ClientMessage::Req {
+            subscription_id,
+            filters,
+        } => {
+            for response in req_handler
+                .handle_req(loop_state.connection_mut(), subscription_id, filters)
+                .await
+            {
+                send_relay_message(socket, &response).await?;
+            }
+        }
+        ClientMessage::Close(subscription_id) => {
+            close_handler.handle_close(loop_state.connection_mut(), &subscription_id);
+        }
+    }
+    Ok(())
+}
+
+fn client_frame_from_message(message: Message) -> ClientFrame {
+    match message {
+        Message::Text(value) => ClientFrame::Text(value.to_string()),
+        Message::Binary(value) => ClientFrame::Binary(value.to_vec()),
+        Message::Ping(value) => ClientFrame::Ping(value.to_vec()),
+        Message::Pong(value) => ClientFrame::Pong(value.to_vec()),
+        Message::Close(_) => ClientFrame::Close,
+    }
+}
+
+async fn send_relay_message(
+    socket: &mut WebSocket,
+    message: &RelayMessage,
+) -> Result<(), axum::Error> {
+    socket.send(Message::Text(message.encode().into())).await
+}
+
+fn now_timestamp() -> UnixTimestamp {
+    UnixTimestamp::new(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct RuntimeConfigDocument {
     server: RuntimeServerConfigDocument,
     database: RuntimeDatabaseConfigDocument,
     auth: RuntimeAuthConfigDocument,
     limits: RuntimeLimitsConfigDocument,
+    #[serde(default)]
+    policy: RuntimePolicyConfigDocument,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -444,6 +826,7 @@ struct RuntimeServerConfigDocument {
 struct RuntimeDatabaseConfigDocument {
     mode: RuntimeDatabaseModeDocument,
     endpoint: Option<String>,
+    path: Option<String>,
     namespace: String,
     database: String,
 }
@@ -452,6 +835,7 @@ struct RuntimeDatabaseConfigDocument {
 #[serde(rename_all = "snake_case")]
 enum RuntimeDatabaseModeDocument {
     Memory,
+    RocksDb,
     Http,
     #[serde(alias = "websocket")]
     WebSocket,
@@ -492,6 +876,23 @@ struct RuntimeLimitValuesDocument {
     pending_store_events: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+struct RuntimePolicyConfigDocument {
+    require_write_auth: Option<bool>,
+    unapproved_seller_action: Option<RuntimeUnapprovedSellerActionDocument>,
+    #[serde(default)]
+    approved_sellers: Vec<String>,
+    #[serde(default)]
+    blocked_pubkeys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RuntimeUnapprovedSellerActionDocument {
+    StoreRawOnly,
+    RejectWrite,
+}
+
 fn runtime_config_from_document(
     document: RuntimeConfigDocument,
 ) -> Result<TangleRuntimeConfig, RuntimeConfigError> {
@@ -511,10 +912,12 @@ fn runtime_config_from_document(
     )
     .map_err(RuntimeConfigError::invalid)?;
     let database = database_config_from_document(document.database)?;
+    let admission_policy = admission_policy_from_document(document.policy)?;
     Ok(TangleRuntimeConfig {
         listen_addr,
         relay_connection,
         database,
+        admission_policy,
         limits: limits.runtime,
     })
 }
@@ -551,7 +954,24 @@ fn database_config_from_document(
                     "database.endpoint must be omitted for memory mode",
                 ));
             }
+            if document.path.is_some() {
+                return Err(RuntimeConfigError::invalid(
+                    "database.path must be omitted for memory mode",
+                ));
+            }
             SurrealConnectionConfig::memory(&document.namespace, &document.database)
+        }
+        RuntimeDatabaseModeDocument::RocksDb => {
+            if document.endpoint.is_some() {
+                return Err(RuntimeConfigError::invalid(
+                    "database.endpoint must be omitted for rocksdb mode",
+                ));
+            }
+            SurrealConnectionConfig::rocksdb(
+                &required_path(document.path, "rocksdb")?,
+                &document.namespace,
+                &document.database,
+            )
         }
         RuntimeDatabaseModeDocument::Http => SurrealConnectionConfig::http(
             &required_endpoint(document.endpoint, "http")?,
@@ -571,6 +991,43 @@ fn required_endpoint(value: Option<String>, mode: &str) -> Result<String, Runtim
     value.ok_or_else(|| {
         RuntimeConfigError::invalid(format!("database.endpoint is required for {mode} mode"))
     })
+}
+
+fn required_path(value: Option<String>, mode: &str) -> Result<String, RuntimeConfigError> {
+    value.ok_or_else(|| {
+        RuntimeConfigError::invalid(format!("database.path is required for {mode} mode"))
+    })
+}
+
+fn admission_policy_from_document(
+    document: RuntimePolicyConfigDocument,
+) -> Result<AdmissionPolicy, RuntimeConfigError> {
+    let action = match document.unapproved_seller_action {
+        Some(RuntimeUnapprovedSellerActionDocument::StoreRawOnly) | None => {
+            UnapprovedSellerAction::StoreRawOnly
+        }
+        Some(RuntimeUnapprovedSellerActionDocument::RejectWrite) => {
+            UnapprovedSellerAction::RejectWrite
+        }
+    };
+    let mut policy = AdmissionPolicy::new()
+        .with_write_auth_required(document.require_write_auth.unwrap_or(true))
+        .with_unapproved_seller_action(action);
+    for pubkey in document.approved_sellers {
+        policy = policy.approve_seller(PublicKeyHex::new(&pubkey).map_err(|error| {
+            RuntimeConfigError::invalid(format!(
+                "policy.approved_sellers contains invalid pubkey: {error}"
+            ))
+        })?);
+    }
+    for pubkey in document.blocked_pubkeys {
+        policy = policy.block_pubkey(PublicKeyHex::new(&pubkey).map_err(|error| {
+            RuntimeConfigError::invalid(format!(
+                "policy.blocked_pubkeys contains invalid pubkey: {error}"
+            ))
+        })?);
+    }
+    Ok(policy)
 }
 
 impl RuntimeLimitValuesDocument {
@@ -1789,6 +2246,13 @@ fn accepts_nostr_json(value: Option<&HeaderValue>) -> bool {
         })
 }
 
+fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+}
+
 fn listing_projection_query(parsed: &ListingHttpQuery) -> Result<ListingProjectionQuery, ApiError> {
     let query = parsed.marketplace();
     if !query.categories.is_empty() {
@@ -2747,7 +3211,7 @@ mod tests {
         assert_eq!(error.kind(), RuntimeCommandErrorKind::Unsupported);
         assert_eq!(
             error.message(),
-            "migrate currently supports memory SurrealDB configs only"
+            "runtime commands currently support memory or rocksdb SurrealDB configs only"
         );
     }
 

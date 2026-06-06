@@ -10,7 +10,16 @@ readme = "../../README"
 
 [dependencies]
 tangle_runtime = { path = "../tangle_runtime" }
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "signal"] }
+
+[dev-dependencies]
+futures-util = "0.3"
+serde_json = "1"
+tangle_protocol = { path = "../tangle_protocol" }
+tangle_store_surreal = { path = "../tangle_store_surreal" }
+tangle_test_support = { path = "../tangle_test_support" }
+tokio = { version = "1", features = ["macros", "rt", "time"] }
+tokio-tungstenite = "0.29"
 
 [lints]
 workspace = true
