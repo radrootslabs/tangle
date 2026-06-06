@@ -1,0 +1,15 @@
+[package]
+name = "tangle_crypto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Cryptographic verification utilities for Tangle"
+
+[dependencies]
+sha2 = "0.10"
+tangle_protocol = { path = "../tangle_protocol" }
+
+[lints]
+workspace = true

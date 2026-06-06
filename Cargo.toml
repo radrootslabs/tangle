@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/tangle", "crates/tangle_protocol"]
+members = ["crates/tangle", "crates/tangle_crypto", "crates/tangle_protocol"]
 resolver = "2"
 
 [workspace.package]
