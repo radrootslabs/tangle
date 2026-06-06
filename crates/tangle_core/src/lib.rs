@@ -4,8 +4,9 @@ use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
 use tangle_crypto::verify_event_signature;
 use tangle_nips::{
-    DeletionRequest, ListingProjectionEvaluation, RelayAuthEvent, evaluate_listing_projection,
-    parse_deletion_request, parse_nip50_filter_search, parse_relay_auth_event,
+    DeletionRequest, FulfillmentMethod, ListingProjectionEvaluation, ListingUnit, RelayAuthEvent,
+    evaluate_listing_projection, parse_deletion_request, parse_nip50_filter_search,
+    parse_relay_auth_event,
 };
 use tangle_protocol::{Event, EventId, Filter, PublicKeyHex, UnixTimestamp, event_to_value};
 use tangle_store::{
@@ -1545,6 +1546,551 @@ impl fmt::Display for QueryPlanError {
 
 impl std::error::Error for QueryPlanError {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketplaceQuerySpec {
+    pub q: Option<String>,
+    pub categories: Vec<String>,
+    pub seller: Option<PublicKeyHex>,
+    pub statuses: Vec<MarketplaceListingStatus>,
+    pub currencies: Vec<String>,
+    pub units: Vec<ListingUnit>,
+    pub min_price: Option<String>,
+    pub max_price: Option<String>,
+    pub fulfillment: Vec<FulfillmentMethod>,
+    pub delivery_only: Option<bool>,
+    pub pickup: Option<bool>,
+    pub latitude_microdegrees: Option<i32>,
+    pub longitude_microdegrees: Option<i32>,
+    pub radius_meters: Option<u64>,
+    pub near: Option<String>,
+    pub sort: MarketplaceSort,
+    pub limit: Option<u64>,
+    pub cursor: Option<MarketplaceCursor>,
+}
+
+impl Default for MarketplaceQuerySpec {
+    fn default() -> Self {
+        Self {
+            q: None,
+            categories: Vec::new(),
+            seller: None,
+            statuses: Vec::new(),
+            currencies: Vec::new(),
+            units: Vec::new(),
+            min_price: None,
+            max_price: None,
+            fulfillment: Vec::new(),
+            delivery_only: None,
+            pickup: None,
+            latitude_microdegrees: None,
+            longitude_microdegrees: None,
+            radius_meters: None,
+            near: None,
+            sort: MarketplaceSort::Relevance,
+            limit: None,
+            cursor: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketplaceQuery {
+    pub text: Option<MarketplaceSearchText>,
+    pub categories: Vec<String>,
+    pub seller: Option<PublicKeyHex>,
+    pub statuses: Vec<MarketplaceListingStatus>,
+    pub currencies: Vec<String>,
+    pub units: Vec<ListingUnit>,
+    pub min_price: Option<MarketplaceDecimal>,
+    pub max_price: Option<MarketplaceDecimal>,
+    pub fulfillment: Vec<FulfillmentMethod>,
+    pub delivery_only: Option<bool>,
+    pub pickup: Option<bool>,
+    pub location: MarketplaceLocationFilter,
+    pub sort: MarketplaceSort,
+    pub limit: u64,
+    pub cursor: Option<MarketplaceCursor>,
+}
+
+impl MarketplaceQuery {
+    pub const DEFAULT_LIMIT: u64 = 50;
+    pub const MAX_LIMIT: u64 = 100;
+
+    pub fn from_spec(
+        spec: MarketplaceQuerySpec,
+        limits: RuntimeLimits,
+    ) -> Result<Self, MarketplaceQueryError> {
+        let text = marketplace_search_text(spec.q, limits)?;
+        let min_price = spec
+            .min_price
+            .as_deref()
+            .map(|value| MarketplaceDecimal::new("min_price", value))
+            .transpose()?;
+        let max_price = spec
+            .max_price
+            .as_deref()
+            .map(|value| MarketplaceDecimal::new("max_price", value))
+            .transpose()?;
+        if let (Some(min_price), Some(max_price)) = (&min_price, &max_price)
+            && decimal_greater_than(min_price, max_price)
+        {
+            return Err(MarketplaceQueryError::new(
+                MarketplaceQueryErrorKind::InvalidPriceRange,
+                "min_price must not exceed max_price",
+            ));
+        }
+        let location = MarketplaceLocationFilter::from_spec(
+            spec.latitude_microdegrees,
+            spec.longitude_microdegrees,
+            spec.radius_meters,
+            spec.near,
+        )?;
+        if spec.sort == MarketplaceSort::Distance && !location.has_distance_reference() {
+            return Err(MarketplaceQueryError::new(
+                MarketplaceQueryErrorKind::MissingDistanceReference,
+                "distance sort requires a point or near filter",
+            ));
+        }
+        let limit = spec.limit.unwrap_or(Self::DEFAULT_LIMIT);
+        if limit == 0 || limit > Self::MAX_LIMIT {
+            return Err(MarketplaceQueryError::new(
+                MarketplaceQueryErrorKind::LimitOutOfRange,
+                format!("limit must be between 1 and {}", Self::MAX_LIMIT),
+            ));
+        }
+        if spec
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.sort != spec.sort)
+        {
+            return Err(MarketplaceQueryError::new(
+                MarketplaceQueryErrorKind::CursorSortMismatch,
+                "cursor sort must match query sort",
+            ));
+        }
+        Ok(Self {
+            text,
+            categories: normalized_text_filters("category", spec.categories)?,
+            seller: spec.seller,
+            statuses: unique_sorted(spec.statuses),
+            currencies: normalized_currencies(spec.currencies)?,
+            units: unique_listing_units(spec.units),
+            min_price,
+            max_price,
+            fulfillment: unique_sorted(spec.fulfillment),
+            delivery_only: spec.delivery_only,
+            pickup: spec.pickup,
+            location,
+            sort: spec.sort,
+            limit,
+            cursor: spec.cursor,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketplaceSearchText {
+    pub raw: String,
+    pub terms: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketplaceDecimal {
+    pub raw: String,
+    whole: String,
+    fraction: String,
+}
+
+impl MarketplaceDecimal {
+    pub fn new(field: &'static str, value: &str) -> Result<Self, MarketplaceQueryError> {
+        let raw = value.trim();
+        let Some((whole, fraction)) = normalized_decimal_parts(raw) else {
+            return Err(MarketplaceQueryError::new(
+                MarketplaceQueryErrorKind::InvalidDecimal,
+                format!("{field} must be an exact unsigned decimal"),
+            ));
+        };
+        Ok(Self {
+            raw: raw.to_owned(),
+            whole,
+            fraction,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketplaceLocationFilter {
+    pub point: Option<MarketplaceGeoPoint>,
+    pub radius_meters: Option<u64>,
+    pub near: Option<String>,
+}
+
+impl MarketplaceLocationFilter {
+    pub fn from_spec(
+        latitude_microdegrees: Option<i32>,
+        longitude_microdegrees: Option<i32>,
+        radius_meters: Option<u64>,
+        near: Option<String>,
+    ) -> Result<Self, MarketplaceQueryError> {
+        let point = match (latitude_microdegrees, longitude_microdegrees) {
+            (Some(latitude_microdegrees), Some(longitude_microdegrees)) => Some(
+                MarketplaceGeoPoint::new(latitude_microdegrees, longitude_microdegrees)?,
+            ),
+            (None, None) => None,
+            _ => {
+                return Err(MarketplaceQueryError::new(
+                    MarketplaceQueryErrorKind::InvalidLocation,
+                    "lat and lon must be provided together",
+                ));
+            }
+        };
+        let radius_meters = match radius_meters {
+            Some(0) => {
+                return Err(MarketplaceQueryError::new(
+                    MarketplaceQueryErrorKind::InvalidLocation,
+                    "radius_meters must be greater than zero",
+                ));
+            }
+            Some(_) if point.is_none() => {
+                return Err(MarketplaceQueryError::new(
+                    MarketplaceQueryErrorKind::InvalidLocation,
+                    "radius_meters requires lat and lon",
+                ));
+            }
+            value => value,
+        };
+        let near = normalize_optional_text("near", near)?;
+        Ok(Self {
+            point,
+            radius_meters,
+            near,
+        })
+    }
+
+    pub fn has_distance_reference(&self) -> bool {
+        self.point.is_some() || self.near.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarketplaceGeoPoint {
+    pub latitude_microdegrees: i32,
+    pub longitude_microdegrees: i32,
+}
+
+impl MarketplaceGeoPoint {
+    pub fn new(
+        latitude_microdegrees: i32,
+        longitude_microdegrees: i32,
+    ) -> Result<Self, MarketplaceQueryError> {
+        if !(-90_000_000..=90_000_000).contains(&latitude_microdegrees) {
+            return Err(MarketplaceQueryError::new(
+                MarketplaceQueryErrorKind::InvalidLocation,
+                "lat must be between -90 and 90 degrees",
+            ));
+        }
+        if !(-180_000_000..=180_000_000).contains(&longitude_microdegrees) {
+            return Err(MarketplaceQueryError::new(
+                MarketplaceQueryErrorKind::InvalidLocation,
+                "lon must be between -180 and 180 degrees",
+            ));
+        }
+        Ok(Self {
+            latitude_microdegrees,
+            longitude_microdegrees,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketplaceCursorSpec {
+    pub version: u16,
+    pub sort: MarketplaceSort,
+    pub score: Option<i64>,
+    pub distance_meters: Option<u64>,
+    pub price: Option<String>,
+    pub updated_at: UnixTimestamp,
+    pub event_id: EventId,
+    pub filter_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketplaceCursor {
+    pub version: u16,
+    pub sort: MarketplaceSort,
+    pub score: Option<i64>,
+    pub distance_meters: Option<u64>,
+    pub price: Option<MarketplaceDecimal>,
+    pub updated_at: UnixTimestamp,
+    pub event_id: EventId,
+    pub filter_hash: String,
+}
+
+impl MarketplaceCursor {
+    pub fn from_spec(spec: MarketplaceCursorSpec) -> Result<Self, MarketplaceQueryError> {
+        if spec.version == 0 {
+            return Err(invalid_cursor("cursor version must be greater than zero"));
+        }
+        let filter_hash = spec.filter_hash.trim();
+        if filter_hash.is_empty() {
+            return Err(invalid_cursor("cursor filter_hash must not be empty"));
+        }
+        let price = spec
+            .price
+            .as_deref()
+            .map(|value| MarketplaceDecimal::new("cursor price", value))
+            .transpose()?;
+        match spec.sort {
+            MarketplaceSort::Relevance if spec.score.is_none() => {
+                return Err(invalid_cursor("relevance cursor requires score"));
+            }
+            MarketplaceSort::Distance if spec.distance_meters.is_none() => {
+                return Err(invalid_cursor("distance cursor requires distance"));
+            }
+            MarketplaceSort::PriceAsc | MarketplaceSort::PriceDesc if price.is_none() => {
+                return Err(invalid_cursor("price cursor requires price"));
+            }
+            _ => {}
+        }
+        Ok(Self {
+            version: spec.version,
+            sort: spec.sort,
+            score: spec.score,
+            distance_meters: spec.distance_meters,
+            price,
+            updated_at: spec.updated_at,
+            event_id: spec.event_id,
+            filter_hash: filter_hash.to_owned(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MarketplaceListingStatus {
+    Active,
+    Sold,
+    Draft,
+    Inactive,
+    Expired,
+    Deleted,
+    Hidden,
+    Rejected,
+}
+
+impl MarketplaceListingStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Sold => "sold",
+            Self::Draft => "draft",
+            Self::Inactive => "inactive",
+            Self::Expired => "expired",
+            Self::Deleted => "deleted",
+            Self::Hidden => "hidden",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+impl fmt::Display for MarketplaceListingStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketplaceSort {
+    Relevance,
+    Freshness,
+    PriceAsc,
+    PriceDesc,
+    Distance,
+    SellerTrust,
+}
+
+impl MarketplaceSort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Relevance => "relevance",
+            Self::Freshness => "freshness",
+            Self::PriceAsc => "price_asc",
+            Self::PriceDesc => "price_desc",
+            Self::Distance => "distance",
+            Self::SellerTrust => "seller_trust",
+        }
+    }
+}
+
+impl fmt::Display for MarketplaceSort {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketplaceQueryError {
+    kind: MarketplaceQueryErrorKind,
+    message: String,
+}
+
+impl MarketplaceQueryError {
+    pub fn new(kind: MarketplaceQueryErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub fn runtime_limit(violation: RuntimeLimitViolation) -> Self {
+        Self::new(
+            MarketplaceQueryErrorKind::RuntimeLimit,
+            format!("runtime limit: {violation}"),
+        )
+    }
+
+    pub fn kind(&self) -> MarketplaceQueryErrorKind {
+        self.kind
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for MarketplaceQueryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for MarketplaceQueryError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketplaceQueryErrorKind {
+    RuntimeLimit,
+    EmptyFilterValue,
+    InvalidDecimal,
+    InvalidPriceRange,
+    InvalidLocation,
+    LimitOutOfRange,
+    MissingDistanceReference,
+    InvalidCursor,
+    CursorSortMismatch,
+}
+
+fn marketplace_search_text(
+    q: Option<String>,
+    limits: RuntimeLimits,
+) -> Result<Option<MarketplaceSearchText>, MarketplaceQueryError> {
+    let Some(q) = q else {
+        return Ok(None);
+    };
+    limits
+        .validate_search_query(&q)
+        .map_err(MarketplaceQueryError::runtime_limit)?;
+    let raw = q.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let terms = unique_sorted(
+        raw.split_whitespace()
+            .map(|term| term.to_ascii_lowercase())
+            .collect(),
+    );
+    Ok(Some(MarketplaceSearchText {
+        raw: raw.to_owned(),
+        terms,
+    }))
+}
+
+fn normalized_text_filters(
+    field: &'static str,
+    values: Vec<String>,
+) -> Result<Vec<String>, MarketplaceQueryError> {
+    let values = values
+        .into_iter()
+        .map(|value| normalize_required_text(field, value))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(unique_sorted(values))
+}
+
+fn normalized_currencies(values: Vec<String>) -> Result<Vec<String>, MarketplaceQueryError> {
+    let values = values
+        .into_iter()
+        .map(|value| {
+            normalize_required_text("currency", value).map(|value| value.to_ascii_uppercase())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(unique_sorted(values))
+}
+
+fn normalize_required_text(
+    field: &'static str,
+    value: String,
+) -> Result<String, MarketplaceQueryError> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Err(MarketplaceQueryError::new(
+            MarketplaceQueryErrorKind::EmptyFilterValue,
+            format!("{field} filter value must not be empty"),
+        ));
+    }
+    Ok(normalized)
+}
+
+fn normalize_optional_text(
+    field: &'static str,
+    value: Option<String>,
+) -> Result<Option<String>, MarketplaceQueryError> {
+    value
+        .map(|value| normalize_required_text(field, value))
+        .transpose()
+}
+
+fn unique_listing_units(mut values: Vec<ListingUnit>) -> Vec<ListingUnit> {
+    values.sort_by_key(|unit| unit.canonical());
+    values.dedup();
+    values
+}
+
+fn normalized_decimal_parts(value: &str) -> Option<(String, String)> {
+    let mut parts = value.split('.');
+    let whole = parts.next().unwrap_or_default();
+    let fraction = parts.next();
+    if parts.next().is_some()
+        || whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let fraction = match fraction {
+        Some(value) if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) => {
+            return None;
+        }
+        Some(value) => value.trim_end_matches('0').to_owned(),
+        None => String::new(),
+    };
+    let whole = whole.trim_start_matches('0');
+    let whole = if whole.is_empty() { "0" } else { whole };
+    Some((whole.to_owned(), fraction))
+}
+
+fn decimal_greater_than(left: &MarketplaceDecimal, right: &MarketplaceDecimal) -> bool {
+    match left.whole.len().cmp(&right.whole.len()) {
+        std::cmp::Ordering::Equal => {}
+        ordering => return ordering == std::cmp::Ordering::Greater,
+    }
+    match left.whole.cmp(&right.whole) {
+        std::cmp::Ordering::Equal => {}
+        ordering => return ordering == std::cmp::Ordering::Greater,
+    }
+    left.fraction > right.fraction
+}
+
+fn invalid_cursor(message: &'static str) -> MarketplaceQueryError {
+    MarketplaceQueryError::new(MarketplaceQueryErrorKind::InvalidCursor, message)
+}
+
 fn unique_sorted<T>(values: Vec<T>) -> Vec<T>
 where
     T: Ord,
@@ -1849,13 +2395,19 @@ mod tests {
         AdmissionContext, AdmissionEffect, AdmissionEvent, AdmissionEventKind, AdmissionPolicy,
         AdmissionRejectionKind, EventIngestionEffect, EventIngestionRejectionKind, EventIngestor,
         EventParser, EventValidationRejection, EventValidationRejectionKind, EventValidator,
+        MarketplaceCursor, MarketplaceCursorSpec, MarketplaceDecimal, MarketplaceGeoPoint,
+        MarketplaceListingStatus, MarketplaceLocationFilter, MarketplaceQuery,
+        MarketplaceQueryErrorKind, MarketplaceQuerySpec, MarketplaceSort,
         Nip50QueryCompileErrorKind, Nip50QueryCompiler, NostrFilterCompileErrorKind,
         NostrFilterCompiler, ProjectionExclusionReason, QueryExecutionMode, QueryPlan,
         QueryPlanBranch, QueryPlanBranchSpec, QueryPlanError, QuerySearch, QuerySort, QuerySource,
         QueryTagFilter, RuntimeLimitConfigError, RuntimeLimitKind, RuntimeLimitValues,
         RuntimeLimits, UnapprovedSellerAction,
     };
-    use tangle_nips::{ListingProjection, evaluate_listing_projection, parse_deletion_request};
+    use tangle_nips::{
+        FulfillmentMethod, ListingProjection, ListingUnit, evaluate_listing_projection,
+        parse_deletion_request,
+    };
     use tangle_protocol::{
         AddressCoordinate, Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp,
         UnsignedEvent, filter_from_value,
@@ -3315,6 +3867,421 @@ mod tests {
         assert_eq!(
             QuerySort::ScoreDescCreatedAtDescEventIdAsc.to_string(),
             "score desc created_at desc event_id asc"
+        );
+    }
+
+    #[test]
+    fn marketplace_query_model_normalizes_http_search_constraints() {
+        let event_id = EventId::new(&"c".repeat(EventId::HEX_LENGTH)).expect("id");
+        let cursor = MarketplaceCursor::from_spec(MarketplaceCursorSpec {
+            version: 1,
+            sort: MarketplaceSort::Distance,
+            score: None,
+            distance_meters: Some(1234),
+            price: None,
+            updated_at: UnixTimestamp::new(50),
+            event_id: event_id.clone(),
+            filter_hash: " hash ".to_owned(),
+        })
+        .expect("cursor");
+        let query = MarketplaceQuery::from_spec(
+            MarketplaceQuerySpec {
+                q: Some(" Fresh carrots fresh ".to_owned()),
+                categories: vec![
+                    " Vegetables ".to_owned(),
+                    "csa".to_owned(),
+                    "vegetables".to_owned(),
+                ],
+                seller: Some(pubkey("1")),
+                statuses: vec![
+                    MarketplaceListingStatus::Sold,
+                    MarketplaceListingStatus::Active,
+                    MarketplaceListingStatus::Active,
+                ],
+                currencies: vec!["usd".to_owned(), " CAD ".to_owned(), "USD".to_owned()],
+                units: vec![ListingUnit::Lb, ListingUnit::Kg, ListingUnit::Lb],
+                min_price: Some("001.500".to_owned()),
+                max_price: Some("10.0".to_owned()),
+                fulfillment: vec![
+                    FulfillmentMethod::Delivery,
+                    FulfillmentMethod::Pickup,
+                    FulfillmentMethod::Delivery,
+                ],
+                delivery_only: Some(false),
+                pickup: Some(true),
+                latitude_microdegrees: Some(47_606_200),
+                longitude_microdegrees: Some(-122_332_100),
+                radius_meters: Some(25_000),
+                near: Some(" Ballard ".to_owned()),
+                sort: MarketplaceSort::Distance,
+                limit: Some(25),
+                cursor: Some(cursor.clone()),
+            },
+            RuntimeLimits::default(),
+        )
+        .expect("query");
+
+        assert_eq!(
+            query.text.as_ref().expect("text").raw,
+            "Fresh carrots fresh"
+        );
+        assert_eq!(
+            query.text.as_ref().expect("text").terms,
+            ["carrots".to_owned(), "fresh".to_owned()]
+        );
+        assert_eq!(
+            query.categories,
+            ["csa".to_owned(), "vegetables".to_owned()]
+        );
+        assert_eq!(query.seller, Some(pubkey("1")));
+        assert_eq!(
+            query.statuses,
+            [
+                MarketplaceListingStatus::Active,
+                MarketplaceListingStatus::Sold
+            ]
+        );
+        assert_eq!(query.currencies, ["CAD".to_owned(), "USD".to_owned()]);
+        assert_eq!(query.units, [ListingUnit::Kg, ListingUnit::Lb]);
+        assert_eq!(query.min_price.as_ref().expect("min").raw, "001.500");
+        assert_eq!(query.min_price.as_ref().expect("min").whole, "1");
+        assert_eq!(query.min_price.as_ref().expect("min").fraction, "5");
+        assert_eq!(query.max_price.as_ref().expect("max").whole, "10");
+        assert_eq!(query.max_price.as_ref().expect("max").fraction, "");
+        assert_eq!(
+            query.fulfillment,
+            [FulfillmentMethod::Pickup, FulfillmentMethod::Delivery]
+        );
+        assert_eq!(query.delivery_only, Some(false));
+        assert_eq!(query.pickup, Some(true));
+        assert_eq!(
+            query.location.point,
+            Some(MarketplaceGeoPoint {
+                latitude_microdegrees: 47_606_200,
+                longitude_microdegrees: -122_332_100,
+            })
+        );
+        assert_eq!(query.location.radius_meters, Some(25_000));
+        assert_eq!(query.location.near, Some("ballard".to_owned()));
+        assert!(query.location.has_distance_reference());
+        assert_eq!(query.sort, MarketplaceSort::Distance);
+        assert_eq!(query.limit, 25);
+        assert_eq!(query.cursor, Some(cursor));
+        assert_eq!(event_id.as_str(), &"c".repeat(EventId::HEX_LENGTH));
+    }
+
+    #[test]
+    fn marketplace_query_model_handles_defaults_labels_and_cursors() {
+        let default_query =
+            MarketplaceQuery::from_spec(MarketplaceQuerySpec::default(), RuntimeLimits::default())
+                .expect("default query");
+        let blank_query = MarketplaceQuery::from_spec(
+            MarketplaceQuerySpec {
+                q: Some("   ".to_owned()),
+                ..MarketplaceQuerySpec::default()
+            },
+            RuntimeLimits::default(),
+        )
+        .expect("blank query");
+        let relevance_cursor = MarketplaceCursor::from_spec(MarketplaceCursorSpec {
+            version: 1,
+            sort: MarketplaceSort::Relevance,
+            score: Some(9),
+            distance_meters: None,
+            price: None,
+            updated_at: UnixTimestamp::new(60),
+            event_id: EventId::new(&"d".repeat(EventId::HEX_LENGTH)).expect("id"),
+            filter_hash: "filter".to_owned(),
+        })
+        .expect("relevance cursor");
+        let price_cursor = MarketplaceCursor::from_spec(MarketplaceCursorSpec {
+            version: 1,
+            sort: MarketplaceSort::PriceAsc,
+            score: None,
+            distance_meters: None,
+            price: Some("009.9900".to_owned()),
+            updated_at: UnixTimestamp::new(61),
+            event_id: EventId::new(&"e".repeat(EventId::HEX_LENGTH)).expect("id"),
+            filter_hash: "price".to_owned(),
+        })
+        .expect("price cursor");
+        let freshness_cursor = MarketplaceCursor::from_spec(MarketplaceCursorSpec {
+            version: 1,
+            sort: MarketplaceSort::Freshness,
+            score: None,
+            distance_meters: None,
+            price: None,
+            updated_at: UnixTimestamp::new(62),
+            event_id: EventId::new(&"f".repeat(EventId::HEX_LENGTH)).expect("id"),
+            filter_hash: "freshness".to_owned(),
+        })
+        .expect("freshness cursor");
+        let zero_decimal = MarketplaceDecimal::new("price", "000").expect("zero");
+        let fraction_decimal = MarketplaceDecimal::new("price", "1.2300").expect("fraction");
+
+        assert_eq!(default_query.text, None);
+        assert_eq!(default_query.limit, MarketplaceQuery::DEFAULT_LIMIT);
+        assert_eq!(default_query.sort, MarketplaceSort::Relevance);
+        assert_eq!(blank_query.text, None);
+        assert_eq!(relevance_cursor.score, Some(9));
+        assert_eq!(price_cursor.price.as_ref().expect("price").whole, "9");
+        assert_eq!(price_cursor.price.as_ref().expect("price").fraction, "99");
+        assert_eq!(freshness_cursor.filter_hash, "freshness");
+        assert_eq!(zero_decimal.whole, "0");
+        assert_eq!(zero_decimal.fraction, "");
+        assert_eq!(fraction_decimal.whole, "1");
+        assert_eq!(fraction_decimal.fraction, "23");
+        assert_eq!(
+            [
+                MarketplaceListingStatus::Active.as_str(),
+                MarketplaceListingStatus::Sold.as_str(),
+                MarketplaceListingStatus::Draft.as_str(),
+                MarketplaceListingStatus::Inactive.as_str(),
+                MarketplaceListingStatus::Expired.as_str(),
+                MarketplaceListingStatus::Deleted.as_str(),
+                MarketplaceListingStatus::Hidden.as_str(),
+                MarketplaceListingStatus::Rejected.as_str(),
+            ],
+            [
+                "active", "sold", "draft", "inactive", "expired", "deleted", "hidden", "rejected",
+            ]
+        );
+        assert_eq!(
+            [
+                MarketplaceSort::Relevance.as_str(),
+                MarketplaceSort::Freshness.as_str(),
+                MarketplaceSort::PriceAsc.as_str(),
+                MarketplaceSort::PriceDesc.as_str(),
+                MarketplaceSort::Distance.as_str(),
+                MarketplaceSort::SellerTrust.as_str(),
+            ],
+            [
+                "relevance",
+                "freshness",
+                "price_asc",
+                "price_desc",
+                "distance",
+                "seller_trust",
+            ]
+        );
+        assert_eq!(MarketplaceListingStatus::Hidden.to_string(), "hidden");
+        assert_eq!(MarketplaceSort::SellerTrust.to_string(), "seller_trust");
+    }
+
+    #[test]
+    fn marketplace_query_model_rejects_invalid_constraints() {
+        let runtime_limit = MarketplaceQuery::from_spec(
+            MarketplaceQuerySpec {
+                q: Some("fresh carrots".to_owned()),
+                ..MarketplaceQuerySpec::default()
+            },
+            limits_with(|values| values.max_search_tokens = 1),
+        )
+        .expect_err("runtime");
+        let empty_category = MarketplaceQuery::from_spec(
+            MarketplaceQuerySpec {
+                categories: vec![" ".to_owned()],
+                ..MarketplaceQuerySpec::default()
+            },
+            RuntimeLimits::default(),
+        )
+        .expect_err("category");
+        let empty_near =
+            MarketplaceLocationFilter::from_spec(None, None, None, Some(" ".to_owned()))
+                .expect_err("near");
+        let invalid_decimal = MarketplaceDecimal::new("min_price", "1..2").expect_err("decimal");
+        let empty_whole = MarketplaceDecimal::new("min_price", ".2").expect_err("decimal");
+        let bad_whole = MarketplaceDecimal::new("min_price", "a.2").expect_err("decimal");
+        let empty_fraction = MarketplaceDecimal::new("min_price", "1.").expect_err("decimal");
+        let bad_fraction = MarketplaceDecimal::new("min_price", "1.a").expect_err("decimal");
+        let invalid_price_range = MarketplaceQuery::from_spec(
+            MarketplaceQuerySpec {
+                min_price: Some("2".to_owned()),
+                max_price: Some("1.99".to_owned()),
+                ..MarketplaceQuerySpec::default()
+            },
+            RuntimeLimits::default(),
+        )
+        .expect_err("price range");
+        let invalid_fraction_range = MarketplaceQuery::from_spec(
+            MarketplaceQuerySpec {
+                min_price: Some("1.2".to_owned()),
+                max_price: Some("1.10".to_owned()),
+                ..MarketplaceQuerySpec::default()
+            },
+            RuntimeLimits::default(),
+        )
+        .expect_err("fraction range");
+        let missing_lon =
+            MarketplaceLocationFilter::from_spec(Some(1), None, None, None).expect_err("location");
+        let query_missing_lon = MarketplaceQuery::from_spec(
+            MarketplaceQuerySpec {
+                latitude_microdegrees: Some(1),
+                ..MarketplaceQuerySpec::default()
+            },
+            RuntimeLimits::default(),
+        )
+        .expect_err("query location");
+        let zero_radius = MarketplaceLocationFilter::from_spec(Some(1), Some(2), Some(0), None)
+            .expect_err("radius");
+        let radius_without_point = MarketplaceLocationFilter::from_spec(None, None, Some(1), None)
+            .expect_err("radius point");
+        let bad_latitude = MarketplaceGeoPoint::new(90_000_001, 0).expect_err("lat");
+        let bad_longitude = MarketplaceGeoPoint::new(0, 180_000_001).expect_err("lon");
+        let missing_distance_reference = MarketplaceQuery::from_spec(
+            MarketplaceQuerySpec {
+                sort: MarketplaceSort::Distance,
+                ..MarketplaceQuerySpec::default()
+            },
+            RuntimeLimits::default(),
+        )
+        .expect_err("distance");
+        let bad_limit = MarketplaceQuery::from_spec(
+            MarketplaceQuerySpec {
+                limit: Some(MarketplaceQuery::MAX_LIMIT + 1),
+                ..MarketplaceQuerySpec::default()
+            },
+            RuntimeLimits::default(),
+        )
+        .expect_err("limit");
+        let cursor_sort = MarketplaceCursor::from_spec(MarketplaceCursorSpec {
+            version: 1,
+            sort: MarketplaceSort::Relevance,
+            score: Some(1),
+            distance_meters: None,
+            price: None,
+            updated_at: UnixTimestamp::new(70),
+            event_id: EventId::new(&"a".repeat(EventId::HEX_LENGTH)).expect("id"),
+            filter_hash: "cursor".to_owned(),
+        })
+        .expect("cursor");
+        let cursor_sort_mismatch = MarketplaceQuery::from_spec(
+            MarketplaceQuerySpec {
+                sort: MarketplaceSort::Freshness,
+                cursor: Some(cursor_sort),
+                ..MarketplaceQuerySpec::default()
+            },
+            RuntimeLimits::default(),
+        )
+        .expect_err("cursor sort");
+
+        assert_eq!(
+            runtime_limit.kind(),
+            MarketplaceQueryErrorKind::RuntimeLimit
+        );
+        assert!(runtime_limit.message().starts_with("runtime limit:"));
+        assert_eq!(runtime_limit.to_string(), runtime_limit.message());
+        assert_eq!(
+            empty_category.kind(),
+            MarketplaceQueryErrorKind::EmptyFilterValue
+        );
+        assert_eq!(
+            empty_category.message(),
+            "category filter value must not be empty"
+        );
+        assert_eq!(
+            empty_near.kind(),
+            MarketplaceQueryErrorKind::EmptyFilterValue
+        );
+        assert_eq!(empty_near.message(), "near filter value must not be empty");
+        for error in [
+            invalid_decimal,
+            empty_whole,
+            bad_whole,
+            empty_fraction,
+            bad_fraction,
+        ] {
+            assert_eq!(error.kind(), MarketplaceQueryErrorKind::InvalidDecimal);
+            assert_eq!(
+                error.message(),
+                "min_price must be an exact unsigned decimal"
+            );
+        }
+        assert_eq!(
+            invalid_price_range.kind(),
+            MarketplaceQueryErrorKind::InvalidPriceRange
+        );
+        assert_eq!(
+            invalid_fraction_range.kind(),
+            MarketplaceQueryErrorKind::InvalidPriceRange
+        );
+        for error in [
+            missing_lon,
+            query_missing_lon,
+            zero_radius,
+            radius_without_point,
+            bad_latitude,
+            bad_longitude,
+        ] {
+            assert_eq!(error.kind(), MarketplaceQueryErrorKind::InvalidLocation);
+        }
+        assert_eq!(
+            missing_distance_reference.kind(),
+            MarketplaceQueryErrorKind::MissingDistanceReference
+        );
+        assert_eq!(bad_limit.kind(), MarketplaceQueryErrorKind::LimitOutOfRange);
+        assert_eq!(
+            cursor_sort_mismatch.kind(),
+            MarketplaceQueryErrorKind::CursorSortMismatch
+        );
+    }
+
+    #[test]
+    fn marketplace_cursor_model_rejects_invalid_payloads() {
+        let base = || MarketplaceCursorSpec {
+            version: 1,
+            sort: MarketplaceSort::Freshness,
+            score: None,
+            distance_meters: None,
+            price: None,
+            updated_at: UnixTimestamp::new(80),
+            event_id: EventId::new(&"b".repeat(EventId::HEX_LENGTH)).expect("id"),
+            filter_hash: "filter".to_owned(),
+        };
+        let zero_version = MarketplaceCursor::from_spec(MarketplaceCursorSpec {
+            version: 0,
+            ..base()
+        })
+        .expect_err("version");
+        let empty_hash = MarketplaceCursor::from_spec(MarketplaceCursorSpec {
+            filter_hash: " ".to_owned(),
+            ..base()
+        })
+        .expect_err("hash");
+        let missing_score = MarketplaceCursor::from_spec(MarketplaceCursorSpec {
+            sort: MarketplaceSort::Relevance,
+            ..base()
+        })
+        .expect_err("score");
+        let missing_distance = MarketplaceCursor::from_spec(MarketplaceCursorSpec {
+            sort: MarketplaceSort::Distance,
+            ..base()
+        })
+        .expect_err("distance");
+        let missing_price = MarketplaceCursor::from_spec(MarketplaceCursorSpec {
+            sort: MarketplaceSort::PriceDesc,
+            ..base()
+        })
+        .expect_err("price");
+        let invalid_price = MarketplaceCursor::from_spec(MarketplaceCursorSpec {
+            sort: MarketplaceSort::PriceAsc,
+            price: Some("bad".to_owned()),
+            ..base()
+        })
+        .expect_err("price decimal");
+
+        for error in [
+            zero_version,
+            empty_hash,
+            missing_score,
+            missing_distance,
+            missing_price,
+        ] {
+            assert_eq!(error.kind(), MarketplaceQueryErrorKind::InvalidCursor);
+        }
+        assert_eq!(
+            invalid_price.kind(),
+            MarketplaceQueryErrorKind::InvalidDecimal
         );
     }
 
