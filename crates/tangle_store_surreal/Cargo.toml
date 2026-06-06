@@ -8,6 +8,7 @@ license.workspace = true
 description = "SurrealDB storage backend for tangle"
 
 [dependencies]
+sha2 = "0.10"
 
 [lints]
 workspace = true

@@ -421,6 +421,9 @@ dependencies = [
 [[package]]
 name = "tangle_store_surreal"
 version = "0.1.0"
+dependencies = [
+ "sha2",
+]
 
 [[package]]
 name = "tangle_test_support"
