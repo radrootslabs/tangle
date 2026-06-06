@@ -369,6 +369,96 @@ pub fn parse_listing_text(event: &Event) -> Result<Option<ListingText>, String> 
     }))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PriceAmount {
+    raw: String,
+}
+
+impl PriceAmount {
+    pub fn raw(&self) -> &str {
+        &self.raw
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListingPrice {
+    amount: PriceAmount,
+    currency: String,
+    display_currency: String,
+    frequency: Option<String>,
+}
+
+impl ListingPrice {
+    pub fn amount(&self) -> &PriceAmount {
+        &self.amount
+    }
+
+    pub fn currency(&self) -> &str {
+        &self.currency
+    }
+
+    pub fn display_currency(&self) -> &str {
+        &self.display_currency
+    }
+
+    pub fn frequency(&self) -> Option<&str> {
+        self.frequency.as_deref()
+    }
+}
+
+pub fn parse_listing_price(event: &Event) -> Result<Option<ListingPrice>, String> {
+    if listing_kind_for_event(event).is_none() {
+        return Ok(None);
+    }
+    let values = required_tag_values(event, "price")?;
+    match values.len() {
+        0 | 1 => Err("price tag must include amount and currency".to_owned()),
+        2 | 3 => {
+            let amount = parse_price_amount(&values[0])?;
+            let currency = values[1].clone();
+            if currency.is_empty() {
+                return Err("price currency must not be empty".to_owned());
+            }
+            let frequency = values.get(2).cloned();
+            if frequency.as_ref().is_some_and(String::is_empty) {
+                return Err("price frequency must not be empty".to_owned());
+            }
+            Ok(Some(ListingPrice {
+                amount,
+                display_currency: currency.to_ascii_uppercase(),
+                currency,
+                frequency,
+            }))
+        }
+        _ => Err("price tag must not include more than amount currency and frequency".to_owned()),
+    }
+}
+
+fn parse_price_amount(value: &str) -> Result<PriceAmount, String> {
+    if is_exact_unsigned_decimal(value) {
+        return Ok(PriceAmount {
+            raw: value.to_owned(),
+        });
+    }
+    Err("price amount must be an exact unsigned decimal".to_owned())
+}
+
+fn is_exact_unsigned_decimal(value: &str) -> bool {
+    let mut parts = value.split('.');
+    let whole = parts.next().unwrap_or_default();
+    let fraction = parts.next();
+    if parts.next().is_some()
+        || whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    match fraction {
+        Some(value) => !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()),
+        None => true,
+    }
+}
+
 fn listing_kind_for_event(event: &Event) -> Option<ListingKind> {
     match event.unsigned().kind().as_u32() {
         NIP99_PUBLIC_LISTING_KIND => Some(ListingKind::Public),
@@ -381,8 +471,8 @@ fn listing_kind_for_event(event: &Event) -> Option<ListingKind> {
 mod tests {
     use super::{
         DeletionTarget, ListingKind, NIP99_PUBLIC_LISTING_KIND, matching_tags, optional_tag_value,
-        optional_tag_values, parse_deletion_request, parse_listing_identity, parse_listing_text,
-        parse_nip50_filter_search, parse_nip50_search, parse_relay_auth_event,
+        optional_tag_values, parse_deletion_request, parse_listing_identity, parse_listing_price,
+        parse_listing_text, parse_nip50_filter_search, parse_nip50_search, parse_relay_auth_event,
         parse_required_u64_tag, parse_u64_field, repeated_or_missing_policy_boundary,
         required_tag_value, required_tag_values, single_letter_tag_values,
         single_letter_values_for, tag_count,
@@ -930,6 +1020,121 @@ mod tests {
         assert_eq!(
             parse_listing_text(&empty).expect_err("empty"),
             "listing summary tag must not be empty"
+        );
+    }
+
+    #[test]
+    fn listing_price_parser_extracts_exact_decimal_currency_and_frequency() {
+        let event = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("price", &["12.50", "usd", "weekly"]).expect("price")],
+        );
+
+        let price = parse_listing_price(&event).expect("parse").expect("price");
+
+        assert_eq!(price.amount().raw(), "12.50");
+        assert_eq!(price.currency(), "usd");
+        assert_eq!(price.display_currency(), "USD");
+        assert_eq!(price.frequency(), Some("weekly"));
+    }
+
+    #[test]
+    fn listing_price_parser_accepts_integer_amount_without_frequency() {
+        let event = event_with_kind_and_tags(
+            30_403,
+            vec![Tag::from_parts("price", &["7", "CAD"]).expect("price")],
+        );
+
+        let price = parse_listing_price(&event).expect("parse").expect("price");
+
+        assert_eq!(price.amount().raw(), "7");
+        assert_eq!(price.currency(), "CAD");
+        assert_eq!(price.display_currency(), "CAD");
+        assert_eq!(price.frequency(), None);
+    }
+
+    #[test]
+    fn listing_price_parser_ignores_non_listing_kinds() {
+        let event =
+            event_with_kind_and_tags(1, vec![Tag::from_parts("price", &["3", "USD"]).expect("p")]);
+
+        assert_eq!(parse_listing_price(&event), Ok(None));
+    }
+
+    #[test]
+    fn listing_price_parser_rejects_missing_repeated_and_bad_shape() {
+        let missing = event_with_kind_and_tags(u64::from(NIP99_PUBLIC_LISTING_KIND), Vec::new());
+        let repeated = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![
+                Tag::from_parts("price", &["3", "USD"]).expect("price"),
+                Tag::from_parts("price", &["4", "USD"]).expect("price"),
+            ],
+        );
+        let no_values = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("price", &[]).expect("price")],
+        );
+        let no_currency = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("price", &["3"]).expect("price")],
+        );
+        let extra = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("price", &["3", "USD", "weekly", "extra"]).expect("price")],
+        );
+
+        assert_eq!(
+            parse_listing_price(&missing).expect_err("missing"),
+            "tag `price` is required"
+        );
+        assert_eq!(
+            parse_listing_price(&repeated).expect_err("repeated"),
+            "tag `price` must not be repeated"
+        );
+        assert_eq!(
+            parse_listing_price(&no_values).expect_err("values"),
+            "price tag must include amount and currency"
+        );
+        assert_eq!(
+            parse_listing_price(&no_currency).expect_err("currency"),
+            "price tag must include amount and currency"
+        );
+        assert_eq!(
+            parse_listing_price(&extra).expect_err("extra"),
+            "price tag must not include more than amount currency and frequency"
+        );
+    }
+
+    #[test]
+    fn listing_price_parser_rejects_malformed_amount_currency_and_frequency() {
+        let bad_amounts = ["", ".50", "12.", "12.5.0", "-12", "1e3", "12 usd"];
+        for amount in bad_amounts {
+            let event = event_with_kind_and_tags(
+                u64::from(NIP99_PUBLIC_LISTING_KIND),
+                vec![Tag::from_parts("price", &[amount, "USD"]).expect("price")],
+            );
+            assert_eq!(
+                parse_listing_price(&event).expect_err("amount"),
+                "price amount must be an exact unsigned decimal"
+            );
+        }
+        let empty_currency = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("price", &["3", ""]).expect("price")],
+        );
+        let empty_frequency = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("price", &["3", "USD", ""]).expect("price")],
+        );
+
+        assert_eq!(
+            parse_listing_price(&empty_currency).expect_err("currency"),
+            "price currency must not be empty"
+        );
+        assert_eq!(
+            parse_listing_price(&empty_frequency).expect_err("frequency"),
+            "price frequency must not be empty"
         );
     }
 
