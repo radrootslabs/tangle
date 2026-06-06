@@ -36,8 +36,8 @@ use tangle_protocol::{
 use tangle_store::{StoreEventOutcome, StoredEvent};
 use tangle_store_surreal::{
     CommentProjectionOutcome, CommentProjectionQuery, DurableRateLimitDecision,
-    ListingProjectionQuery, MigrationApplyOutcome, SearchDocumentQuery, SurrealConnectionConfig,
-    SurrealConnectionMode, SurrealStore, base_migration_plan,
+    ListingProjectionQuery, MigrationApplyOutcome, ReactionProjectionOutcome, SearchDocumentQuery,
+    SurrealConnectionConfig, SurrealConnectionMode, SurrealStore, base_migration_plan,
 };
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -597,6 +597,11 @@ async fn project_stored_event(
         Ok(CommentProjectionOutcome::NotComment | CommentProjectionOutcome::Ineligible) => false,
         Err(_) => return Err(RuntimeCommandError::store("event projection failed")),
     };
+    let reaction_projected = match store.project_reaction(event, now).await {
+        Ok(ReactionProjectionOutcome::Projected) => true,
+        Ok(ReactionProjectionOutcome::NotReaction | ReactionProjectionOutcome::Ineligible) => false,
+        Err(_) => return Err(RuntimeCommandError::store("event projection failed")),
+    };
     if effect == AdmissionEffect::StoreRawAndProjectPublicListing {
         if store.project_current_listing(event, now).await.is_err()
             || store.project_listing_helpers(event).await.is_err()
@@ -606,7 +611,7 @@ async fn project_stored_event(
         }
         return Ok(true);
     }
-    Ok(comment_projected)
+    Ok(comment_projected || reaction_projected)
 }
 
 fn parse_event_import_document(raw: &str) -> Result<Vec<Event>, RuntimeCommandError> {
@@ -963,6 +968,10 @@ fn runtime_router(
             "/api/listings/{pubkey}/{d}/comments",
             get(runtime_listing_comments),
         )
+        .route(
+            "/api/listings/{pubkey}/{d}/reactions",
+            get(runtime_listing_reactions),
+        )
         .route("/api/search", get(runtime_marketplace_search))
         .route("/api/sellers/{pubkey}", get(runtime_seller_detail))
         .route(
@@ -1051,6 +1060,20 @@ async fn runtime_listing_comments(
         )),
         Path((pubkey, d)),
         RawQuery(query),
+    )
+    .await
+}
+
+async fn runtime_listing_reactions(
+    State(state): State<RuntimeRelayState>,
+    Path((pubkey, d)): Path<(String, String)>,
+) -> Result<Json<ReactionCountsDocument>, ApiError> {
+    listing_reactions(
+        State(ListingsHttpState::new(
+            state.store.clone(),
+            state.config.limits(),
+        )),
+        Path((pubkey, d)),
     )
     .await
 }
@@ -1887,6 +1910,7 @@ impl EventMessageHandler {
                 .await
                 .is_err()
             || self.store.project_comment(&event, now).await.is_err()
+            || self.store.project_reaction(&event, now).await.is_err()
         {
             return ok_rejected(event_id, "error: projection failed".to_owned());
         }
@@ -2568,6 +2592,18 @@ pub struct CommentReferenceDocument {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReactionCountsDocument {
+    pub target_event_id: String,
+    pub target_kind: Option<String>,
+    pub like_count: u64,
+    pub dislike_count: u64,
+    pub emoji_count: u64,
+    pub text_count: u64,
+    pub total_count: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SellerDocument {
     pub pubkey: String,
     pub approved: bool,
@@ -2771,6 +2807,10 @@ pub fn listings_router(state: ListingsHttpState) -> Router {
         .route("/api/listings", get(listings))
         .route("/api/listings/{pubkey}/{d}", get(listing_detail))
         .route("/api/listings/{pubkey}/{d}/comments", get(listing_comments))
+        .route(
+            "/api/listings/{pubkey}/{d}/reactions",
+            get(listing_reactions),
+        )
         .route("/api/search", get(marketplace_search))
         .route("/api/sellers/{pubkey}", get(seller_detail))
         .with_state(state)
@@ -2910,6 +2950,36 @@ async fn listing_comments(
         items,
         next_cursor: None,
     }))
+}
+
+async fn listing_reactions(
+    State(state): State<ListingsHttpState>,
+    Path((pubkey, d)): Path<(String, String)>,
+) -> Result<Json<ReactionCountsDocument>, ApiError> {
+    let pubkey = parse_pubkey("pubkey", &pubkey)?;
+    let d = required_value("d", &d)?;
+    let listing_key = format!("30402:{}:{d}", pubkey.as_str());
+    let listing = state
+        .store
+        .listing_current_row(&listing_key)
+        .await
+        .map_err(|_| ApiError::internal())?
+        .ok_or_else(|| ApiError::not_found("listing not found"))?;
+    if bool_field(&listing, "hidden")? || bool_field(&listing, "deleted")? {
+        return Err(ApiError::not_found("listing not found"));
+    }
+    let event_id =
+        EventId::new(&string_field(&listing, "event_id")?).map_err(|_| ApiError::internal())?;
+    let row = state
+        .store
+        .reaction_count_row(&event_id)
+        .await
+        .map_err(|_| ApiError::internal())?;
+    Ok(Json(reaction_counts_document(
+        row.as_ref(),
+        event_id.as_str(),
+        Some("30402"),
+    )?))
 }
 
 async fn marketplace_search(
@@ -3187,6 +3257,35 @@ fn comment_item_document(row: &serde_json::Value) -> Result<CommentItemDocument,
             author: optional_string_field(row, "parent_author")?,
         },
     })
+}
+
+fn reaction_counts_document(
+    row: Option<&serde_json::Value>,
+    target_event_id: &str,
+    target_kind: Option<&str>,
+) -> Result<ReactionCountsDocument, ApiError> {
+    match row {
+        Some(row) => Ok(ReactionCountsDocument {
+            target_event_id: string_field(row, "target_event_id")?,
+            target_kind: optional_string_field(row, "target_kind")?,
+            like_count: u64_field(row, "like_count")?,
+            dislike_count: u64_field(row, "dislike_count")?,
+            emoji_count: u64_field(row, "emoji_count")?,
+            text_count: u64_field(row, "text_count")?,
+            total_count: u64_field(row, "total_count")?,
+            updated_at: u64_field(row, "updated_at")?,
+        }),
+        None => Ok(ReactionCountsDocument {
+            target_event_id: target_event_id.to_owned(),
+            target_kind: target_kind.map(str::to_owned),
+            like_count: 0,
+            dislike_count: 0,
+            emoji_count: 0,
+            text_count: 0,
+            total_count: 0,
+            updated_at: 0,
+        }),
+    }
 }
 
 fn fulfillment_document(row: &serde_json::Value) -> Result<Vec<String>, ApiError> {
@@ -5532,6 +5631,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn listing_reactions_endpoint_returns_aggregate_counts() {
+        let store = runtime_memory_store().await;
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let reaction = listing_reaction(&listing, 1_714_125_420, "+");
+        store
+            .project_current_listing(&listing, UnixTimestamp::new(1_714_125_419))
+            .await
+            .expect("project listing");
+
+        let uri = format!(
+            "/api/listings/{}/listing-a/reactions",
+            listing.unsigned().pubkey().as_str()
+        );
+        let empty = listings_router(ListingsHttpState::new(
+            store.clone(),
+            RuntimeLimits::default(),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri(uri.as_str())
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+        assert_eq!(empty.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(empty.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
+            serde_json::json!({
+                "target_event_id": listing.id().as_str(),
+                "target_kind": "30402",
+                "like_count": 0,
+                "dislike_count": 0,
+                "emoji_count": 0,
+                "text_count": 0,
+                "total_count": 0,
+                "updated_at": 0
+            })
+        );
+
+        store
+            .project_reaction(&reaction, UnixTimestamp::new(1_714_125_421))
+            .await
+            .expect("project reaction");
+        let response = listings_router(ListingsHttpState::new(store, RuntimeLimits::default()))
+            .oneshot(
+                Request::builder()
+                    .uri(uri.as_str())
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
+            serde_json::json!({
+                "target_event_id": listing.id().as_str(),
+                "target_kind": "30402",
+                "like_count": 1,
+                "dislike_count": 0,
+                "emoji_count": 0,
+                "text_count": 0,
+                "total_count": 1,
+                "updated_at": 1714125421
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn listing_detail_endpoint_rejects_invalid_or_missing_listing() {
         let store = runtime_memory_store().await;
         let response = listings_router(ListingsHttpState::new(
@@ -5791,6 +5966,35 @@ mod tests {
             content,
         )
         .expect("comment event")
+    }
+
+    fn listing_reaction(
+        listing: &tangle_protocol::Event,
+        created_at: u64,
+        content: &str,
+    ) -> tangle_protocol::Event {
+        let listing_key = format!("30402:{}:listing-a", listing.unsigned().pubkey().as_str());
+        build_fixture_event_from_parts(
+            FixtureKey::Buyer,
+            created_at,
+            7,
+            vec![
+                vec![
+                    "e".to_owned(),
+                    listing.id().as_str().to_owned(),
+                    "wss://relay.radroots.test".to_owned(),
+                    listing.unsigned().pubkey().as_str().to_owned(),
+                ],
+                vec![
+                    "p".to_owned(),
+                    listing.unsigned().pubkey().as_str().to_owned(),
+                ],
+                vec!["a".to_owned(), listing_key],
+                vec!["k".to_owned(), "30402".to_owned()],
+            ],
+            content,
+        )
+        .expect("reaction event")
     }
 
     fn runtime_client_message_loop() -> ClientMessageLoop {

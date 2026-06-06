@@ -53,6 +53,7 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
 
     let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
     let comment = listing_comment(&listing, 1_714_124_436, "Can I pickup Saturday?");
+    let reaction = listing_reaction(&listing, 1_714_124_437, "+");
     let auth = build_fixture_event(&auth_event_spec()).expect("auth");
     let seller = FixtureKey::Seller.public_key();
 
@@ -163,6 +164,29 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
     assert_eq!(fetched_comment[2]["id"], comment.id().as_str());
     assert_eq!(next_label(&mut publisher).await, "EOSE");
 
+    publisher
+        .send(Message::Text(
+            serde_json::json!(["EVENT", event_to_value(&reaction)])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("reaction send");
+    assert_ok(&next_json(&mut publisher).await, true);
+    publisher
+        .send(Message::Text(
+            serde_json::json!(["REQ", "sub-reaction", { "ids": [reaction.id().as_str()] }])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("reaction fetch send");
+    let fetched_reaction = next_json(&mut publisher).await;
+    assert_eq!(fetched_reaction[0], "EVENT");
+    assert_eq!(fetched_reaction[1], "sub-reaction");
+    assert_eq!(fetched_reaction[2]["id"], reaction.id().as_str());
+    assert_eq!(next_label(&mut publisher).await, "EOSE");
+
     subscriber
         .send(Message::Text(
             serde_json::json!(["CLOSE", "sub-live"]).to_string().into(),
@@ -191,6 +215,13 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
     assert!(comments.contains("200 OK"));
     assert!(comments.contains(comment.id().as_str()));
     assert!(comments.contains("Can I pickup Saturday?"));
+    let reactions = http_get(
+        port,
+        &format!("/api/listings/{}/listing-a/reactions", seller.as_str()),
+    );
+    assert!(reactions.contains("200 OK"));
+    assert!(reactions.contains("\"like_count\":1"));
+    assert!(reactions.contains("\"total_count\":1"));
     let search = http_get(port, "/api/search?q=carrots&limit=5");
     assert!(search.contains("200 OK"));
     assert!(search.contains(listing.id().as_str()));
@@ -234,6 +265,14 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
     assert_eq!(comment_row["event_id"], comment.id().as_str());
     assert_eq!(comment_row["root_ref"], listing_key);
     assert_eq!(comment_row["content"], "Can I pickup Saturday?");
+    let reaction_count = store
+        .reaction_count_row(listing.id())
+        .await
+        .expect("reaction count")
+        .expect("reaction count exists");
+    assert_eq!(reaction_count["target_event_id"], listing.id().as_str());
+    assert_eq!(reaction_count["like_count"], 1_i64);
+    assert_eq!(reaction_count["total_count"], 1_i64);
     assert!(
         store
             .search_document_row(&listing_key)
@@ -821,6 +860,35 @@ fn listing_comment(
         content,
     )
     .expect("comment event")
+}
+
+fn listing_reaction(
+    listing: &tangle_protocol::Event,
+    created_at: u64,
+    content: &str,
+) -> tangle_protocol::Event {
+    let listing_key = format!("30402:{}:listing-a", listing.unsigned().pubkey().as_str());
+    build_fixture_event_from_parts(
+        FixtureKey::Seller,
+        created_at,
+        7,
+        vec![
+            vec![
+                "e".to_owned(),
+                listing.id().as_str().to_owned(),
+                "wss://relay.radroots.test".to_owned(),
+                listing.unsigned().pubkey().as_str().to_owned(),
+            ],
+            vec![
+                "p".to_owned(),
+                listing.unsigned().pubkey().as_str().to_owned(),
+            ],
+            vec!["a".to_owned(), listing_key],
+            vec!["k".to_owned(), "30402".to_owned()],
+        ],
+        content,
+    )
+    .expect("reaction event")
 }
 
 fn stop_relay(mut relay: Child) {
