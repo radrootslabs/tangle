@@ -287,6 +287,7 @@ pub fn base_migration_plan() -> SurrealMigrationPlan {
         listing_current_schema(),
         listing_helper_schemas(),
         search_document_schema(),
+        policy_schemas(),
     ])
     .expect("base migration plan is strictly ordered")
 }
@@ -559,6 +560,69 @@ DEFINE INDEX IF NOT EXISTS search_doc_body_ft ON TABLE search_doc FIELDS body FU
 "#,
     )
     .expect("search document schema is valid")
+}
+
+pub fn policy_schemas() -> SurrealMigration {
+    SurrealMigration::new(
+        "0010_policy",
+        r#"
+DEFINE TABLE IF NOT EXISTS relay_user SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS pubkey ON TABLE relay_user TYPE string;
+DEFINE FIELD IF NOT EXISTS role ON TABLE relay_user TYPE string;
+DEFINE FIELD IF NOT EXISTS seller_approved ON TABLE relay_user TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS blocked ON TABLE relay_user TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS created_at ON TABLE relay_user TYPE int;
+DEFINE FIELD IF NOT EXISTS updated_at ON TABLE relay_user TYPE int;
+DEFINE INDEX IF NOT EXISTS relay_user_pubkey_uid ON TABLE relay_user COLUMNS pubkey UNIQUE;
+DEFINE INDEX IF NOT EXISTS relay_user_role ON TABLE relay_user COLUMNS role;
+DEFINE INDEX IF NOT EXISTS relay_user_seller_gate ON TABLE relay_user COLUMNS seller_approved, blocked;
+
+DEFINE TABLE IF NOT EXISTS hidden_event SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS event_id ON TABLE hidden_event TYPE string;
+DEFINE FIELD IF NOT EXISTS reason ON TABLE hidden_event TYPE string;
+DEFINE FIELD IF NOT EXISTS source ON TABLE hidden_event TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON TABLE hidden_event TYPE int;
+DEFINE FIELD IF NOT EXISTS admin_pubkey ON TABLE hidden_event TYPE string;
+DEFINE INDEX IF NOT EXISTS hidden_event_uid ON TABLE hidden_event COLUMNS event_id UNIQUE;
+DEFINE INDEX IF NOT EXISTS hidden_event_created ON TABLE hidden_event COLUMNS created_at;
+
+DEFINE TABLE IF NOT EXISTS moderation_action SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS action_id ON TABLE moderation_action TYPE string;
+DEFINE FIELD IF NOT EXISTS admin_pubkey ON TABLE moderation_action TYPE string;
+DEFINE FIELD IF NOT EXISTS target_type ON TABLE moderation_action TYPE string;
+DEFINE FIELD IF NOT EXISTS target_ref ON TABLE moderation_action TYPE string;
+DEFINE FIELD IF NOT EXISTS action ON TABLE moderation_action TYPE string;
+DEFINE FIELD IF NOT EXISTS reason ON TABLE moderation_action TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON TABLE moderation_action TYPE int;
+DEFINE INDEX IF NOT EXISTS moderation_action_target ON TABLE moderation_action COLUMNS target_type, target_ref, created_at;
+DEFINE INDEX IF NOT EXISTS moderation_action_admin ON TABLE moderation_action COLUMNS admin_pubkey, created_at;
+
+DEFINE TABLE IF NOT EXISTS rate_limit_state SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS key ON TABLE rate_limit_state TYPE string;
+DEFINE FIELD IF NOT EXISTS state ON TABLE rate_limit_state TYPE string;
+DEFINE FIELD IF NOT EXISTS expires_at ON TABLE rate_limit_state TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS created_at ON TABLE rate_limit_state TYPE int;
+DEFINE FIELD IF NOT EXISTS updated_at ON TABLE rate_limit_state TYPE int;
+DEFINE INDEX IF NOT EXISTS rate_limit_state_key_uid ON TABLE rate_limit_state COLUMNS key UNIQUE;
+DEFINE INDEX IF NOT EXISTS rate_limit_state_expires ON TABLE rate_limit_state COLUMNS expires_at;
+
+DEFINE TABLE IF NOT EXISTS import_checkpoint SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS name ON TABLE import_checkpoint TYPE string;
+DEFINE FIELD IF NOT EXISTS offset ON TABLE import_checkpoint TYPE int;
+DEFINE FIELD IF NOT EXISTS event_id ON TABLE import_checkpoint TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS updated_at ON TABLE import_checkpoint TYPE int;
+DEFINE INDEX IF NOT EXISTS import_checkpoint_name_uid ON TABLE import_checkpoint COLUMNS name UNIQUE;
+
+DEFINE TABLE IF NOT EXISTS projection_error SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS event_id ON TABLE projection_error TYPE string;
+DEFINE FIELD IF NOT EXISTS projector ON TABLE projection_error TYPE string;
+DEFINE FIELD IF NOT EXISTS error ON TABLE projection_error TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON TABLE projection_error TYPE int;
+DEFINE INDEX IF NOT EXISTS projection_error_event ON TABLE projection_error COLUMNS event_id;
+DEFINE INDEX IF NOT EXISTS projection_error_projector_created ON TABLE projection_error COLUMNS projector, created_at;
+"#,
+    )
+    .expect("policy schemas are valid")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1315,6 +1379,98 @@ mod tests {
             "BM25",
         ] {
             assert!(info.contains(expected), "missing {expected} in {info}");
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_schemas_define_user_moderation_and_rebuild_tables() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+
+        for (table, expected) in [
+            (
+                "relay_user",
+                vec![
+                    "pubkey",
+                    "role",
+                    "seller_approved",
+                    "blocked",
+                    "created_at",
+                    "updated_at",
+                    "relay_user_pubkey_uid",
+                    "relay_user_seller_gate",
+                ],
+            ),
+            (
+                "hidden_event",
+                vec![
+                    "event_id",
+                    "reason",
+                    "source",
+                    "created_at",
+                    "admin_pubkey",
+                    "hidden_event_uid",
+                    "hidden_event_created",
+                ],
+            ),
+            (
+                "moderation_action",
+                vec![
+                    "action_id",
+                    "admin_pubkey",
+                    "target_type",
+                    "target_ref",
+                    "action",
+                    "reason",
+                    "created_at",
+                    "moderation_action_target",
+                    "moderation_action_admin",
+                ],
+            ),
+            (
+                "rate_limit_state",
+                vec![
+                    "key",
+                    "state",
+                    "expires_at",
+                    "created_at",
+                    "updated_at",
+                    "rate_limit_state_key_uid",
+                    "rate_limit_state_expires",
+                ],
+            ),
+            (
+                "import_checkpoint",
+                vec![
+                    "name",
+                    "offset",
+                    "event_id",
+                    "updated_at",
+                    "import_checkpoint_name_uid",
+                ],
+            ),
+            (
+                "projection_error",
+                vec![
+                    "event_id",
+                    "projector",
+                    "error",
+                    "created_at",
+                    "projection_error_event",
+                    "projection_error_projector_created",
+                ],
+            ),
+        ] {
+            let info = store.table_info(table).await.expect("table info");
+            for field in expected {
+                assert!(
+                    info.contains(field),
+                    "missing {field} in {table} info {info}"
+                );
+            }
         }
     }
 }
