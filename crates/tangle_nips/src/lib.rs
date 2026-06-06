@@ -549,6 +549,90 @@ fn parse_unit_value(value: &str) -> Option<ListingUnit> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FulfillmentMethod {
+    Pickup,
+    Delivery,
+    Shipping,
+}
+
+impl FulfillmentMethod {
+    pub fn canonical(self) -> &'static str {
+        match self {
+            Self::Pickup => "pickup",
+            Self::Delivery => "delivery",
+            Self::Shipping => "shipping",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListingFulfillment {
+    methods: Vec<FulfillmentMethod>,
+}
+
+impl ListingFulfillment {
+    pub fn methods(&self) -> &[FulfillmentMethod] {
+        &self.methods
+    }
+
+    pub fn pickup_available(&self) -> bool {
+        self.methods.contains(&FulfillmentMethod::Pickup)
+    }
+
+    pub fn delivery_available(&self) -> bool {
+        self.methods.contains(&FulfillmentMethod::Delivery)
+    }
+
+    pub fn shipping_available(&self) -> bool {
+        self.methods.contains(&FulfillmentMethod::Shipping)
+    }
+
+    pub fn delivery_only(&self) -> bool {
+        self.delivery_available() && !self.pickup_available() && !self.shipping_available()
+    }
+}
+
+pub fn parse_listing_fulfillment(event: &Event) -> Result<Option<ListingFulfillment>, String> {
+    if listing_kind_for_event(event).is_none() {
+        return Ok(None);
+    }
+    let tags = matching_tags(event, "fulfillment");
+    if tags.is_empty() {
+        return Err("tag `fulfillment` is required".to_owned());
+    }
+    let mut methods = Vec::new();
+    for tag in tags {
+        let values = tag.values();
+        let raw = values
+            .first()
+            .ok_or_else(|| "tag `fulfillment` must include a value".to_owned())?;
+        if values.len() > 1 {
+            return Err("fulfillment tag must include exactly one method".to_owned());
+        }
+        let normalized = raw.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            return Err("fulfillment tag method must not be empty".to_owned());
+        }
+        let method = parse_fulfillment_method(&normalized)
+            .ok_or_else(|| format!("fulfillment method `{raw}` is unsupported"))?;
+        if !methods.contains(&method) {
+            methods.push(method);
+        }
+    }
+    methods.sort_unstable();
+    Ok(Some(ListingFulfillment { methods }))
+}
+
+fn parse_fulfillment_method(value: &str) -> Option<FulfillmentMethod> {
+    match value {
+        "pickup" => Some(FulfillmentMethod::Pickup),
+        "delivery" => Some(FulfillmentMethod::Delivery),
+        "shipping" => Some(FulfillmentMethod::Shipping),
+        _ => None,
+    }
+}
+
 fn listing_kind_for_event(event: &Event) -> Option<ListingKind> {
     match event.unsigned().kind().as_u32() {
         NIP99_PUBLIC_LISTING_KIND => Some(ListingKind::Public),
@@ -560,12 +644,13 @@ fn listing_kind_for_event(event: &Event) -> Option<ListingKind> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeletionTarget, ListingKind, ListingUnit, NIP99_PUBLIC_LISTING_KIND, matching_tags,
-        optional_tag_value, optional_tag_values, parse_deletion_request, parse_listing_identity,
-        parse_listing_price, parse_listing_text, parse_listing_unit, parse_nip50_filter_search,
-        parse_nip50_search, parse_relay_auth_event, parse_required_u64_tag, parse_u64_field,
-        repeated_or_missing_policy_boundary, required_tag_value, required_tag_values,
-        single_letter_tag_values, single_letter_values_for, tag_count,
+        DeletionTarget, FulfillmentMethod, ListingKind, ListingUnit, NIP99_PUBLIC_LISTING_KIND,
+        matching_tags, optional_tag_value, optional_tag_values, parse_deletion_request,
+        parse_listing_fulfillment, parse_listing_identity, parse_listing_price, parse_listing_text,
+        parse_listing_unit, parse_nip50_filter_search, parse_nip50_search, parse_relay_auth_event,
+        parse_required_u64_tag, parse_u64_field, repeated_or_missing_policy_boundary,
+        required_tag_value, required_tag_values, single_letter_tag_values,
+        single_letter_values_for, tag_count,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -1326,6 +1411,106 @@ mod tests {
         assert_eq!(
             parse_listing_unit(&event).expect_err("unsupported"),
             "listing unit `bushel` is unsupported"
+        );
+    }
+
+    #[test]
+    fn listing_fulfillment_parser_extracts_methods_and_availability_flags() {
+        let event = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![
+                Tag::from_parts("fulfillment", &["shipping"]).expect("shipping"),
+                Tag::from_parts("fulfillment", &["pickup"]).expect("pickup"),
+                Tag::from_parts("fulfillment", &["delivery"]).expect("delivery"),
+                Tag::from_parts("fulfillment", &["pickup"]).expect("pickup"),
+            ],
+        );
+
+        let fulfillment = parse_listing_fulfillment(&event)
+            .expect("parse")
+            .expect("fulfillment");
+
+        assert_eq!(
+            fulfillment.methods(),
+            &[
+                FulfillmentMethod::Pickup,
+                FulfillmentMethod::Delivery,
+                FulfillmentMethod::Shipping
+            ]
+        );
+        assert_eq!(FulfillmentMethod::Pickup.canonical(), "pickup");
+        assert_eq!(FulfillmentMethod::Delivery.canonical(), "delivery");
+        assert_eq!(FulfillmentMethod::Shipping.canonical(), "shipping");
+        assert!(fulfillment.pickup_available());
+        assert!(fulfillment.delivery_available());
+        assert!(fulfillment.shipping_available());
+        assert!(!fulfillment.delivery_only());
+    }
+
+    #[test]
+    fn listing_fulfillment_parser_derives_delivery_only_and_ignores_non_listings() {
+        let delivery = event_with_kind_and_tags(
+            30_403,
+            vec![Tag::from_parts("fulfillment", &[" delivery "]).expect("delivery")],
+        );
+        let note = event_with_kind_and_tags(
+            1,
+            vec![Tag::from_parts("fulfillment", &["pickup"]).expect("pickup")],
+        );
+
+        let fulfillment = parse_listing_fulfillment(&delivery)
+            .expect("delivery")
+            .expect("fulfillment");
+
+        assert_eq!(fulfillment.methods(), &[FulfillmentMethod::Delivery]);
+        assert!(fulfillment.delivery_only());
+        assert_eq!(parse_listing_fulfillment(&note), Ok(None));
+    }
+
+    #[test]
+    fn listing_fulfillment_parser_rejects_missing_and_malformed_tags() {
+        let missing = event_with_kind_and_tags(u64::from(NIP99_PUBLIC_LISTING_KIND), Vec::new());
+        let missing_value = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("fulfillment", &[]).expect("fulfillment")],
+        );
+        let extra_value = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("fulfillment", &["pickup", "delivery"]).expect("fulfillment")],
+        );
+        let empty = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("fulfillment", &["  "]).expect("fulfillment")],
+        );
+
+        assert_eq!(
+            parse_listing_fulfillment(&missing).expect_err("missing"),
+            "tag `fulfillment` is required"
+        );
+        assert_eq!(
+            parse_listing_fulfillment(&missing_value).expect_err("value"),
+            "tag `fulfillment` must include a value"
+        );
+        assert_eq!(
+            parse_listing_fulfillment(&extra_value).expect_err("extra"),
+            "fulfillment tag must include exactly one method"
+        );
+        assert_eq!(
+            parse_listing_fulfillment(&empty).expect_err("empty"),
+            "fulfillment tag method must not be empty"
+        );
+    }
+
+    #[test]
+    fn listing_fulfillment_parser_rejects_unsupported_methods() {
+        let event = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("fulfillment", &["drone"]).expect("fulfillment")],
+        );
+
+        assert_eq!(
+            parse_listing_fulfillment(&event).expect_err("unsupported"),
+            "fulfillment method `drone` is unsupported"
         );
     }
 
