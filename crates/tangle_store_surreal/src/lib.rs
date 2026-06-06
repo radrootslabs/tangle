@@ -286,6 +286,7 @@ pub fn base_migration_plan() -> SurrealMigrationPlan {
         listing_revision_schema(),
         listing_current_schema(),
         listing_helper_schemas(),
+        search_document_schema(),
     ])
     .expect("base migration plan is strictly ordered")
 }
@@ -521,6 +522,43 @@ DEFINE INDEX IF NOT EXISTS listing_certification_listing ON TABLE listing_certif
 "#,
     )
     .expect("listing helper schemas are valid")
+}
+
+pub fn search_document_schema() -> SurrealMigration {
+    SurrealMigration::new(
+        "0009_search_document",
+        r#"
+DEFINE ANALYZER IF NOT EXISTS tangle_listing_search TOKENIZERS blank,class FILTERS lowercase,snowball(english);
+DEFINE TABLE IF NOT EXISTS search_doc SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS doc_key ON TABLE search_doc TYPE string;
+DEFINE FIELD IF NOT EXISTS event_id ON TABLE search_doc TYPE string;
+DEFINE FIELD IF NOT EXISTS current_event_id ON TABLE search_doc TYPE string;
+DEFINE FIELD IF NOT EXISTS doc_type ON TABLE search_doc TYPE string;
+DEFINE FIELD IF NOT EXISTS kind ON TABLE search_doc TYPE int;
+DEFINE FIELD IF NOT EXISTS pubkey ON TABLE search_doc TYPE string;
+DEFINE FIELD IF NOT EXISTS address_key ON TABLE search_doc TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS title ON TABLE search_doc TYPE string;
+DEFINE FIELD IF NOT EXISTS summary ON TABLE search_doc TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS body ON TABLE search_doc TYPE string;
+DEFINE FIELD IF NOT EXISTS category_text ON TABLE search_doc TYPE string;
+DEFINE FIELD IF NOT EXISTS location_text ON TABLE search_doc TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS tags ON TABLE search_doc TYPE array;
+DEFINE FIELD IF NOT EXISTS categories ON TABLE search_doc TYPE array;
+DEFINE FIELD IF NOT EXISTS created_at ON TABLE search_doc TYPE int;
+DEFINE FIELD IF NOT EXISTS updated_at ON TABLE search_doc TYPE int;
+DEFINE FIELD IF NOT EXISTS visible ON TABLE search_doc TYPE bool;
+DEFINE FIELD IF NOT EXISTS status ON TABLE search_doc TYPE string;
+DEFINE FIELD IF NOT EXISTS seller_trust_score ON TABLE search_doc TYPE option<int>;
+DEFINE INDEX IF NOT EXISTS search_doc_key_uid ON TABLE search_doc COLUMNS doc_key UNIQUE;
+DEFINE INDEX IF NOT EXISTS search_doc_type_visible_updated ON TABLE search_doc COLUMNS doc_type, visible, updated_at, event_id;
+DEFINE INDEX IF NOT EXISTS search_doc_kind_visible_updated ON TABLE search_doc COLUMNS visible, kind, updated_at, event_id;
+DEFINE INDEX IF NOT EXISTS search_doc_kind_pubkey_updated ON TABLE search_doc COLUMNS kind, pubkey, updated_at, event_id;
+DEFINE INDEX IF NOT EXISTS search_doc_title_ft ON TABLE search_doc FIELDS title FULLTEXT ANALYZER tangle_listing_search BM25 HIGHLIGHTS;
+DEFINE INDEX IF NOT EXISTS search_doc_summary_ft ON TABLE search_doc FIELDS summary FULLTEXT ANALYZER tangle_listing_search BM25 HIGHLIGHTS;
+DEFINE INDEX IF NOT EXISTS search_doc_body_ft ON TABLE search_doc FIELDS body FULLTEXT ANALYZER tangle_listing_search BM25 HIGHLIGHTS;
+"#,
+    )
+    .expect("search document schema is valid")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1236,6 +1274,47 @@ mod tests {
                     "missing {expected} in {table} info {info}"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn search_document_schema_defines_listing_search_surface() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let info = store.table_info("search_doc").await.expect("table info");
+
+        for expected in [
+            "doc_key",
+            "event_id",
+            "current_event_id",
+            "doc_type",
+            "kind",
+            "pubkey",
+            "address_key",
+            "title",
+            "summary",
+            "body",
+            "category_text",
+            "location_text",
+            "tags",
+            "categories",
+            "created_at",
+            "updated_at",
+            "visible",
+            "status",
+            "seller_trust_score",
+            "search_doc_key_uid",
+            "search_doc_type_visible_updated",
+            "search_doc_kind_visible_updated",
+            "search_doc_title_ft",
+            "tangle_listing_search",
+            "FULLTEXT",
+            "BM25",
+        ] {
+            assert!(info.contains(expected), "missing {expected} in {info}");
         }
     }
 }
