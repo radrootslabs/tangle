@@ -2,6 +2,7 @@
 
 use axum::{
     Json, Router,
+    extract::ws::WebSocketUpgrade,
     extract::{Path, RawQuery, State},
     response::{IntoResponse, Response},
     routing::get,
@@ -167,6 +168,27 @@ impl RelayConnection {
 
     pub fn rate_limiter_mut(&mut self) -> &mut FixedWindowRateLimiter {
         &mut self.rate_limiter
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSocketHttpState {
+    connection_config: RelayConnectionConfig,
+}
+
+impl WebSocketHttpState {
+    pub fn new(connection_config: RelayConnectionConfig) -> Self {
+        Self { connection_config }
+    }
+
+    pub fn connection_config(&self) -> &RelayConnectionConfig {
+        &self.connection_config
+    }
+}
+
+impl Default for WebSocketHttpState {
+    fn default() -> Self {
+        Self::new(RelayConnectionConfig::default())
     }
 }
 
@@ -687,6 +709,12 @@ pub fn relay_info_router(document: RelayInfoDocument) -> Router {
         .with_state(document)
 }
 
+pub fn websocket_router(state: WebSocketHttpState) -> Router {
+    Router::new()
+        .route("/", get(websocket_upgrade))
+        .with_state(state)
+}
+
 pub fn listings_router(state: ListingsHttpState) -> Router {
     Router::new()
         .route("/api/listings", get(listings))
@@ -724,6 +752,17 @@ async fn relay_info(State(relay_info): State<RelayInfoDocument>, headers: Header
         )],
         Json(relay_info),
     )
+        .into_response()
+}
+
+async fn websocket_upgrade(
+    State(state): State<WebSocketHttpState>,
+    websocket: WebSocketUpgrade,
+) -> Response {
+    websocket
+        .on_upgrade(move |_socket| async move {
+            let _connection_config = state.connection_config;
+        })
         .into_response()
 }
 
@@ -1316,9 +1355,9 @@ mod tests {
         ApiError, ApiErrorBody, ApiErrorCode, ApiErrorEnvelope, ListingsHttpState,
         ReadinessCheckStatus, ReadinessState, RelayConnection, RelayConnectionConfig,
         RelayConnectionId, RelayInfoDocument, TANGLE_RELAY_SOFTWARE, TANGLE_SUPPORTED_NIPS,
-        health_router, listing_item_document, listing_projection_query, listings_router,
-        parse_listing_query, parse_marketplace_search_query, relay_info_router,
-        search_document_query,
+        WebSocketHttpState, health_router, listing_item_document, listing_projection_query,
+        listings_router, parse_listing_query, parse_marketplace_search_query, relay_info_router,
+        search_document_query, websocket_router,
     };
     use axum::{body::Body, response::IntoResponse};
     use http::{HeaderValue, Request, StatusCode, header};
@@ -1488,6 +1527,59 @@ mod tests {
         assert_eq!(decision.remaining(), 1);
         assert_eq!(connection.rate_limiter().tracked_key_count(), 1);
         assert_eq!(connection.subscriptions_mut().active_count(), 0);
+    }
+
+    #[test]
+    fn websocket_state_uses_relay_connection_config() {
+        let config = RelayConnectionConfig::new(
+            "wss://relay.radroots.test",
+            60,
+            RateLimitConfig::new(5, 10).expect("rate limit"),
+            RuntimeLimits::default(),
+        )
+        .expect("config");
+        let state = WebSocketHttpState::new(config.clone());
+        let default_state = WebSocketHttpState::default();
+
+        assert_eq!(state.connection_config(), &config);
+        assert_eq!(
+            default_state.connection_config().relay_url(),
+            "wss://relay.radroots.test"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_route_requires_upgrade_headers() {
+        let response = websocket_router(WebSocketHttpState::default())
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn websocket_route_requires_hyper_upgrade_extension() {
+        let response = websocket_router(WebSocketHttpState::default())
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::CONNECTION, "upgrade")
+                    .header(header::UPGRADE, "websocket")
+                    .header("sec-websocket-version", "13")
+                    .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
     }
 
     #[tokio::test]
