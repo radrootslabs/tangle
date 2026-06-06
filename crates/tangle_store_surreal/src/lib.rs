@@ -6,8 +6,9 @@ use std::collections::BTreeSet;
 use surrealdb::Surreal;
 use surrealdb::engine::local::{Db, Mem, RocksDb};
 use tangle_nips::{
-    DeletionTarget, ListingProjection, ListingProjectionEvaluation, NIP99_DRAFT_LISTING_KIND,
-    NIP99_PUBLIC_LISTING_KIND, evaluate_listing_projection, parse_deletion_request,
+    CommentEvent, DeletionTarget, ListingProjection, ListingProjectionEvaluation,
+    NIP99_DRAFT_LISTING_KIND, NIP99_PUBLIC_LISTING_KIND, evaluate_listing_projection,
+    parse_comment_event, parse_deletion_request,
 };
 use tangle_protocol::{AddressCoordinate, Event, EventId, Filter, UnixTimestamp, event_to_value};
 use tangle_store::{StoreEventOutcome, StoredEvent};
@@ -737,6 +738,13 @@ pub enum SearchDocumentOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentProjectionOutcome {
+    NotComment,
+    Ineligible,
+    Projected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HiddenEventOutcome {
     NotFound,
     Hidden,
@@ -884,6 +892,44 @@ impl SearchDocumentQuery {
 
     pub fn with_limit(mut self, value: u64) -> Self {
         self.limit = Some(value);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommentProjectionQuery {
+    root_target_type: Option<String>,
+    root_ref: Option<String>,
+    parent_target_type: Option<String>,
+    parent_ref: Option<String>,
+    pubkey: Option<String>,
+    limit: Option<u64>,
+}
+
+impl CommentProjectionQuery {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_root(mut self, target_type: &str, target_ref: &str) -> Self {
+        self.root_target_type = Some(target_type.to_owned());
+        self.root_ref = Some(target_ref.to_owned());
+        self
+    }
+
+    pub fn with_parent(mut self, target_type: &str, target_ref: &str) -> Self {
+        self.parent_target_type = Some(target_type.to_owned());
+        self.parent_ref = Some(target_ref.to_owned());
+        self
+    }
+
+    pub fn with_pubkey(mut self, pubkey: &str) -> Self {
+        self.pubkey = Some(pubkey.to_owned());
+        self
+    }
+
+    pub fn with_limit(mut self, limit: u64) -> Self {
+        self.limit = Some(limit);
         self
     }
 }
@@ -1716,6 +1762,129 @@ UPSERT type::record('listing_current', $listing_key) CONTENT {
         response.take(0).map_err(SurrealStoreError::from)
     }
 
+    pub async fn project_comment(
+        &self,
+        event: &Event,
+        projected_at: UnixTimestamp,
+    ) -> Result<CommentProjectionOutcome, SurrealStoreError> {
+        let comment = match parse_comment_event(event) {
+            Ok(Some(comment)) => comment,
+            Ok(None) => return Ok(CommentProjectionOutcome::NotComment),
+            Err(_) => return Ok(CommentProjectionOutcome::Ineligible),
+        };
+        let fields = comment_projection_fields(&comment, projected_at);
+        self.db
+            .query(
+                r#"
+UPSERT type::record('comment_projection', $event_id) CONTENT {
+    comment_id: $comment_id,
+    event_id: $event_id,
+    pubkey: $pubkey,
+    created_at: $created_at,
+    content: $content,
+    root_target_type: $root_target_type,
+    root_ref: $root_ref,
+    root_kind: $root_kind,
+    root_author: $root_author,
+    parent_target_type: $parent_target_type,
+    parent_ref: $parent_ref,
+    parent_kind: $parent_kind,
+    parent_author: $parent_author,
+    hidden: false,
+    deleted: false,
+    projected_at: $projected_at
+};
+"#,
+            )
+            .bind(("event_id", event.id().as_str()))
+            .bind(("comment_id", fields.comment_id))
+            .bind(("pubkey", fields.pubkey))
+            .bind(("created_at", fields.created_at))
+            .bind(("content", fields.content))
+            .bind(("root_target_type", fields.root_target_type))
+            .bind(("root_ref", fields.root_ref))
+            .bind(("root_kind", fields.root_kind))
+            .bind(("root_author", fields.root_author))
+            .bind(("parent_target_type", fields.parent_target_type))
+            .bind(("parent_ref", fields.parent_ref))
+            .bind(("parent_kind", fields.parent_kind))
+            .bind(("parent_author", fields.parent_author))
+            .bind(("projected_at", fields.projected_at))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        Ok(CommentProjectionOutcome::Projected)
+    }
+
+    pub async fn comment_projection_row(
+        &self,
+        event_id: &EventId,
+    ) -> Result<Option<serde_json::Value>, SurrealStoreError> {
+        let mut response = self
+            .db
+            .query("SELECT * FROM ONLY type::record('comment_projection', $event_id);")
+            .bind(("event_id", event_id.as_str()))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
+    pub async fn query_comment_projections(
+        &self,
+        query: &CommentProjectionQuery,
+    ) -> Result<Vec<serde_json::Value>, SurrealStoreError> {
+        let mut statement =
+            "SELECT * FROM comment_projection WHERE hidden = false AND deleted = false".to_owned();
+        if query.root_target_type.is_some() {
+            statement.push_str(" AND root_target_type = $root_target_type");
+        }
+        if query.root_ref.is_some() {
+            statement.push_str(" AND root_ref = $root_ref");
+        }
+        if query.parent_target_type.is_some() {
+            statement.push_str(" AND parent_target_type = $parent_target_type");
+        }
+        if query.parent_ref.is_some() {
+            statement.push_str(" AND parent_ref = $parent_ref");
+        }
+        if query.pubkey.is_some() {
+            statement.push_str(" AND pubkey = $pubkey");
+        }
+        statement.push_str(" ORDER BY created_at ASC, event_id ASC");
+        if query.limit.is_some() {
+            statement.push_str(" LIMIT $limit");
+        }
+        statement.push(';');
+        let mut surreal_query = self.db.query(statement);
+        if let Some(value) = &query.root_target_type {
+            surreal_query = surreal_query.bind(("root_target_type", value.as_str()));
+        }
+        if let Some(value) = &query.root_ref {
+            surreal_query = surreal_query.bind(("root_ref", value.as_str()));
+        }
+        if let Some(value) = &query.parent_target_type {
+            surreal_query = surreal_query.bind(("parent_target_type", value.as_str()));
+        }
+        if let Some(value) = &query.parent_ref {
+            surreal_query = surreal_query.bind(("parent_ref", value.as_str()));
+        }
+        if let Some(value) = &query.pubkey {
+            surreal_query = surreal_query.bind(("pubkey", value.as_str()));
+        }
+        if let Some(value) = query.limit {
+            surreal_query = surreal_query.bind(("limit", value));
+        }
+        let mut response = surreal_query
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
     pub async fn project_listing_helpers(
         &self,
         event: &Event,
@@ -2011,6 +2180,7 @@ CREATE moderation_action CONTENT {
 UPDATE nostr_event SET hidden = true WHERE event_id = $event_id;
 UPDATE event_current SET hidden = true WHERE event_id = $event_id;
 UPDATE listing_current SET hidden = true WHERE event_id = $event_id;
+UPDATE comment_projection SET hidden = true WHERE event_id = $event_id;
 UPDATE search_doc SET visible = false WHERE event_id = $event_id OR current_event_id = $event_id;
 "#,
             )
@@ -2058,6 +2228,7 @@ CREATE moderation_action CONTENT {
 UPDATE nostr_event SET hidden = false WHERE event_id = $event_id;
 UPDATE event_current SET hidden = false WHERE event_id = $event_id;
 UPDATE listing_current SET hidden = false WHERE event_id = $event_id;
+UPDATE comment_projection SET hidden = false WHERE event_id = $event_id;
 UPDATE search_doc SET visible = true WHERE (event_id = $event_id OR current_event_id = $event_id) AND status = "active";
 UPDATE search_doc SET visible = false WHERE (event_id = $event_id OR current_event_id = $event_id) AND status != "active";
 "#,
@@ -2489,7 +2660,10 @@ UPSERT type::record('relay_user', $pubkey) CONTENT {
     ) -> Result<(), SurrealStoreError> {
         self.db
             .query(
-                "UPDATE nostr_event SET deleted = true WHERE event_id = $event_id AND pubkey = $author_pubkey;",
+                r#"
+UPDATE nostr_event SET deleted = true WHERE event_id = $event_id AND pubkey = $author_pubkey;
+UPDATE comment_projection SET deleted = true WHERE event_id = $event_id AND pubkey = $author_pubkey;
+"#,
             )
             .bind(("event_id", event_id))
             .bind(("author_pubkey", author_pubkey))
@@ -2713,6 +2887,22 @@ struct ListingRevisionFields {
     status_tag: Option<String>,
 }
 
+struct CommentProjectionFields {
+    comment_id: String,
+    pubkey: String,
+    created_at: u64,
+    content: String,
+    root_target_type: String,
+    root_ref: String,
+    root_kind: String,
+    root_author: Option<String>,
+    parent_target_type: String,
+    parent_ref: String,
+    parent_kind: String,
+    parent_author: Option<String>,
+    projected_at: u64,
+}
+
 struct ListingCurrentFields {
     listing_key: String,
     listing_key_hash: String,
@@ -2752,6 +2942,33 @@ struct ListingHelperProjectionContext<'a> {
     effective_status: &'a str,
     updated_at: u64,
     event_id: &'a str,
+}
+
+fn comment_projection_fields(
+    comment: &CommentEvent,
+    projected_at: UnixTimestamp,
+) -> CommentProjectionFields {
+    CommentProjectionFields {
+        comment_id: comment.event_id().as_str().to_owned(),
+        pubkey: comment.pubkey().as_str().to_owned(),
+        created_at: comment.created_at().as_u64(),
+        content: comment.content().to_owned(),
+        root_target_type: comment.root().target().target_type().to_owned(),
+        root_ref: comment.root().target().target_ref(),
+        root_kind: comment.root().kind().to_owned(),
+        root_author: comment
+            .root()
+            .author()
+            .map(|pubkey| pubkey.as_str().to_owned()),
+        parent_target_type: comment.parent().target().target_type().to_owned(),
+        parent_ref: comment.parent().target().target_ref(),
+        parent_kind: comment.parent().kind().to_owned(),
+        parent_author: comment
+            .parent()
+            .author()
+            .map(|pubkey| pubkey.as_str().to_owned()),
+        projected_at: projected_at.as_u64(),
+    }
 }
 
 struct SearchDocumentFields {
@@ -2979,12 +3196,13 @@ impl From<surrealdb::Error> for SurrealStoreError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CurrentEventOutcome, DeletionMarkerOutcome, DurableRateLimitDecision, HiddenEventOutcome,
-        ListingCurrentOutcome, ListingHelperOutcome, ListingProjectionQuery,
-        ListingRevisionOutcome, MigrationApplyOutcome, SearchDocumentOutcome, SearchDocumentQuery,
-        SurrealConfigError, SurrealConnectionConfig, SurrealConnectionMode, SurrealMigration,
-        SurrealMigrationError, SurrealMigrationPlan, SurrealStore, SurrealStoreError,
-        base_migration_plan, migration_tracking_schema,
+        CommentProjectionOutcome, CommentProjectionQuery, CurrentEventOutcome,
+        DeletionMarkerOutcome, DurableRateLimitDecision, HiddenEventOutcome, ListingCurrentOutcome,
+        ListingHelperOutcome, ListingProjectionQuery, ListingRevisionOutcome,
+        MigrationApplyOutcome, SearchDocumentOutcome, SearchDocumentQuery, SurrealConfigError,
+        SurrealConnectionConfig, SurrealConnectionMode, SurrealMigration, SurrealMigrationError,
+        SurrealMigrationPlan, SurrealStore, SurrealStoreError, base_migration_plan,
+        migration_tracking_schema,
     };
     use tangle_nips::ListingProjectionEvaluation;
     use tangle_protocol::{
@@ -2992,7 +3210,9 @@ mod tests {
         filter_from_value,
     };
     use tangle_store::{StoreEventOutcome, StoredEvent};
-    use tangle_test_support::{build_fixture_event, valid_public_listing_spec};
+    use tangle_test_support::{
+        FixtureKey, build_fixture_event, build_fixture_event_from_parts, valid_public_listing_spec,
+    };
 
     #[test]
     fn memory_config_normalizes_namespace_and_database() {
@@ -4905,6 +5125,202 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_comments_persists_threaded_comment_rows() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let listing_key = format!("30402:{}:listing-a", listing.unsigned().pubkey().as_str());
+        let comment = listing_comment(&listing, 1_714_125_010, "Is pickup open Friday?");
+        let invalid_comment = build_fixture_event_from_parts(
+            FixtureKey::Buyer,
+            1_714_125_009,
+            1_111,
+            vec![vec!["K".to_owned(), "30402".to_owned()]],
+            "missing scoped targets",
+        )
+        .expect("invalid comment");
+
+        assert_eq!(
+            store
+                .project_comment(&listing, UnixTimestamp::new(1_714_125_011))
+                .await
+                .expect("not comment"),
+            CommentProjectionOutcome::NotComment
+        );
+        assert_eq!(
+            store
+                .project_comment(&invalid_comment, UnixTimestamp::new(1_714_125_011))
+                .await
+                .expect("invalid comment"),
+            CommentProjectionOutcome::Ineligible
+        );
+        assert_eq!(
+            store
+                .project_comment(&comment, UnixTimestamp::new(1_714_125_011))
+                .await
+                .expect("project comment"),
+            CommentProjectionOutcome::Projected
+        );
+
+        let row = store
+            .comment_projection_row(comment.id())
+            .await
+            .expect("comment row")
+            .expect("comment row exists");
+        assert_eq!(row["comment_id"], comment.id().as_str());
+        assert_eq!(row["event_id"], comment.id().as_str());
+        assert_eq!(row["pubkey"], FixtureKey::Buyer.public_key().as_str());
+        assert_eq!(row["content"], "Is pickup open Friday?");
+        assert_eq!(row["root_target_type"], "address");
+        assert_eq!(row["root_ref"], listing_key);
+        assert_eq!(row["root_kind"], "30402");
+        assert_eq!(row["root_author"], listing.unsigned().pubkey().as_str());
+        assert_eq!(row["parent_target_type"], "address");
+        assert_eq!(row["parent_ref"], listing_key);
+        assert_eq!(row["parent_kind"], "30402");
+        assert_eq!(row["parent_author"], listing.unsigned().pubkey().as_str());
+        assert_eq!(row["hidden"], false);
+        assert_eq!(row["deleted"], false);
+        assert_eq!(row["projected_at"], 1_714_125_011_u64);
+
+        let rows = store
+            .query_comment_projections(
+                &CommentProjectionQuery::new()
+                    .with_root("address", &listing_key)
+                    .with_parent("address", &listing_key)
+                    .with_pubkey(FixtureKey::Buyer.public_key().as_str())
+                    .with_limit(5),
+            )
+            .await
+            .expect("comment query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["event_id"], comment.id().as_str());
+    }
+
+    #[tokio::test]
+    async fn comment_projection_visibility_tracks_hidden_and_deleted_events() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let listing_key = format!("30402:{}:listing-a", listing.unsigned().pubkey().as_str());
+        let comment = listing_comment(&listing, 1_714_125_020, "Do you offer bunch pricing?");
+        let admin_pubkey = "a".repeat(PublicKeyHex::HEX_LENGTH);
+        store
+            .store_raw_event(&StoredEvent::new(
+                comment.clone(),
+                UnixTimestamp::new(1_714_125_021),
+            ))
+            .await
+            .expect("raw comment");
+        store
+            .project_comment(&comment, UnixTimestamp::new(1_714_125_022))
+            .await
+            .expect("project comment");
+
+        assert_eq!(
+            store
+                .query_comment_projections(
+                    &CommentProjectionQuery::new().with_root("address", &listing_key)
+                )
+                .await
+                .expect("visible comments")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .hide_event(
+                    comment.id(),
+                    "discussion moderation",
+                    "admin_api",
+                    &admin_pubkey,
+                    UnixTimestamp::new(1_714_125_023),
+                )
+                .await
+                .expect("hide comment"),
+            HiddenEventOutcome::Hidden
+        );
+        assert!(
+            store
+                .query_comment_projections(
+                    &CommentProjectionQuery::new().with_root("address", &listing_key)
+                )
+                .await
+                .expect("hidden comments")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .comment_projection_row(comment.id())
+                .await
+                .expect("comment row")
+                .expect("comment row exists")["hidden"],
+            true
+        );
+        assert_eq!(
+            store
+                .unhide_event(
+                    comment.id(),
+                    "discussion restored",
+                    &admin_pubkey,
+                    UnixTimestamp::new(1_714_125_024),
+                )
+                .await
+                .expect("unhide comment"),
+            HiddenEventOutcome::Unhidden
+        );
+        assert_eq!(
+            store
+                .query_comment_projections(
+                    &CommentProjectionQuery::new().with_root("address", &listing_key)
+                )
+                .await
+                .expect("restored comments")
+                .len(),
+            1
+        );
+
+        let deletion = build_fixture_event_from_parts(
+            FixtureKey::Buyer,
+            1_714_125_025,
+            5,
+            vec![vec!["e".to_owned(), comment.id().as_str().to_owned()]],
+            "",
+        )
+        .expect("deletion event");
+        assert_eq!(
+            store
+                .apply_deletion_markers(&deletion)
+                .await
+                .expect("delete comment"),
+            DeletionMarkerOutcome::Applied { targets: 1 }
+        );
+        assert!(
+            store
+                .query_comment_projections(
+                    &CommentProjectionQuery::new().with_root("address", &listing_key)
+                )
+                .await
+                .expect("deleted comments")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .comment_projection_row(comment.id())
+                .await
+                .expect("comment row")
+                .expect("comment row exists")["deleted"],
+            true
+        );
+    }
+
+    #[tokio::test]
     async fn hidden_event_overlay_excludes_events_from_public_read_models() {
         let store = memory_store().await;
         store
@@ -5440,6 +5856,31 @@ mod tests {
             error.message(),
             "listing price amount must fit two decimal minor units"
         );
+    }
+
+    fn listing_comment(listing: &Event, created_at: u64, content: &str) -> Event {
+        let listing_key = format!("30402:{}:listing-a", listing.unsigned().pubkey().as_str());
+        build_fixture_event_from_parts(
+            FixtureKey::Buyer,
+            created_at,
+            1_111,
+            vec![
+                vec!["A".to_owned(), listing_key.clone()],
+                vec!["K".to_owned(), "30402".to_owned()],
+                vec![
+                    "P".to_owned(),
+                    listing.unsigned().pubkey().as_str().to_owned(),
+                ],
+                vec!["a".to_owned(), listing_key],
+                vec!["k".to_owned(), "30402".to_owned()],
+                vec![
+                    "p".to_owned(),
+                    listing.unsigned().pubkey().as_str().to_owned(),
+                ],
+            ],
+            content,
+        )
+        .expect("comment event")
     }
 
     fn synthetic_event(
