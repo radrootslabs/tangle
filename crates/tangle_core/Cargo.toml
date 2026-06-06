@@ -8,13 +8,13 @@ license.workspace = true
 description = "Transport-independent relay core policy for tangle"
 
 [dependencies]
+serde_json = "1"
 tangle_crypto = { path = "../tangle_crypto" }
 tangle_nips = { path = "../tangle_nips" }
 tangle_protocol = { path = "../tangle_protocol" }
 tangle_store = { path = "../tangle_store" }
 
 [dev-dependencies]
-serde_json = "1"
 tangle_test_support = { path = "../tangle_test_support" }
 
 [lints]

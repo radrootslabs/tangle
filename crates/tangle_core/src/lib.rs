@@ -781,6 +781,7 @@ impl EventValidator {
             .validate_event_timestamp(event, now)
             .map_err(EventValidationRejection::RuntimeLimit)?;
         verify_event_signature(event).map_err(EventValidationRejection::Crypto)?;
+        validate_private_commerce_plaintext(event)?;
         let payload = validation_payload(event)?;
         let admission_event =
             AdmissionEvent::new(event.unsigned().pubkey().clone(), payload.admission_kind());
@@ -883,6 +884,7 @@ impl ValidatedEventPayload {
 pub enum EventValidationRejection {
     RuntimeLimit(RuntimeLimitViolation),
     Crypto(String),
+    Privacy(String),
     Parser(EventParserRejection),
     Admission(AdmissionRejection),
 }
@@ -892,6 +894,7 @@ impl EventValidationRejection {
         match self {
             Self::RuntimeLimit(_) => EventValidationRejectionKind::RuntimeLimit,
             Self::Crypto(_) => EventValidationRejectionKind::Crypto,
+            Self::Privacy(_) => EventValidationRejectionKind::Privacy,
             Self::Parser(_) => EventValidationRejectionKind::Parser,
             Self::Admission(_) => EventValidationRejectionKind::Admission,
         }
@@ -903,6 +906,10 @@ impl fmt::Display for EventValidationRejection {
         match self {
             Self::RuntimeLimit(violation) => write!(formatter, "runtime limit: {violation}"),
             Self::Crypto(message) => write!(formatter, "crypto: {message}"),
+            Self::Privacy(field) => write!(
+                formatter,
+                "privacy: private commerce plaintext field `{field}` is not allowed"
+            ),
             Self::Parser(rejection) => write!(formatter, "parser: {rejection}"),
             Self::Admission(rejection) => write!(formatter, "admission: {rejection}"),
         }
@@ -915,6 +922,7 @@ impl std::error::Error for EventValidationRejection {}
 pub enum EventValidationRejectionKind {
     RuntimeLimit,
     Crypto,
+    Privacy,
     Parser,
     Admission,
 }
@@ -966,6 +974,69 @@ impl fmt::Display for EventParser {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
+}
+
+fn validate_private_commerce_plaintext(event: &Event) -> Result<(), EventValidationRejection> {
+    for tag in event.unsigned().tags() {
+        let field = tag.name().as_str().to_owned();
+        if private_commerce_plaintext_field(&field) {
+            return Err(EventValidationRejection::Privacy(field));
+        }
+    }
+    if let Ok(content) = serde_json::from_str::<serde_json::Value>(event.unsigned().content())
+        && let Some(field) = private_commerce_plaintext_json_field(&content)
+    {
+        return Err(EventValidationRejection::Privacy(field));
+    }
+    Ok(())
+}
+
+fn private_commerce_plaintext_json_field(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (field, value) in fields {
+                if private_commerce_plaintext_field(field) {
+                    return Some(field.clone());
+                }
+                if let Some(field) = private_commerce_plaintext_json_field(value) {
+                    return Some(field);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .find_map(private_commerce_plaintext_json_field),
+        _ => None,
+    }
+}
+
+fn private_commerce_plaintext_field(field: &str) -> bool {
+    matches!(
+        normalized_privacy_field(field).as_str(),
+        "buyercontact"
+            | "contact"
+            | "deliveryaddress"
+            | "dispute"
+            | "disputeevidence"
+            | "order"
+            | "orderid"
+            | "ordernote"
+            | "payment"
+            | "paymentdetails"
+            | "phone"
+            | "privatenote"
+            | "refund"
+            | "refunddetails"
+    )
+}
+
+fn normalized_privacy_field(field: &str) -> String {
+    field
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn validation_payload(event: &Event) -> Result<ValidatedEventPayload, EventValidationRejection> {
@@ -3142,8 +3213,9 @@ mod tests {
         RepositoryError, StoreEventOutcome, StoreProjectionOutcome, StoredEvent,
     };
     use tangle_test_support::{
-        FixtureKey, InMemoryRepository, auth_event_spec, build_fixture_event, deletion_event_spec,
-        fixture_spec_from_json, projection_ineligible_listing_spec, valid_public_listing_spec,
+        FixtureKey, InMemoryRepository, auth_event_spec, build_fixture_event,
+        build_fixture_event_from_parts, deletion_event_spec, fixture_spec_from_json,
+        projection_ineligible_listing_spec, valid_public_listing_spec,
     };
 
     #[test]
@@ -3865,6 +3937,67 @@ mod tests {
         );
         assert_eq!(note.admission_kind(), AdmissionEventKind::Write);
         assert_eq!(note.payload(), &super::ValidatedEventPayload::Other);
+    }
+
+    #[test]
+    fn event_validator_rejects_private_commerce_plaintext_before_storage() {
+        let seller = FixtureKey::Seller.public_key();
+        let validator = EventValidator::new(
+            RuntimeLimits::default(),
+            AdmissionPolicy::new().approve_seller(seller.clone()),
+        );
+        let delivery_payload = build_fixture_event_from_parts(
+            FixtureKey::Seller,
+            1_714_124_437,
+            1,
+            vec![vec!["t".to_owned(), "commerce-privacy".to_owned()]],
+            r#"{"private_commerce":{"delivery_address":"100 Privacy Fixture Way","payment_details":"fixture-payment-token"}}"#,
+        )
+        .expect("delivery payload");
+        let phone_tag = build_fixture_event_from_parts(
+            FixtureKey::Seller,
+            1_714_124_438,
+            1,
+            vec![vec!["phone".to_owned(), "5550100".to_owned()]],
+            "private phone detail",
+        )
+        .expect("phone tag");
+        let public_listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+
+        let delivery_rejection = validator
+            .validate(
+                &delivery_payload,
+                &AdmissionContext::authenticated(seller.clone()),
+                UnixTimestamp::new(1_714_124_500),
+            )
+            .expect_err("delivery privacy rejection");
+        let tag_rejection = validator
+            .validate(
+                &phone_tag,
+                &AdmissionContext::authenticated(seller.clone()),
+                UnixTimestamp::new(1_714_124_500),
+            )
+            .expect_err("phone privacy rejection");
+
+        assert_eq!(
+            delivery_rejection.kind(),
+            EventValidationRejectionKind::Privacy
+        );
+        assert_eq!(
+            delivery_rejection.to_string(),
+            "privacy: private commerce plaintext field `delivery_address` is not allowed"
+        );
+        assert_eq!(
+            tag_rejection,
+            EventValidationRejection::Privacy("phone".to_owned())
+        );
+        validator
+            .validate(
+                &public_listing,
+                &AdmissionContext::authenticated(seller),
+                UnixTimestamp::new(1_714_124_500),
+            )
+            .expect("public listing remains valid");
     }
 
     #[test]
