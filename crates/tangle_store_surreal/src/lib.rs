@@ -305,6 +305,7 @@ pub fn base_migration_plan() -> SurrealMigrationPlan {
         listing_helper_schemas(),
         search_document_schema(),
         policy_schemas(),
+        comment_projection_schema(),
     ])
     .expect("base migration plan is strictly ordered")
 }
@@ -640,6 +641,36 @@ DEFINE INDEX IF NOT EXISTS projection_error_projector_created ON TABLE projectio
 "#,
     )
     .expect("policy schemas are valid")
+}
+
+pub fn comment_projection_schema() -> SurrealMigration {
+    SurrealMigration::new(
+        "0011_comment_projection",
+        r#"
+DEFINE TABLE IF NOT EXISTS comment_projection SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS comment_id ON TABLE comment_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS event_id ON TABLE comment_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS pubkey ON TABLE comment_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON TABLE comment_projection TYPE int;
+DEFINE FIELD IF NOT EXISTS content ON TABLE comment_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS root_target_type ON TABLE comment_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS root_ref ON TABLE comment_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS root_kind ON TABLE comment_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS root_author ON TABLE comment_projection TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS parent_target_type ON TABLE comment_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS parent_ref ON TABLE comment_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS parent_kind ON TABLE comment_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS parent_author ON TABLE comment_projection TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS hidden ON TABLE comment_projection TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS deleted ON TABLE comment_projection TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS projected_at ON TABLE comment_projection TYPE int;
+DEFINE INDEX IF NOT EXISTS comment_projection_event_uid ON TABLE comment_projection COLUMNS event_id UNIQUE;
+DEFINE INDEX IF NOT EXISTS comment_projection_root_lookup ON TABLE comment_projection COLUMNS root_target_type, root_ref, created_at, event_id;
+DEFINE INDEX IF NOT EXISTS comment_projection_parent_lookup ON TABLE comment_projection COLUMNS parent_target_type, parent_ref, created_at, event_id;
+DEFINE INDEX IF NOT EXISTS comment_projection_author_created ON TABLE comment_projection COLUMNS pubkey, created_at, event_id;
+"#,
+    )
+    .expect("comment projection schema is valid")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3359,6 +3390,44 @@ mod tests {
             "listing_revision_event_uid",
             "listing_revision_listing_created",
             "listing_revision_seller_created",
+        ] {
+            assert!(info.contains(expected), "missing {expected} in {info}");
+        }
+    }
+
+    #[tokio::test]
+    async fn comment_projection_schema_defines_threaded_comment_table() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let info = store
+            .table_info("comment_projection")
+            .await
+            .expect("table info");
+
+        for expected in [
+            "comment_id",
+            "event_id",
+            "pubkey",
+            "created_at",
+            "content",
+            "root_target_type",
+            "root_ref",
+            "root_kind",
+            "root_author",
+            "parent_target_type",
+            "parent_ref",
+            "parent_kind",
+            "parent_author",
+            "hidden",
+            "deleted",
+            "projected_at",
+            "comment_projection_event_uid",
+            "comment_projection_root_lookup",
+            "comment_projection_parent_lookup",
+            "comment_projection_author_created",
         ] {
             assert!(info.contains(expected), "missing {expected} in {info}");
         }
