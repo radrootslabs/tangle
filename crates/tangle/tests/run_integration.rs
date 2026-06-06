@@ -8,7 +8,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-use tangle_protocol::event_to_value;
+use tangle_protocol::{EventId, event_to_value};
 use tangle_store_surreal::{SurrealConnectionConfig, SurrealStore};
 use tangle_test_support::{
     FixtureKey, auth_event_spec, build_fixture_event, build_fixture_event_from_parts,
@@ -33,7 +33,11 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
         port,
         "tangle_it",
         serde_json::json!({
-            "approved_sellers": [FixtureKey::Seller.public_key().as_str()]
+            "approved_sellers": [FixtureKey::Seller.public_key().as_str()],
+            "write_rate_limit": {
+                "limit": 10,
+                "window_seconds": 60
+            }
         }),
     );
 
@@ -54,6 +58,8 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
     let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
     let comment = listing_comment(&listing, 1_714_124_436, "Can I pickup Saturday?");
     let reaction = listing_reaction(&listing, 1_714_124_437, "+");
+    let thread = forum_thread(1_714_124_438, Some("Market day thread"), &["market", "csa"]);
+    let thread_comment = forum_thread_comment(&thread, 1_714_124_439, "I can bring greens.");
     let auth = build_fixture_event(&auth_event_spec()).expect("auth");
     let seller = FixtureKey::Seller.public_key();
 
@@ -187,6 +193,55 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
     assert_eq!(fetched_reaction[2]["id"], reaction.id().as_str());
     assert_eq!(next_label(&mut publisher).await, "EOSE");
 
+    publisher
+        .send(Message::Text(
+            serde_json::json!(["EVENT", event_to_value(&thread)])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("thread send");
+    assert_ok(&next_json(&mut publisher).await, true);
+    publisher
+        .send(Message::Text(
+            serde_json::json!(["REQ", "sub-thread", { "ids": [thread.id().as_str()] }])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("thread fetch send");
+    let fetched_thread = next_json(&mut publisher).await;
+    assert_eq!(fetched_thread[0], "EVENT");
+    assert_eq!(fetched_thread[1], "sub-thread");
+    assert_eq!(fetched_thread[2]["id"], thread.id().as_str());
+    assert_eq!(next_label(&mut publisher).await, "EOSE");
+
+    publisher
+        .send(Message::Text(
+            serde_json::json!(["EVENT", event_to_value(&thread_comment)])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("thread comment send");
+    assert_ok(&next_json(&mut publisher).await, true);
+    publisher
+        .send(Message::Text(
+            serde_json::json!(["REQ", "sub-thread-comment", { "ids": [thread_comment.id().as_str()] }])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("thread comment fetch send");
+    let fetched_thread_comment = next_json(&mut publisher).await;
+    assert_eq!(fetched_thread_comment[0], "EVENT");
+    assert_eq!(fetched_thread_comment[1], "sub-thread-comment");
+    assert_eq!(
+        fetched_thread_comment[2]["id"],
+        thread_comment.id().as_str()
+    );
+    assert_eq!(next_label(&mut publisher).await, "EOSE");
+
     subscriber
         .send(Message::Text(
             serde_json::json!(["CLOSE", "sub-live"]).to_string().into(),
@@ -222,6 +277,27 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
     assert!(reactions.contains("200 OK"));
     assert!(reactions.contains("\"like_count\":1"));
     assert!(reactions.contains("\"total_count\":1"));
+    let forum_threads = http_get(port, "/api/forum/threads?topic=market&limit=5");
+    assert!(forum_threads.contains("200 OK"));
+    assert!(forum_threads.contains(thread.id().as_str()));
+    assert!(forum_threads.contains("Market day thread"));
+    let forum_detail = http_get(
+        port,
+        &format!("/api/forum/threads/{}", thread.id().as_str()),
+    );
+    assert!(forum_detail.contains("200 OK"));
+    assert!(forum_detail.contains(thread.id().as_str()));
+    assert!(forum_detail.contains("Market day thread"));
+    let forum_comments = http_get(
+        port,
+        &format!(
+            "/api/forum/threads/{}/comments?limit=5",
+            thread.id().as_str()
+        ),
+    );
+    assert!(forum_comments.contains("200 OK"));
+    assert!(forum_comments.contains(thread_comment.id().as_str()));
+    assert!(forum_comments.contains("I can bring greens."));
     let search = http_get(port, "/api/search?q=carrots&limit=5");
     assert!(search.contains("200 OK"));
     assert!(search.contains(listing.id().as_str()));
@@ -273,6 +349,27 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
     assert_eq!(reaction_count["target_event_id"], listing.id().as_str());
     assert_eq!(reaction_count["like_count"], 1_i64);
     assert_eq!(reaction_count["total_count"], 1_i64);
+    let thread_row = store
+        .forum_thread_row(thread.id())
+        .await
+        .expect("thread row")
+        .expect("thread row exists");
+    assert_eq!(thread_row["event_id"], thread.id().as_str());
+    assert_eq!(thread_row["title"], "Market day thread");
+    let thread_comment_row = store
+        .comment_projection_row(thread_comment.id())
+        .await
+        .expect("thread comment row")
+        .expect("thread comment row exists");
+    assert_eq!(thread_comment_row["root_ref"], thread.id().as_str());
+    assert_eq!(thread_comment_row["content"], "I can bring greens.");
+    assert!(
+        store
+            .search_document_row(thread.id().as_str())
+            .await
+            .expect("thread search row")
+            .is_some()
+    );
     assert!(
         store
             .search_document_row(&listing_key)
@@ -830,7 +927,7 @@ async fn next_label(
 
 fn assert_ok(message: &Value, accepted: bool) {
     assert_eq!(message[0], "OK");
-    assert_eq!(message[2], accepted);
+    assert_eq!(message[2], accepted, "relay OK frame: {message}");
 }
 
 fn listing_comment(
@@ -889,6 +986,70 @@ fn listing_reaction(
         content,
     )
     .expect("reaction event")
+}
+
+fn forum_thread(created_at: u64, title: Option<&str>, topics: &[&str]) -> tangle_protocol::Event {
+    let mut tags = vec![
+        vec!["e".to_owned(), "5".repeat(EventId::HEX_LENGTH)],
+        vec![
+            "p".to_owned(),
+            FixtureKey::Buyer.public_key().as_str().to_owned(),
+        ],
+    ];
+    if let Some(title) = title {
+        tags.push(vec!["title".to_owned(), title.to_owned()]);
+    }
+    tags.extend(
+        topics
+            .iter()
+            .map(|topic| vec!["t".to_owned(), (*topic).to_owned()]),
+    );
+    build_fixture_event_from_parts(
+        FixtureKey::Seller,
+        created_at,
+        11,
+        tags,
+        "What is everyone bringing this weekend?",
+    )
+    .expect("forum thread")
+}
+
+fn forum_thread_comment(
+    thread: &tangle_protocol::Event,
+    created_at: u64,
+    content: &str,
+) -> tangle_protocol::Event {
+    build_fixture_event_from_parts(
+        FixtureKey::Seller,
+        created_at,
+        1_111,
+        vec![
+            vec![
+                "E".to_owned(),
+                thread.id().as_str().to_owned(),
+                "wss://relay.radroots.test".to_owned(),
+                thread.unsigned().pubkey().as_str().to_owned(),
+            ],
+            vec!["K".to_owned(), "11".to_owned()],
+            vec![
+                "P".to_owned(),
+                thread.unsigned().pubkey().as_str().to_owned(),
+            ],
+            vec![
+                "e".to_owned(),
+                thread.id().as_str().to_owned(),
+                "wss://relay.radroots.test".to_owned(),
+                thread.unsigned().pubkey().as_str().to_owned(),
+            ],
+            vec!["k".to_owned(), "11".to_owned()],
+            vec![
+                "p".to_owned(),
+                thread.unsigned().pubkey().as_str().to_owned(),
+            ],
+        ],
+        content,
+    )
+    .expect("forum comment event")
 }
 
 fn stop_relay(mut relay: Child) {

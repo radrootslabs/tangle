@@ -36,8 +36,10 @@ use tangle_protocol::{
 use tangle_store::{StoreEventOutcome, StoredEvent};
 use tangle_store_surreal::{
     CommentProjectionOutcome, CommentProjectionQuery, DurableRateLimitDecision,
-    ListingProjectionQuery, MigrationApplyOutcome, ReactionProjectionOutcome, SearchDocumentQuery,
-    SurrealConnectionConfig, SurrealConnectionMode, SurrealStore, base_migration_plan,
+    ForumThreadProjectionOutcome, ForumThreadProjectionQuery, ListingProjectionQuery,
+    LongFormProjectionOutcome, MigrationApplyOutcome, ReactionProjectionOutcome,
+    SearchDocumentQuery, SurrealConnectionConfig, SurrealConnectionMode, SurrealStore,
+    base_migration_plan,
 };
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -602,6 +604,18 @@ async fn project_stored_event(
         Ok(ReactionProjectionOutcome::NotReaction | ReactionProjectionOutcome::Ineligible) => false,
         Err(_) => return Err(RuntimeCommandError::store("event projection failed")),
     };
+    let long_form_projected = match store.project_long_form(event, now).await {
+        Ok(LongFormProjectionOutcome::Projected) => true,
+        Ok(LongFormProjectionOutcome::NotLongForm | LongFormProjectionOutcome::Ineligible) => false,
+        Err(_) => return Err(RuntimeCommandError::store("event projection failed")),
+    };
+    let forum_thread_projected = match store.project_forum_thread(event, now).await {
+        Ok(ForumThreadProjectionOutcome::Projected) => true,
+        Ok(
+            ForumThreadProjectionOutcome::NotForumThread | ForumThreadProjectionOutcome::Ineligible,
+        ) => false,
+        Err(_) => return Err(RuntimeCommandError::store("event projection failed")),
+    };
     if effect == AdmissionEffect::StoreRawAndProjectPublicListing {
         if store.project_current_listing(event, now).await.is_err()
             || store.project_listing_helpers(event).await.is_err()
@@ -611,7 +625,7 @@ async fn project_stored_event(
         }
         return Ok(true);
     }
-    Ok(comment_projected || reaction_projected)
+    Ok(comment_projected || reaction_projected || long_form_projected || forum_thread_projected)
 }
 
 fn parse_event_import_document(raw: &str) -> Result<Vec<Event>, RuntimeCommandError> {
@@ -972,6 +986,15 @@ fn runtime_router(
             "/api/listings/{pubkey}/{d}/reactions",
             get(runtime_listing_reactions),
         )
+        .route("/api/forum/threads", get(runtime_forum_threads))
+        .route(
+            "/api/forum/threads/{event_id}",
+            get(runtime_forum_thread_detail),
+        )
+        .route(
+            "/api/forum/threads/{event_id}/comments",
+            get(runtime_forum_thread_comments),
+        )
         .route("/api/search", get(runtime_marketplace_search))
         .route("/api/sellers/{pubkey}", get(runtime_seller_detail))
         .route(
@@ -1074,6 +1097,50 @@ async fn runtime_listing_reactions(
             state.config.limits(),
         )),
         Path((pubkey, d)),
+    )
+    .await
+}
+
+async fn runtime_forum_threads(
+    State(state): State<RuntimeRelayState>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<ForumThreadsDocument>, ApiError> {
+    forum_threads(
+        State(ListingsHttpState::new(
+            state.store.clone(),
+            state.config.limits(),
+        )),
+        RawQuery(query),
+    )
+    .await
+}
+
+async fn runtime_forum_thread_detail(
+    State(state): State<RuntimeRelayState>,
+    Path(event_id): Path<String>,
+) -> Result<Json<ForumThreadDetailDocument>, ApiError> {
+    forum_thread_detail(
+        State(ListingsHttpState::new(
+            state.store.clone(),
+            state.config.limits(),
+        )),
+        Path(event_id),
+    )
+    .await
+}
+
+async fn runtime_forum_thread_comments(
+    State(state): State<RuntimeRelayState>,
+    Path(event_id): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<ListingCommentsDocument>, ApiError> {
+    forum_thread_comments(
+        State(ListingsHttpState::new(
+            state.store.clone(),
+            state.config.limits(),
+        )),
+        Path(event_id),
+        RawQuery(query),
     )
     .await
 }
@@ -1911,6 +1978,8 @@ impl EventMessageHandler {
                 .is_err()
             || self.store.project_comment(&event, now).await.is_err()
             || self.store.project_reaction(&event, now).await.is_err()
+            || self.store.project_long_form(&event, now).await.is_err()
+            || self.store.project_forum_thread(&event, now).await.is_err()
         {
             return ok_rejected(event_id, "error: projection failed".to_owned());
         }
@@ -2604,6 +2673,29 @@ pub struct ReactionCountsDocument {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForumThreadsDocument {
+    pub items: Vec<ForumThreadItemDocument>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForumThreadItemDocument {
+    pub event_id: String,
+    pub pubkey: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub title: Option<String>,
+    pub content: String,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForumThreadDetailDocument {
+    pub thread: ForumThreadItemDocument,
+    pub raw_event: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SellerDocument {
     pub pubkey: String,
     pub approved: bool,
@@ -2811,6 +2903,12 @@ pub fn listings_router(state: ListingsHttpState) -> Router {
             "/api/listings/{pubkey}/{d}/reactions",
             get(listing_reactions),
         )
+        .route("/api/forum/threads", get(forum_threads))
+        .route("/api/forum/threads/{event_id}", get(forum_thread_detail))
+        .route(
+            "/api/forum/threads/{event_id}/comments",
+            get(forum_thread_comments),
+        )
         .route("/api/search", get(marketplace_search))
         .route("/api/sellers/{pubkey}", get(seller_detail))
         .with_state(state)
@@ -2980,6 +3078,94 @@ async fn listing_reactions(
         event_id.as_str(),
         Some("30402"),
     )?))
+}
+
+async fn forum_threads(
+    State(state): State<ListingsHttpState>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<ForumThreadsDocument>, ApiError> {
+    let query = forum_thread_query(query.as_deref().unwrap_or_default())?;
+    let rows = state
+        .store
+        .query_forum_threads(&query)
+        .await
+        .map_err(|_| ApiError::internal())?;
+    let items = rows
+        .iter()
+        .map(forum_thread_item_document)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(ForumThreadsDocument {
+        items,
+        next_cursor: None,
+    }))
+}
+
+async fn forum_thread_detail(
+    State(state): State<ListingsHttpState>,
+    Path(event_id): Path<String>,
+) -> Result<Json<ForumThreadDetailDocument>, ApiError> {
+    let event_id =
+        EventId::new(&event_id).map_err(|_| invalid_parameter("event_id", "is invalid"))?;
+    let row = state
+        .store
+        .forum_thread_row(&event_id)
+        .await
+        .map_err(|_| ApiError::internal())?
+        .ok_or_else(|| ApiError::not_found("forum thread not found"))?;
+    if bool_field(&row, "hidden")? || bool_field(&row, "deleted")? {
+        return Err(ApiError::not_found("forum thread not found"));
+    }
+    let raw_row = state
+        .store
+        .raw_event_row(&event_id)
+        .await
+        .map_err(|_| ApiError::internal())?
+        .ok_or_else(ApiError::internal)?;
+    if bool_field(&raw_row, "hidden")? || bool_field(&raw_row, "deleted")? {
+        return Err(ApiError::not_found("forum thread not found"));
+    }
+    let raw_event = serde_json::from_str(&string_field(&raw_row, "raw_json")?)
+        .map_err(|_| ApiError::internal())?;
+    Ok(Json(ForumThreadDetailDocument {
+        thread: forum_thread_item_document(&row)?,
+        raw_event,
+    }))
+}
+
+async fn forum_thread_comments(
+    State(state): State<ListingsHttpState>,
+    Path(event_id): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<ListingCommentsDocument>, ApiError> {
+    let event_id =
+        EventId::new(&event_id).map_err(|_| invalid_parameter("event_id", "is invalid"))?;
+    let limit = parse_comment_query(query.as_deref().unwrap_or_default())?;
+    let row = state
+        .store
+        .forum_thread_row(&event_id)
+        .await
+        .map_err(|_| ApiError::internal())?
+        .ok_or_else(|| ApiError::not_found("forum thread not found"))?;
+    if bool_field(&row, "hidden")? || bool_field(&row, "deleted")? {
+        return Err(ApiError::not_found("forum thread not found"));
+    }
+    let rows = state
+        .store
+        .query_comment_projections(
+            &CommentProjectionQuery::new()
+                .with_root("event", event_id.as_str())
+                .with_limit(limit),
+        )
+        .await
+        .map_err(|_| ApiError::internal())?;
+    let items = rows
+        .iter()
+        .map(comment_item_document)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(ListingCommentsDocument {
+        items,
+        next_cursor: None,
+    }))
 }
 
 async fn marketplace_search(
@@ -3198,6 +3384,40 @@ fn search_document_query(parsed: &MarketplaceSearchHttpQuery) -> SearchDocumentQ
     query
 }
 
+fn forum_thread_query(raw: &str) -> Result<ForumThreadProjectionQuery, ApiError> {
+    let mut pubkey = None;
+    let mut topic = None;
+    let mut limit = None;
+    for (key, value) in form_urlencoded::parse(raw.as_bytes()) {
+        let value = value.into_owned();
+        match key.as_ref() {
+            "pubkey" => set_once("pubkey", &mut pubkey, parse_pubkey("pubkey", &value)?)?,
+            "topic" => set_once("topic", &mut topic, required_value("topic", &value)?)?,
+            "limit" => set_once("limit", &mut limit, parse_limit(&value)?)?,
+            "cursor" => {
+                return Err(invalid_parameter(
+                    "cursor",
+                    "signed cursor decoding is not implemented",
+                ));
+            }
+            "" => {}
+            unsupported => {
+                return Err(ApiError::invalid_request(format!(
+                    "query parameter `{unsupported}` is unsupported"
+                )));
+            }
+        }
+    }
+    let mut query = ForumThreadProjectionQuery::new().with_limit(limit.unwrap_or(50));
+    if let Some(pubkey) = pubkey {
+        query = query.with_pubkey(pubkey.as_str());
+    }
+    if let Some(topic) = topic {
+        query = query.with_topic(&topic);
+    }
+    Ok(query)
+}
+
 fn parse_comment_query(raw: &str) -> Result<u64, ApiError> {
     let mut limit = None;
     for (key, value) in form_urlencoded::parse(raw.as_bytes()) {
@@ -3235,6 +3455,20 @@ fn listing_item_document(row: &serde_json::Value) -> Result<ListingItemDocument,
         fulfillment: fulfillment_document(row)?,
         status: string_field(row, "effective_status")?,
         updated_at: u64_field(row, "updated_at")?,
+    })
+}
+
+fn forum_thread_item_document(
+    row: &serde_json::Value,
+) -> Result<ForumThreadItemDocument, ApiError> {
+    Ok(ForumThreadItemDocument {
+        event_id: string_field(row, "event_id")?,
+        pubkey: string_field(row, "pubkey")?,
+        created_at: u64_field(row, "created_at")?,
+        updated_at: u64_field(row, "updated_at")?,
+        title: optional_string_field(row, "title")?,
+        content: string_field(row, "content")?,
+        tags: string_array_field(row, "tags")?,
     })
 }
 
@@ -3352,6 +3586,23 @@ fn optional_string_field(
             .ok_or_else(ApiError::internal),
         None => Ok(None),
     }
+}
+
+fn string_array_field(
+    row: &serde_json::Value,
+    field: &'static str,
+) -> Result<Vec<String>, ApiError> {
+    row.get(field)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(ApiError::internal)?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(ApiError::internal)
+        })
+        .collect()
 }
 
 fn u64_field(row: &serde_json::Value, field: &'static str) -> Result<u64, ApiError> {
@@ -3611,8 +3862,8 @@ mod tests {
     };
     use tangle_nips::{FulfillmentMethod, ListingUnit, parse_relay_auth_event};
     use tangle_protocol::{
-        ClientMessage, PublicKeyHex, RelayMessage, SubscriptionId, UnixTimestamp, event_to_value,
-        filter_from_value,
+        ClientMessage, EventId, PublicKeyHex, RelayMessage, SubscriptionId, UnixTimestamp,
+        event_to_value, filter_from_value,
     };
     use tangle_store::StoredEvent;
     use tangle_store_surreal::{
@@ -5707,6 +5958,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forum_threads_endpoint_returns_visible_projected_threads() {
+        let store = runtime_memory_store().await;
+        let thread = forum_thread(1_714_125_430, Some("Market day thread"), &["Market", "CSA"]);
+        store
+            .project_forum_thread(&thread, UnixTimestamp::new(1_714_125_431))
+            .await
+            .expect("project thread");
+
+        let response = listings_router(ListingsHttpState::new(
+            store.clone(),
+            RuntimeLimits::default(),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri("/api/forum/threads?topic=market&limit=5")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
+            serde_json::json!({
+                "items": [{
+                    "event_id": thread.id().as_str(),
+                    "pubkey": FixtureKey::Buyer.public_key().as_str(),
+                    "created_at": 1714125430_u64,
+                    "updated_at": 1714125430_u64,
+                    "title": "Market day thread",
+                    "content": "What is everyone bringing this weekend?",
+                    "tags": ["csa", "market"]
+                }],
+                "next_cursor": null
+            })
+        );
+
+        store
+            .database()
+            .query("UPDATE forum_thread_projection SET hidden = true WHERE event_id = $event_id;")
+            .bind(("event_id", thread.id().as_str()))
+            .await
+            .expect("hide thread")
+            .check()
+            .expect("hide thread check");
+        let response = listings_router(ListingsHttpState::new(store, RuntimeLimits::default()))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/forum/threads?topic=market&limit=5")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
+            serde_json::json!({
+                "items": [],
+                "next_cursor": null
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn forum_thread_detail_and_comments_endpoints_return_visible_rows() {
+        let store = runtime_memory_store().await;
+        let thread = forum_thread(1_714_125_440, Some("Market day thread"), &["market"]);
+        let comment = forum_thread_comment(&thread, 1_714_125_441, "I can bring greens.");
+        store
+            .store_raw_event(&StoredEvent::new(
+                thread.clone(),
+                UnixTimestamp::new(1_714_125_442),
+            ))
+            .await
+            .expect("raw thread");
+        store
+            .project_forum_thread(&thread, UnixTimestamp::new(1_714_125_443))
+            .await
+            .expect("project thread");
+        store
+            .project_comment(&comment, UnixTimestamp::new(1_714_125_444))
+            .await
+            .expect("project comment");
+
+        let detail_uri = format!("/api/forum/threads/{}", thread.id().as_str());
+        let response = listings_router(ListingsHttpState::new(
+            store.clone(),
+            RuntimeLimits::default(),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri(detail_uri.as_str())
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let detail = serde_json::from_slice::<serde_json::Value>(&body).expect("json");
+        assert_eq!(detail["thread"]["event_id"], thread.id().as_str());
+        assert_eq!(detail["thread"]["title"], "Market day thread");
+        assert_eq!(detail["raw_event"]["id"], thread.id().as_str());
+
+        let comments_uri = format!(
+            "/api/forum/threads/{}/comments?limit=5",
+            thread.id().as_str()
+        );
+        let response = listings_router(ListingsHttpState::new(store, RuntimeLimits::default()))
+            .oneshot(
+                Request::builder()
+                    .uri(comments_uri.as_str())
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
+            serde_json::json!({
+                "items": [{
+                    "event_id": comment.id().as_str(),
+                    "pubkey": FixtureKey::Seller.public_key().as_str(),
+                    "created_at": 1714125441_u64,
+                    "content": "I can bring greens.",
+                    "root": {
+                        "target_type": "event",
+                        "target_ref": thread.id().as_str(),
+                        "kind": "11",
+                        "author": thread.unsigned().pubkey().as_str()
+                    },
+                    "parent": {
+                        "target_type": "event",
+                        "target_ref": thread.id().as_str(),
+                        "kind": "11",
+                        "author": thread.unsigned().pubkey().as_str()
+                    }
+                }],
+                "next_cursor": null
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn listing_detail_endpoint_rejects_invalid_or_missing_listing() {
         let store = runtime_memory_store().await;
         let response = listings_router(ListingsHttpState::new(
@@ -5995,6 +6403,74 @@ mod tests {
             content,
         )
         .expect("reaction event")
+    }
+
+    fn forum_thread(
+        created_at: u64,
+        title: Option<&str>,
+        topics: &[&str],
+    ) -> tangle_protocol::Event {
+        let mut tags = vec![
+            vec!["e".to_owned(), "5".repeat(EventId::HEX_LENGTH)],
+            vec![
+                "p".to_owned(),
+                FixtureKey::Seller.public_key().as_str().to_owned(),
+            ],
+        ];
+        if let Some(title) = title {
+            tags.push(vec!["title".to_owned(), title.to_owned()]);
+        }
+        tags.extend(
+            topics
+                .iter()
+                .map(|topic| vec!["t".to_owned(), (*topic).to_owned()]),
+        );
+        build_fixture_event_from_parts(
+            FixtureKey::Buyer,
+            created_at,
+            11,
+            tags,
+            "What is everyone bringing this weekend?",
+        )
+        .expect("forum thread")
+    }
+
+    fn forum_thread_comment(
+        thread: &tangle_protocol::Event,
+        created_at: u64,
+        content: &str,
+    ) -> tangle_protocol::Event {
+        build_fixture_event_from_parts(
+            FixtureKey::Seller,
+            created_at,
+            1_111,
+            vec![
+                vec![
+                    "E".to_owned(),
+                    thread.id().as_str().to_owned(),
+                    "wss://relay.radroots.test".to_owned(),
+                    thread.unsigned().pubkey().as_str().to_owned(),
+                ],
+                vec!["K".to_owned(), "11".to_owned()],
+                vec![
+                    "P".to_owned(),
+                    thread.unsigned().pubkey().as_str().to_owned(),
+                ],
+                vec![
+                    "e".to_owned(),
+                    thread.id().as_str().to_owned(),
+                    "wss://relay.radroots.test".to_owned(),
+                    thread.unsigned().pubkey().as_str().to_owned(),
+                ],
+                vec!["k".to_owned(), "11".to_owned()],
+                vec![
+                    "p".to_owned(),
+                    thread.unsigned().pubkey().as_str().to_owned(),
+                ],
+            ],
+            content,
+        )
+        .expect("forum comment event")
     }
 
     fn runtime_client_message_loop() -> ClientMessageLoop {
