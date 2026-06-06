@@ -19,6 +19,7 @@ tangle_store_surreal = { path = "../tangle_store_surreal" }
 url = "2"
 
 [dev-dependencies]
+tangle_store = { path = "../tangle_store" }
 tangle_test_support = { path = "../tangle_test_support" }
 tokio = { version = "1", features = ["macros", "rt"] }
 tower = { version = "0.5", features = ["util"] }

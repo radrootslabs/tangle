@@ -2,7 +2,7 @@
 
 use axum::{
     Json, Router,
-    extract::{RawQuery, State},
+    extract::{Path, RawQuery, State},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -14,7 +14,7 @@ use tangle_core::{
     MarketplaceSort, RuntimeLimits,
 };
 use tangle_nips::{FulfillmentMethod, ListingUnit};
-use tangle_protocol::PublicKeyHex;
+use tangle_protocol::{EventId, PublicKeyHex};
 use tangle_store_surreal::{ListingProjectionQuery, SurrealStore};
 use url::form_urlencoded;
 
@@ -340,6 +340,12 @@ pub struct ListingLocationDocument {
     pub geohash: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListingDetailDocument {
+    pub listing: ListingItemDocument,
+    pub raw_event: serde_json::Value,
+}
+
 pub fn parse_listing_query(
     query: &str,
     limits: RuntimeLimits,
@@ -443,6 +449,7 @@ pub fn relay_info_router(document: RelayInfoDocument) -> Router {
 pub fn listings_router(state: ListingsHttpState) -> Router {
     Router::new()
         .route("/api/listings", get(listings))
+        .route("/api/listings/{pubkey}/{d}", get(listing_detail))
         .with_state(state)
 }
 
@@ -495,6 +502,41 @@ async fn listings(
     Ok(Json(ListingsDocument {
         items,
         next_cursor: None,
+    }))
+}
+
+async fn listing_detail(
+    State(state): State<ListingsHttpState>,
+    Path((pubkey, d)): Path<(String, String)>,
+) -> Result<Json<ListingDetailDocument>, ApiError> {
+    let pubkey = parse_pubkey("pubkey", &pubkey)?;
+    let d = required_value("d", &d)?;
+    let listing_key = format!("30402:{}:{d}", pubkey.as_str());
+    let row = state
+        .store
+        .listing_current_row(&listing_key)
+        .await
+        .map_err(|_| ApiError::internal())?
+        .ok_or_else(|| ApiError::not_found("listing not found"))?;
+    if bool_field(&row, "hidden")? || bool_field(&row, "deleted")? {
+        return Err(ApiError::not_found("listing not found"));
+    }
+    let event_id =
+        EventId::new(&string_field(&row, "event_id")?).map_err(|_| ApiError::internal())?;
+    let raw_row = state
+        .store
+        .raw_event_row(&event_id)
+        .await
+        .map_err(|_| ApiError::internal())?
+        .ok_or_else(ApiError::internal)?;
+    if bool_field(&raw_row, "hidden")? || bool_field(&raw_row, "deleted")? {
+        return Err(ApiError::not_found("listing not found"));
+    }
+    let raw_event = serde_json::from_str(&string_field(&raw_row, "raw_json")?)
+        .map_err(|_| ApiError::internal())?;
+    Ok(Json(ListingDetailDocument {
+        listing: listing_item_document(&row)?,
+        raw_event,
     }))
 }
 
@@ -936,7 +978,8 @@ mod tests {
     use http::{HeaderValue, Request, StatusCode, header};
     use tangle_core::{MarketplaceListingStatus, MarketplaceSort, RuntimeLimits};
     use tangle_nips::{FulfillmentMethod, ListingUnit};
-    use tangle_protocol::UnixTimestamp;
+    use tangle_protocol::{UnixTimestamp, event_to_value};
+    use tangle_store::StoredEvent;
     use tangle_store_surreal::{SurrealConnectionConfig, SurrealStore, base_migration_plan};
     use tangle_test_support::{build_fixture_event, valid_public_listing_spec};
     use tower::ServiceExt;
@@ -1643,6 +1686,135 @@ mod tests {
                 "next_cursor": null
             })
         );
+    }
+
+    #[tokio::test]
+    async fn listing_detail_endpoint_returns_projection_and_raw_event() {
+        let store = runtime_memory_store().await;
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let listing_key = format!("30402:{}:listing-a", listing.unsigned().pubkey().as_str());
+        store
+            .store_raw_event(&StoredEvent::new(
+                listing.clone(),
+                UnixTimestamp::new(1_714_125_300),
+            ))
+            .await
+            .expect("raw event");
+        store
+            .project_current_listing(&listing, UnixTimestamp::new(1_714_125_400))
+            .await
+            .expect("project listing");
+
+        let uri = format!(
+            "/api/listings/{}/listing-a",
+            listing.unsigned().pubkey().as_str()
+        );
+        let response = listings_router(ListingsHttpState::new(
+            store.clone(),
+            RuntimeLimits::default(),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri(uri.as_str())
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json = serde_json::from_slice::<serde_json::Value>(&body).expect("json");
+        assert_eq!(json["listing"]["listing_key"], listing_key);
+        assert_eq!(json["listing"]["event_id"], listing.id().as_str());
+        assert_eq!(json["raw_event"], event_to_value(&listing));
+
+        store
+            .database()
+            .query("UPDATE nostr_event SET hidden = true WHERE event_id = $event_id;")
+            .bind(("event_id", listing.id().as_str()))
+            .await
+            .expect("hide raw")
+            .check()
+            .expect("hide raw check");
+        let response = listings_router(ListingsHttpState::new(
+            store.clone(),
+            RuntimeLimits::default(),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri(uri.as_str())
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        store
+            .database()
+            .query(
+                "UPDATE nostr_event SET hidden = false WHERE event_id = $event_id;
+                 UPDATE listing_current SET hidden = true WHERE listing_key = $listing_key;",
+            )
+            .bind(("event_id", listing.id().as_str()))
+            .bind(("listing_key", listing_key.as_str()))
+            .await
+            .expect("hide listing")
+            .check()
+            .expect("hide listing check");
+        let response = listings_router(ListingsHttpState::new(store, RuntimeLimits::default()))
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn listing_detail_endpoint_rejects_invalid_or_missing_listing() {
+        let store = runtime_memory_store().await;
+        let response = listings_router(ListingsHttpState::new(
+            store.clone(),
+            RuntimeLimits::default(),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri("/api/listings/not-a-pubkey/listing-a")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
+            serde_json::json!({
+                "error": {
+                    "code": "invalid_request",
+                    "message": "pubkey must be a 64-character hex public key"
+                }
+            })
+        );
+
+        let response = listings_router(ListingsHttpState::new(store, RuntimeLimits::default()))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/listings/{}/missing", "1".repeat(64)))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     async fn runtime_memory_store() -> SurrealStore {
