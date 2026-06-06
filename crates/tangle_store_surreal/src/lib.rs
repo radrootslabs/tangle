@@ -6,10 +6,11 @@ use std::collections::BTreeSet;
 use surrealdb::Surreal;
 use surrealdb::engine::local::{Db, Mem, RocksDb};
 use tangle_nips::{
-    CommentEvent, DeletionTarget, ForumThreadEvent, ListingProjection, ListingProjectionEvaluation,
-    LongFormEvent, LongFormKind, NIP99_DRAFT_LISTING_KIND, NIP99_PUBLIC_LISTING_KIND,
-    ReactionEvent, ReactionValue, evaluate_listing_projection, parse_comment_event,
-    parse_deletion_request, parse_forum_thread_event, parse_long_form_event, parse_reaction_event,
+    CommentEvent, DeletionTarget, ForumThreadEvent, LabelEvent, ListingProjection,
+    ListingProjectionEvaluation, LongFormEvent, LongFormKind, NIP99_DRAFT_LISTING_KIND,
+    NIP99_PUBLIC_LISTING_KIND, ReactionEvent, ReactionValue, evaluate_listing_projection,
+    parse_comment_event, parse_deletion_request, parse_forum_thread_event, parse_label_event,
+    parse_long_form_event, parse_reaction_event,
 };
 use tangle_protocol::{AddressCoordinate, Event, EventId, Filter, UnixTimestamp, event_to_value};
 use tangle_store::{StoreEventOutcome, StoredEvent};
@@ -918,6 +919,13 @@ pub enum ForumThreadProjectionOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelProjectionOutcome {
+    NotLabel,
+    Ineligible,
+    Projected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HiddenEventOutcome {
     NotFound,
     Hidden,
@@ -1154,6 +1162,48 @@ impl ForumThreadProjectionQuery {
 
     pub fn with_topic(mut self, topic: &str) -> Self {
         self.topic = Some(topic.to_owned());
+        self
+    }
+
+    pub fn with_limit(mut self, limit: u64) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LabelProjectionQuery {
+    target_type: Option<String>,
+    target_ref: Option<String>,
+    namespace: Option<String>,
+    label: Option<String>,
+    pubkey: Option<String>,
+    limit: Option<u64>,
+}
+
+impl LabelProjectionQuery {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_target(mut self, target_type: &str, target_ref: &str) -> Self {
+        self.target_type = Some(target_type.to_owned());
+        self.target_ref = Some(target_ref.to_owned());
+        self
+    }
+
+    pub fn with_namespace(mut self, namespace: &str) -> Self {
+        self.namespace = Some(namespace.to_owned());
+        self
+    }
+
+    pub fn with_label(mut self, label: &str) -> Self {
+        self.label = Some(label.to_owned());
+        self
+    }
+
+    pub fn with_pubkey(mut self, pubkey: &str) -> Self {
+        self.pubkey = Some(pubkey.to_owned());
         self
     }
 
@@ -2551,6 +2601,132 @@ UPSERT type::record('search_doc', $thread_id) CONTENT {
         response.take(0).map_err(SurrealStoreError::from)
     }
 
+    pub async fn project_label(
+        &self,
+        event: &Event,
+        projected_at: UnixTimestamp,
+    ) -> Result<LabelProjectionOutcome, SurrealStoreError> {
+        let label = match parse_label_event(event) {
+            Ok(Some(label)) => label,
+            Ok(None) => return Ok(LabelProjectionOutcome::NotLabel),
+            Err(_) => return Ok(LabelProjectionOutcome::Ineligible),
+        };
+        let fields = label_projection_fields(&label, projected_at);
+        self.db
+            .query("DELETE label_projection WHERE event_id = $event_id;")
+            .bind(("event_id", label.event_id().as_str()))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        for field in fields {
+            self.db
+                .query(
+                    r#"
+UPSERT type::record('label_projection', $label_id) CONTENT {
+    label_id: $label_id,
+    event_id: $event_id,
+    pubkey: $pubkey,
+    created_at: $created_at,
+    content: $content,
+    namespace: $namespace,
+    label: $label,
+    target_type: $target_type,
+    target_ref: $target_ref,
+    hidden: false,
+    deleted: false,
+    projected_at: $projected_at
+};
+"#,
+                )
+                .bind(("label_id", field.label_id.as_str()))
+                .bind(("event_id", field.event_id.as_str()))
+                .bind(("pubkey", field.pubkey.as_str()))
+                .bind(("created_at", field.created_at))
+                .bind(("content", field.content.as_str()))
+                .bind(("namespace", field.namespace.as_str()))
+                .bind(("label", field.label.as_str()))
+                .bind(("target_type", field.target_type.as_str()))
+                .bind(("target_ref", field.target_ref.as_str()))
+                .bind(("projected_at", field.projected_at))
+                .await
+                .map_err(SurrealStoreError::from)?
+                .check()
+                .map_err(SurrealStoreError::from)?;
+        }
+        Ok(LabelProjectionOutcome::Projected)
+    }
+
+    pub async fn label_projection_rows(
+        &self,
+        event_id: &EventId,
+    ) -> Result<Vec<serde_json::Value>, SurrealStoreError> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT * FROM label_projection WHERE event_id = $event_id ORDER BY target_type ASC, target_ref ASC, namespace ASC, label ASC, label_id ASC;",
+            )
+            .bind(("event_id", event_id.as_str()))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
+    pub async fn query_label_projections(
+        &self,
+        query: &LabelProjectionQuery,
+    ) -> Result<Vec<serde_json::Value>, SurrealStoreError> {
+        let mut statement =
+            "SELECT * FROM label_projection WHERE hidden = false AND deleted = false".to_owned();
+        if query.target_type.is_some() {
+            statement.push_str(" AND target_type = $target_type");
+        }
+        if query.target_ref.is_some() {
+            statement.push_str(" AND target_ref = $target_ref");
+        }
+        if query.namespace.is_some() {
+            statement.push_str(" AND namespace = $namespace");
+        }
+        if query.label.is_some() {
+            statement.push_str(" AND label = $label");
+        }
+        if query.pubkey.is_some() {
+            statement.push_str(" AND pubkey = $pubkey");
+        }
+        statement.push_str(" ORDER BY created_at DESC, event_id ASC, label_id ASC");
+        if query.limit.is_some() {
+            statement.push_str(" LIMIT $limit");
+        }
+        statement.push(';');
+        let mut surreal_query = self.db.query(statement);
+        if let Some(value) = &query.target_type {
+            surreal_query = surreal_query.bind(("target_type", value.as_str()));
+        }
+        if let Some(value) = &query.target_ref {
+            surreal_query = surreal_query.bind(("target_ref", value.as_str()));
+        }
+        if let Some(value) = &query.namespace {
+            surreal_query = surreal_query.bind(("namespace", value.as_str()));
+        }
+        if let Some(value) = &query.label {
+            surreal_query = surreal_query.bind(("label", value.as_str()));
+        }
+        if let Some(value) = &query.pubkey {
+            surreal_query = surreal_query.bind(("pubkey", value.as_str()));
+        }
+        if let Some(value) = query.limit {
+            surreal_query = surreal_query.bind(("limit", value));
+        }
+        let mut response = surreal_query
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
     pub async fn project_listing_helpers(
         &self,
         event: &Event,
@@ -2852,6 +3028,7 @@ UPDATE long_form_current SET hidden = true WHERE event_id = $event_id;
 UPDATE long_form_topic SET hidden = true WHERE event_id = $event_id;
 UPDATE forum_thread_projection SET hidden = true WHERE event_id = $event_id;
 UPDATE forum_thread_topic SET hidden = true WHERE event_id = $event_id;
+UPDATE label_projection SET hidden = true WHERE event_id = $event_id;
 UPDATE search_doc SET visible = false WHERE event_id = $event_id OR current_event_id = $event_id;
 "#,
             )
@@ -2907,6 +3084,7 @@ UPDATE long_form_current SET hidden = false WHERE event_id = $event_id;
 UPDATE long_form_topic SET hidden = false WHERE event_id = $event_id;
 UPDATE forum_thread_projection SET hidden = false WHERE event_id = $event_id;
 UPDATE forum_thread_topic SET hidden = false WHERE event_id = $event_id;
+UPDATE label_projection SET hidden = false WHERE event_id = $event_id;
 UPDATE search_doc SET visible = true WHERE (event_id = $event_id OR current_event_id = $event_id) AND (status = "active" OR status = "published" OR status = "open");
 UPDATE search_doc SET visible = false WHERE (event_id = $event_id OR current_event_id = $event_id) AND status != "active" AND status != "published" AND status != "open";
 "#,
@@ -3507,6 +3685,7 @@ UPDATE long_form_current SET deleted = true WHERE event_id = $event_id AND autho
 UPDATE long_form_topic SET deleted = true WHERE event_id = $event_id;
 UPDATE forum_thread_projection SET deleted = true WHERE event_id = $event_id AND pubkey = $author_pubkey;
 UPDATE forum_thread_topic SET deleted = true WHERE event_id = $event_id;
+UPDATE label_projection SET deleted = true WHERE event_id = $event_id AND pubkey = $author_pubkey;
 UPDATE search_doc SET visible = false WHERE event_id = $event_id OR current_event_id = $event_id;
 "#,
             )
@@ -3827,6 +4006,19 @@ struct ForumThreadProjectionFields {
     search_title: String,
 }
 
+struct LabelProjectionFields {
+    label_id: String,
+    event_id: String,
+    pubkey: String,
+    created_at: u64,
+    content: String,
+    namespace: String,
+    label: String,
+    target_type: String,
+    target_ref: String,
+    projected_at: u64,
+}
+
 struct ListingCurrentFields {
     listing_key: String,
     listing_key_hash: String,
@@ -4012,6 +4204,63 @@ fn fallback_thread_title(thread: &ForumThreadEvent) -> String {
         return thread.event_id().as_str().to_owned();
     }
     fallback
+}
+
+fn label_projection_fields(
+    label: &LabelEvent,
+    projected_at: UnixTimestamp,
+) -> Vec<LabelProjectionFields> {
+    let mut pairs = BTreeSet::new();
+    for target in label.targets() {
+        let target_type = target.target_type().to_owned();
+        let target_ref = target.target_ref();
+        for value in label.labels() {
+            pairs.insert((
+                target_type.clone(),
+                target_ref.clone(),
+                value.namespace().to_owned(),
+                value.value().to_owned(),
+            ));
+        }
+    }
+    pairs
+        .into_iter()
+        .map(|(target_type, target_ref, namespace, value)| {
+            let event_id = label.event_id().as_str().to_owned();
+            let pubkey = label.pubkey().as_str().to_owned();
+            LabelProjectionFields {
+                label_id: label_projection_id(
+                    &event_id,
+                    &target_type,
+                    &target_ref,
+                    &namespace,
+                    &value,
+                ),
+                event_id,
+                pubkey,
+                created_at: label.created_at().as_u64(),
+                content: label.content().to_owned(),
+                namespace,
+                label: value,
+                target_type,
+                target_ref,
+                projected_at: projected_at.as_u64(),
+            }
+        })
+        .collect()
+}
+
+fn label_projection_id(
+    event_id: &str,
+    target_type: &str,
+    target_ref: &str,
+    namespace: &str,
+    label: &str,
+) -> String {
+    checksum(
+        &serde_json::to_string(&[event_id, target_type, target_ref, namespace, label])
+            .expect("label projection identity serializes"),
+    )
 }
 
 struct SearchDocumentFields {
@@ -4241,17 +4490,17 @@ mod tests {
     use super::{
         CommentProjectionOutcome, CommentProjectionQuery, CurrentEventOutcome,
         DeletionMarkerOutcome, DurableRateLimitDecision, ForumThreadProjectionOutcome,
-        ForumThreadProjectionQuery, HiddenEventOutcome, ListingCurrentOutcome,
-        ListingHelperOutcome, ListingProjectionQuery, ListingRevisionOutcome,
-        LongFormProjectionOutcome, LongFormProjectionQuery, MigrationApplyOutcome,
-        ReactionProjectionOutcome, SearchDocumentOutcome, SearchDocumentQuery, SurrealConfigError,
-        SurrealConnectionConfig, SurrealConnectionMode, SurrealMigration, SurrealMigrationError,
-        SurrealMigrationPlan, SurrealStore, SurrealStoreError, base_migration_plan,
-        migration_tracking_schema,
+        ForumThreadProjectionQuery, HiddenEventOutcome, LabelProjectionOutcome,
+        LabelProjectionQuery, ListingCurrentOutcome, ListingHelperOutcome, ListingProjectionQuery,
+        ListingRevisionOutcome, LongFormProjectionOutcome, LongFormProjectionQuery,
+        MigrationApplyOutcome, ReactionProjectionOutcome, SearchDocumentOutcome,
+        SearchDocumentQuery, SurrealConfigError, SurrealConnectionConfig, SurrealConnectionMode,
+        SurrealMigration, SurrealMigrationError, SurrealMigrationPlan, SurrealStore,
+        SurrealStoreError, base_migration_plan, migration_tracking_schema,
     };
     use tangle_nips::{
         ListingProjectionEvaluation, NIP7D_THREAD_KIND, NIP23_LONG_FORM_DRAFT_KIND,
-        NIP23_LONG_FORM_KIND,
+        NIP23_LONG_FORM_KIND, NIP32_LABEL_KIND,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -7317,6 +7566,239 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_labels_persists_deterministic_target_label_rows() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let listing_key = format!("30402:{}:listing-a", listing.unsigned().pubkey().as_str());
+        let label = listing_label(
+            &listing,
+            1_714_125_100,
+            &["reviewed", "market"],
+            "moderator labels listing",
+        );
+        let invalid_label = build_fixture_event_from_parts(
+            FixtureKey::Buyer,
+            1_714_125_099,
+            u64::from(NIP32_LABEL_KIND),
+            vec![vec!["l".to_owned(), "reviewed".to_owned()]],
+            "missing target",
+        )
+        .expect("invalid label");
+
+        assert_eq!(
+            store
+                .project_label(&listing, UnixTimestamp::new(1_714_125_101))
+                .await
+                .expect("not label"),
+            LabelProjectionOutcome::NotLabel
+        );
+        assert_eq!(
+            store
+                .project_label(&invalid_label, UnixTimestamp::new(1_714_125_101))
+                .await
+                .expect("invalid label"),
+            LabelProjectionOutcome::Ineligible
+        );
+        assert_eq!(
+            store
+                .project_label(&label, UnixTimestamp::new(1_714_125_102))
+                .await
+                .expect("project label"),
+            LabelProjectionOutcome::Projected
+        );
+        assert_eq!(
+            store
+                .project_label(&label, UnixTimestamp::new(1_714_125_103))
+                .await
+                .expect("reproject label"),
+            LabelProjectionOutcome::Projected
+        );
+
+        let rows = store
+            .label_projection_rows(label.id())
+            .await
+            .expect("label rows");
+        assert_eq!(rows.len(), 4);
+        assert!(
+            rows.iter()
+                .all(|row| row["label_id"].as_str().expect("label id").len() == 64)
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row["event_id"] == label.id().as_str())
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row["pubkey"] == FixtureKey::Buyer.public_key().as_str())
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row["created_at"] == 1_714_125_100_u64)
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row["content"] == "moderator labels listing")
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row["namespace"] == "com.radroots.moderation")
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row["projected_at"] == 1_714_125_103_u64)
+        );
+
+        let address_rows = store
+            .query_label_projections(
+                &LabelProjectionQuery::new()
+                    .with_target("address", &listing_key)
+                    .with_namespace("com.radroots.moderation")
+                    .with_label("reviewed")
+                    .with_pubkey(FixtureKey::Buyer.public_key().as_str())
+                    .with_limit(5),
+            )
+            .await
+            .expect("label query");
+        assert_eq!(address_rows.len(), 1);
+        assert_eq!(address_rows[0]["target_type"], "address");
+        assert_eq!(address_rows[0]["target_ref"], listing_key);
+        assert_eq!(address_rows[0]["label"], "reviewed");
+        assert_eq!(address_rows[0]["hidden"], false);
+        assert_eq!(address_rows[0]["deleted"], false);
+
+        let event_rows = store
+            .query_label_projections(
+                &LabelProjectionQuery::new()
+                    .with_target("event", listing.id().as_str())
+                    .with_namespace("com.radroots.moderation")
+                    .with_limit(5),
+            )
+            .await
+            .expect("event label query");
+        assert_eq!(event_rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn label_projection_visibility_tracks_hidden_and_deleted_events() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let listing_key = format!("30402:{}:listing-a", listing.unsigned().pubkey().as_str());
+        let label = listing_label(&listing, 1_714_125_110, &["reviewed"], "label under review");
+        let admin_pubkey = "a".repeat(PublicKeyHex::HEX_LENGTH);
+        store
+            .store_raw_event(&StoredEvent::new(
+                label.clone(),
+                UnixTimestamp::new(1_714_125_111),
+            ))
+            .await
+            .expect("raw label");
+        store
+            .project_label(&label, UnixTimestamp::new(1_714_125_112))
+            .await
+            .expect("project label");
+
+        let query = LabelProjectionQuery::new()
+            .with_target("address", &listing_key)
+            .with_namespace("com.radroots.moderation")
+            .with_label("reviewed");
+        assert_eq!(
+            store
+                .query_label_projections(&query)
+                .await
+                .expect("visible labels")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .hide_event(
+                    label.id(),
+                    "label moderation",
+                    "admin_api",
+                    &admin_pubkey,
+                    UnixTimestamp::new(1_714_125_113),
+                )
+                .await
+                .expect("hide label"),
+            HiddenEventOutcome::Hidden
+        );
+        assert!(
+            store
+                .query_label_projections(&query)
+                .await
+                .expect("hidden labels")
+                .is_empty()
+        );
+        assert!(
+            store
+                .label_projection_rows(label.id())
+                .await
+                .expect("label rows")
+                .iter()
+                .all(|row| row["hidden"] == true)
+        );
+        assert_eq!(
+            store
+                .unhide_event(
+                    label.id(),
+                    "label restored",
+                    &admin_pubkey,
+                    UnixTimestamp::new(1_714_125_114),
+                )
+                .await
+                .expect("unhide label"),
+            HiddenEventOutcome::Unhidden
+        );
+        assert_eq!(
+            store
+                .query_label_projections(&query)
+                .await
+                .expect("restored labels")
+                .len(),
+            1
+        );
+
+        let deletion = build_fixture_event_from_parts(
+            FixtureKey::Buyer,
+            1_714_125_115,
+            5,
+            vec![vec!["e".to_owned(), label.id().as_str().to_owned()]],
+            "",
+        )
+        .expect("deletion event");
+        assert_eq!(
+            store
+                .apply_deletion_markers(&deletion)
+                .await
+                .expect("delete label"),
+            DeletionMarkerOutcome::Applied { targets: 1 }
+        );
+        assert!(
+            store
+                .query_label_projections(&query)
+                .await
+                .expect("deleted labels")
+                .is_empty()
+        );
+        assert!(
+            store
+                .label_projection_rows(label.id())
+                .await
+                .expect("label rows")
+                .iter()
+                .all(|row| row["deleted"] == true)
+        );
+    }
+
+    #[tokio::test]
     async fn hidden_event_overlay_excludes_events_from_public_read_models() {
         let store = memory_store().await;
         store
@@ -7902,6 +8384,29 @@ mod tests {
             content,
         )
         .expect("reaction event")
+    }
+
+    fn listing_label(listing: &Event, created_at: u64, labels: &[&str], content: &str) -> Event {
+        let listing_key = format!("30402:{}:listing-a", listing.unsigned().pubkey().as_str());
+        let namespace = "com.radroots.moderation";
+        let mut tags = vec![
+            vec!["L".to_owned(), namespace.to_owned()],
+            vec!["e".to_owned(), listing.id().as_str().to_owned()],
+            vec!["a".to_owned(), listing_key],
+        ];
+        tags.extend(
+            labels
+                .iter()
+                .map(|label| vec!["l".to_owned(), (*label).to_owned(), namespace.to_owned()]),
+        );
+        build_fixture_event_from_parts(
+            FixtureKey::Buyer,
+            created_at,
+            u64::from(NIP32_LABEL_KIND),
+            tags,
+            content,
+        )
+        .expect("label event")
     }
 
     fn long_form_article(
