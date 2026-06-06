@@ -288,6 +288,105 @@ async fn tangle_run_enforces_seller_projection_policy() {
     fs::remove_dir_all(&reject_write.root).expect("remove reject root");
 }
 
+#[tokio::test]
+async fn tangle_run_persists_durable_write_rate_limits() {
+    let port = free_port();
+    let root = std::env::temp_dir().join(format!(
+        "tangle-rate-limit-integration-{}-{port}",
+        std::process::id()
+    ));
+    let db_path = root.join("surrealdb");
+    let config_path = root.join("runtime.json");
+    fs::create_dir_all(&root).expect("runtime root");
+    let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+    let auth = build_fixture_event(&auth_event_spec()).expect("auth");
+    let seller = FixtureKey::Seller.public_key();
+    write_runtime_config(
+        &config_path,
+        &db_path,
+        port,
+        "tangle_rate_limit",
+        serde_json::json!({
+            "approved_sellers": [seller.as_str()],
+            "write_rate_limit": {
+                "limit": 1,
+                "window_seconds": 60
+            }
+        }),
+    );
+    let mut relay = spawn_relay(&config_path);
+    wait_for_http(port, &mut relay);
+    let (mut client, _) = connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("client connect");
+    assert_eq!(next_label(&mut client).await, "AUTH");
+    client
+        .send(Message::Text(
+            serde_json::json!(["AUTH", event_to_value(&auth)])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("auth send");
+    assert_ok(&next_json(&mut client).await, true);
+
+    client
+        .send(Message::Text(
+            serde_json::json!(["EVENT", event_to_value(&listing)])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("first event send");
+    assert_ok(&next_json(&mut client).await, true);
+    client
+        .send(Message::Text(
+            serde_json::json!(["EVENT", event_to_value(&listing)])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("second event send");
+    let rejected = next_json(&mut client).await;
+    assert_ok(&rejected, false);
+    assert!(
+        rejected[3]
+            .as_str()
+            .expect("rate rejection")
+            .contains("rate-limited: retry after")
+    );
+    stop_relay(relay);
+
+    let store_config = SurrealConnectionConfig::rocksdb(
+        db_path.to_str().expect("db path"),
+        "tangle_rate_limit",
+        "relay",
+    )
+    .expect("store config");
+    let store = reopen_store(&store_config).await;
+    let key = format!("event_write:{}", seller.as_str());
+    let row = store
+        .rate_limit_state_row(&key)
+        .await
+        .expect("rate row")
+        .expect("rate row exists");
+    assert_eq!(row["key"], key);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(row["state"].as_str().expect("state"))
+            .expect("state json")["used"],
+        1_u64
+    );
+    assert!(
+        store
+            .raw_event_row(listing.id())
+            .await
+            .expect("raw row")
+            .is_some()
+    );
+    drop(store);
+    fs::remove_dir_all(&root).expect("remove runtime root");
+}
+
 struct PolicyWriteScenario {
     root: std::path::PathBuf,
     store_config: SurrealConnectionConfig,

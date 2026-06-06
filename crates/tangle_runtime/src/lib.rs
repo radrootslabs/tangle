@@ -35,8 +35,8 @@ use tangle_protocol::{
 };
 use tangle_store::{StoreEventOutcome, StoredEvent};
 use tangle_store_surreal::{
-    ListingProjectionQuery, MigrationApplyOutcome, SearchDocumentQuery, SurrealConnectionConfig,
-    SurrealConnectionMode, SurrealStore, base_migration_plan,
+    DurableRateLimitDecision, ListingProjectionQuery, MigrationApplyOutcome, SearchDocumentQuery,
+    SurrealConnectionConfig, SurrealConnectionMode, SurrealStore, base_migration_plan,
 };
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -236,6 +236,7 @@ pub struct TangleRuntimeConfig {
     relay_connection: RelayConnectionConfig,
     database: SurrealConnectionConfig,
     admission_policy: AdmissionPolicy,
+    durable_write_rate_limit: Option<RateLimitConfig>,
     limits: RuntimeLimits,
 }
 
@@ -254,6 +255,10 @@ impl TangleRuntimeConfig {
 
     pub fn admission_policy(&self) -> &AdmissionPolicy {
         &self.admission_policy
+    }
+
+    pub fn durable_write_rate_limit(&self) -> Option<RateLimitConfig> {
+        self.durable_write_rate_limit
     }
 
     pub fn limits(&self) -> RuntimeLimits {
@@ -1035,7 +1040,8 @@ async fn handle_websocket(mut socket: WebSocket, state: RuntimeRelayState) {
     let mut shutdown = state.shutdown_signal.subscribe();
     let mut event_rx = state.event_tx.subscribe();
     let mut loop_state = ClientMessageLoop::new(state.next_connection());
-    let event_handler = EventMessageHandler::new(state.store.clone(), state.validator());
+    let event_handler = EventMessageHandler::new(state.store.clone(), state.validator())
+        .with_durable_write_rate_limit(state.config.durable_write_rate_limit());
     let auth_handler = AuthMessageHandler;
     let req_handler = ReqMessageHandler::new(state.store.clone(), NostrFilterCompiler::default());
     let close_handler = CloseMessageHandler;
@@ -1269,6 +1275,7 @@ struct RuntimeLimitValuesDocument {
 struct RuntimePolicyConfigDocument {
     require_write_auth: Option<bool>,
     unapproved_seller_action: Option<RuntimeUnapprovedSellerActionDocument>,
+    write_rate_limit: Option<RuntimeRateLimitConfigDocument>,
     #[serde(default)]
     approved_sellers: Vec<String>,
     #[serde(default)]
@@ -1301,12 +1308,14 @@ fn runtime_config_from_document(
     )
     .map_err(RuntimeConfigError::invalid)?;
     let database = database_config_from_document(document.database)?;
-    let admission_policy = admission_policy_from_document(document.policy)?;
+    let durable_write_rate_limit = durable_write_rate_limit_from_document(&document.policy)?;
+    let admission_policy = admission_policy_from_document(&document.policy)?;
     Ok(TangleRuntimeConfig {
         listen_addr,
         relay_connection,
         database,
         admission_policy,
+        durable_write_rate_limit,
         limits: limits.runtime,
     })
 }
@@ -1388,8 +1397,21 @@ fn required_path(value: Option<String>, mode: &str) -> Result<String, RuntimeCon
     })
 }
 
+fn durable_write_rate_limit_from_document(
+    document: &RuntimePolicyConfigDocument,
+) -> Result<Option<RateLimitConfig>, RuntimeConfigError> {
+    document
+        .write_rate_limit
+        .as_ref()
+        .map(|value| {
+            RateLimitConfig::new(value.limit, value.window_seconds)
+                .map_err(|error| RuntimeConfigError::invalid(error.to_string()))
+        })
+        .transpose()
+}
+
 fn admission_policy_from_document(
-    document: RuntimePolicyConfigDocument,
+    document: &RuntimePolicyConfigDocument,
 ) -> Result<AdmissionPolicy, RuntimeConfigError> {
     let action = match document.unapproved_seller_action {
         Some(RuntimeUnapprovedSellerActionDocument::StoreRawOnly) | None => {
@@ -1402,15 +1424,15 @@ fn admission_policy_from_document(
     let mut policy = AdmissionPolicy::new()
         .with_write_auth_required(document.require_write_auth.unwrap_or(true))
         .with_unapproved_seller_action(action);
-    for pubkey in document.approved_sellers {
-        policy = policy.approve_seller(PublicKeyHex::new(&pubkey).map_err(|error| {
+    for pubkey in &document.approved_sellers {
+        policy = policy.approve_seller(PublicKeyHex::new(pubkey.as_str()).map_err(|error| {
             RuntimeConfigError::invalid(format!(
                 "policy.approved_sellers contains invalid pubkey: {error}"
             ))
         })?);
     }
-    for pubkey in document.blocked_pubkeys {
-        policy = policy.block_pubkey(PublicKeyHex::new(&pubkey).map_err(|error| {
+    for pubkey in &document.blocked_pubkeys {
+        policy = policy.block_pubkey(PublicKeyHex::new(pubkey.as_str()).map_err(|error| {
             RuntimeConfigError::invalid(format!(
                 "policy.blocked_pubkeys contains invalid pubkey: {error}"
             ))
@@ -1596,11 +1618,16 @@ impl ClientMessageLoop {
 pub struct EventMessageHandler {
     store: SurrealStore,
     validator: EventValidator,
+    durable_write_rate_limit: Option<RateLimitConfig>,
 }
 
 impl EventMessageHandler {
     pub fn new(store: SurrealStore, validator: EventValidator) -> Self {
-        Self { store, validator }
+        Self {
+            store,
+            validator,
+            durable_write_rate_limit: None,
+        }
     }
 
     pub fn store(&self) -> &SurrealStore {
@@ -1609,6 +1636,15 @@ impl EventMessageHandler {
 
     pub fn validator(&self) -> &EventValidator {
         &self.validator
+    }
+
+    pub fn durable_write_rate_limit(&self) -> Option<RateLimitConfig> {
+        self.durable_write_rate_limit
+    }
+
+    pub fn with_durable_write_rate_limit(mut self, config: Option<RateLimitConfig>) -> Self {
+        self.durable_write_rate_limit = config;
+        self
     }
 
     pub async fn handle_event(
@@ -1626,6 +1662,33 @@ impl EventMessageHandler {
         };
         if validated.admission().effect() == AdmissionEffect::AuthenticateOnly {
             return ok_rejected(event_id, "invalid: auth events must use AUTH".to_owned());
+        }
+        if let Some(config) = self.durable_write_rate_limit {
+            match self
+                .store
+                .check_durable_rate_limit(
+                    &durable_write_rate_limit_key(validated.author_pubkey()),
+                    config.limit,
+                    config.window_seconds,
+                    1,
+                    now,
+                )
+                .await
+            {
+                Ok(DurableRateLimitDecision::Accepted { .. }) => {}
+                Ok(DurableRateLimitDecision::Rejected {
+                    retry_after_seconds,
+                    ..
+                }) => {
+                    return ok_rejected(
+                        event_id,
+                        format!("rate-limited: retry after {retry_after_seconds} seconds"),
+                    );
+                }
+                Err(_) => {
+                    return ok_rejected(event_id, "error: rate limit unavailable".to_owned());
+                }
+            }
         }
         if event.unsigned().kind().is_ephemeral() {
             return ok_accepted(event_id);
@@ -1899,6 +1962,10 @@ fn admission_context(connection: &RelayConnection) -> AdmissionContext {
         .cloned()
         .map(AdmissionContext::authenticated)
         .unwrap_or_else(AdmissionContext::unauthenticated)
+}
+
+fn durable_write_rate_limit_key(pubkey: &PublicKeyHex) -> String {
+    format!("event_write:{}", pubkey.as_str())
 }
 
 fn ok_accepted(event_id: EventId) -> RelayMessage {
@@ -3345,6 +3412,12 @@ mod tests {
                         "max_content_bytes": 1024,
                         "max_subscriptions_per_connection": 8
                     }
+                },
+                "policy": {
+                    "write_rate_limit": {
+                        "limit": 2,
+                        "window_seconds": 60
+                    }
                 }
             }"#,
         )
@@ -3365,6 +3438,10 @@ mod tests {
         assert_eq!(config.limits().max_event_bytes(), 2048);
         assert_eq!(config.limits().max_content_bytes(), 1024);
         assert_eq!(config.limits().max_subscriptions_per_connection(), 8);
+        assert_eq!(
+            config.durable_write_rate_limit(),
+            Some(RateLimitConfig::new(2, 60).expect("write limit"))
+        );
         assert_eq!(config.database_config().namespace(), "tangle_test");
         assert_eq!(config.database_config().database(), "relay");
         assert_eq!(
@@ -3840,6 +3917,75 @@ mod tests {
             } => assert!(message.contains("write authentication required")),
             outcome => panic!("unexpected outcome: {outcome:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn event_message_handler_persists_durable_write_rate_limits() {
+        let store = runtime_memory_store().await;
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let connection = authenticated_connection();
+        let handler = EventMessageHandler::new(
+            store.clone(),
+            EventValidator::new(
+                RuntimeLimits::default(),
+                AdmissionPolicy::new().approve_seller(listing.unsigned().pubkey().clone()),
+            ),
+        )
+        .with_durable_write_rate_limit(Some(RateLimitConfig::new(1, 60).expect("write rate")));
+
+        let accepted = handler
+            .handle_event(
+                &connection,
+                listing.clone(),
+                UnixTimestamp::new(1_714_125_500),
+                UnixTimestamp::new(1_714_125_500),
+            )
+            .await;
+        let rejected = handler
+            .handle_event(
+                &connection,
+                listing.clone(),
+                UnixTimestamp::new(1_714_125_501),
+                UnixTimestamp::new(1_714_125_501),
+            )
+            .await;
+
+        assert_eq!(
+            handler.durable_write_rate_limit(),
+            Some(RateLimitConfig::new(1, 60).expect("write rate"))
+        );
+        assert_eq!(
+            accepted,
+            RelayMessage::Ok {
+                event_id: listing.id().clone(),
+                accepted: true,
+                message: String::new()
+            }
+        );
+        match rejected {
+            RelayMessage::Ok {
+                accepted: false,
+                message,
+                ..
+            } => assert_eq!(message, "rate-limited: retry after 59 seconds"),
+            outcome => panic!("unexpected outcome: {outcome:?}"),
+        }
+        let key = format!("event_write:{}", listing.unsigned().pubkey().as_str());
+        let row = store
+            .rate_limit_state_row(&key)
+            .await
+            .expect("rate row")
+            .expect("rate row exists");
+        assert_eq!(row["key"], key);
+        assert_eq!(row["expires_at"], 1_714_125_560_u64);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(row["state"].as_str().expect("state"))
+                .expect("state json"),
+            serde_json::json!({
+                "started_at": 1714125500_u64,
+                "used": 1
+            })
+        );
     }
 
     #[test]

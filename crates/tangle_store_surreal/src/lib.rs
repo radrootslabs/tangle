@@ -712,6 +712,47 @@ pub enum HiddenEventOutcome {
     Unhidden,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableRateLimitDecision {
+    Accepted {
+        remaining: u64,
+        reset_at: UnixTimestamp,
+    },
+    Rejected {
+        retry_after_seconds: u64,
+        reset_at: UnixTimestamp,
+    },
+}
+
+impl DurableRateLimitDecision {
+    pub fn allowed(self) -> bool {
+        matches!(self, Self::Accepted { .. })
+    }
+
+    pub fn remaining(self) -> u64 {
+        match self {
+            Self::Accepted { remaining, .. } => remaining,
+            Self::Rejected { .. } => 0,
+        }
+    }
+
+    pub fn reset_at(self) -> UnixTimestamp {
+        match self {
+            Self::Accepted { reset_at, .. } | Self::Rejected { reset_at, .. } => reset_at,
+        }
+    }
+
+    pub fn retry_after_seconds(self) -> Option<u64> {
+        match self {
+            Self::Accepted { .. } => None,
+            Self::Rejected {
+                retry_after_seconds,
+                ..
+            } => Some(retry_after_seconds),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ListingProjectionQuery {
     effective_status: Option<String>,
@@ -2044,6 +2085,99 @@ UPDATE search_doc SET visible = false WHERE (event_id = $event_id OR current_eve
         response.take(0).map_err(SurrealStoreError::from)
     }
 
+    pub async fn check_durable_rate_limit(
+        &self,
+        key: &str,
+        limit: u64,
+        window_seconds: u64,
+        cost: u64,
+        now: UnixTimestamp,
+    ) -> Result<DurableRateLimitDecision, SurrealStoreError> {
+        let key = required_policy_text(key, "rate limit key")?;
+        if limit == 0 {
+            return Err(SurrealStoreError::new(
+                "rate limit must be greater than zero",
+            ));
+        }
+        if window_seconds == 0 {
+            return Err(SurrealStoreError::new(
+                "rate limit window must be greater than zero seconds",
+            ));
+        }
+        if cost == 0 {
+            return Err(SurrealStoreError::new(
+                "rate limit cost must be greater than zero",
+            ));
+        }
+        if cost > limit {
+            return Err(SurrealStoreError::new(&format!(
+                "rate limit cost {cost} exceeds limit {limit}"
+            )));
+        }
+        let row = self.rate_limit_state_row(&key).await?;
+        let created_at = row
+            .as_ref()
+            .and_then(|row| row.get("created_at"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_else(|| now.as_u64());
+        let mut state = row
+            .as_ref()
+            .map(rate_limit_window_state_from_row)
+            .transpose()?
+            .unwrap_or_else(|| DurableRateLimitWindowState::new(now));
+        state.reset_if_elapsed(now, window_seconds);
+        let reset_at = state.reset_at(window_seconds);
+        if state.used.saturating_add(cost) > limit {
+            return Ok(DurableRateLimitDecision::Rejected {
+                retry_after_seconds: reset_at.as_u64().saturating_sub(now.as_u64()),
+                reset_at,
+            });
+        }
+        state.used += cost;
+        self.upsert_rate_limit_state(&key, state, reset_at, created_at, now)
+            .await?;
+        Ok(DurableRateLimitDecision::Accepted {
+            remaining: limit - state.used,
+            reset_at,
+        })
+    }
+
+    pub async fn rate_limit_state_row(
+        &self,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, SurrealStoreError> {
+        let key = required_policy_text(key, "rate limit key")?;
+        let mut response = self
+            .db
+            .query("SELECT * FROM ONLY type::record('rate_limit_state', $key);")
+            .bind(("key", key.as_str()))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
+    pub async fn prune_expired_rate_limit_state(
+        &self,
+        now: UnixTimestamp,
+    ) -> Result<u64, SurrealStoreError> {
+        let mut response = self
+            .db
+            .query(
+                "DELETE rate_limit_state WHERE expires_at != NONE AND expires_at <= $now RETURN BEFORE;",
+            )
+            .bind(("now", now.as_u64()))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        let rows = response
+            .take::<Vec<serde_json::Value>>(0)
+            .map_err(SurrealStoreError::from)?;
+        Ok(rows.len() as u64)
+    }
+
     async fn replace_listing_helper_rows(
         &self,
         table: &str,
@@ -2095,6 +2229,38 @@ UPDATE search_doc SET visible = false WHERE (event_id = $event_id OR current_eve
             .check()
             .map_err(SurrealStoreError::from)?;
         response.take(0).map_err(SurrealStoreError::from)
+    }
+
+    async fn upsert_rate_limit_state(
+        &self,
+        key: &str,
+        state: DurableRateLimitWindowState,
+        expires_at: UnixTimestamp,
+        created_at: u64,
+        updated_at: UnixTimestamp,
+    ) -> Result<(), SurrealStoreError> {
+        self.db
+            .query(
+                r#"
+UPSERT type::record('rate_limit_state', $key) CONTENT {
+    key: $key,
+    state: $state,
+    expires_at: $expires_at,
+    created_at: $created_at,
+    updated_at: $updated_at
+};
+"#,
+            )
+            .bind(("key", key))
+            .bind(("state", state.to_json_string()))
+            .bind(("expires_at", expires_at.as_u64()))
+            .bind(("created_at", created_at))
+            .bind(("updated_at", updated_at.as_u64()))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        Ok(())
     }
 
     async fn query_single_indexed_tag_event_ids(
@@ -2277,6 +2443,63 @@ fn moderation_action_id(
         "{action}:{target_ref}:{admin_pubkey}:{}",
         created_at.as_u64()
     ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DurableRateLimitWindowState {
+    started_at: UnixTimestamp,
+    used: u64,
+}
+
+impl DurableRateLimitWindowState {
+    fn new(started_at: UnixTimestamp) -> Self {
+        Self {
+            started_at,
+            used: 0,
+        }
+    }
+
+    fn reset_at(self, window_seconds: u64) -> UnixTimestamp {
+        UnixTimestamp::new(self.started_at.as_u64().saturating_add(window_seconds))
+    }
+
+    fn reset_if_elapsed(&mut self, now: UnixTimestamp, window_seconds: u64) {
+        if now >= self.reset_at(window_seconds) || now < self.started_at {
+            self.started_at = now;
+            self.used = 0;
+        }
+    }
+
+    fn to_json_string(self) -> String {
+        serde_json::json!({
+            "started_at": self.started_at.as_u64(),
+            "used": self.used
+        })
+        .to_string()
+    }
+}
+
+fn rate_limit_window_state_from_row(
+    row: &serde_json::Value,
+) -> Result<DurableRateLimitWindowState, SurrealStoreError> {
+    let raw = row
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| SurrealStoreError::new("rate limit state is invalid"))?;
+    let value = serde_json::from_str::<serde_json::Value>(raw)
+        .map_err(|_| SurrealStoreError::new("rate limit state is invalid"))?;
+    let started_at = value
+        .get("started_at")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| SurrealStoreError::new("rate limit state is invalid"))?;
+    let used = value
+        .get("used")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| SurrealStoreError::new("rate limit state is invalid"))?;
+    Ok(DurableRateLimitWindowState {
+        started_at: UnixTimestamp::new(started_at),
+        used,
+    })
 }
 
 fn d_tag_value(event: &Event) -> Option<String> {
@@ -2624,12 +2847,12 @@ impl From<surrealdb::Error> for SurrealStoreError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CurrentEventOutcome, DeletionMarkerOutcome, HiddenEventOutcome, ListingCurrentOutcome,
-        ListingHelperOutcome, ListingProjectionQuery, ListingRevisionOutcome,
-        MigrationApplyOutcome, SearchDocumentOutcome, SearchDocumentQuery, SurrealConfigError,
-        SurrealConnectionConfig, SurrealConnectionMode, SurrealMigration, SurrealMigrationError,
-        SurrealMigrationPlan, SurrealStore, SurrealStoreError, base_migration_plan,
-        migration_tracking_schema,
+        CurrentEventOutcome, DeletionMarkerOutcome, DurableRateLimitDecision, HiddenEventOutcome,
+        ListingCurrentOutcome, ListingHelperOutcome, ListingProjectionQuery,
+        ListingRevisionOutcome, MigrationApplyOutcome, SearchDocumentOutcome, SearchDocumentQuery,
+        SurrealConfigError, SurrealConnectionConfig, SurrealConnectionMode, SurrealMigration,
+        SurrealMigrationError, SurrealMigrationPlan, SurrealStore, SurrealStoreError,
+        base_migration_plan, migration_tracking_schema,
     };
     use tangle_nips::ListingProjectionEvaluation;
     use tangle_protocol::{
@@ -4751,6 +4974,109 @@ mod tests {
                 .await
                 .expect("missing hide"),
             HiddenEventOutcome::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_rate_limit_state_persists_fixed_windows() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let key = "event_write:".to_owned() + &"1".repeat(PublicKeyHex::HEX_LENGTH);
+
+        let first = store
+            .check_durable_rate_limit(&key, 3, 60, 1, UnixTimestamp::new(100))
+            .await
+            .expect("first");
+        let second = store
+            .check_durable_rate_limit(&key, 3, 60, 2, UnixTimestamp::new(110))
+            .await
+            .expect("second");
+        let rejected = store
+            .check_durable_rate_limit(&key, 3, 60, 1, UnixTimestamp::new(120))
+            .await
+            .expect("rejected");
+
+        assert_eq!(
+            first,
+            DurableRateLimitDecision::Accepted {
+                remaining: 2,
+                reset_at: UnixTimestamp::new(160)
+            }
+        );
+        assert!(first.allowed());
+        assert_eq!(first.remaining(), 2);
+        assert_eq!(first.reset_at(), UnixTimestamp::new(160));
+        assert_eq!(first.retry_after_seconds(), None);
+        assert_eq!(
+            second,
+            DurableRateLimitDecision::Accepted {
+                remaining: 0,
+                reset_at: UnixTimestamp::new(160)
+            }
+        );
+        assert_eq!(
+            rejected,
+            DurableRateLimitDecision::Rejected {
+                retry_after_seconds: 40,
+                reset_at: UnixTimestamp::new(160)
+            }
+        );
+        assert!(!rejected.allowed());
+        assert_eq!(rejected.remaining(), 0);
+        assert_eq!(rejected.retry_after_seconds(), Some(40));
+        let row = store
+            .rate_limit_state_row(&key)
+            .await
+            .expect("rate row")
+            .expect("rate row exists");
+        assert_eq!(row["key"], key);
+        assert_eq!(row["expires_at"], 160_u64);
+        assert_eq!(row["created_at"], 100_u64);
+        assert_eq!(row["updated_at"], 110_u64);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(row["state"].as_str().expect("state"))
+                .expect("state json"),
+            serde_json::json!({
+                "started_at": 100,
+                "used": 3
+            })
+        );
+
+        let reset = store
+            .check_durable_rate_limit(&key, 3, 60, 1, UnixTimestamp::new(160))
+            .await
+            .expect("reset");
+        assert_eq!(
+            reset,
+            DurableRateLimitDecision::Accepted {
+                remaining: 2,
+                reset_at: UnixTimestamp::new(220)
+            }
+        );
+        let row = store
+            .rate_limit_state_row(&key)
+            .await
+            .expect("rate row")
+            .expect("rate row exists");
+        assert_eq!(row["expires_at"], 220_u64);
+        assert_eq!(row["created_at"], 100_u64);
+        assert_eq!(row["updated_at"], 160_u64);
+        assert_eq!(
+            store
+                .prune_expired_rate_limit_state(UnixTimestamp::new(221))
+                .await
+                .expect("prune"),
+            1
+        );
+        assert!(
+            store
+                .rate_limit_state_row(&key)
+                .await
+                .expect("pruned row")
+                .is_none()
         );
     }
 
