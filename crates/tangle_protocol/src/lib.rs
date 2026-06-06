@@ -320,6 +320,140 @@ impl fmt::Display for TagValue {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DTag(String);
+
+impl DTag {
+    pub fn new(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for DTag {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for DTag {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self::new(value))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AddressKey(String);
+
+impl AddressKey {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AddressKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AddressCoordinate {
+    kind: Kind,
+    pubkey: PublicKeyHex,
+    d: DTag,
+}
+
+impl AddressCoordinate {
+    pub fn new(kind: Kind, pubkey: PublicKeyHex, d: DTag) -> Result<Self, String> {
+        if !kind.is_addressable() {
+            return Err(format!(
+                "address coordinate kind must be addressable, got {}",
+                kind.as_u32()
+            ));
+        }
+        Ok(Self { kind, pubkey, d })
+    }
+
+    pub fn from_event(event: &Event) -> Result<Option<Self>, String> {
+        let kind = event.unsigned().kind();
+        if !kind.is_addressable() {
+            return Ok(None);
+        }
+        let d = event
+            .unsigned()
+            .tags()
+            .iter()
+            .find_map(|tag| {
+                tag.indexed_pair().and_then(|(name, value)| {
+                    if name == "d" {
+                        Some(DTag::new(value))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .ok_or_else(|| "addressable event must include a d tag".to_owned())?;
+        Self::new(kind, event.unsigned().pubkey().clone(), d).map(Some)
+    }
+
+    pub fn kind(&self) -> Kind {
+        self.kind
+    }
+
+    pub fn pubkey(&self) -> &PublicKeyHex {
+        &self.pubkey
+    }
+
+    pub fn d(&self) -> &DTag {
+        &self.d
+    }
+
+    pub fn key(&self) -> AddressKey {
+        AddressKey(self.to_string())
+    }
+}
+
+impl fmt::Display for AddressCoordinate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}:{}:{}",
+            self.kind.as_u32(),
+            self.pubkey.as_str(),
+            self.d.as_str()
+        )
+    }
+}
+
+impl FromStr for AddressCoordinate {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let mut parts = value.splitn(3, ':');
+        let kind = parts
+            .next()
+            .unwrap_or_default()
+            .parse::<u64>()
+            .map_err(|_| "address coordinate kind must be an unsigned integer".to_owned())
+            .and_then(Kind::new)?;
+        let pubkey = parts
+            .next()
+            .ok_or_else(|| "address coordinate pubkey is missing".to_owned())
+            .and_then(PublicKeyHex::new)?;
+        let d = parts
+            .next()
+            .ok_or_else(|| "address coordinate d tag is missing".to_owned())
+            .map(DTag::new)?;
+        Self::new(kind, pubkey, d)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsignedEvent {
     pubkey: PublicKeyHex,
@@ -994,12 +1128,12 @@ fn kind_out_of_range_error(value: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientMessage, Event, EventId, EventShapeError, Filter, Kind, KindClass, PublicKeyHex,
-        RawEventJson, RelayMessage, SignatureHex, SubscriptionId, Tag, TagName, TagValue,
-        UnixTimestamp, UnsignedEvent, canonical_event_json, empty_error, encode_relay_message,
-        event_from_value, event_to_value, filter_from_value, invalid_length_error,
-        kind_out_of_range_error, non_lowercase_hex_error, parse_client_message, parse_event_json,
-        relay_message_to_value, too_long_error,
+        AddressCoordinate, AddressKey, ClientMessage, DTag, Event, EventId, EventShapeError,
+        Filter, Kind, KindClass, PublicKeyHex, RawEventJson, RelayMessage, SignatureHex,
+        SubscriptionId, Tag, TagName, TagValue, UnixTimestamp, UnsignedEvent, canonical_event_json,
+        empty_error, encode_relay_message, event_from_value, event_to_value, filter_from_value,
+        invalid_length_error, kind_out_of_range_error, non_lowercase_hex_error,
+        parse_client_message, parse_event_json, relay_message_to_value, too_long_error,
     };
     use core::str::FromStr;
     use std::collections::hash_map::DefaultHasher;
@@ -1140,6 +1274,95 @@ mod tests {
 
         assert_eq!(format!("{:?}", KindClass::Regular), "Regular");
         assert_eq!(KindClass::Regular, KindClass::Regular);
+    }
+
+    #[test]
+    fn address_coordinate_parses_formats_and_extracts_from_events() {
+        let pubkey = PublicKeyHex::new(&"1".repeat(PublicKeyHex::HEX_LENGTH)).expect("pubkey");
+        let coordinate = AddressCoordinate::new(
+            Kind::new(30_402).expect("kind"),
+            pubkey.clone(),
+            DTag::new("market-stall"),
+        )
+        .expect("coordinate");
+        let key: AddressKey = coordinate.key();
+        let parsed = AddressCoordinate::from_str(&coordinate.to_string()).expect("parsed");
+        let empty_d =
+            AddressCoordinate::from_str(&format!("30000:{}:", pubkey.as_str())).expect("empty d");
+        let event = addressable_event("market-stall", 30_402);
+
+        assert_eq!(coordinate.kind().as_u32(), 30_402);
+        assert_eq!(coordinate.pubkey(), &pubkey);
+        assert_eq!(coordinate.d().as_str(), "market-stall");
+        assert_eq!(
+            coordinate.to_string(),
+            format!("30402:{}:market-stall", pubkey.as_str())
+        );
+        assert_eq!(key.as_str(), coordinate.to_string());
+        assert_eq!(key.to_string(), coordinate.to_string());
+        assert_eq!(parsed, coordinate);
+        assert_eq!(empty_d.d().as_str(), "");
+        assert_eq!(
+            AddressCoordinate::from_event(&event).expect("event"),
+            Some(coordinate)
+        );
+        assert_eq!(
+            AddressCoordinate::from_event(&event_for_filter(
+                &"e".repeat(EventId::HEX_LENGTH),
+                50,
+                1
+            ))
+            .expect("regular"),
+            None
+        );
+        assert_eq!(format!("{:?}", DTag::new("d")), "DTag(\"d\")");
+        assert_eq!(DTag::new("d").to_string(), "d");
+        assert_eq!(DTag::from_str("d"), Ok(DTag::new("d")));
+    }
+
+    #[test]
+    fn address_coordinate_rejects_invalid_coordinates() {
+        let pubkey = "1".repeat(PublicKeyHex::HEX_LENGTH);
+
+        assert_eq!(
+            AddressCoordinate::new(
+                Kind::new(1).expect("kind"),
+                PublicKeyHex::new(&pubkey).expect("pubkey"),
+                DTag::new("d")
+            )
+            .expect_err("regular kind"),
+            "address coordinate kind must be addressable, got 1"
+        );
+        assert_eq!(
+            AddressCoordinate::from_str("bad").expect_err("kind parse"),
+            "address coordinate kind must be an unsigned integer"
+        );
+        assert_eq!(
+            AddressCoordinate::from_str(&format!("{}:{pubkey}:d", u64::from(u32::MAX) + 1))
+                .expect_err("kind range"),
+            format!("kind must fit in u32, got {}", u64::from(u32::MAX) + 1)
+        );
+        assert_eq!(
+            AddressCoordinate::from_str("1").expect_err("missing pubkey"),
+            "address coordinate pubkey is missing"
+        );
+        assert_eq!(
+            AddressCoordinate::from_str("30000:bad").expect_err("bad pubkey"),
+            "public key must be 64 characters, got 3"
+        );
+        assert_eq!(
+            AddressCoordinate::from_str(&format!("30000:{pubkey}")).expect_err("missing d"),
+            "address coordinate d tag is missing"
+        );
+        assert_eq!(
+            AddressCoordinate::from_str(&format!("1:{pubkey}:d")).expect_err("regular parse"),
+            "address coordinate kind must be addressable, got 1"
+        );
+        assert_eq!(
+            AddressCoordinate::from_event(&addressable_event_without_d())
+                .expect_err("missing event d"),
+            "addressable event must include a d tag"
+        );
     }
 
     #[test]
@@ -1856,6 +2079,47 @@ mod tests {
                     )
                     .expect("pubkey tag"),
                     Tag::from_parts("t", &["radroots"]).expect("topic tag"),
+                ],
+                "hello",
+            ),
+            SignatureHex::new(&"b".repeat(SignatureHex::HEX_LENGTH)).expect("sig"),
+        )
+    }
+
+    fn addressable_event(d: &str, kind: u64) -> Event {
+        Event::new(
+            EventId::new(&"a".repeat(EventId::HEX_LENGTH)).expect("id"),
+            UnsignedEvent::new(
+                PublicKeyHex::new(&"1".repeat(PublicKeyHex::HEX_LENGTH)).expect("pubkey"),
+                UnixTimestamp::new(50),
+                Kind::new(kind).expect("kind"),
+                vec![
+                    Tag::from_parts(
+                        "p",
+                        &["1111111111111111111111111111111111111111111111111111111111111111"],
+                    )
+                    .expect("pubkey tag"),
+                    Tag::from_parts("d", &[d]).expect("d tag"),
+                ],
+                "hello",
+            ),
+            SignatureHex::new(&"b".repeat(SignatureHex::HEX_LENGTH)).expect("sig"),
+        )
+    }
+
+    fn addressable_event_without_d() -> Event {
+        Event::new(
+            EventId::new(&"a".repeat(EventId::HEX_LENGTH)).expect("id"),
+            UnsignedEvent::new(
+                PublicKeyHex::new(&"1".repeat(PublicKeyHex::HEX_LENGTH)).expect("pubkey"),
+                UnixTimestamp::new(50),
+                Kind::new(30_402).expect("kind"),
+                vec![
+                    Tag::from_parts(
+                        "p",
+                        &["1111111111111111111111111111111111111111111111111111111111111111"],
+                    )
+                    .expect("pubkey tag"),
                 ],
                 "hello",
             ),
