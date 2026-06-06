@@ -4001,6 +4001,36 @@ mod tests {
     }
 
     #[test]
+    fn event_validator_rejects_private_commerce_plaintext_inside_arrays() {
+        let seller = FixtureKey::Seller.public_key();
+        let validator = EventValidator::new(
+            RuntimeLimits::default(),
+            AdmissionPolicy::new().approve_seller(seller.clone()),
+        );
+        let event = build_fixture_event_from_parts(
+            FixtureKey::Seller,
+            1_714_124_439,
+            1,
+            vec![vec!["t".to_owned(), "commerce-privacy".to_owned()]],
+            r#"{"items":[{"note":"public"},{"delivery_address":"100 Privacy Fixture Way"}]}"#,
+        )
+        .expect("array privacy event");
+
+        let rejection = validator
+            .validate(
+                &event,
+                &AdmissionContext::authenticated(seller),
+                UnixTimestamp::new(1_714_124_500),
+            )
+            .expect_err("privacy rejection");
+
+        assert_eq!(
+            rejection,
+            EventValidationRejection::Privacy("delivery_address".to_owned())
+        );
+    }
+
+    #[test]
     fn event_validator_rejects_limits_crypto_parser_and_admission_failures() {
         let seller = FixtureKey::Seller.public_key();
         let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");

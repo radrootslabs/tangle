@@ -4178,6 +4178,7 @@ name = "tangle_runtime"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
  "http",
  "serde",
  "serde_json",
@@ -4189,6 +4190,7 @@ dependencies = [
  "tangle_store_surreal",
  "tangle_test_support",
  "tokio",
+ "tokio-tungstenite 0.28.0",
  "tower",
  "tracing",
  "url",

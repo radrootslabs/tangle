@@ -44,18 +44,7 @@ impl TangleCommand {
     }
 
     pub fn implemented(self) -> bool {
-        matches!(
-            self,
-            Self::Version
-                | Self::Help
-                | Self::Migrate
-                | Self::Run
-                | Self::EventImport
-                | Self::EventExport
-                | Self::ProjectionRebuild
-                | Self::OpsBackup
-                | Self::OpsRestore
-        )
+        true
     }
 }
 
@@ -450,11 +439,8 @@ fn initialize_tracing(config: &tangle_runtime::RuntimeTracingConfig) -> Result<(
                 .try_init();
         }
     }
-    tracing::info!(
-        filter = config.filter(),
-        format = config.format().as_str(),
-        "tracing initialized"
-    );
+    #[rustfmt::skip]
+    tracing::info!(filter = config.filter(), format = config.format().as_str(), "tracing initialized");
     Ok(())
 }
 
@@ -505,6 +491,15 @@ mod tests {
     }
 
     #[test]
+    fn tracing_setup_accepts_compact_format() {
+        let config =
+            RuntimeTracingConfig::new(true, "info,tangle=info", RuntimeTracingFormat::Compact)
+                .expect("compact tracing config");
+
+        assert_eq!(initialize_tracing(&config), Ok(()));
+    }
+
+    #[test]
     fn usage_output_lists_supported_command_model() {
         assert_eq!(
             usage_output(),
@@ -515,40 +510,44 @@ mod tests {
     #[test]
     fn command_model_parses_known_commands() {
         let cases = [
-            (Vec::<&str>::new(), TangleCommand::Help),
-            (vec!["--version"], TangleCommand::Version),
-            (vec!["-V"], TangleCommand::Version),
-            (vec!["--help"], TangleCommand::Help),
-            (vec!["help"], TangleCommand::Help),
-            (vec!["migrate"], TangleCommand::Migrate),
-            (vec!["run"], TangleCommand::Run),
-            (vec!["event", "import"], TangleCommand::EventImport),
-            (vec!["event", "export"], TangleCommand::EventExport),
+            (Vec::<&str>::new(), TangleCommand::Help, "help"),
+            (vec!["--version"], TangleCommand::Version, "version"),
+            (vec!["-V"], TangleCommand::Version, "version"),
+            (vec!["--help"], TangleCommand::Help, "help"),
+            (vec!["help"], TangleCommand::Help, "help"),
+            (vec!["migrate"], TangleCommand::Migrate, "migrate"),
+            (vec!["run"], TangleCommand::Run, "run"),
+            (
+                vec!["event", "import"],
+                TangleCommand::EventImport,
+                "event import",
+            ),
+            (
+                vec!["event", "export"],
+                TangleCommand::EventExport,
+                "event export",
+            ),
             (
                 vec!["projection", "rebuild"],
                 TangleCommand::ProjectionRebuild,
+                "projection rebuild",
             ),
-            (vec!["ops", "backup"], TangleCommand::OpsBackup),
-            (vec!["ops", "restore"], TangleCommand::OpsRestore),
+            (
+                vec!["ops", "backup"],
+                TangleCommand::OpsBackup,
+                "ops backup",
+            ),
+            (
+                vec!["ops", "restore"],
+                TangleCommand::OpsRestore,
+                "ops restore",
+            ),
         ];
 
-        for (args, expected) in cases {
+        for (args, expected, label) in cases {
             assert_eq!(parse_tangle_command(args).expect("command"), expected);
-            assert_eq!(
-                expected.implemented(),
-                matches!(
-                    expected,
-                    TangleCommand::Version
-                        | TangleCommand::Help
-                        | TangleCommand::Migrate
-                        | TangleCommand::Run
-                        | TangleCommand::EventImport
-                        | TangleCommand::EventExport
-                        | TangleCommand::ProjectionRebuild
-                        | TangleCommand::OpsBackup
-                        | TangleCommand::OpsRestore
-                )
-            );
+            assert_eq!(expected.as_str(), label);
+            assert!(expected.implemented());
         }
     }
 
@@ -682,6 +681,14 @@ mod tests {
             TangleCliError::MissingNestedCommand("event")
         );
         assert_eq!(
+            parse_tangle_command(["event", "bad"]).expect_err("event bad"),
+            TangleCliError::UnknownCommand("event bad".to_owned())
+        );
+        assert_eq!(
+            parse_tangle_command(["projection"]).expect_err("projection nested"),
+            TangleCliError::MissingNestedCommand("projection")
+        );
+        assert_eq!(
             parse_tangle_command(["projection", "bad"]).expect_err("projection"),
             TangleCliError::UnknownCommand("projection bad".to_owned())
         );
@@ -740,6 +747,22 @@ mod tests {
             parse_tangle_invocation(["event", "export", "--output", "a", "--output", "b"])
                 .expect_err("repeated output"),
             TangleCliError::RepeatedOption("--output")
+        );
+        assert_eq!(
+            TangleCliError::MissingNestedCommand("event").to_string(),
+            "event command requires a nested command"
+        );
+        assert_eq!(
+            TangleCliError::RepeatedOption("--config").to_string(),
+            "--config must not be repeated"
+        );
+        assert_eq!(
+            TangleCliError::UnexpectedArgument {
+                command: "run".to_owned(),
+                argument: "--extra".to_owned()
+            }
+            .to_string(),
+            "run command does not accept argument: --extra"
         );
     }
 

@@ -48,6 +48,40 @@ fn tangle_unknown_arg_reports_usage_error() {
 }
 
 #[test]
+fn tangle_runtime_commands_report_config_load_failures() {
+    let root =
+        std::env::temp_dir().join(format!("tangle-cli-config-errors-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("runtime root");
+    let config_path = root.join("missing-runtime.json");
+    let output_path = root.join("output");
+    let cases: Vec<(Vec<&str>, Option<&str>)> = vec![
+        (vec!["run", "--config"], None),
+        (vec!["event", "import", "--config"], Some("--input")),
+        (vec!["event", "export", "--config"], Some("--output")),
+        (vec!["ops", "backup", "--config"], Some("--output")),
+        (vec!["ops", "restore", "--config"], Some("--input")),
+    ];
+
+    for (args, path_option) in cases {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tangle"));
+        command.args(&args).arg(&config_path);
+        if let Some(path_option) = path_option {
+            command.arg(path_option).arg(&output_path);
+        }
+        let output = command.output().expect("run tangle command");
+
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.starts_with("Read: failed to read runtime config `"));
+        assert!(stderr.contains("missing-runtime.json"));
+    }
+
+    std::fs::remove_dir_all(&root).expect("remove runtime root");
+}
+
+#[test]
 fn tangle_migrate_command_applies_configured_migrations() {
     let path = std::env::temp_dir().join(format!("tangle-cli-migrate-{}.json", std::process::id()));
     std::fs::write(

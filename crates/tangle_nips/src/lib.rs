@@ -2260,13 +2260,13 @@ mod tests {
         ListingKind, ListingProjectionEvaluation, ListingUnit, LongFormKind, NIP01_METADATA_KIND,
         NIP7D_THREAD_KIND, NIP22_COMMENT_KIND, NIP23_LONG_FORM_DRAFT_KIND, NIP23_LONG_FORM_KIND,
         NIP25_REACTION_KIND, NIP32_LABEL_KIND, NIP56_REPORT_KIND, NIP99_PUBLIC_LISTING_KIND,
-        ReactionValue, ReportTarget, ReportType, evaluate_listing_projection, matching_tags,
-        optional_tag_value, optional_tag_values, parse_comment_event, parse_deletion_request,
-        parse_forum_thread_event, parse_label_event, parse_listing_fulfillment,
-        parse_listing_identity, parse_listing_location, parse_listing_price, parse_listing_status,
-        parse_listing_taxonomy, parse_listing_text, parse_listing_unit, parse_long_form_event,
-        parse_nip50_filter_search, parse_nip50_search, parse_reaction_event,
-        parse_relay_auth_event, parse_report_event, parse_required_u64_tag,
+        ParsedTag, ReactionValue, ReportTarget, ReportType, evaluate_listing_projection,
+        matching_tags, optional_tag_value, optional_tag_values, parse_comment_event,
+        parse_deletion_request, parse_forum_thread_event, parse_label_event,
+        parse_listing_fulfillment, parse_listing_identity, parse_listing_location,
+        parse_listing_price, parse_listing_status, parse_listing_taxonomy, parse_listing_text,
+        parse_listing_unit, parse_long_form_event, parse_nip50_filter_search, parse_nip50_search,
+        parse_reaction_event, parse_relay_auth_event, parse_report_event, parse_required_u64_tag,
         parse_seller_profile_event, parse_u64_field, repeated_or_missing_policy_boundary,
         required_tag_value, required_tag_values, single_letter_tag_values,
         single_letter_values_for, tag_count,
@@ -2456,28 +2456,26 @@ mod tests {
         assert_eq!(comment.cited_events(), std::slice::from_ref(&comment_event));
         assert_eq!(comment.mentioned_pubkeys()[0].as_str(), parent_pubkey);
         assert_eq!(comment.mentioned_pubkeys()[1].as_str(), mentioned_pubkey);
-        match comment.root().target() {
-            CommentTarget::Address {
-                address: parsed,
-                relay_hint,
-            } => {
-                assert_eq!(parsed.key().to_string(), address);
-                assert_eq!(relay_hint.as_deref(), Some("wss://relay.radroots.test"));
-            }
-            other => panic!("unexpected target {other:?}"),
-        }
-        match comment.parent().target() {
-            CommentTarget::Event {
-                event_id,
-                relay_hint,
-                pubkey_hint,
-            } => {
-                assert_eq!(event_id.as_str(), comment_event);
-                assert_eq!(relay_hint.as_deref(), Some("wss://relay.radroots.test"));
-                assert_eq!(pubkey_hint.as_ref().expect("hint").as_str(), parent_pubkey);
-            }
-            other => panic!("unexpected target {other:?}"),
-        }
+        assert!(matches!(
+            comment.root().target(),
+            CommentTarget::Address { .. }
+        ));
+        assert_eq!(comment.root().target().target_type(), "address");
+        assert_eq!(comment.root().target().target_ref(), address);
+        assert_eq!(
+            comment.root().target().relay_hint(),
+            Some("wss://relay.radroots.test")
+        );
+        assert!(matches!(
+            comment.parent().target(),
+            CommentTarget::Event { .. }
+        ));
+        assert_eq!(comment.parent().target().target_type(), "event");
+        assert_eq!(comment.parent().target().target_ref(), comment_event);
+        assert_eq!(
+            comment.parent().target().relay_hint(),
+            Some("wss://relay.radroots.test")
+        );
     }
 
     #[test]
@@ -2498,12 +2496,16 @@ mod tests {
             .expect("comment");
 
         assert_eq!(parse_comment_event(&note), Ok(None));
-        match comment.root().target() {
-            CommentTarget::External { identity, .. } => {
-                assert_eq!(identity, "https://radroots.test/posts/harvest");
-            }
-            other => panic!("unexpected target {other:?}"),
-        }
+        assert!(matches!(
+            comment.root().target(),
+            CommentTarget::External { .. }
+        ));
+        assert_eq!(comment.root().target().target_type(), "external");
+        assert_eq!(
+            comment.root().target().target_ref(),
+            "https://radroots.test/posts/harvest"
+        );
+        assert_eq!(comment.root().target().relay_hint(), None);
     }
 
     #[test]
@@ -2565,6 +2567,125 @@ mod tests {
         assert_eq!(
             parse_comment_event(&kind_one).expect_err("kind one"),
             "NIP-22 comments must not reply to kind 1 notes"
+        );
+    }
+
+    #[test]
+    fn comment_parser_rejects_empty_kinds_authors_and_malformed_targets() {
+        let event_id = "2".repeat(EventId::HEX_LENGTH);
+        let pubkey = "3".repeat(PublicKeyHex::HEX_LENGTH);
+        let address = format!("30023:{pubkey}:article-a");
+        let empty_root_kind = event_with_kind_and_tags(
+            NIP22_COMMENT_KIND.into(),
+            vec![
+                Tag::from_parts("E", &[&event_id]).expect("E"),
+                Tag::from_parts("K", &[""]).expect("K"),
+                Tag::from_parts("e", &[&event_id]).expect("e"),
+                Tag::from_parts("k", &["30023"]).expect("k"),
+            ],
+        );
+        let empty_parent_kind = event_with_kind_and_tags(
+            NIP22_COMMENT_KIND.into(),
+            vec![
+                Tag::from_parts("E", &[&event_id]).expect("E"),
+                Tag::from_parts("K", &["30023"]).expect("K"),
+                Tag::from_parts("e", &[&event_id]).expect("e"),
+                Tag::from_parts("k", &[""]).expect("k"),
+            ],
+        );
+        let repeated_root_author = event_with_kind_and_tags(
+            NIP22_COMMENT_KIND.into(),
+            vec![
+                Tag::from_parts("E", &[&event_id]).expect("E"),
+                Tag::from_parts("K", &["30023"]).expect("K"),
+                Tag::from_parts("P", &[&pubkey]).expect("P"),
+                Tag::from_parts("P", &[&pubkey]).expect("P2"),
+                Tag::from_parts("e", &[&event_id]).expect("e"),
+                Tag::from_parts("k", &["30023"]).expect("k"),
+            ],
+        );
+        let empty_relay = event_with_kind_and_tags(
+            NIP22_COMMENT_KIND.into(),
+            vec![
+                Tag::from_parts("E", &[&event_id, ""]).expect("E"),
+                Tag::from_parts("K", &["30023"]).expect("K"),
+                Tag::from_parts("e", &[&event_id]).expect("e"),
+                Tag::from_parts("k", &["30023"]).expect("k"),
+            ],
+        );
+
+        assert_eq!(
+            parse_comment_event(&empty_root_kind).expect_err("root kind"),
+            "comment root kind tag must not be empty"
+        );
+        assert_eq!(
+            parse_comment_event(&empty_parent_kind).expect_err("parent kind"),
+            "comment parent kind tag must not be empty"
+        );
+        assert_eq!(
+            parse_comment_event(&repeated_root_author).expect_err("root author"),
+            "comment root author tag `P` must not be repeated"
+        );
+        assert_eq!(
+            parse_comment_event(&empty_relay).expect_err("relay"),
+            "comment root target relay hint must not be empty"
+        );
+        assert_eq!(
+            super::parse_comment_target_tag(
+                "E",
+                &ParsedTag {
+                    name: "E".to_owned(),
+                    values: vec![
+                        event_id.clone(),
+                        "relay".to_owned(),
+                        pubkey.clone(),
+                        "extra".to_owned(),
+                    ],
+                },
+                "root",
+            )
+            .expect_err("event target"),
+            "comment root event target tag `E` must include at most event relay and pubkey values"
+        );
+        assert_eq!(
+            super::parse_comment_target_tag(
+                "A",
+                &ParsedTag {
+                    name: "A".to_owned(),
+                    values: vec![address, "relay".to_owned(), "extra".to_owned()],
+                },
+                "root",
+            )
+            .expect_err("address target"),
+            "comment root address target tag `A` must include at most address and relay values"
+        );
+        assert_eq!(
+            super::parse_comment_target_tag(
+                "I",
+                &ParsedTag {
+                    name: "I".to_owned(),
+                    values: vec![
+                        "https://radroots.test/post".to_owned(),
+                        "relay".to_owned(),
+                        "extra".to_owned(),
+                    ],
+                },
+                "root",
+            )
+            .expect_err("external target"),
+            "comment root external target tag `I` must include at most identity and relay values"
+        );
+        assert_eq!(
+            super::parse_comment_target_tag(
+                "x",
+                &ParsedTag {
+                    name: "x".to_owned(),
+                    values: vec!["value".to_owned()],
+                },
+                "root",
+            )
+            .expect_err("unsupported target"),
+            "comment root target tag `x` is unsupported"
         );
     }
 
@@ -2644,6 +2765,7 @@ mod tests {
                 .expect("reaction");
 
             assert_eq!(reaction.value(), &expected);
+            assert_eq!(reaction.value().canonical(), expected.canonical());
         }
         let note = event_with_kind_and_tags(1, Vec::new());
         assert_eq!(parse_reaction_event(&note), Ok(None));
@@ -2775,6 +2897,10 @@ mod tests {
             ],
         );
         let missing_d = event_with_kind_and_tags(NIP23_LONG_FORM_KIND.into(), Vec::new());
+        let empty_d = event_with_kind_and_tags(
+            NIP23_LONG_FORM_KIND.into(),
+            vec![Tag::from_parts("d", &[""]).expect("d")],
+        );
         let empty_title = event_with_kind_and_tags(
             NIP23_LONG_FORM_KIND.into(),
             vec![
@@ -2811,6 +2937,10 @@ mod tests {
         assert_eq!(
             parse_long_form_event(&missing_d).expect_err("missing"),
             "tag `d` is required"
+        );
+        assert_eq!(
+            parse_long_form_event(&empty_d).expect_err("empty d"),
+            "long-form d tag must not be empty"
         );
         assert_eq!(
             parse_long_form_event(&empty_title).expect_err("empty title"),
@@ -2899,6 +3029,10 @@ mod tests {
             NIP7D_THREAD_KIND.into(),
             vec![Tag::from_parts("t", &[" "]).expect("topic")],
         );
+        let extra_topic = event_with_kind_and_tags(
+            NIP7D_THREAD_KIND.into(),
+            vec![Tag::from_parts("t", &["market", "extra"]).expect("topic")],
+        );
         let bad_event_reference = event_with_kind_and_tags(
             NIP7D_THREAD_KIND.into(),
             vec![Tag::from_parts("e", &["bad"]).expect("e")],
@@ -2919,6 +3053,10 @@ mod tests {
         assert_eq!(
             parse_forum_thread_event(&empty_topic).expect_err("empty topic"),
             "forum thread topic value must not be empty"
+        );
+        assert_eq!(
+            parse_forum_thread_event(&extra_topic).expect_err("extra topic"),
+            "forum thread topic tag must include exactly one value"
         );
         assert_eq!(
             parse_forum_thread_event(&bad_event_reference).expect_err("bad event"),
@@ -2966,6 +3104,28 @@ mod tests {
         assert_eq!(report.targets()[1].target_type(), "event");
         assert_eq!(report.targets()[1].target_ref(), reported_event);
         assert_eq!(report.targets()[1].report_type(), ReportType::Illegal);
+        assert_eq!(report.targets()[2].target_type(), "blob");
+        assert_eq!(report.targets()[2].target_ref(), blob_hash);
+        assert_eq!(
+            [
+                ReportType::Nudity.canonical(),
+                ReportType::Malware.canonical(),
+                ReportType::Profanity.canonical(),
+                ReportType::Illegal.canonical(),
+                ReportType::Spam.canonical(),
+                ReportType::Impersonation.canonical(),
+                ReportType::Other.canonical(),
+            ],
+            [
+                "nudity",
+                "malware",
+                "profanity",
+                "illegal",
+                "spam",
+                "impersonation",
+                "other",
+            ]
+        );
         assert!(
             matches!(&report.targets()[2], ReportTarget::Blob { hash, report_type } if hash == &blob_hash && *report_type == ReportType::Malware)
         );
@@ -3022,6 +3182,26 @@ mod tests {
                 Tag::from_parts("x", &[&blob_hash, "malware"]).expect("x"),
             ],
         );
+        let empty_x_hash = event_with_kind_and_tags(
+            NIP56_REPORT_KIND.into(),
+            vec![
+                Tag::from_parts("p", &[&reported_pubkey]).expect("p"),
+                Tag::from_parts("e", &[&reported_event]).expect("e"),
+                Tag::from_parts("x", &["", "malware"]).expect("x"),
+            ],
+        );
+        let missing_x_report_type = event_with_kind_and_tags(
+            NIP56_REPORT_KIND.into(),
+            vec![
+                Tag::from_parts("p", &[&reported_pubkey]).expect("p"),
+                Tag::from_parts("e", &[&reported_event]).expect("e"),
+                Tag::from_parts("x", &[&blob_hash]).expect("x"),
+            ],
+        );
+        let empty_report_type = event_with_kind_and_tags(
+            NIP56_REPORT_KIND.into(),
+            vec![Tag::from_parts("p", &[&reported_pubkey, ""]).expect("p")],
+        );
         let malformed_pubkey = event_with_kind_and_tags(
             NIP56_REPORT_KIND.into(),
             vec![Tag::from_parts("p", &["bad", "spam"]).expect("p")],
@@ -3049,6 +3229,18 @@ mod tests {
         assert_eq!(
             parse_report_event(&x_without_event).expect_err("x context"),
             "report x target requires an e tag context"
+        );
+        assert_eq!(
+            parse_report_event(&empty_x_hash).expect_err("x hash"),
+            "report x hash must not be empty"
+        );
+        assert_eq!(
+            parse_report_event(&missing_x_report_type).expect_err("x type"),
+            "report x tag must include a report type"
+        );
+        assert_eq!(
+            parse_report_event(&empty_report_type).expect_err("empty type"),
+            "report type must not be empty"
         );
         assert_eq!(
             parse_report_event(&malformed_pubkey).expect_err("bad pubkey"),
@@ -3093,11 +3285,15 @@ mod tests {
         assert_eq!(label.targets()[0].target_ref(), event_id);
         assert_eq!(label.targets()[1].target_type(), "pubkey");
         assert_eq!(label.targets()[1].target_ref(), pubkey);
+        assert_eq!(label.targets()[2].target_type(), "address");
+        assert_eq!(label.targets()[2].target_ref(), address);
         assert!(
             matches!(&label.targets()[2], LabelTarget::Address(parsed) if parsed.key().to_string() == address)
         );
         assert_eq!(label.targets()[3].target_type(), "relay");
+        assert_eq!(label.targets()[3].target_ref(), "wss://relay.radroots.test");
         assert_eq!(label.targets()[4].target_type(), "topic");
+        assert_eq!(label.targets()[4].target_ref(), "market");
     }
 
     #[test]
@@ -3146,11 +3342,68 @@ mod tests {
                 Tag::from_parts("e", &[&target]).expect("e"),
             ],
         );
+        let empty_namespace = event_with_kind_and_tags(
+            NIP32_LABEL_KIND.into(),
+            vec![
+                Tag::from_parts("L", &[""]).expect("L"),
+                Tag::from_parts("l", &["approve"]).expect("l"),
+                Tag::from_parts("e", &[&target]).expect("e"),
+            ],
+        );
+        let missing_label_value = event_with_kind_and_tags(
+            NIP32_LABEL_KIND.into(),
+            vec![
+                Tag::from_parts("l", &[]).expect("l"),
+                Tag::from_parts("e", &[&target]).expect("e"),
+            ],
+        );
+        let empty_label_value = event_with_kind_and_tags(
+            NIP32_LABEL_KIND.into(),
+            vec![
+                Tag::from_parts("l", &[""]).expect("l"),
+                Tag::from_parts("e", &[&target]).expect("e"),
+            ],
+        );
+        let empty_label_namespace = event_with_kind_and_tags(
+            NIP32_LABEL_KIND.into(),
+            vec![
+                Tag::from_parts("l", &["approve", ""]).expect("l"),
+                Tag::from_parts("e", &[&target]).expect("e"),
+            ],
+        );
+        let extra_label_value = event_with_kind_and_tags(
+            NIP32_LABEL_KIND.into(),
+            vec![
+                Tag::from_parts("l", &["approve", "ugc", "extra"]).expect("l"),
+                Tag::from_parts("e", &[&target]).expect("e"),
+            ],
+        );
         let bad_target = event_with_kind_and_tags(
             NIP32_LABEL_KIND.into(),
             vec![
                 Tag::from_parts("l", &["approve"]).expect("l"),
                 Tag::from_parts("e", &["bad"]).expect("e"),
+            ],
+        );
+        let bad_pubkey_target = event_with_kind_and_tags(
+            NIP32_LABEL_KIND.into(),
+            vec![
+                Tag::from_parts("l", &["approve"]).expect("l"),
+                Tag::from_parts("p", &["bad"]).expect("p"),
+            ],
+        );
+        let empty_relay = event_with_kind_and_tags(
+            NIP32_LABEL_KIND.into(),
+            vec![
+                Tag::from_parts("l", &["approve"]).expect("l"),
+                Tag::from_parts("r", &[""]).expect("r"),
+            ],
+        );
+        let empty_topic = event_with_kind_and_tags(
+            NIP32_LABEL_KIND.into(),
+            vec![
+                Tag::from_parts("l", &["approve"]).expect("l"),
+                Tag::from_parts("t", &[""]).expect("t"),
             ],
         );
 
@@ -3171,8 +3424,40 @@ mod tests {
             "label l tag must include a namespace matching an L tag"
         );
         assert_eq!(
+            parse_label_event(&empty_namespace).expect_err("empty namespace"),
+            "label namespace L tag must include exactly one non-empty value"
+        );
+        assert_eq!(
+            parse_label_event(&missing_label_value).expect_err("missing value"),
+            "label l tag must include a value"
+        );
+        assert_eq!(
+            parse_label_event(&empty_label_value).expect_err("empty value"),
+            "label l value must not be empty"
+        );
+        assert_eq!(
+            parse_label_event(&empty_label_namespace).expect_err("empty label namespace"),
+            "label l namespace must not be empty"
+        );
+        assert_eq!(
+            parse_label_event(&extra_label_value).expect_err("extra label value"),
+            "label l tag must include at most value and namespace"
+        );
+        assert_eq!(
             parse_label_event(&bad_target).expect_err("bad target"),
             "event id must be 64 characters, got 3"
+        );
+        assert_eq!(
+            parse_label_event(&bad_pubkey_target).expect_err("bad pubkey target"),
+            "label target pubkey is invalid: public key must be 64 characters, got 3"
+        );
+        assert_eq!(
+            parse_label_event(&empty_relay).expect_err("empty relay"),
+            "label relay target must not be empty"
+        );
+        assert_eq!(
+            parse_label_event(&empty_topic).expect_err("empty topic"),
+            "label topic target must not be empty"
         );
     }
 

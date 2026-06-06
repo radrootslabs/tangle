@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use surrealdb::Surreal;
 use surrealdb::engine::any::{Any, connect as connect_any};
-use surrealdb::opt::auth::Root;
+use surrealdb::opt::{Config as SurrealClientConfig, auth::Root};
 use tangle_nips::{
     CommentEvent, DeletionTarget, ForumThreadEvent, LabelEvent, ListingProjection,
     ListingProjectionEvaluation, LongFormEvent, LongFormKind, NIP99_DRAFT_LISTING_KIND,
@@ -1549,15 +1549,17 @@ impl SurrealStore {
         let credentials = config.root_credentials().ok_or_else(|| {
             SurrealStoreError::new("surreal remote connection requires root credentials")
         })?;
-        let db = connect_any(endpoint)
-            .await
-            .map_err(SurrealStoreError::from)?;
-        db.signin(Root {
+        let root = Root {
             username: credentials.username().to_owned(),
             password: credentials.password().to_owned(),
-        })
+        };
+        let db = connect_any((
+            endpoint.to_owned(),
+            SurrealClientConfig::new().user(root.clone()),
+        ))
         .await
         .map_err(SurrealStoreError::from)?;
+        db.signin(root).await.map_err(SurrealStoreError::from)?;
         db.use_ns(config.namespace())
             .use_db(config.database())
             .await
@@ -5329,12 +5331,14 @@ mod tests {
         ReportProjectionQuery, SearchDocumentOutcome, SearchDocumentQuery,
         SellerProfileProjectionOutcome, SellerProfileQuery, SurrealConfigError,
         SurrealConnectionConfig, SurrealConnectionMode, SurrealMigration, SurrealMigrationError,
-        SurrealMigrationPlan, SurrealStore, SurrealStoreError, base_migration_plan,
-        migration_tracking_schema,
+        SurrealMigrationPlan, SurrealStore, SurrealStoreError, base_migration_plan, count_value,
+        fallback_thread_title, long_form_current_should_replace, migration_tracking_schema,
+        optional_string_row_field, required_policy_text, seller_profile_should_replace,
     };
     use tangle_nips::{
         ListingProjectionEvaluation, NIP01_METADATA_KIND, NIP7D_THREAD_KIND,
         NIP23_LONG_FORM_DRAFT_KIND, NIP23_LONG_FORM_KIND, NIP32_LABEL_KIND, NIP56_REPORT_KIND,
+        parse_forum_thread_event, parse_long_form_event, parse_seller_profile_event,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -5565,6 +5569,183 @@ mod tests {
         assert_eq!(
             error.message(),
             "surreal remote connection requires root credentials"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_connection_uses_any_engine_endpoint_with_root_credentials() {
+        for config in [
+            SurrealConnectionConfig::http("memory", "ns", "db")
+                .expect("http config")
+                .with_root_credentials("root", "root")
+                .expect("http credentials"),
+            SurrealConnectionConfig::websocket("memory", "ns", "db")
+                .expect("websocket config")
+                .with_root_credentials("root", "root")
+                .expect("websocket credentials"),
+        ] {
+            SurrealStore::connect(&config)
+                .await
+                .expect("remote any connection")
+                .ping()
+                .await
+                .expect("remote any ping");
+        }
+    }
+
+    #[test]
+    fn row_helper_functions_accept_supported_shapes_and_reject_malformed_values() {
+        assert_eq!(count_value(serde_json::json!(3)).expect("numeric count"), 3);
+        assert_eq!(
+            count_value(serde_json::json!({"count": 4})).expect("object count"),
+            4
+        );
+        assert_eq!(
+            count_value(serde_json::json!({"count": "4"}))
+                .expect_err("bad count")
+                .message(),
+            "surreal count query returned a non-numeric count"
+        );
+        assert_eq!(
+            required_policy_text(" seller ", "seller profile pubkey").expect("policy text"),
+            "seller"
+        );
+        assert_eq!(
+            required_policy_text(" ", "seller profile pubkey")
+                .expect_err("empty policy text")
+                .message(),
+            "seller profile pubkey must not be empty"
+        );
+        assert_eq!(
+            optional_string_row_field(&serde_json::json!({"target_kind": null}), "target_kind")
+                .expect("null field"),
+            None
+        );
+        assert_eq!(
+            optional_string_row_field(&serde_json::json!({"target_kind": "30402"}), "target_kind")
+                .expect("string field"),
+            Some("30402".to_owned())
+        );
+        assert_eq!(
+            optional_string_row_field(&serde_json::json!({}), "target_kind")
+                .expect("missing field"),
+            None
+        );
+        assert_eq!(
+            optional_string_row_field(&serde_json::json!({"target_kind": 30402}), "target_kind")
+                .expect_err("numeric field")
+                .message(),
+            "target_kind row field must be a string"
+        );
+    }
+
+    #[test]
+    fn projection_helper_edges_cover_replacement_ties_and_empty_forum_titles() {
+        let article_event = long_form_article(1_714_125_010, "tie-break", "Tie break", "Body", &[]);
+        let article = parse_long_form_event(&article_event)
+            .expect("long form parse")
+            .expect("long form");
+        assert!(long_form_current_should_replace(
+            &article,
+            &serde_json::json!({
+                "updated_at": 1714125010_u64,
+                "event_id": "0".repeat(EventId::HEX_LENGTH)
+            })
+        ));
+
+        let empty_thread = build_fixture_event_from_parts(
+            FixtureKey::Buyer,
+            1_714_125_011,
+            u64::from(NIP7D_THREAD_KIND),
+            Vec::new(),
+            "",
+        )
+        .expect("empty thread");
+        let thread = parse_forum_thread_event(&empty_thread)
+            .expect("thread parse")
+            .expect("thread");
+        assert_eq!(fallback_thread_title(&thread), empty_thread.id().as_str());
+
+        let profile_event = seller_profile(1_714_125_012, "tie-market", None, &[], &[], &[]);
+        let profile = parse_seller_profile_event(&profile_event)
+            .expect("profile parse")
+            .expect("profile");
+        assert!(seller_profile_should_replace(
+            &profile,
+            &serde_json::json!({
+                "updated_at": 1714125012_u64,
+                "event_id": "0".repeat(EventId::HEX_LENGTH)
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_rate_limit_rejects_invalid_window_and_cost_inputs() {
+        let store = memory_store().await;
+        let now = UnixTimestamp::new(1_714_124_500);
+        let cases = [
+            (0, 60, 1, "rate limit must be greater than zero"),
+            (
+                1,
+                0,
+                1,
+                "rate limit window must be greater than zero seconds",
+            ),
+            (1, 60, 0, "rate limit cost must be greater than zero"),
+            (1, 60, 2, "rate limit cost 2 exceeds limit 1"),
+        ];
+
+        for (limit, window, cost, expected) in cases {
+            assert_eq!(
+                store
+                    .check_durable_rate_limit("key", limit, window, cost, now)
+                    .await
+                    .expect_err(expected)
+                    .message(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn topic_projection_queries_short_circuit_when_topic_indexes_are_empty() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+
+        assert_eq!(
+            store
+                .query_long_form_projections(&LongFormProjectionQuery::new().with_topic("missing"))
+                .await
+                .expect("long form query"),
+            Vec::<serde_json::Value>::new()
+        );
+        assert_eq!(
+            store
+                .query_forum_threads(&ForumThreadProjectionQuery::new().with_topic("missing"))
+                .await
+                .expect("forum query"),
+            Vec::<serde_json::Value>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn unhide_event_reports_not_found_before_policy_validation() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let missing = EventId::new(&"1".repeat(EventId::HEX_LENGTH)).expect("event id");
+
+        assert_eq!(
+            store
+                .unhide_event(&missing, "", "", UnixTimestamp::new(1_714_124_500))
+                .await
+                .expect("unhide missing"),
+            HiddenEventOutcome::NotFound
         );
     }
 
@@ -6844,6 +7025,25 @@ mod tests {
             .expect("address rows");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["event_id"], addressable.id().as_str());
+        store
+            .database()
+            .query("DELETE nostr_event WHERE event_id = $event_id;")
+            .bind(("event_id", addressable.id().as_str()))
+            .await
+            .expect("delete raw")
+            .check()
+            .expect("delete raw check");
+        let orphan_filter = filter_from_value(&serde_json::json!({
+            "ids": [addressable.id().as_str()]
+        }))
+        .expect("orphan filter");
+        assert!(
+            store
+                .query_current_events(&orphan_filter)
+                .await
+                .expect("orphan current")
+                .is_empty()
+        );
 
         store
             .database()
@@ -7819,6 +8019,7 @@ mod tests {
         let like = listing_reaction(&listing, 1_714_125_030, "+");
         let dislike = listing_reaction(&listing, 1_714_125_031, "-");
         let emoji = listing_reaction(&listing, 1_714_125_032, "⭐");
+        let text = listing_reaction(&listing, 1_714_125_033, "fresh");
         let invalid =
             build_fixture_event_from_parts(FixtureKey::Buyer, 1_714_125_029, 7, Vec::new(), "+")
                 .expect("invalid reaction");
@@ -7837,10 +8038,10 @@ mod tests {
                 .expect("invalid reaction"),
             ReactionProjectionOutcome::Ineligible
         );
-        for reaction in [&like, &dislike, &emoji] {
+        for reaction in [&like, &dislike, &emoji, &text] {
             assert_eq!(
                 store
-                    .project_reaction(reaction, UnixTimestamp::new(1_714_125_033))
+                    .project_reaction(reaction, UnixTimestamp::new(1_714_125_034))
                     .await
                     .expect("project reaction"),
                 ReactionProjectionOutcome::Projected
@@ -7875,6 +8076,30 @@ mod tests {
             .expect("count row exists");
         assert_eq!(count["target_event_id"], listing.id().as_str());
         assert_eq!(count["target_kind"], "30402");
+        assert_eq!(count["like_count"], 1_i64);
+        assert_eq!(count["dislike_count"], 1_i64);
+        assert_eq!(count["emoji_count"], 1_i64);
+        assert_eq!(count["text_count"], 1_i64);
+        assert_eq!(count["total_count"], 4_i64);
+        store
+            .database()
+            .query(
+                "UPDATE reaction_projection SET value_type = 'unknown' WHERE event_id = $event_id;",
+            )
+            .bind(("event_id", text.id().as_str()))
+            .await
+            .expect("unknown reaction update")
+            .check()
+            .expect("unknown reaction update check");
+        store
+            .refresh_reaction_count_for_event(text.id().as_str(), 1_714_125_035)
+            .await
+            .expect("refresh unknown reaction");
+        let count = store
+            .reaction_count_row(listing.id())
+            .await
+            .expect("unknown count row")
+            .expect("unknown count row exists");
         assert_eq!(count["like_count"], 1_i64);
         assert_eq!(count["dislike_count"], 1_i64);
         assert_eq!(count["emoji_count"], 1_i64);
@@ -8122,6 +8347,14 @@ mod tests {
             "Updated body.",
             &["storage"],
         );
+        let malformed = build_fixture_event_from_parts(
+            FixtureKey::Seller,
+            1_714_125_072,
+            u64::from(NIP23_LONG_FORM_KIND),
+            Vec::new(),
+            "Missing d tag",
+        )
+        .expect("malformed long form");
         let long_form_key = format!(
             "30023:{}:harvest-notes",
             second.unsigned().pubkey().as_str()
@@ -8141,6 +8374,13 @@ mod tests {
                 .await
                 .expect("project first"),
             LongFormProjectionOutcome::Projected
+        );
+        assert_eq!(
+            store
+                .project_long_form(&malformed, UnixTimestamp::new(1_714_125_073))
+                .await
+                .expect("malformed long form"),
+            LongFormProjectionOutcome::Ineligible
         );
         assert_eq!(
             store
