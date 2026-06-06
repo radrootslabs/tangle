@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+use k256::schnorr::signature::Verifier;
+use k256::schnorr::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 use tangle_protocol::{Event, EventId, UnsignedEvent, canonical_event_json};
 
@@ -31,6 +33,27 @@ pub fn verify_event_id(event: &Event) -> Result<(), String> {
     }
 }
 
+pub fn verify_event_signature(event: &Event) -> Result<(), String> {
+    verify_event_id(event)?;
+    let event_id =
+        validated_fixed_hex_bytes(event.id().as_str(), EventId::HEX_LENGTH / 2, "event id");
+    let pubkey = fixed_hex_bytes(
+        event.unsigned().pubkey().as_str(),
+        EventId::HEX_LENGTH / 2,
+        "public key",
+    )
+    .expect("validated public key scalar decodes");
+    let signature = fixed_hex_bytes(event.sig().as_str(), 64, "signature")
+        .expect("validated signature decodes");
+    let verifying_key = VerifyingKey::from_bytes(&pubkey)
+        .map_err(|_| "event public key is not a valid secp256k1 x-only key".to_owned())?;
+    let signature = Signature::try_from(signature.as_slice())
+        .map_err(|_| "event signature is not a valid schnorr signature".to_owned())?;
+    verifying_key
+        .verify(&event_id, &signature)
+        .map_err(|_| "event signature verification failed".to_owned())
+}
+
 fn lower_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -41,9 +64,42 @@ fn lower_hex(bytes: &[u8]) -> String {
     output
 }
 
+fn fixed_hex_bytes(value: &str, expected: usize, scalar: &str) -> Result<Vec<u8>, String> {
+    if value.len() != expected * 2 {
+        return Err(format!(
+            "{scalar} must decode to {expected} bytes, got {} hex characters",
+            value.len()
+        ));
+    }
+    let mut output = Vec::with_capacity(expected);
+    for chunk in value.as_bytes().chunks_exact(2) {
+        let high = hex_value(chunk[0], scalar)?;
+        let low = hex_value(chunk[1], scalar)?;
+        output.push((high << 4) | low);
+    }
+    Ok(output)
+}
+
+fn validated_fixed_hex_bytes(value: &str, expected: usize, scalar: &str) -> Vec<u8> {
+    fixed_hex_bytes(value, expected, scalar).expect("validated hex scalar decodes")
+}
+
+fn hex_value(value: u8, scalar: &str) -> Result<u8, String> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        _ => Err(format!("{scalar} must be lowercase hex")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{compute_event_id, compute_event_id_hex, event_id_matches, verify_event_id};
+    use super::{
+        compute_event_id, compute_event_id_hex, event_id_matches, fixed_hex_bytes, lower_hex,
+        verify_event_id, verify_event_signature,
+    };
+    use k256::schnorr::signature::Signer;
+    use k256::schnorr::{Signature, SigningKey};
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
     };
@@ -93,6 +149,86 @@ mod tests {
         );
     }
 
+    #[test]
+    fn schnorr_verifier_accepts_deterministically_signed_event() {
+        let event = signed_event();
+
+        assert_eq!(verify_event_signature(&event), Ok(()));
+    }
+
+    #[test]
+    fn schnorr_verifier_rejects_bad_id_bad_pubkey_and_bad_signature() {
+        let event = signed_event();
+        let wrong_id = Event::new(
+            EventId::new(&"f".repeat(EventId::HEX_LENGTH)).expect("id"),
+            event.unsigned().clone(),
+            event.sig().clone(),
+        );
+        let invalid_pubkey_unsigned = UnsignedEvent::new(
+            PublicKeyHex::new(&"f".repeat(PublicKeyHex::HEX_LENGTH)).expect("pubkey"),
+            event.unsigned().created_at(),
+            event.unsigned().kind(),
+            event.unsigned().tags().to_vec(),
+            event.unsigned().content(),
+        );
+        let invalid_pubkey = Event::new(
+            compute_event_id(&invalid_pubkey_unsigned),
+            invalid_pubkey_unsigned,
+            event.sig().clone(),
+        );
+        let invalid_signature = Event::new(
+            compute_event_id(event.unsigned()),
+            event.unsigned().clone(),
+            SignatureHex::new(&"f".repeat(SignatureHex::HEX_LENGTH)).expect("sig"),
+        );
+        let wrong_message_unsigned = UnsignedEvent::new(
+            event.unsigned().pubkey().clone(),
+            event.unsigned().created_at(),
+            event.unsigned().kind(),
+            event.unsigned().tags().to_vec(),
+            "different message",
+        );
+        let wrong_message_signature = Event::new(
+            compute_event_id(&wrong_message_unsigned),
+            wrong_message_unsigned,
+            event.sig().clone(),
+        );
+
+        assert!(
+            verify_event_signature(&wrong_id)
+                .expect_err("bad id")
+                .starts_with("event id mismatch")
+        );
+        assert_eq!(
+            verify_event_signature(&invalid_pubkey).expect_err("bad pubkey"),
+            "event public key is not a valid secp256k1 x-only key"
+        );
+        assert_eq!(
+            verify_event_signature(&invalid_signature).expect_err("bad sig"),
+            "event signature is not a valid schnorr signature"
+        );
+        assert_eq!(
+            verify_event_signature(&wrong_message_signature).expect_err("wrong message"),
+            "event signature verification failed"
+        );
+    }
+
+    #[test]
+    fn hex_decoder_rejects_bad_length_and_non_hex_input() {
+        assert_eq!(
+            fixed_hex_bytes("abc", 2, "sample").expect_err("length"),
+            "sample must decode to 2 bytes, got 3 hex characters"
+        );
+        assert_eq!(
+            fixed_hex_bytes("0G", 1, "sample").expect_err("hex"),
+            "sample must be lowercase hex"
+        );
+        assert_eq!(
+            fixed_hex_bytes("G0", 1, "sample").expect_err("hex"),
+            "sample must be lowercase hex"
+        );
+    }
+
     fn unsigned_event(tags: Vec<Tag>, content: &str) -> UnsignedEvent {
         UnsignedEvent::new(
             PublicKeyHex::new(&"1".repeat(PublicKeyHex::HEX_LENGTH)).expect("pubkey"),
@@ -101,5 +237,24 @@ mod tests {
             tags,
             content,
         )
+    }
+
+    fn signed_event() -> Event {
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]).expect("signing key");
+        let public_key =
+            PublicKeyHex::new(&lower_hex(signing_key.verifying_key().to_bytes().as_ref()))
+                .expect("pubkey");
+        let unsigned = UnsignedEvent::new(
+            public_key,
+            UnixTimestamp::new(1_714_124_433),
+            Kind::new(1).expect("kind"),
+            vec![Tag::from_parts("t", &["radroots"]).expect("tag")],
+            "radroots cafe",
+        );
+        let event_id = compute_event_id(&unsigned);
+        let event_id_bytes = fixed_hex_bytes(event_id.as_str(), 32, "event id").expect("event id");
+        let signature: Signature = signing_key.sign(&event_id_bytes);
+        let signature = SignatureHex::new(&lower_hex(signature.to_bytes().as_ref())).expect("sig");
+        Event::new(event_id, unsigned, signature)
     }
 }

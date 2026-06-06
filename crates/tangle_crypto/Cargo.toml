@@ -8,6 +8,7 @@ license.workspace = true
 description = "Cryptographic verification utilities for Tangle"
 
 [dependencies]
+k256 = { version = "0.13", features = ["schnorr"] }
 sha2 = "0.10"
 tangle_protocol = { path = "../tangle_protocol" }
 
