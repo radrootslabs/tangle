@@ -310,6 +310,7 @@ pub fn base_migration_plan() -> SurrealMigrationPlan {
         comment_projection_schema(),
         reaction_projection_schema(),
         long_form_projection_schema(),
+        forum_thread_schema(),
     ])
     .expect("base migration plan is strictly ordered")
 }
@@ -758,6 +759,42 @@ DEFINE INDEX IF NOT EXISTS long_form_topic_long_form ON TABLE long_form_topic CO
 "#,
     )
     .expect("long-form projection schema is valid")
+}
+
+pub fn forum_thread_schema() -> SurrealMigration {
+    SurrealMigration::new(
+        "0014_forum_thread_projection",
+        r#"
+DEFINE TABLE IF NOT EXISTS forum_thread_projection SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS thread_id ON TABLE forum_thread_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS event_id ON TABLE forum_thread_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS pubkey ON TABLE forum_thread_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON TABLE forum_thread_projection TYPE int;
+DEFINE FIELD IF NOT EXISTS updated_at ON TABLE forum_thread_projection TYPE int;
+DEFINE FIELD IF NOT EXISTS title ON TABLE forum_thread_projection TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS content ON TABLE forum_thread_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS tags ON TABLE forum_thread_projection TYPE array;
+DEFINE FIELD IF NOT EXISTS referenced_events ON TABLE forum_thread_projection TYPE array;
+DEFINE FIELD IF NOT EXISTS referenced_pubkeys ON TABLE forum_thread_projection TYPE array;
+DEFINE FIELD IF NOT EXISTS hidden ON TABLE forum_thread_projection TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS deleted ON TABLE forum_thread_projection TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS projected_at ON TABLE forum_thread_projection TYPE int;
+DEFINE INDEX IF NOT EXISTS forum_thread_event_uid ON TABLE forum_thread_projection COLUMNS event_id UNIQUE;
+DEFINE INDEX IF NOT EXISTS forum_thread_pubkey_updated ON TABLE forum_thread_projection COLUMNS pubkey, updated_at, event_id;
+DEFINE INDEX IF NOT EXISTS forum_thread_visibility_updated ON TABLE forum_thread_projection COLUMNS hidden, deleted, updated_at, event_id;
+
+DEFINE TABLE IF NOT EXISTS forum_thread_topic SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS thread_id ON TABLE forum_thread_topic TYPE string;
+DEFINE FIELD IF NOT EXISTS topic ON TABLE forum_thread_topic TYPE string;
+DEFINE FIELD IF NOT EXISTS updated_at ON TABLE forum_thread_topic TYPE int;
+DEFINE FIELD IF NOT EXISTS event_id ON TABLE forum_thread_topic TYPE string;
+DEFINE FIELD IF NOT EXISTS hidden ON TABLE forum_thread_topic TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS deleted ON TABLE forum_thread_topic TYPE bool DEFAULT false;
+DEFINE INDEX IF NOT EXISTS forum_thread_topic_lookup ON TABLE forum_thread_topic COLUMNS topic, hidden, deleted, updated_at, thread_id;
+DEFINE INDEX IF NOT EXISTS forum_thread_topic_thread ON TABLE forum_thread_topic COLUMNS thread_id;
+"#,
+    )
+    .expect("forum thread schema is valid")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4448,6 +4485,59 @@ mod tests {
             "deleted",
             "long_form_topic_lookup",
             "long_form_topic_long_form",
+        ] {
+            assert!(topic.contains(expected), "missing {expected} in {topic}");
+        }
+    }
+
+    #[tokio::test]
+    async fn forum_thread_schema_defines_projection_and_topic_tables() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let projection = store
+            .table_info("forum_thread_projection")
+            .await
+            .expect("projection info");
+        let topic = store
+            .table_info("forum_thread_topic")
+            .await
+            .expect("topic info");
+
+        for expected in [
+            "thread_id",
+            "event_id",
+            "pubkey",
+            "created_at",
+            "updated_at",
+            "title",
+            "content",
+            "tags",
+            "referenced_events",
+            "referenced_pubkeys",
+            "hidden",
+            "deleted",
+            "projected_at",
+            "forum_thread_event_uid",
+            "forum_thread_pubkey_updated",
+            "forum_thread_visibility_updated",
+        ] {
+            assert!(
+                projection.contains(expected),
+                "missing {expected} in {projection}"
+            );
+        }
+        for expected in [
+            "thread_id",
+            "topic",
+            "updated_at",
+            "event_id",
+            "hidden",
+            "deleted",
+            "forum_thread_topic_lookup",
+            "forum_thread_topic_thread",
         ] {
             assert!(topic.contains(expected), "missing {expected} in {topic}");
         }
