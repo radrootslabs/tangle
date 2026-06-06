@@ -680,6 +680,13 @@ pub enum ListingCurrentOutcome {
     Projected,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListingHelperOutcome {
+    NotListing,
+    Ineligible,
+    Projected,
+}
+
 #[derive(Clone)]
 pub struct SurrealStore {
     db: Surreal<Db>,
@@ -1244,6 +1251,183 @@ UPSERT type::record('listing_current', $listing_key) CONTENT {
         response.take(0).map_err(SurrealStoreError::from)
     }
 
+    pub async fn project_listing_helpers(
+        &self,
+        event: &Event,
+    ) -> Result<ListingHelperOutcome, SurrealStoreError> {
+        let evaluation = evaluate_listing_projection(event);
+        let ListingProjectionEvaluation::Eligible(projection) = evaluation else {
+            return Ok(
+                if matches!(evaluation, ListingProjectionEvaluation::NotListing) {
+                    ListingHelperOutcome::NotListing
+                } else {
+                    ListingHelperOutcome::Ineligible
+                },
+            );
+        };
+        let listing_key = projection.identity().address().key().to_string();
+        let effective_status = projection
+            .status()
+            .effective_status()
+            .canonical()
+            .to_owned();
+        let updated_at = event.unsigned().created_at().as_u64();
+        let event_id = event.id().as_str();
+        self.replace_listing_helper_rows(
+            "listing_category",
+            "category",
+            &listing_key,
+            projection.taxonomy().categories(),
+            &effective_status,
+            updated_at,
+            event_id,
+        )
+        .await?;
+        let fulfillment = projection
+            .fulfillment()
+            .methods()
+            .iter()
+            .map(|method| method.canonical().to_owned())
+            .collect::<Vec<_>>();
+        self.replace_listing_helper_rows(
+            "listing_fulfillment",
+            "mode",
+            &listing_key,
+            &fulfillment,
+            &effective_status,
+            updated_at,
+            event_id,
+        )
+        .await?;
+        self.replace_listing_helper_rows(
+            "listing_tag",
+            "tag_value",
+            &listing_key,
+            projection.taxonomy().topics(),
+            &effective_status,
+            updated_at,
+            event_id,
+        )
+        .await?;
+        self.replace_listing_helper_rows(
+            "listing_practice",
+            "practice",
+            &listing_key,
+            projection.taxonomy().practices(),
+            &effective_status,
+            updated_at,
+            event_id,
+        )
+        .await?;
+        self.replace_listing_helper_rows(
+            "listing_certification",
+            "certification",
+            &listing_key,
+            projection.taxonomy().certifications(),
+            &effective_status,
+            updated_at,
+            event_id,
+        )
+        .await?;
+        Ok(ListingHelperOutcome::Projected)
+    }
+
+    pub async fn listing_category_rows(
+        &self,
+        listing_key: &str,
+    ) -> Result<Vec<serde_json::Value>, SurrealStoreError> {
+        self.listing_helper_rows("listing_category", "category", listing_key)
+            .await
+    }
+
+    pub async fn listing_fulfillment_rows(
+        &self,
+        listing_key: &str,
+    ) -> Result<Vec<serde_json::Value>, SurrealStoreError> {
+        self.listing_helper_rows("listing_fulfillment", "mode", listing_key)
+            .await
+    }
+
+    pub async fn listing_topic_rows(
+        &self,
+        listing_key: &str,
+    ) -> Result<Vec<serde_json::Value>, SurrealStoreError> {
+        self.listing_helper_rows("listing_tag", "tag_value", listing_key)
+            .await
+    }
+
+    pub async fn listing_practice_rows(
+        &self,
+        listing_key: &str,
+    ) -> Result<Vec<serde_json::Value>, SurrealStoreError> {
+        self.listing_helper_rows("listing_practice", "practice", listing_key)
+            .await
+    }
+
+    pub async fn listing_certification_rows(
+        &self,
+        listing_key: &str,
+    ) -> Result<Vec<serde_json::Value>, SurrealStoreError> {
+        self.listing_helper_rows("listing_certification", "certification", listing_key)
+            .await
+    }
+
+    async fn replace_listing_helper_rows(
+        &self,
+        table: &str,
+        field: &str,
+        listing_key: &str,
+        values: &[String],
+        effective_status: &str,
+        updated_at: u64,
+        event_id: &str,
+    ) -> Result<(), SurrealStoreError> {
+        let delete_query = format!("DELETE {table} WHERE listing_key = $listing_key;");
+        self.db
+            .query(delete_query)
+            .bind(("listing_key", listing_key))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        let create_query = format!(
+            "CREATE {table} CONTENT {{ listing_key: $listing_key, {field}: $value, effective_status: $effective_status, updated_at: $updated_at, event_id: $event_id }};"
+        );
+        for value in values {
+            self.db
+                .query(create_query.as_str())
+                .bind(("listing_key", listing_key))
+                .bind(("value", value.as_str()))
+                .bind(("effective_status", effective_status))
+                .bind(("updated_at", updated_at))
+                .bind(("event_id", event_id))
+                .await
+                .map_err(SurrealStoreError::from)?
+                .check()
+                .map_err(SurrealStoreError::from)?;
+        }
+        Ok(())
+    }
+
+    async fn listing_helper_rows(
+        &self,
+        table: &str,
+        field: &str,
+        listing_key: &str,
+    ) -> Result<Vec<serde_json::Value>, SurrealStoreError> {
+        let query =
+            format!("SELECT * FROM {table} WHERE listing_key = $listing_key ORDER BY {field} ASC;");
+        let mut response = self
+            .db
+            .query(query)
+            .bind(("listing_key", listing_key))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
     async fn applied_migration(
         &self,
         name: &str,
@@ -1633,10 +1817,10 @@ impl From<surrealdb::Error> for SurrealStoreError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CurrentEventOutcome, DeletionMarkerOutcome, ListingCurrentOutcome, ListingRevisionOutcome,
-        MigrationApplyOutcome, SurrealConfigError, SurrealConnectionConfig, SurrealConnectionMode,
-        SurrealMigration, SurrealMigrationError, SurrealMigrationPlan, SurrealStore,
-        base_migration_plan, migration_tracking_schema,
+        CurrentEventOutcome, DeletionMarkerOutcome, ListingCurrentOutcome, ListingHelperOutcome,
+        ListingRevisionOutcome, MigrationApplyOutcome, SurrealConfigError, SurrealConnectionConfig,
+        SurrealConnectionMode, SurrealMigration, SurrealMigrationError, SurrealMigrationPlan,
+        SurrealStore, base_migration_plan, migration_tracking_schema,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -2890,6 +3074,109 @@ mod tests {
                 .await
                 .expect("invalid row")
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn project_listing_helpers_persists_discovery_tables() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let listing_key = format!("30402:{}:listing-a", listing.unsigned().pubkey().as_str());
+
+        assert_eq!(
+            store
+                .project_listing_helpers(&listing)
+                .await
+                .expect("helpers"),
+            ListingHelperOutcome::Projected
+        );
+        assert_eq!(
+            store
+                .project_listing_helpers(&listing)
+                .await
+                .expect("helpers again"),
+            ListingHelperOutcome::Projected
+        );
+
+        let categories = store
+            .listing_category_rows(&listing_key)
+            .await
+            .expect("categories");
+        let fulfillment = store
+            .listing_fulfillment_rows(&listing_key)
+            .await
+            .expect("fulfillment");
+        let topics = store
+            .listing_topic_rows(&listing_key)
+            .await
+            .expect("topics");
+        let practices = store
+            .listing_practice_rows(&listing_key)
+            .await
+            .expect("practices");
+        let certifications = store
+            .listing_certification_rows(&listing_key)
+            .await
+            .expect("certifications");
+
+        assert_eq!(categories.len(), 1);
+        assert_eq!(categories[0]["category"], "vegetables");
+        assert_eq!(categories[0]["effective_status"], "active");
+        assert_eq!(categories[0]["updated_at"], 1_714_124_433_u64);
+        assert_eq!(categories[0]["event_id"], listing.id().as_str());
+        assert_eq!(fulfillment.len(), 1);
+        assert_eq!(fulfillment[0]["mode"], "pickup");
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0]["tag_value"], "carrots");
+        assert_eq!(practices.len(), 1);
+        assert_eq!(practices[0]["practice"], "no spray");
+        assert_eq!(certifications.len(), 1);
+        assert_eq!(certifications[0]["certification"], "organic");
+
+        let pubkey = "e".repeat(PublicKeyHex::HEX_LENGTH);
+        let invalid = synthetic_event(
+            "e",
+            "9",
+            &pubkey,
+            1_714_125_210,
+            30_402,
+            vec![Tag::from_parts("d", &["listing-invalid"]).expect("d tag")],
+            "",
+        );
+        let note = synthetic_event(
+            "f",
+            "a",
+            &pubkey,
+            1_714_125_211,
+            1,
+            Vec::new(),
+            "not a listing",
+        );
+
+        assert_eq!(
+            store
+                .project_listing_helpers(&invalid)
+                .await
+                .expect("invalid helpers"),
+            ListingHelperOutcome::Ineligible
+        );
+        assert_eq!(
+            store
+                .project_listing_helpers(&note)
+                .await
+                .expect("note helpers"),
+            ListingHelperOutcome::NotListing
+        );
+        assert!(
+            store
+                .listing_category_rows(&format!("30402:{pubkey}:listing-invalid"))
+                .await
+                .expect("invalid categories")
+                .is_empty()
         );
     }
 
