@@ -6,9 +6,10 @@ use std::collections::BTreeSet;
 use surrealdb::Surreal;
 use surrealdb::engine::local::{Db, Mem, RocksDb};
 use tangle_nips::{
-    CommentEvent, DeletionTarget, ListingProjection, ListingProjectionEvaluation,
-    NIP99_DRAFT_LISTING_KIND, NIP99_PUBLIC_LISTING_KIND, ReactionEvent, ReactionValue,
-    evaluate_listing_projection, parse_comment_event, parse_deletion_request, parse_reaction_event,
+    CommentEvent, DeletionTarget, ListingProjection, ListingProjectionEvaluation, LongFormEvent,
+    LongFormKind, NIP99_DRAFT_LISTING_KIND, NIP99_PUBLIC_LISTING_KIND, ReactionEvent,
+    ReactionValue, evaluate_listing_projection, parse_comment_event, parse_deletion_request,
+    parse_long_form_event, parse_reaction_event,
 };
 use tangle_protocol::{AddressCoordinate, Event, EventId, Filter, UnixTimestamp, event_to_value};
 use tangle_store::{StoreEventOutcome, StoredEvent};
@@ -837,6 +838,13 @@ pub enum ReactionProjectionOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LongFormProjectionOutcome {
+    NotLongForm,
+    Ineligible,
+    Projected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HiddenEventOutcome {
     NotFound,
     Hidden,
@@ -1017,6 +1025,34 @@ impl CommentProjectionQuery {
 
     pub fn with_pubkey(mut self, pubkey: &str) -> Self {
         self.pubkey = Some(pubkey.to_owned());
+        self
+    }
+
+    pub fn with_limit(mut self, limit: u64) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LongFormProjectionQuery {
+    author_pubkey: Option<String>,
+    topic: Option<String>,
+    limit: Option<u64>,
+}
+
+impl LongFormProjectionQuery {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_author_pubkey(mut self, pubkey: &str) -> Self {
+        self.author_pubkey = Some(pubkey.to_owned());
+        self
+    }
+
+    pub fn with_topic(mut self, topic: &str) -> Self {
+        self.topic = Some(topic.to_owned());
         self
     }
 
@@ -2068,6 +2104,189 @@ UPSERT type::record('reaction_projection', $event_id) CONTENT {
         response.take(0).map_err(SurrealStoreError::from)
     }
 
+    pub async fn project_long_form(
+        &self,
+        event: &Event,
+        projected_at: UnixTimestamp,
+    ) -> Result<LongFormProjectionOutcome, SurrealStoreError> {
+        let article = match parse_long_form_event(event) {
+            Ok(Some(article)) => article,
+            Ok(None) => return Ok(LongFormProjectionOutcome::NotLongForm),
+            Err(_) => return Ok(LongFormProjectionOutcome::Ineligible),
+        };
+        if article.long_form_kind() != LongFormKind::Published {
+            return Ok(LongFormProjectionOutcome::Ineligible);
+        }
+        let fields = long_form_projection_fields(&article, projected_at);
+        if self
+            .long_form_current_row(&fields.long_form_key)
+            .await?
+            .as_ref()
+            .is_some_and(|row| !long_form_current_should_replace(&article, row))
+        {
+            return Ok(LongFormProjectionOutcome::Ineligible);
+        }
+        self.db
+            .query(
+                r#"
+UPSERT type::record('long_form_current', $long_form_key) CONTENT {
+    long_form_key: $long_form_key,
+    event_id: $event_id,
+    author_pubkey: $author_pubkey,
+    d: $d,
+    created_at: $created_at,
+    updated_at: $updated_at,
+    published_at: $published_at,
+    title: $title,
+    image: $image,
+    summary: $summary,
+    content: $content,
+    tags: $tags,
+    referenced_events: $referenced_events,
+    referenced_addresses: $referenced_addresses,
+    referenced_pubkeys: $referenced_pubkeys,
+    hidden: false,
+    deleted: false,
+    projected_at: $projected_at
+};
+UPSERT type::record('search_doc', $long_form_key) CONTENT {
+    doc_key: $long_form_key,
+    event_id: $event_id,
+    current_event_id: $event_id,
+    doc_type: "long_form",
+    kind: $kind,
+    pubkey: $author_pubkey,
+    address_key: $long_form_key,
+    title: $search_title,
+    summary: $summary,
+    body: $content,
+    category_text: $category_text,
+    location_text: NONE,
+    tags: $tags,
+    categories: [],
+    created_at: $created_at,
+    updated_at: $updated_at,
+    visible: true,
+    status: "published",
+    seller_trust_score: NONE
+};
+"#,
+            )
+            .bind(("long_form_key", fields.long_form_key.as_str()))
+            .bind(("event_id", fields.event_id.as_str()))
+            .bind(("author_pubkey", fields.author_pubkey.as_str()))
+            .bind(("d", fields.d.as_str()))
+            .bind(("created_at", fields.created_at))
+            .bind(("updated_at", fields.updated_at))
+            .bind(("published_at", fields.published_at))
+            .bind(("title", fields.title.as_deref()))
+            .bind(("image", fields.image.as_deref()))
+            .bind(("summary", fields.summary.as_deref()))
+            .bind(("content", fields.content.as_str()))
+            .bind(("tags", fields.tags.clone()))
+            .bind(("referenced_events", fields.referenced_events.clone()))
+            .bind(("referenced_addresses", fields.referenced_addresses.clone()))
+            .bind(("referenced_pubkeys", fields.referenced_pubkeys.clone()))
+            .bind(("projected_at", fields.projected_at))
+            .bind(("kind", fields.kind))
+            .bind(("search_title", fields.search_title.as_str()))
+            .bind(("category_text", fields.tags.join(" ")))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        self.replace_long_form_topic_rows(&fields).await?;
+        Ok(LongFormProjectionOutcome::Projected)
+    }
+
+    pub async fn long_form_current_row(
+        &self,
+        long_form_key: &str,
+    ) -> Result<Option<serde_json::Value>, SurrealStoreError> {
+        let mut response = self
+            .db
+            .query("SELECT * FROM ONLY type::record('long_form_current', $long_form_key);")
+            .bind(("long_form_key", long_form_key))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
+    pub async fn long_form_topic_rows(
+        &self,
+        long_form_key: &str,
+    ) -> Result<Vec<serde_json::Value>, SurrealStoreError> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT * FROM long_form_topic WHERE long_form_key = $long_form_key ORDER BY topic ASC;",
+            )
+            .bind(("long_form_key", long_form_key))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
+    pub async fn query_long_form_projections(
+        &self,
+        query: &LongFormProjectionQuery,
+    ) -> Result<Vec<serde_json::Value>, SurrealStoreError> {
+        let topic_keys = match query.topic.as_deref() {
+            Some(topic) => {
+                let normalized = topic.trim().to_ascii_lowercase();
+                let mut response = self
+                    .db
+                    .query(
+                        "SELECT VALUE long_form_key FROM long_form_topic WHERE topic = $topic AND hidden = false AND deleted = false ORDER BY updated_at DESC, event_id ASC;",
+                    )
+                    .bind(("topic", normalized.as_str()))
+                    .await
+                    .map_err(SurrealStoreError::from)?
+                    .check()
+                    .map_err(SurrealStoreError::from)?;
+                let keys: Vec<String> = response.take(0).map_err(SurrealStoreError::from)?;
+                if keys.is_empty() {
+                    return Ok(Vec::new());
+                }
+                Some(keys)
+            }
+            None => None,
+        };
+        let mut statement =
+            "SELECT * FROM long_form_current WHERE hidden = false AND deleted = false".to_owned();
+        if query.author_pubkey.is_some() {
+            statement.push_str(" AND author_pubkey = $author_pubkey");
+        }
+        if topic_keys.is_some() {
+            statement.push_str(" AND long_form_key IN $topic_keys");
+        }
+        statement.push_str(" ORDER BY updated_at DESC, event_id ASC");
+        if query.limit.is_some() {
+            statement.push_str(" LIMIT $limit");
+        }
+        statement.push(';');
+        let mut surreal_query = self.db.query(statement);
+        if let Some(value) = &query.author_pubkey {
+            surreal_query = surreal_query.bind(("author_pubkey", value.as_str()));
+        }
+        if let Some(keys) = topic_keys {
+            surreal_query = surreal_query.bind(("topic_keys", keys));
+        }
+        if let Some(value) = query.limit {
+            surreal_query = surreal_query.bind(("limit", value));
+        }
+        let mut response = surreal_query
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
     pub async fn project_listing_helpers(
         &self,
         event: &Event,
@@ -2365,6 +2584,8 @@ UPDATE event_current SET hidden = true WHERE event_id = $event_id;
 UPDATE listing_current SET hidden = true WHERE event_id = $event_id;
 UPDATE comment_projection SET hidden = true WHERE event_id = $event_id;
 UPDATE reaction_projection SET hidden = true WHERE event_id = $event_id;
+UPDATE long_form_current SET hidden = true WHERE event_id = $event_id;
+UPDATE long_form_topic SET hidden = true WHERE event_id = $event_id;
 UPDATE search_doc SET visible = false WHERE event_id = $event_id OR current_event_id = $event_id;
 "#,
             )
@@ -2416,8 +2637,10 @@ UPDATE event_current SET hidden = false WHERE event_id = $event_id;
 UPDATE listing_current SET hidden = false WHERE event_id = $event_id;
 UPDATE comment_projection SET hidden = false WHERE event_id = $event_id;
 UPDATE reaction_projection SET hidden = false WHERE event_id = $event_id;
-UPDATE search_doc SET visible = true WHERE (event_id = $event_id OR current_event_id = $event_id) AND status = "active";
-UPDATE search_doc SET visible = false WHERE (event_id = $event_id OR current_event_id = $event_id) AND status != "active";
+UPDATE long_form_current SET hidden = false WHERE event_id = $event_id;
+UPDATE long_form_topic SET hidden = false WHERE event_id = $event_id;
+UPDATE search_doc SET visible = true WHERE (event_id = $event_id OR current_event_id = $event_id) AND (status = "active" OR status = "published");
+UPDATE search_doc SET visible = false WHERE (event_id = $event_id OR current_event_id = $event_id) AND status != "active" AND status != "published";
 "#,
             )
             .bind(("event_id", event_id.as_str()))
@@ -2688,6 +2911,43 @@ UPDATE search_doc SET visible = false WHERE (event_id = $event_id OR current_eve
         response.take(0).map_err(SurrealStoreError::from)
     }
 
+    async fn replace_long_form_topic_rows(
+        &self,
+        fields: &LongFormProjectionFields,
+    ) -> Result<(), SurrealStoreError> {
+        self.db
+            .query("DELETE long_form_topic WHERE long_form_key = $long_form_key;")
+            .bind(("long_form_key", fields.long_form_key.as_str()))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        for topic in &fields.tags {
+            self.db
+                .query(
+                    r#"
+CREATE long_form_topic CONTENT {
+    long_form_key: $long_form_key,
+    topic: $topic,
+    updated_at: $updated_at,
+    event_id: $event_id,
+    hidden: false,
+    deleted: false
+};
+"#,
+                )
+                .bind(("long_form_key", fields.long_form_key.as_str()))
+                .bind(("topic", topic.as_str()))
+                .bind(("updated_at", fields.updated_at))
+                .bind(("event_id", fields.event_id.as_str()))
+                .await
+                .map_err(SurrealStoreError::from)?
+                .check()
+                .map_err(SurrealStoreError::from)?;
+        }
+        Ok(())
+    }
+
     async fn upsert_rate_limit_state(
         &self,
         key: &str,
@@ -2938,6 +3198,9 @@ UPSERT type::record('reaction_count', $target_event_id) CONTENT {
 UPDATE nostr_event SET deleted = true WHERE event_id = $event_id AND pubkey = $author_pubkey;
 UPDATE comment_projection SET deleted = true WHERE event_id = $event_id AND pubkey = $author_pubkey;
 UPDATE reaction_projection SET deleted = true WHERE event_id = $event_id AND pubkey = $author_pubkey;
+UPDATE long_form_current SET deleted = true WHERE event_id = $event_id AND author_pubkey = $author_pubkey;
+UPDATE long_form_topic SET deleted = true WHERE event_id = $event_id;
+UPDATE search_doc SET visible = false WHERE event_id = $event_id OR current_event_id = $event_id;
 "#,
             )
             .bind(("event_id", event_id))
@@ -2963,6 +3226,11 @@ UPDATE reaction_projection SET deleted = true WHERE event_id = $event_id AND pub
             .query(
                 "UPDATE event_current SET deleted = true WHERE address_key = $address_key AND pubkey = $author_pubkey;",
             )
+            .query(
+                "UPDATE long_form_current SET deleted = true WHERE long_form_key = $address_key AND author_pubkey = $author_pubkey;",
+            )
+            .query("UPDATE long_form_topic SET deleted = true WHERE long_form_key = $address_key;")
+            .query("UPDATE search_doc SET visible = false WHERE address_key = $address_key;")
             .bind(("address_key", address_key))
             .bind(("author_pubkey", author_pubkey))
             .await
@@ -3215,6 +3483,27 @@ struct ReactionProjectionFields {
     projected_at: u64,
 }
 
+struct LongFormProjectionFields {
+    long_form_key: String,
+    event_id: String,
+    author_pubkey: String,
+    d: String,
+    created_at: u64,
+    updated_at: u64,
+    published_at: Option<u64>,
+    title: Option<String>,
+    image: Option<String>,
+    summary: Option<String>,
+    content: String,
+    tags: Vec<String>,
+    referenced_events: Vec<String>,
+    referenced_addresses: Vec<String>,
+    referenced_pubkeys: Vec<String>,
+    projected_at: u64,
+    kind: u32,
+    search_title: String,
+}
+
 struct ListingCurrentFields {
     listing_key: String,
     listing_key_hash: String,
@@ -3312,6 +3601,54 @@ fn reaction_value_string(value: &ReactionValue) -> String {
         ReactionValue::Dislike => "dislike".to_owned(),
         ReactionValue::Emoji(value) | ReactionValue::Text(value) => value.clone(),
     }
+}
+
+fn long_form_projection_fields(
+    article: &LongFormEvent,
+    projected_at: UnixTimestamp,
+) -> LongFormProjectionFields {
+    let d = article.d().as_str().to_owned();
+    LongFormProjectionFields {
+        long_form_key: article.address().key().to_string(),
+        event_id: article.event_id().as_str().to_owned(),
+        author_pubkey: article.pubkey().as_str().to_owned(),
+        d: d.clone(),
+        created_at: article.created_at().as_u64(),
+        updated_at: article.created_at().as_u64(),
+        published_at: article.published_at(),
+        title: article.title().map(str::to_owned),
+        image: article.image().map(str::to_owned),
+        summary: article.summary().map(str::to_owned),
+        content: article.content().to_owned(),
+        tags: article.topics().to_vec(),
+        referenced_events: article
+            .referenced_events()
+            .iter()
+            .map(|event_id| event_id.as_str().to_owned())
+            .collect(),
+        referenced_addresses: article
+            .referenced_addresses()
+            .iter()
+            .map(|address| address.key().to_string())
+            .collect(),
+        referenced_pubkeys: article
+            .referenced_pubkeys()
+            .iter()
+            .map(|pubkey| pubkey.as_str().to_owned())
+            .collect(),
+        projected_at: projected_at.as_u64(),
+        kind: article.address().kind().as_u32(),
+        search_title: article.title().unwrap_or(&d).to_owned(),
+    }
+}
+
+fn long_form_current_should_replace(article: &LongFormEvent, row: &serde_json::Value) -> bool {
+    let incoming_created_at = article.created_at().as_u64();
+    let existing_created_at = row["updated_at"].as_u64().unwrap_or_default();
+    let existing_event_id = row["event_id"].as_str().unwrap_or_default();
+    incoming_created_at > existing_created_at
+        || (incoming_created_at == existing_created_at
+            && article.event_id().as_str() > existing_event_id)
 }
 
 struct SearchDocumentFields {
@@ -3542,12 +3879,15 @@ mod tests {
         CommentProjectionOutcome, CommentProjectionQuery, CurrentEventOutcome,
         DeletionMarkerOutcome, DurableRateLimitDecision, HiddenEventOutcome, ListingCurrentOutcome,
         ListingHelperOutcome, ListingProjectionQuery, ListingRevisionOutcome,
-        MigrationApplyOutcome, ReactionProjectionOutcome, SearchDocumentOutcome,
-        SearchDocumentQuery, SurrealConfigError, SurrealConnectionConfig, SurrealConnectionMode,
-        SurrealMigration, SurrealMigrationError, SurrealMigrationPlan, SurrealStore,
-        SurrealStoreError, base_migration_plan, migration_tracking_schema,
+        LongFormProjectionOutcome, LongFormProjectionQuery, MigrationApplyOutcome,
+        ReactionProjectionOutcome, SearchDocumentOutcome, SearchDocumentQuery, SurrealConfigError,
+        SurrealConnectionConfig, SurrealConnectionMode, SurrealMigration, SurrealMigrationError,
+        SurrealMigrationPlan, SurrealStore, SurrealStoreError, base_migration_plan,
+        migration_tracking_schema,
     };
-    use tangle_nips::ListingProjectionEvaluation;
+    use tangle_nips::{
+        ListingProjectionEvaluation, NIP23_LONG_FORM_DRAFT_KIND, NIP23_LONG_FORM_KIND,
+    };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
         filter_from_value,
@@ -5948,6 +6288,323 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_long_form_posts_persists_current_topic_and_search_rows() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let article = long_form_article(
+            1_714_125_060,
+            "harvest-notes",
+            "Harvest notes",
+            "The storage carrots held well.",
+            &["Carrots", "CSA"],
+        );
+        let draft = build_fixture_event_from_parts(
+            FixtureKey::Seller,
+            1_714_125_061,
+            u64::from(NIP23_LONG_FORM_DRAFT_KIND),
+            vec![vec!["d".to_owned(), "draft-a".to_owned()]],
+            "Draft body.",
+        )
+        .expect("draft");
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let long_form_key = format!(
+            "30023:{}:harvest-notes",
+            article.unsigned().pubkey().as_str()
+        );
+
+        assert_eq!(
+            store
+                .project_long_form(&listing, UnixTimestamp::new(1_714_125_062))
+                .await
+                .expect("not long form"),
+            LongFormProjectionOutcome::NotLongForm
+        );
+        assert_eq!(
+            store
+                .project_long_form(&draft, UnixTimestamp::new(1_714_125_062))
+                .await
+                .expect("draft long form"),
+            LongFormProjectionOutcome::Ineligible
+        );
+        assert_eq!(
+            store
+                .project_long_form(&article, UnixTimestamp::new(1_714_125_063))
+                .await
+                .expect("project article"),
+            LongFormProjectionOutcome::Projected
+        );
+
+        let row = store
+            .long_form_current_row(&long_form_key)
+            .await
+            .expect("long-form row")
+            .expect("long-form row exists");
+        assert_eq!(row["long_form_key"], long_form_key);
+        assert_eq!(row["event_id"], article.id().as_str());
+        assert_eq!(
+            row["author_pubkey"],
+            FixtureKey::Seller.public_key().as_str()
+        );
+        assert_eq!(row["d"], "harvest-notes");
+        assert_eq!(row["created_at"], 1_714_125_060_u64);
+        assert_eq!(row["updated_at"], 1_714_125_060_u64);
+        assert_eq!(row["published_at"], 1_714_125_000_u64);
+        assert_eq!(row["title"], "Harvest notes");
+        assert_eq!(row["image"], "https://radroots.test/harvest.jpg");
+        assert_eq!(row["summary"], "Long-form harvest field notes.");
+        assert_eq!(row["content"], "The storage carrots held well.");
+        assert_eq!(row["tags"][0], "carrots");
+        assert_eq!(row["tags"][1], "csa");
+        assert_eq!(row["referenced_events"][0], "4".repeat(EventId::HEX_LENGTH));
+        assert_eq!(
+            row["referenced_pubkeys"][0],
+            FixtureKey::Buyer.public_key().as_str()
+        );
+        assert_eq!(row["hidden"], false);
+        assert_eq!(row["deleted"], false);
+
+        let topics = store
+            .long_form_topic_rows(&long_form_key)
+            .await
+            .expect("topic rows");
+        assert_eq!(topics.len(), 2);
+        assert_eq!(topics[0]["topic"], "carrots");
+        assert_eq!(topics[1]["topic"], "csa");
+        assert_eq!(
+            store
+                .query_long_form_projections(
+                    &LongFormProjectionQuery::new()
+                        .with_author_pubkey(FixtureKey::Seller.public_key().as_str())
+                        .with_topic("CSA")
+                        .with_limit(5),
+                )
+                .await
+                .expect("long-form query")
+                .len(),
+            1
+        );
+
+        let search = store
+            .search_document_row(&long_form_key)
+            .await
+            .expect("search row")
+            .expect("search row exists");
+        assert_eq!(search["doc_type"], "long_form");
+        assert_eq!(search["kind"], u64::from(NIP23_LONG_FORM_KIND));
+        assert_eq!(search["title"], "Harvest notes");
+        assert_eq!(search["body"], "The storage carrots held well.");
+        assert_eq!(search["status"], "published");
+        assert_eq!(search["visible"], true);
+        assert_eq!(
+            store
+                .query_search_documents(
+                    &SearchDocumentQuery::new()
+                        .with_text("carrots")
+                        .with_doc_type("long_form")
+                        .with_visible(true),
+                )
+                .await
+                .expect("search query")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn long_form_projection_tracks_replacement_moderation_and_deletion() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let first = long_form_article(
+            1_714_125_070,
+            "harvest-notes",
+            "First harvest notes",
+            "First body.",
+            &["carrots"],
+        );
+        let second = long_form_article(
+            1_714_125_071,
+            "harvest-notes",
+            "Updated harvest notes",
+            "Updated body.",
+            &["storage"],
+        );
+        let long_form_key = format!(
+            "30023:{}:harvest-notes",
+            second.unsigned().pubkey().as_str()
+        );
+        let admin_pubkey = "a".repeat(PublicKeyHex::HEX_LENGTH);
+        store
+            .store_raw_event(&StoredEvent::new(
+                second.clone(),
+                UnixTimestamp::new(1_714_125_072),
+            ))
+            .await
+            .expect("raw article");
+
+        assert_eq!(
+            store
+                .project_long_form(&first, UnixTimestamp::new(1_714_125_073))
+                .await
+                .expect("project first"),
+            LongFormProjectionOutcome::Projected
+        );
+        assert_eq!(
+            store
+                .project_long_form(&second, UnixTimestamp::new(1_714_125_074))
+                .await
+                .expect("project second"),
+            LongFormProjectionOutcome::Projected
+        );
+        assert_eq!(
+            store
+                .project_long_form(&first, UnixTimestamp::new(1_714_125_075))
+                .await
+                .expect("stale first"),
+            LongFormProjectionOutcome::Ineligible
+        );
+        assert_eq!(
+            store
+                .long_form_current_row(&long_form_key)
+                .await
+                .expect("row")
+                .expect("row exists")["event_id"],
+            second.id().as_str()
+        );
+        assert_eq!(
+            store
+                .long_form_topic_rows(&long_form_key)
+                .await
+                .expect("topics")[0]["topic"],
+            "storage"
+        );
+
+        assert_eq!(
+            store
+                .hide_event(
+                    second.id(),
+                    "long-form moderation",
+                    "admin_api",
+                    &admin_pubkey,
+                    UnixTimestamp::new(1_714_125_076),
+                )
+                .await
+                .expect("hide article"),
+            HiddenEventOutcome::Hidden
+        );
+        assert!(
+            store
+                .query_long_form_projections(&LongFormProjectionQuery::new())
+                .await
+                .expect("hidden query")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .long_form_current_row(&long_form_key)
+                .await
+                .expect("row")
+                .expect("row exists")["hidden"],
+            true
+        );
+        assert_eq!(
+            store
+                .long_form_topic_rows(&long_form_key)
+                .await
+                .expect("topics")[0]["hidden"],
+            true
+        );
+        assert_eq!(
+            store
+                .search_document_row(&long_form_key)
+                .await
+                .expect("search row")
+                .expect("search exists")["visible"],
+            false
+        );
+
+        assert_eq!(
+            store
+                .unhide_event(
+                    second.id(),
+                    "long-form restored",
+                    &admin_pubkey,
+                    UnixTimestamp::new(1_714_125_077),
+                )
+                .await
+                .expect("unhide article"),
+            HiddenEventOutcome::Unhidden
+        );
+        assert_eq!(
+            store
+                .query_long_form_projections(&LongFormProjectionQuery::new())
+                .await
+                .expect("visible query")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .search_document_row(&long_form_key)
+                .await
+                .expect("search row")
+                .expect("search exists")["visible"],
+            true
+        );
+
+        let deletion = build_fixture_event_from_parts(
+            FixtureKey::Seller,
+            1_714_125_078,
+            5,
+            vec![vec!["e".to_owned(), second.id().as_str().to_owned()]],
+            "",
+        )
+        .expect("deletion event");
+        assert_eq!(
+            store
+                .apply_deletion_markers(&deletion)
+                .await
+                .expect("delete article"),
+            DeletionMarkerOutcome::Applied { targets: 1 }
+        );
+        assert!(
+            store
+                .query_long_form_projections(&LongFormProjectionQuery::new())
+                .await
+                .expect("deleted query")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .long_form_current_row(&long_form_key)
+                .await
+                .expect("row")
+                .expect("row exists")["deleted"],
+            true
+        );
+        assert_eq!(
+            store
+                .long_form_topic_rows(&long_form_key)
+                .await
+                .expect("topics")[0]["deleted"],
+            true
+        );
+        assert_eq!(
+            store
+                .search_document_row(&long_form_key)
+                .await
+                .expect("search row")
+                .expect("search exists")["visible"],
+            false
+        );
+    }
+
+    #[tokio::test]
     async fn hidden_event_overlay_excludes_events_from_public_read_models() {
         let store = memory_store().await;
         store
@@ -6533,6 +7190,46 @@ mod tests {
             content,
         )
         .expect("reaction event")
+    }
+
+    fn long_form_article(
+        created_at: u64,
+        d: &str,
+        title: &str,
+        content: &str,
+        topics: &[&str],
+    ) -> Event {
+        let buyer_pubkey = FixtureKey::Buyer.public_key().as_str().to_owned();
+        let referenced_address = format!("30023:{buyer_pubkey}:soil-notes");
+        let mut tags = vec![
+            vec!["d".to_owned(), d.to_owned()],
+            vec!["title".to_owned(), title.to_owned()],
+            vec![
+                "summary".to_owned(),
+                "Long-form harvest field notes.".to_owned(),
+            ],
+            vec![
+                "image".to_owned(),
+                "https://radroots.test/harvest.jpg".to_owned(),
+            ],
+            vec!["published_at".to_owned(), "1714125000".to_owned()],
+            vec!["e".to_owned(), "4".repeat(EventId::HEX_LENGTH)],
+            vec!["a".to_owned(), referenced_address],
+            vec!["p".to_owned(), buyer_pubkey],
+        ];
+        tags.extend(
+            topics
+                .iter()
+                .map(|topic| vec!["t".to_owned(), (*topic).to_owned()]),
+        );
+        build_fixture_event_from_parts(
+            FixtureKey::Seller,
+            created_at,
+            u64::from(NIP23_LONG_FORM_KIND),
+            tags,
+            content,
+        )
+        .expect("long-form article")
     }
 
     fn synthetic_event(
