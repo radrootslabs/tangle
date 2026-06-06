@@ -449,6 +449,171 @@ impl UnsignedEvent {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClientMessage {
+    Event(Event),
+    Req {
+        subscription_id: SubscriptionId,
+        filters: Vec<serde_json::Value>,
+    },
+    Close(SubscriptionId),
+    Auth(Event),
+}
+
+pub fn parse_client_message(raw: &str) -> Result<ClientMessage, String> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|source| format!("client message JSON is invalid: {source}"))?;
+    let array = value
+        .as_array()
+        .ok_or_else(|| "client message must be an array".to_owned())?;
+    let command_value = array
+        .first()
+        .ok_or_else(|| "client message command is missing".to_owned())?;
+    let command = command_value
+        .as_str()
+        .ok_or_else(|| "client message command must be a string".to_owned())?;
+    match command {
+        "EVENT" => parse_event_client_message(array),
+        "REQ" => parse_req_client_message(array),
+        "CLOSE" => parse_close_client_message(array),
+        "AUTH" => parse_auth_client_message(array),
+        unsupported => Err(format!(
+            "client message command `{unsupported}` is unsupported"
+        )),
+    }
+}
+
+pub fn parse_event_json(raw: &RawEventJson) -> Result<Event, EventShapeError> {
+    let value = serde_json::from_str(raw.as_str()).map_err(|source| {
+        EventShapeError::invalid_field("event", &format!("invalid JSON: {source}"))
+    })?;
+    event_from_value(&value)
+}
+
+pub fn event_from_value(value: &serde_json::Value) -> Result<Event, EventShapeError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| EventShapeError::invalid_field("event", "must be an object"))?;
+    let id = EventId::new(field_string(object, "id")?)
+        .map_err(|reason| EventShapeError::invalid_field("id", &reason))?;
+    let pubkey = PublicKeyHex::new(field_string(object, "pubkey")?)
+        .map_err(|reason| EventShapeError::invalid_field("pubkey", &reason))?;
+    let created_at = UnixTimestamp::new(field_u64(object, "created_at")?);
+    let kind = Kind::new(field_u64(object, "kind")?)
+        .map_err(|reason| EventShapeError::invalid_field("kind", &reason))?;
+    let tags = tags_from_value(field_value(object, "tags")?)?;
+    let content = field_string(object, "content")?;
+    let sig = SignatureHex::new(field_string(object, "sig")?)
+        .map_err(|reason| EventShapeError::invalid_field("sig", &reason))?;
+    Ok(Event::new(
+        id,
+        UnsignedEvent::new(pubkey, created_at, kind, tags, content),
+        sig,
+    ))
+}
+
+fn parse_event_client_message(array: &[serde_json::Value]) -> Result<ClientMessage, String> {
+    if array.len() != 2 {
+        return Err("EVENT client message must contain exactly 2 elements".to_owned());
+    }
+    event_from_value(&array[1])
+        .map(ClientMessage::Event)
+        .map_err(|source| source.to_string())
+}
+
+fn parse_auth_client_message(array: &[serde_json::Value]) -> Result<ClientMessage, String> {
+    if array.len() != 2 {
+        return Err("AUTH client message must contain exactly 2 elements".to_owned());
+    }
+    event_from_value(&array[1])
+        .map(ClientMessage::Auth)
+        .map_err(|source| source.to_string())
+}
+
+fn parse_req_client_message(array: &[serde_json::Value]) -> Result<ClientMessage, String> {
+    if array.len() < 3 {
+        return Err("REQ client message must contain a subscription id and filters".to_owned());
+    }
+    let subscription_id = array[1]
+        .as_str()
+        .ok_or_else(|| "REQ subscription id must be a string".to_owned())
+        .and_then(SubscriptionId::new)?;
+    let filters = array[2..]
+        .iter()
+        .map(|filter| {
+            if filter.is_object() {
+                Ok(filter.clone())
+            } else {
+                Err("REQ filters must be JSON objects".to_owned())
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ClientMessage::Req {
+        subscription_id,
+        filters,
+    })
+}
+
+fn parse_close_client_message(array: &[serde_json::Value]) -> Result<ClientMessage, String> {
+    if array.len() != 2 {
+        return Err("CLOSE client message must contain exactly 2 elements".to_owned());
+    }
+    array[1]
+        .as_str()
+        .ok_or_else(|| "CLOSE subscription id must be a string".to_owned())
+        .and_then(SubscriptionId::new)
+        .map(ClientMessage::Close)
+}
+
+fn field_value<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+) -> Result<&'a serde_json::Value, EventShapeError> {
+    object
+        .get(field)
+        .ok_or_else(|| EventShapeError::missing_field(field))
+}
+
+fn field_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+) -> Result<&'a str, EventShapeError> {
+    field_value(object, field)?
+        .as_str()
+        .ok_or_else(|| EventShapeError::invalid_field(field, "must be a string"))
+}
+
+fn field_u64(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+) -> Result<u64, EventShapeError> {
+    field_value(object, field)?
+        .as_u64()
+        .ok_or_else(|| EventShapeError::invalid_field(field, "must be an unsigned integer"))
+}
+
+fn tags_from_value(value: &serde_json::Value) -> Result<Vec<Tag>, EventShapeError> {
+    let array = value
+        .as_array()
+        .ok_or_else(|| EventShapeError::invalid_field("tags", "must be an array"))?;
+    array
+        .iter()
+        .map(|tag| {
+            let values = tag
+                .as_array()
+                .ok_or_else(|| EventShapeError::invalid_field("tags", "tag must be an array"))?
+                .iter()
+                .map(|part| {
+                    part.as_str().map(str::to_owned).ok_or_else(|| {
+                        EventShapeError::invalid_field("tags", "tag elements must be strings")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Tag::new(values).map_err(|reason| EventShapeError::invalid_field("tags", &reason))
+        })
+        .collect()
+}
+
 fn require_lowercase_hex(scalar: &'static str, value: &str, expected: usize) -> Result<(), String> {
     let actual = value.chars().count();
     if actual != expected {
@@ -486,9 +651,10 @@ fn kind_out_of_range_error(value: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Event, EventId, EventShapeError, Kind, PublicKeyHex, RawEventJson, SignatureHex,
-        SubscriptionId, Tag, TagName, TagValue, UnixTimestamp, UnsignedEvent, canonical_event_json,
-        empty_error, invalid_length_error, kind_out_of_range_error, non_lowercase_hex_error,
+        ClientMessage, Event, EventId, EventShapeError, Kind, PublicKeyHex, RawEventJson,
+        SignatureHex, SubscriptionId, Tag, TagName, TagValue, UnixTimestamp, UnsignedEvent,
+        canonical_event_json, empty_error, event_from_value, invalid_length_error,
+        kind_out_of_range_error, non_lowercase_hex_error, parse_client_message, parse_event_json,
         too_long_error,
     };
     use core::str::FromStr;
@@ -737,6 +903,225 @@ mod tests {
     }
 
     #[test]
+    fn parse_event_json_builds_typed_event_shape() {
+        let raw = RawEventJson::new(&event_json("a", "b", 1, tags_json())).expect("raw");
+        let event = parse_event_json(&raw).expect("event");
+
+        assert_eq!(event.id().as_str(), "a".repeat(EventId::HEX_LENGTH));
+        assert_eq!(
+            event.unsigned().pubkey().as_str(),
+            "1".repeat(PublicKeyHex::HEX_LENGTH)
+        );
+        assert_eq!(event.unsigned().created_at().as_u64(), 1_714_124_433);
+        assert_eq!(event.unsigned().kind().as_u32(), 1);
+        assert_eq!(event.unsigned().tags().len(), 2);
+        assert_eq!(event.unsigned().content(), "hello");
+        assert_eq!(event.sig().as_str(), "b".repeat(SignatureHex::HEX_LENGTH));
+    }
+
+    #[test]
+    fn parse_client_message_accepts_event_auth_req_and_close() {
+        let event_payload = event_json("a", "b", 1, tags_json());
+        let auth_event_json = event_json("c", "d", 22242, "[]");
+        let event_message = format!("[\"EVENT\",{event_payload}]");
+        let auth_message = format!("[\"AUTH\",{auth_event_json}]");
+        let req_message = "[\"REQ\",\"sub-a\",{\"ids\":[\"a\"]},{\"kinds\":[1]}]";
+        let close_message = "[\"CLOSE\",\"sub-a\"]";
+        let event =
+            parse_event_json(&RawEventJson::new(&event_payload).expect("raw")).expect("event");
+        let auth_event =
+            parse_event_json(&RawEventJson::new(&auth_event_json).expect("raw")).expect("auth");
+
+        assert_eq!(
+            parse_client_message(&event_message),
+            Ok(ClientMessage::Event(event))
+        );
+        assert_eq!(
+            parse_client_message(&auth_message),
+            Ok(ClientMessage::Auth(auth_event))
+        );
+        assert_eq!(
+            parse_client_message(req_message),
+            Ok(ClientMessage::Req {
+                subscription_id: SubscriptionId::new("sub-a").expect("sub"),
+                filters: vec![
+                    serde_json::json!({"ids":["a"]}),
+                    serde_json::json!({"kinds":[1]})
+                ]
+            })
+        );
+        assert_eq!(
+            parse_client_message(close_message).expect("close"),
+            ClientMessage::Close(SubscriptionId::new("sub-a").expect("sub"))
+        );
+    }
+
+    #[test]
+    fn parse_client_message_rejects_malformed_envelopes() {
+        assert!(
+            parse_client_message("{")
+                .expect_err("json")
+                .starts_with("client message JSON is invalid")
+        );
+        assert_eq!(
+            parse_client_message("{}").expect_err("object"),
+            "client message must be an array"
+        );
+        assert_eq!(
+            parse_client_message("[]").expect_err("empty"),
+            "client message command is missing"
+        );
+        assert_eq!(
+            parse_client_message("[1]").expect_err("command type"),
+            "client message command must be a string"
+        );
+        assert_eq!(
+            parse_client_message("[\"COUNT\"]").expect_err("unsupported"),
+            "client message command `COUNT` is unsupported"
+        );
+        assert_eq!(
+            parse_client_message("[\"EVENT\"]").expect_err("event length"),
+            "EVENT client message must contain exactly 2 elements"
+        );
+        assert_eq!(
+            parse_client_message("[\"EVENT\",{}]").expect_err("event shape"),
+            "event field `id` is missing"
+        );
+        assert_eq!(
+            parse_client_message("[\"AUTH\"]").expect_err("auth length"),
+            "AUTH client message must contain exactly 2 elements"
+        );
+        assert_eq!(
+            parse_client_message("[\"AUTH\",{}]").expect_err("auth shape"),
+            "event field `id` is missing"
+        );
+        assert_eq!(
+            parse_client_message("[\"REQ\",\"sub-a\"]").expect_err("req length"),
+            "REQ client message must contain a subscription id and filters"
+        );
+        assert_eq!(
+            parse_client_message("[\"REQ\",1,{}]").expect_err("req sub type"),
+            "REQ subscription id must be a string"
+        );
+        assert_eq!(
+            parse_client_message("[\"REQ\",\"\",{}]").expect_err("req sub empty"),
+            "subscription id must not be empty"
+        );
+        assert_eq!(
+            parse_client_message("[\"REQ\",\"sub-a\",1]").expect_err("req filter"),
+            "REQ filters must be JSON objects"
+        );
+        assert_eq!(
+            parse_client_message("[\"CLOSE\"]").expect_err("close length"),
+            "CLOSE client message must contain exactly 2 elements"
+        );
+        assert_eq!(
+            parse_client_message("[\"CLOSE\",1]").expect_err("close sub type"),
+            "CLOSE subscription id must be a string"
+        );
+    }
+
+    #[test]
+    fn parse_event_json_rejects_invalid_event_shapes() {
+        assert_eq!(
+            parse_event_json(&RawEventJson::new("{").expect("raw"))
+                .expect_err("invalid json")
+                .to_string(),
+            "event field `event` is invalid: invalid JSON: EOF while parsing an object at line 1 column 1"
+        );
+        assert_eq!(
+            event_from_value(&serde_json::json!(1))
+                .expect_err("not object")
+                .to_string(),
+            "event field `event` is invalid: must be an object"
+        );
+        assert_eq!(
+            event_from_value(&serde_json::json!({}))
+                .expect_err("missing id")
+                .to_string(),
+            "event field `id` is missing"
+        );
+        assert_eq!(
+            event_from_value(&event_value_without("created_at"))
+                .expect_err("missing created_at")
+                .to_string(),
+            "event field `created_at` is missing"
+        );
+        assert_eq!(
+            event_from_value(&event_value_with("id", serde_json::json!(1)))
+                .expect_err("id type")
+                .to_string(),
+            "event field `id` is invalid: must be a string"
+        );
+        assert_eq!(
+            event_from_value(&event_value_with("id", serde_json::json!("bad")))
+                .expect_err("id scalar")
+                .to_string(),
+            "event field `id` is invalid: event id must be 64 characters, got 3"
+        );
+        assert_eq!(
+            event_from_value(&event_value_with("pubkey", serde_json::json!("bad")))
+                .expect_err("pubkey scalar")
+                .to_string(),
+            "event field `pubkey` is invalid: public key must be 64 characters, got 3"
+        );
+        assert_eq!(
+            event_from_value(&event_value_with("created_at", serde_json::json!("now")))
+                .expect_err("created type")
+                .to_string(),
+            "event field `created_at` is invalid: must be an unsigned integer"
+        );
+        assert_eq!(
+            event_from_value(&event_value_with(
+                "kind",
+                serde_json::json!(u64::from(u32::MAX) + 1)
+            ))
+            .expect_err("kind range")
+            .to_string(),
+            format!(
+                "event field `kind` is invalid: kind must fit in u32, got {}",
+                u64::from(u32::MAX) + 1
+            )
+        );
+        assert_eq!(
+            event_from_value(&event_value_with("tags", serde_json::json!(1)))
+                .expect_err("tags type")
+                .to_string(),
+            "event field `tags` is invalid: must be an array"
+        );
+        assert_eq!(
+            event_from_value(&event_value_with("tags", serde_json::json!([1])))
+                .expect_err("tag type")
+                .to_string(),
+            "event field `tags` is invalid: tag must be an array"
+        );
+        assert_eq!(
+            event_from_value(&event_value_with("tags", serde_json::json!([[1]])))
+                .expect_err("tag part type")
+                .to_string(),
+            "event field `tags` is invalid: tag elements must be strings"
+        );
+        assert_eq!(
+            event_from_value(&event_value_with("tags", serde_json::json!([[]])))
+                .expect_err("tag empty")
+                .to_string(),
+            "event field `tags` is invalid: tag must not be empty"
+        );
+        assert_eq!(
+            event_from_value(&event_value_with("content", serde_json::json!(1)))
+                .expect_err("content type")
+                .to_string(),
+            "event field `content` is invalid: must be a string"
+        );
+        assert_eq!(
+            event_from_value(&event_value_with("sig", serde_json::json!("bad")))
+                .expect_err("sig scalar")
+                .to_string(),
+            "event field `sig` is invalid: signature must be 128 characters, got 3"
+        );
+    }
+
+    #[test]
     fn canonical_event_json_serializes_empty_content_and_tags() {
         let event = unsigned_event(Vec::new(), "");
 
@@ -798,5 +1183,39 @@ mod tests {
             tags,
             content,
         )
+    }
+
+    fn tags_json() -> &'static str {
+        "[[\"e\",\"root\"],[\"p\",\"peer\",\"wss://relay.example\"]]"
+    }
+
+    fn event_json(id_char: &str, sig_char: &str, kind: u64, tags: &str) -> String {
+        format!(
+            "{{\"id\":\"{}\",\"pubkey\":\"{}\",\"created_at\":1714124433,\"kind\":{},\"tags\":{},\"content\":\"hello\",\"sig\":\"{}\"}}",
+            id_char.repeat(EventId::HEX_LENGTH),
+            "1".repeat(PublicKeyHex::HEX_LENGTH),
+            kind,
+            tags,
+            sig_char.repeat(SignatureHex::HEX_LENGTH)
+        )
+    }
+
+    fn event_value_with(field: &'static str, value: serde_json::Value) -> serde_json::Value {
+        let mut event =
+            serde_json::from_str::<serde_json::Value>(&event_json("a", "b", 1, tags_json()))
+                .expect("event value");
+        event
+            .as_object_mut()
+            .expect("event object")
+            .insert(field.to_owned(), value);
+        event
+    }
+
+    fn event_value_without(field: &'static str) -> serde_json::Value {
+        let mut event =
+            serde_json::from_str::<serde_json::Value>(&event_json("a", "b", 1, tags_json()))
+                .expect("event value");
+        event.as_object_mut().expect("event object").remove(field);
+        event
     }
 }
