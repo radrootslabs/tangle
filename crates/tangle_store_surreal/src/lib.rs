@@ -121,6 +121,62 @@ impl fmt::Display for SurrealConfigError {
 
 impl std::error::Error for SurrealConfigError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurrealMetricsSnapshot {
+    stored_events: u64,
+    visible_events: u64,
+    hidden_events: u64,
+    deleted_events: u64,
+    current_listings: u64,
+    active_listings: u64,
+    seller_profiles: u64,
+    visible_seller_profiles: u64,
+    approved_sellers: u64,
+    blocked_pubkeys: u64,
+}
+
+impl SurrealMetricsSnapshot {
+    pub fn stored_events(self) -> u64 {
+        self.stored_events
+    }
+
+    pub fn visible_events(self) -> u64 {
+        self.visible_events
+    }
+
+    pub fn hidden_events(self) -> u64 {
+        self.hidden_events
+    }
+
+    pub fn deleted_events(self) -> u64 {
+        self.deleted_events
+    }
+
+    pub fn current_listings(self) -> u64 {
+        self.current_listings
+    }
+
+    pub fn active_listings(self) -> u64 {
+        self.active_listings
+    }
+
+    pub fn seller_profiles(self) -> u64 {
+        self.seller_profiles
+    }
+
+    pub fn visible_seller_profiles(self) -> u64 {
+        self.visible_seller_profiles
+    }
+
+    pub fn approved_sellers(self) -> u64 {
+        self.approved_sellers
+    }
+
+    pub fn blocked_pubkeys(self) -> u64 {
+        self.blocked_pubkeys
+    }
+}
+
 fn normalized_identifier(value: &str, field: &str) -> Result<String, SurrealConfigError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1494,6 +1550,51 @@ impl SurrealStore {
         Ok(format!("{info:?}"))
     }
 
+    pub async fn metrics_snapshot(&self) -> Result<SurrealMetricsSnapshot, SurrealStoreError> {
+        Ok(SurrealMetricsSnapshot {
+            stored_events: self
+                .count_query("SELECT VALUE count() FROM nostr_event GROUP ALL;")
+                .await?,
+            visible_events: self
+                .count_query(
+                    "SELECT VALUE count() FROM nostr_event WHERE deleted = false AND hidden = false GROUP ALL;",
+                )
+                .await?,
+            hidden_events: self
+                .count_query("SELECT VALUE count() FROM nostr_event WHERE hidden = true GROUP ALL;")
+                .await?,
+            deleted_events: self
+                .count_query(
+                    "SELECT VALUE count() FROM nostr_event WHERE deleted = true GROUP ALL;",
+                )
+                .await?,
+            current_listings: self
+                .count_query("SELECT VALUE count() FROM listing_current GROUP ALL;")
+                .await?,
+            active_listings: self
+                .count_query(
+                    "SELECT VALUE count() FROM listing_current WHERE effective_status = 'active' AND hidden = false AND deleted = false GROUP ALL;",
+                )
+                .await?,
+            seller_profiles: self
+                .count_query("SELECT VALUE count() FROM seller_profile GROUP ALL;")
+                .await?,
+            visible_seller_profiles: self
+                .count_query(
+                    "SELECT VALUE count() FROM seller_profile WHERE hidden = false AND deleted = false GROUP ALL;",
+                )
+                .await?,
+            approved_sellers: self
+                .count_query(
+                    "SELECT VALUE count() FROM relay_user WHERE seller_approved = true AND blocked = false GROUP ALL;",
+                )
+                .await?,
+            blocked_pubkeys: self
+                .count_query("SELECT VALUE count() FROM relay_user WHERE blocked = true GROUP ALL;")
+                .await?,
+        })
+    }
+
     pub async fn store_raw_event(
         &self,
         stored: &StoredEvent,
@@ -1558,6 +1659,18 @@ CREATE type::record('nostr_event', $event_id) CONTENT {
             .check()
             .map_err(SurrealStoreError::from)?;
         response.take(0).map_err(SurrealStoreError::from)
+    }
+
+    async fn count_query(&self, statement: &str) -> Result<u64, SurrealStoreError> {
+        let mut response = self
+            .db
+            .query(statement)
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        let rows: Vec<serde_json::Value> = response.take(0).map_err(SurrealStoreError::from)?;
+        rows.into_iter().next().map(count_value).unwrap_or(Ok(0))
     }
 
     pub async fn query_raw_events(
@@ -4201,6 +4314,18 @@ fn event_tags_json(event: &Event) -> Vec<serde_json::Value> {
             )
         })
         .collect()
+}
+
+fn count_value(value: serde_json::Value) -> Result<u64, SurrealStoreError> {
+    if let Some(count) = value.as_u64() {
+        return Ok(count);
+    }
+    if let Some(count) = value.get("count").and_then(serde_json::Value::as_u64) {
+        return Ok(count);
+    }
+    Err(SurrealStoreError::new(
+        "surreal count query returned a non-numeric count",
+    ))
 }
 
 fn required_policy_text(value: &str, field: &str) -> Result<String, SurrealStoreError> {
@@ -8789,6 +8914,72 @@ mod tests {
             .expect("seller query");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["event_id"], profile.id().as_str());
+    }
+
+    #[tokio::test]
+    async fn metrics_snapshot_counts_projected_store_state() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let profile = seller_profile(
+            1_714_125_145,
+            "radroots-market",
+            Some("Radroots Market"),
+            &["PNW"],
+            &["Produce"],
+            &["CSA"],
+        );
+        let blocked_pubkey = "b".repeat(PublicKeyHex::HEX_LENGTH);
+
+        store
+            .store_raw_event(&StoredEvent::new(
+                listing.clone(),
+                UnixTimestamp::new(1_714_125_146),
+            ))
+            .await
+            .expect("store listing");
+        store
+            .store_raw_event(&StoredEvent::new(
+                profile.clone(),
+                UnixTimestamp::new(1_714_125_147),
+            ))
+            .await
+            .expect("store profile");
+        store
+            .project_current_listing(&listing, UnixTimestamp::new(1_714_125_148))
+            .await
+            .expect("project listing");
+        store
+            .project_seller_profile(&profile, UnixTimestamp::new(1_714_125_149))
+            .await
+            .expect("project profile");
+        store
+            .set_seller_approved(
+                FixtureKey::Seller.public_key().as_str(),
+                true,
+                UnixTimestamp::new(1_714_125_150),
+            )
+            .await
+            .expect("approve seller");
+        store
+            .set_pubkey_blocked(&blocked_pubkey, true, UnixTimestamp::new(1_714_125_151))
+            .await
+            .expect("block pubkey");
+
+        let snapshot = store.metrics_snapshot().await.expect("snapshot");
+        assert_eq!(snapshot.stored_events(), 2);
+        assert_eq!(snapshot.visible_events(), 2);
+        assert_eq!(snapshot.hidden_events(), 0);
+        assert_eq!(snapshot.deleted_events(), 0);
+        assert_eq!(snapshot.current_listings(), 1);
+        assert_eq!(snapshot.active_listings(), 1);
+        assert_eq!(snapshot.seller_profiles(), 1);
+        assert_eq!(snapshot.visible_seller_profiles(), 1);
+        assert_eq!(snapshot.approved_sellers(), 1);
+        assert_eq!(snapshot.blocked_pubkeys(), 1);
     }
 
     #[tokio::test]

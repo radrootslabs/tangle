@@ -410,6 +410,16 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
     assert!(seller_detail.contains(profile.id().as_str()));
     assert!(seller_detail.contains("\"display_name\":\"Radroots Market\""));
     assert!(seller_detail.contains("\"regions\":[\"cascadia\",\"pnw\"]"));
+    let metrics = http_get(port, "/metrics");
+    assert!(metrics.contains("200 OK"));
+    assert!(metrics.contains("text/plain; version=0.0.4"));
+    assert!(metrics.contains("tangle_info{"));
+    assert!(metrics.contains("tangle_relay_ready 1"));
+    assert!(metrics.contains("tangle_store_events{state=\"stored\"} 8"));
+    assert!(metrics.contains("tangle_store_events{state=\"visible\"} 8"));
+    assert!(metrics.contains("tangle_store_listings{state=\"active\"} 1"));
+    assert!(metrics.contains("tangle_store_seller_profiles{state=\"visible\"} 1"));
+    assert!(metrics.contains("tangle_store_sellers{state=\"approved\"} 0"));
 
     let trace_output = stop_relay_with_stderr(relay);
     assert!(trace_output.contains("tracing initialized"));
@@ -442,6 +452,14 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
             .expect("profile raw row")
             .is_some()
     );
+    let metrics_snapshot = store.metrics_snapshot().await.expect("metrics snapshot");
+    assert_eq!(metrics_snapshot.stored_events(), 8);
+    assert_eq!(metrics_snapshot.visible_events(), 8);
+    assert_eq!(metrics_snapshot.current_listings(), 1);
+    assert_eq!(metrics_snapshot.active_listings(), 1);
+    assert_eq!(metrics_snapshot.seller_profiles(), 1);
+    assert_eq!(metrics_snapshot.visible_seller_profiles(), 1);
+    assert_eq!(metrics_snapshot.approved_sellers(), 0);
     let profile_row = store
         .seller_profile_row(seller.as_str())
         .await

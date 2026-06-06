@@ -39,8 +39,8 @@ use tangle_store_surreal::{
     ForumThreadProjectionOutcome, ForumThreadProjectionQuery, LabelProjectionOutcome,
     LabelProjectionQuery, ListingProjectionQuery, LongFormProjectionOutcome, MigrationApplyOutcome,
     ReactionProjectionOutcome, ReportProjectionOutcome, ReportProjectionQuery, SearchDocumentQuery,
-    SellerProfileProjectionOutcome, SurrealConnectionConfig, SurrealConnectionMode, SurrealStore,
-    base_migration_plan,
+    SellerProfileProjectionOutcome, SurrealConnectionConfig, SurrealConnectionMode,
+    SurrealMetricsSnapshot, SurrealStore, base_migration_plan,
 };
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -48,6 +48,7 @@ use url::form_urlencoded;
 
 pub const TANGLE_SUPPORTED_NIPS: [u16; 8] = [1, 9, 11, 16, 33, 42, 50, 99];
 pub const TANGLE_RELAY_SOFTWARE: &str = "https://github.com/radrootslabs/tangle";
+pub const TANGLE_RELAY_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RelayConnectionId(String);
@@ -1128,6 +1129,7 @@ fn runtime_router(
         .route("/ws", get(runtime_websocket_upgrade))
         .route("/healthz", get(runtime_healthz))
         .route("/readyz", get(runtime_readyz))
+        .route("/metrics", get(runtime_metrics))
         .route("/api/listings", get(runtime_listings))
         .route("/api/listings/{pubkey}/{d}", get(runtime_listing_detail))
         .route(
@@ -1201,6 +1203,10 @@ async fn runtime_healthz() -> Json<HealthDocument> {
 
 async fn runtime_readyz() -> (StatusCode, Json<ReadinessDocument>) {
     readyz(State(ReadinessState::ready())).await
+}
+
+async fn runtime_metrics(State(state): State<RuntimeRelayState>) -> Result<Response, ApiError> {
+    metrics(State(MetricsHttpState::new(state.store))).await
 }
 
 async fn runtime_listings(
@@ -2785,7 +2791,7 @@ impl RelayInfoDocument {
             icon: None,
             supported_nips: TANGLE_SUPPORTED_NIPS.to_vec(),
             software: TANGLE_RELAY_SOFTWARE.to_owned(),
-            version: env!("CARGO_PKG_VERSION").to_owned(),
+            version: TANGLE_RELAY_VERSION.to_owned(),
             limitation: RelayInfoLimitationDocument {
                 payment_required: false,
                 restricted_writes: true,
@@ -2846,6 +2852,17 @@ pub struct ListingsHttpState {
 impl ListingsHttpState {
     pub fn new(store: SurrealStore, limits: RuntimeLimits) -> Self {
         Self { store, limits }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MetricsHttpState {
+    store: SurrealStore,
+}
+
+impl MetricsHttpState {
+    pub fn new(store: SurrealStore) -> Self {
+        Self { store }
     }
 }
 
@@ -3187,6 +3204,12 @@ pub fn health_router(readiness: ReadinessState) -> Router {
         .with_state(readiness)
 }
 
+pub fn metrics_router(state: MetricsHttpState) -> Router {
+    Router::new()
+        .route("/metrics", get(metrics))
+        .with_state(state)
+}
+
 pub fn relay_info_router(document: RelayInfoDocument) -> Router {
     Router::new()
         .route("/", get(relay_info))
@@ -3232,6 +3255,122 @@ async fn readyz(State(readiness): State<ReadinessState>) -> (StatusCode, Json<Re
         StatusCode::SERVICE_UNAVAILABLE
     };
     (status, Json(readiness.response()))
+}
+
+async fn metrics(State(state): State<MetricsHttpState>) -> Result<Response, ApiError> {
+    let snapshot = state
+        .store
+        .metrics_snapshot()
+        .await
+        .map_err(|_| ApiError::internal())?;
+    Ok((
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4"),
+        )],
+        metrics_text(snapshot),
+    )
+        .into_response())
+}
+
+fn metrics_text(snapshot: SurrealMetricsSnapshot) -> String {
+    let mut output = String::new();
+    output.push_str("# HELP tangle_info Tangle relay build information\n");
+    output.push_str("# TYPE tangle_info gauge\n");
+    output.push_str(&format!(
+        "tangle_info{{software=\"{}\",version=\"{}\"}} 1\n",
+        prometheus_label_value(TANGLE_RELAY_SOFTWARE),
+        prometheus_label_value(TANGLE_RELAY_VERSION)
+    ));
+    output.push_str("# HELP tangle_relay_ready Relay readiness gauge\n");
+    output.push_str("# TYPE tangle_relay_ready gauge\n");
+    output.push_str("tangle_relay_ready 1\n");
+    output.push_str("# HELP tangle_store_events Stored Nostr event gauges\n");
+    output.push_str("# TYPE tangle_store_events gauge\n");
+    append_labeled_gauge(
+        &mut output,
+        "tangle_store_events",
+        "stored",
+        snapshot.stored_events(),
+    );
+    append_labeled_gauge(
+        &mut output,
+        "tangle_store_events",
+        "visible",
+        snapshot.visible_events(),
+    );
+    append_labeled_gauge(
+        &mut output,
+        "tangle_store_events",
+        "hidden",
+        snapshot.hidden_events(),
+    );
+    append_labeled_gauge(
+        &mut output,
+        "tangle_store_events",
+        "deleted",
+        snapshot.deleted_events(),
+    );
+    output.push_str("# HELP tangle_store_listings Current listing projection gauges\n");
+    output.push_str("# TYPE tangle_store_listings gauge\n");
+    append_labeled_gauge(
+        &mut output,
+        "tangle_store_listings",
+        "current",
+        snapshot.current_listings(),
+    );
+    append_labeled_gauge(
+        &mut output,
+        "tangle_store_listings",
+        "active",
+        snapshot.active_listings(),
+    );
+    output.push_str("# HELP tangle_store_seller_profiles Seller profile projection gauges\n");
+    output.push_str("# TYPE tangle_store_seller_profiles gauge\n");
+    append_labeled_gauge(
+        &mut output,
+        "tangle_store_seller_profiles",
+        "stored",
+        snapshot.seller_profiles(),
+    );
+    append_labeled_gauge(
+        &mut output,
+        "tangle_store_seller_profiles",
+        "visible",
+        snapshot.visible_seller_profiles(),
+    );
+    output.push_str("# HELP tangle_store_sellers Seller policy gauges\n");
+    output.push_str("# TYPE tangle_store_sellers gauge\n");
+    append_labeled_gauge(
+        &mut output,
+        "tangle_store_sellers",
+        "approved",
+        snapshot.approved_sellers(),
+    );
+    output.push_str("# HELP tangle_store_pubkeys Relay pubkey policy gauges\n");
+    output.push_str("# TYPE tangle_store_pubkeys gauge\n");
+    append_labeled_gauge(
+        &mut output,
+        "tangle_store_pubkeys",
+        "blocked",
+        snapshot.blocked_pubkeys(),
+    );
+    output
+}
+
+fn append_labeled_gauge(output: &mut String, metric: &str, state: &str, value: u64) {
+    output.push_str(&format!(
+        "{metric}{{state=\"{}\"}} {value}\n",
+        prometheus_label_value(state)
+    ));
+}
+
+fn prometheus_label_value(value: &str) -> String {
+    value
+        .replace('\\', r"\\")
+        .replace('"', r#"\""#)
+        .replace('\n', r"\n")
 }
 
 async fn relay_info(State(relay_info): State<RelayInfoDocument>, headers: HeaderMap) -> Response {
@@ -4369,11 +4508,12 @@ mod tests {
         ApiError, ApiErrorBody, ApiErrorCode, ApiErrorEnvelope, AuthMessageHandler, ClientFrame,
         ClientFrameOutcome, ClientMessageLoop, CloseMessageHandler, CloseMessageOutcome,
         EventMessageHandler, GracefulShutdownSignal, ListingsHttpState, LiveEventFanout,
-        ReadinessCheckStatus, ReadinessState, RelayConnection, RelayConnectionConfig,
-        RelayConnectionId, RelayInfoDocument, ReqMessageHandler, RuntimeCommandErrorKind,
-        RuntimeConfigErrorKind, RuntimeTracingFormat, TANGLE_RELAY_SOFTWARE, TANGLE_SUPPORTED_NIPS,
-        WebSocketHttpState, health_router, listing_item_document, listing_projection_query,
-        listings_router, load_runtime_config, migrate_runtime_database, parse_listing_query,
+        MetricsHttpState, ReadinessCheckStatus, ReadinessState, RelayConnection,
+        RelayConnectionConfig, RelayConnectionId, RelayInfoDocument, ReqMessageHandler,
+        RuntimeCommandErrorKind, RuntimeConfigErrorKind, RuntimeTracingFormat,
+        TANGLE_RELAY_SOFTWARE, TANGLE_RELAY_VERSION, TANGLE_SUPPORTED_NIPS, WebSocketHttpState,
+        health_router, listing_item_document, listing_projection_query, listings_router,
+        load_runtime_config, metrics_router, migrate_runtime_database, parse_listing_query,
         parse_marketplace_search_query, parse_runtime_config_json, relay_info_router,
         search_document_query, websocket_router,
     };
@@ -5705,6 +5845,69 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_reports_store_snapshot() {
+        let store = runtime_memory_store().await;
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let profile = seller_profile(1_714_125_300, "radroots-market", Some("Radroots Market"));
+        let seller = listing.unsigned().pubkey().as_str().to_owned();
+        store
+            .store_raw_event(&StoredEvent::new(
+                listing.clone(),
+                UnixTimestamp::new(1_714_125_301),
+            ))
+            .await
+            .expect("store listing");
+        store
+            .store_raw_event(&StoredEvent::new(
+                profile.clone(),
+                UnixTimestamp::new(1_714_125_302),
+            ))
+            .await
+            .expect("store profile");
+        store
+            .project_current_listing(&listing, UnixTimestamp::new(1_714_125_303))
+            .await
+            .expect("project listing");
+        store
+            .project_seller_profile(&profile, UnixTimestamp::new(1_714_125_304))
+            .await
+            .expect("project profile");
+        store
+            .set_seller_approved(seller.as_str(), true, UnixTimestamp::new(1_714_125_305))
+            .await
+            .expect("approve seller");
+
+        let response = metrics_router(MetricsHttpState::new(store))
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/plain; version=0.0.4"))
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(body.contains(&format!(
+            "tangle_info{{software=\"{}\",version=\"{}\"}} 1",
+            TANGLE_RELAY_SOFTWARE, TANGLE_RELAY_VERSION
+        )));
+        assert!(body.contains("tangle_relay_ready 1"));
+        assert!(body.contains("tangle_store_events{state=\"stored\"} 2"));
+        assert!(body.contains("tangle_store_events{state=\"visible\"} 2"));
+        assert!(body.contains("tangle_store_listings{state=\"active\"} 1"));
+        assert!(body.contains("tangle_store_seller_profiles{state=\"visible\"} 1"));
+        assert!(body.contains("tangle_store_sellers{state=\"approved\"} 1"));
     }
 
     #[test]
