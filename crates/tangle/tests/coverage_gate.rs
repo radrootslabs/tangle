@@ -8,6 +8,8 @@ fn coverage_script_requires_workspace_full_line_coverage() {
     let script = read("scripts/coverage.sh");
 
     assert!(script.contains("cargo llvm-cov --version"));
+    assert!(script.contains("LLVM_COV=\"$(command -v llvm-cov)\""));
+    assert!(script.contains("LLVM_PROFDATA=\"$(command -v llvm-profdata)\""));
     assert!(script.contains("cargo llvm-cov clean --workspace"));
     assert!(script.contains("cargo llvm-cov --workspace --all-targets"));
     assert!(script.contains("--show-missing-lines"));
