@@ -356,6 +356,52 @@ pub async fn run_search_benchmark(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryPlanCaptureReport {
+    pub listing_plan_steps: u64,
+    pub search_plan_steps: u64,
+    pub listing_plan_text: String,
+    pub search_plan_text: String,
+}
+
+pub async fn capture_query_plans(
+    config: BenchDatasetConfig,
+) -> Result<QueryPlanCaptureReport, String> {
+    let dataset = BenchDataset::generate(config)?;
+    let materialized = materialize_listing_workload(&dataset).await?;
+    for event in dataset.listings() {
+        materialized
+            .store()
+            .index_listing_search_document(event)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    let listing_query = "SELECT * FROM listing_current WHERE hidden = false AND deleted = false AND effective_status = 'active' ORDER BY updated_at DESC, event_id ASC LIMIT 10 EXPLAIN;";
+    let search_query = "SELECT * FROM search_doc WHERE doc_type = 'listing' AND visible = true ORDER BY updated_at DESC, event_id ASC LIMIT 10 EXPLAIN;";
+    let listing_plan = explain_query(materialized.store(), listing_query).await?;
+    let search_plan = explain_query(materialized.store(), search_query).await?;
+    Ok(QueryPlanCaptureReport {
+        listing_plan_steps: listing_plan.len() as u64,
+        search_plan_steps: search_plan.len() as u64,
+        listing_plan_text: format!("{listing_query}\n{listing_plan:?}"),
+        search_plan_text: format!("{search_query}\n{search_plan:?}"),
+    })
+}
+
+async fn explain_query(
+    store: &SurrealStore,
+    query: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut response = store
+        .database()
+        .query(query)
+        .await
+        .map_err(|error| error.to_string())?
+        .check()
+        .map_err(|error| error.to_string())?;
+    response.take(0).map_err(|error| error.to_string())
+}
+
 async fn bench_memory_store(database: &str) -> Result<SurrealStore, String> {
     let config = SurrealConnectionConfig::memory("tangle_bench", database)
         .map_err(|error| error.to_string())?;
@@ -575,5 +621,17 @@ mod tests {
         assert_eq!(report.text_results, 16);
         assert_eq!(report.browse_results, 9);
         assert!(report.elapsed_micros > 0);
+    }
+
+    #[tokio::test]
+    async fn query_plan_capture_records_listing_and_search_plans() {
+        let report = super::capture_query_plans(BenchDatasetConfig::new(4, 0))
+            .await
+            .expect("query plan capture");
+
+        assert!(report.listing_plan_steps > 0);
+        assert!(report.search_plan_steps > 0);
+        assert!(report.listing_plan_text.contains("listing_current"));
+        assert!(report.search_plan_text.contains("search_doc"));
     }
 }
