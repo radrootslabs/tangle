@@ -4,16 +4,26 @@ use std::env;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let mut args = env::args().skip(1);
-    match args.next().as_deref() {
-        Some("--version") | Some("-V") => {
+    let command = match tangle::parse_tangle_command(env::args().skip(1)) {
+        Ok(command) => command,
+        Err(error) => {
+            eprintln!("{error}");
+            eprintln!("{}", tangle::usage_output());
+            return ExitCode::from(2);
+        }
+    };
+    match command {
+        tangle::TangleCommand::Version => {
             println!("{}", tangle::version_output());
             ExitCode::SUCCESS
         }
-        Some(_) => {
-            eprintln!("usage: tangle [--version]");
+        tangle::TangleCommand::Help => {
+            println!("{}", tangle::usage_output());
+            ExitCode::SUCCESS
+        }
+        command => {
+            eprintln!("command not implemented: {}", command.as_str());
             ExitCode::from(2)
         }
-        None => ExitCode::SUCCESS,
     }
 }
