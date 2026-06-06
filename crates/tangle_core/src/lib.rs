@@ -7,7 +7,7 @@ use tangle_nips::{
     DeletionRequest, ListingProjectionEvaluation, RelayAuthEvent, evaluate_listing_projection,
     parse_deletion_request, parse_relay_auth_event,
 };
-use tangle_protocol::{Event, EventId, PublicKeyHex, UnixTimestamp, event_to_value};
+use tangle_protocol::{Event, EventId, Filter, PublicKeyHex, UnixTimestamp, event_to_value};
 use tangle_store::{
     DeletionMarker, DeletionMarkerRepository, ListingProjectionRepository, RawEventRepository,
     RepositoryError, StoreEventOutcome, StoreProjectionOutcome, StoredEvent,
@@ -1556,6 +1556,150 @@ where
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NostrFilterCompiler {
+    limits: RuntimeLimits,
+}
+
+impl NostrFilterCompiler {
+    pub fn new(limits: RuntimeLimits) -> Self {
+        Self { limits }
+    }
+
+    pub fn limits(self) -> RuntimeLimits {
+        self.limits
+    }
+
+    pub fn compile(
+        &self,
+        filters: &[Filter],
+        mode: QueryExecutionMode,
+    ) -> Result<QueryPlan, NostrFilterCompileError> {
+        self.limits
+            .validate_filters(filters.len() as u64, filter_complexity(filters))
+            .map_err(NostrFilterCompileError::RuntimeLimit)?;
+        let branches = filters
+            .iter()
+            .map(compile_filter_branch)
+            .collect::<Result<Vec<_>, _>>()?;
+        let source = if branches.iter().any(|branch| branch.search().is_some()) {
+            QuerySource::SearchDocuments
+        } else {
+            QuerySource::RawEvents
+        };
+        let sort = if source == QuerySource::SearchDocuments {
+            QuerySort::ScoreDescCreatedAtDescEventIdAsc
+        } else {
+            QuerySort::CreatedAtDescEventIdAsc
+        };
+        QueryPlan::new(source, mode, sort, branches).map_err(NostrFilterCompileError::QueryPlan)
+    }
+}
+
+impl Default for NostrFilterCompiler {
+    fn default() -> Self {
+        Self::new(RuntimeLimits::default())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NostrFilterCompileError {
+    RuntimeLimit(RuntimeLimitViolation),
+    QueryPlan(QueryPlanError),
+}
+
+impl NostrFilterCompileError {
+    pub fn kind(&self) -> NostrFilterCompileErrorKind {
+        match self {
+            Self::RuntimeLimit(_) => NostrFilterCompileErrorKind::RuntimeLimit,
+            Self::QueryPlan(_) => NostrFilterCompileErrorKind::QueryPlan,
+        }
+    }
+}
+
+impl fmt::Display for NostrFilterCompileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RuntimeLimit(violation) => write!(formatter, "runtime limit: {violation}"),
+            Self::QueryPlan(error) => write!(formatter, "query plan: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for NostrFilterCompileError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NostrFilterCompileErrorKind {
+    RuntimeLimit,
+    QueryPlan,
+}
+
+fn compile_filter_branch(filter: &Filter) -> Result<QueryPlanBranch, NostrFilterCompileError> {
+    let tag_filters = filter
+        .tag_filters()
+        .iter()
+        .map(|(name, values)| {
+            let name = name
+                .as_str()
+                .chars()
+                .next()
+                .expect("protocol tag filters are non-empty");
+            QueryTagFilter::new(
+                name,
+                values
+                    .iter()
+                    .map(|value| value.as_str().to_owned())
+                    .collect(),
+            )
+            .map_err(NostrFilterCompileError::QueryPlan)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let search = filter
+        .search()
+        .map(|raw| {
+            QuerySearch::new(
+                raw,
+                raw.split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(NostrFilterCompileError::QueryPlan)
+        })
+        .transpose()?;
+    QueryPlanBranch::from_spec(QueryPlanBranchSpec {
+        ids: filter.ids().to_vec(),
+        authors: filter.authors().to_vec(),
+        kinds: filter.kinds().to_vec(),
+        tag_filters,
+        since: filter.since(),
+        until: filter.until(),
+        limit: filter.limit(),
+        search,
+    })
+    .map_err(NostrFilterCompileError::QueryPlan)
+}
+
+fn filter_complexity(filters: &[Filter]) -> u64 {
+    filters
+        .iter()
+        .map(|filter| {
+            let tag_value_count = filter.tag_filters().values().map(Vec::len).sum::<usize>();
+            let search_terms = filter
+                .search()
+                .map_or(0, |search| search.split_whitespace().count());
+            1 + filter.ids().len()
+                + filter.authors().len()
+                + filter.kinds().len()
+                + filter.tag_filters().len()
+                + tag_value_count
+                + usize::from(filter.since().is_some())
+                + usize::from(filter.until().is_some())
+                + usize::from(filter.limit().is_some())
+                + search_terms
+        })
+        .sum::<usize>() as u64
+}
+
 fn require_positive(field: &'static str, value: u64) -> Result<(), RuntimeLimitConfigError> {
     if value == 0 {
         Err(RuntimeLimitConfigError::Zero { field })
@@ -1582,15 +1726,15 @@ mod tests {
         AdmissionContext, AdmissionEffect, AdmissionEvent, AdmissionEventKind, AdmissionPolicy,
         AdmissionRejectionKind, EventIngestionEffect, EventIngestionRejectionKind, EventIngestor,
         EventParser, EventValidationRejection, EventValidationRejectionKind, EventValidator,
-        ProjectionExclusionReason, QueryExecutionMode, QueryPlan, QueryPlanBranch,
-        QueryPlanBranchSpec, QueryPlanError, QuerySearch, QuerySort, QuerySource, QueryTagFilter,
-        RuntimeLimitConfigError, RuntimeLimitKind, RuntimeLimitValues, RuntimeLimits,
-        UnapprovedSellerAction,
+        NostrFilterCompileErrorKind, NostrFilterCompiler, ProjectionExclusionReason,
+        QueryExecutionMode, QueryPlan, QueryPlanBranch, QueryPlanBranchSpec, QueryPlanError,
+        QuerySearch, QuerySort, QuerySource, QueryTagFilter, RuntimeLimitConfigError,
+        RuntimeLimitKind, RuntimeLimitValues, RuntimeLimits, UnapprovedSellerAction,
     };
     use tangle_nips::{ListingProjection, evaluate_listing_projection, parse_deletion_request};
     use tangle_protocol::{
         AddressCoordinate, Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp,
-        UnsignedEvent,
+        UnsignedEvent, filter_from_value,
     };
     use tangle_store::{
         DeletionMarker, DeletionMarkerRepository, ListingProjectionRepository, RawEventRepository,
@@ -3047,6 +3191,131 @@ mod tests {
         assert_eq!(
             QuerySort::ScoreDescCreatedAtDescEventIdAsc.to_string(),
             "score desc created_at desc event_id asc"
+        );
+    }
+
+    #[test]
+    fn nostr_filter_compiler_builds_search_backed_query_plans() {
+        let filter = filter_from_value(&serde_json::json!({
+            "ids": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+            "authors": ["1111111111111111111111111111111111111111111111111111111111111111"],
+            "kinds": [1, 30402],
+            "#t": ["vegetables", "carrots", "vegetables"],
+            "since": 10,
+            "until": 20,
+            "limit": 25,
+            "search": "fresh carrots"
+        }))
+        .expect("filter");
+        let compiler = NostrFilterCompiler::default();
+        let plan = compiler
+            .compile(&[filter], QueryExecutionMode::HistoricalThenLive)
+            .expect("plan");
+        let branch = &plan.branches()[0];
+
+        assert_eq!(compiler.limits(), RuntimeLimits::default());
+        assert_eq!(plan.source(), QuerySource::SearchDocuments);
+        assert_eq!(plan.sort(), QuerySort::ScoreDescCreatedAtDescEventIdAsc);
+        assert_eq!(plan.mode(), QueryExecutionMode::HistoricalThenLive);
+        assert!(plan.requires_historical_query());
+        assert!(plan.subscribes_to_live_events());
+        assert_eq!(branch.ids()[0].as_str(), &"b".repeat(EventId::HEX_LENGTH));
+        assert_eq!(branch.authors()[0], pubkey("1"));
+        assert_eq!(
+            branch.kinds(),
+            &[
+                Kind::new(1).expect("kind"),
+                Kind::new(30_402).expect("kind")
+            ]
+        );
+        assert_eq!(
+            branch.tag_filters().get(&'t').expect("tag"),
+            &["carrots".to_owned(), "vegetables".to_owned()]
+        );
+        assert_eq!(branch.since(), Some(UnixTimestamp::new(10)));
+        assert_eq!(branch.until(), Some(UnixTimestamp::new(20)));
+        assert_eq!(branch.limit(), Some(25));
+        assert_eq!(
+            branch.search().expect("search").terms(),
+            &["carrots".to_owned(), "fresh".to_owned()]
+        );
+    }
+
+    #[test]
+    fn nostr_filter_compiler_preserves_limit_zero_historical_skip() {
+        let filter = filter_from_value(&serde_json::json!({
+            "limit": 0,
+            "#p": ["1111111111111111111111111111111111111111111111111111111111111111"]
+        }))
+        .expect("filter");
+        let plan = NostrFilterCompiler::default()
+            .compile(&[filter], QueryExecutionMode::HistoricalThenLive)
+            .expect("plan");
+
+        assert_eq!(plan.source(), QuerySource::RawEvents);
+        assert_eq!(plan.sort(), QuerySort::CreatedAtDescEventIdAsc);
+        assert!(!plan.requires_historical_query());
+        assert!(plan.subscribes_to_live_events());
+        assert_eq!(
+            plan.branches()[0].tag_filters().get(&'p').expect("p"),
+            &["1111111111111111111111111111111111111111111111111111111111111111".to_owned()]
+        );
+    }
+
+    #[test]
+    fn nostr_filter_compiler_rejects_limit_and_plan_errors() {
+        let empty_filters = NostrFilterCompiler::default()
+            .compile(&[], QueryExecutionMode::Historical)
+            .expect_err("empty filters");
+        let too_many_filters = NostrFilterCompiler::new(limits_with(|values| {
+            values.max_filters_per_subscription = 1;
+        }))
+        .compile(
+            &[
+                tangle_protocol::Filter::empty(),
+                tangle_protocol::Filter::empty(),
+            ],
+            QueryExecutionMode::Historical,
+        )
+        .expect_err("filter count");
+        let too_complex = NostrFilterCompiler::new(limits_with(|values| {
+            values.max_filter_complexity = 1;
+        }))
+        .compile(
+            &[filter_from_value(&serde_json::json!({
+                "ids": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+                "authors": ["1111111111111111111111111111111111111111111111111111111111111111"]
+            }))
+            .expect("filter")],
+            QueryExecutionMode::Historical,
+        )
+        .expect_err("complexity");
+        let blank_search = NostrFilterCompiler::default()
+            .compile(
+                &[filter_from_value(&serde_json::json!({ "search": " " })).expect("filter")],
+                QueryExecutionMode::Historical,
+            )
+            .expect_err("blank search");
+
+        assert_eq!(empty_filters.kind(), NostrFilterCompileErrorKind::QueryPlan);
+        assert_eq!(
+            too_many_filters.kind(),
+            NostrFilterCompileErrorKind::RuntimeLimit
+        );
+        assert_eq!(
+            too_complex.kind(),
+            NostrFilterCompileErrorKind::RuntimeLimit
+        );
+        assert_eq!(blank_search.kind(), NostrFilterCompileErrorKind::QueryPlan);
+        assert_eq!(
+            empty_filters.to_string(),
+            "query plan: query plan must include at least one branch"
+        );
+        assert!(too_many_filters.to_string().starts_with("runtime limit:"));
+        assert!(too_complex.to_string().starts_with("runtime limit:"));
+        assert_eq!(
+            blank_search.to_string(),
+            "query plan: search query must include terms"
         );
     }
 
