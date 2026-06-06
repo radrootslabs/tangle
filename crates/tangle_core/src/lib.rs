@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use tangle_crypto::verify_event_signature;
 use tangle_nips::{
     DeletionRequest, ListingProjectionEvaluation, RelayAuthEvent, evaluate_listing_projection,
-    parse_deletion_request, parse_relay_auth_event,
+    parse_deletion_request, parse_nip50_filter_search, parse_relay_auth_event,
 };
 use tangle_protocol::{Event, EventId, Filter, PublicKeyHex, UnixTimestamp, event_to_value};
 use tangle_store::{
@@ -1634,26 +1634,95 @@ pub enum NostrFilterCompileErrorKind {
     QueryPlan,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Nip50QueryCompiler {
+    limits: RuntimeLimits,
+}
+
+impl Nip50QueryCompiler {
+    pub fn new(limits: RuntimeLimits) -> Self {
+        Self { limits }
+    }
+
+    pub fn limits(self) -> RuntimeLimits {
+        self.limits
+    }
+
+    pub fn compile(
+        &self,
+        filters: &[Filter],
+        mode: QueryExecutionMode,
+    ) -> Result<QueryPlan, Nip50QueryCompileError> {
+        self.limits
+            .validate_filters(filters.len() as u64, filter_complexity(filters))
+            .map_err(Nip50QueryCompileError::RuntimeLimit)?;
+        let branches = filters
+            .iter()
+            .map(|filter| compile_nip50_filter_branch(filter, self.limits))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        if branches.is_empty() {
+            return Err(Nip50QueryCompileError::MissingSearchTerms);
+        }
+        QueryPlan::new(
+            QuerySource::SearchDocuments,
+            mode,
+            QuerySort::ScoreDescCreatedAtDescEventIdAsc,
+            branches,
+        )
+        .map_err(Nip50QueryCompileError::QueryPlan)
+    }
+}
+
+impl Default for Nip50QueryCompiler {
+    fn default() -> Self {
+        Self::new(RuntimeLimits::default())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Nip50QueryCompileError {
+    RuntimeLimit(RuntimeLimitViolation),
+    QueryPlan(QueryPlanError),
+    MissingSearchTerms,
+}
+
+impl Nip50QueryCompileError {
+    pub fn kind(&self) -> Nip50QueryCompileErrorKind {
+        match self {
+            Self::RuntimeLimit(_) => Nip50QueryCompileErrorKind::RuntimeLimit,
+            Self::QueryPlan(_) => Nip50QueryCompileErrorKind::QueryPlan,
+            Self::MissingSearchTerms => Nip50QueryCompileErrorKind::MissingSearchTerms,
+        }
+    }
+}
+
+impl fmt::Display for Nip50QueryCompileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RuntimeLimit(violation) => write!(formatter, "runtime limit: {violation}"),
+            Self::QueryPlan(error) => write!(formatter, "query plan: {error}"),
+            Self::MissingSearchTerms => {
+                formatter.write_str("nip50 query must include plain search terms")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Nip50QueryCompileError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Nip50QueryCompileErrorKind {
+    RuntimeLimit,
+    QueryPlan,
+    MissingSearchTerms,
+}
+
 fn compile_filter_branch(filter: &Filter) -> Result<QueryPlanBranch, NostrFilterCompileError> {
-    let tag_filters = filter
-        .tag_filters()
-        .iter()
-        .map(|(name, values)| {
-            let name = name
-                .as_str()
-                .chars()
-                .next()
-                .expect("protocol tag filters are non-empty");
-            QueryTagFilter::new(
-                name,
-                values
-                    .iter()
-                    .map(|value| value.as_str().to_owned())
-                    .collect(),
-            )
-            .map_err(NostrFilterCompileError::QueryPlan)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let tag_filters =
+        compile_filter_tag_constraints(filter).map_err(NostrFilterCompileError::QueryPlan)?;
     let search = filter
         .search()
         .map(|raw| {
@@ -1677,6 +1746,60 @@ fn compile_filter_branch(filter: &Filter) -> Result<QueryPlanBranch, NostrFilter
         search,
     })
     .map_err(NostrFilterCompileError::QueryPlan)
+}
+
+fn compile_nip50_filter_branch(
+    filter: &Filter,
+    limits: RuntimeLimits,
+) -> Result<Option<QueryPlanBranch>, Nip50QueryCompileError> {
+    if let Some(raw) = filter.search() {
+        limits
+            .validate_search_query(raw)
+            .map_err(Nip50QueryCompileError::RuntimeLimit)?;
+    }
+    let search = match parse_nip50_filter_search(filter)
+        .expect("validated protocol filters are valid nip50 parser input")
+    {
+        Some(search) => search,
+        None => return Ok(None),
+    };
+    let search = QuerySearch::new(search.text(), search.terms().to_vec())
+        .expect("nip50 parser only returns search queries with plain terms");
+    let tag_filters =
+        compile_filter_tag_constraints(filter).map_err(Nip50QueryCompileError::QueryPlan)?;
+    QueryPlanBranch::from_spec(QueryPlanBranchSpec {
+        ids: filter.ids().to_vec(),
+        authors: filter.authors().to_vec(),
+        kinds: filter.kinds().to_vec(),
+        tag_filters,
+        since: filter.since(),
+        until: filter.until(),
+        limit: filter.limit(),
+        search: Some(search),
+    })
+    .map(Some)
+    .map_err(Nip50QueryCompileError::QueryPlan)
+}
+
+fn compile_filter_tag_constraints(filter: &Filter) -> Result<Vec<QueryTagFilter>, QueryPlanError> {
+    filter
+        .tag_filters()
+        .iter()
+        .map(|(name, values)| {
+            let name = name
+                .as_str()
+                .chars()
+                .next()
+                .expect("protocol tag filters are non-empty");
+            QueryTagFilter::new(
+                name,
+                values
+                    .iter()
+                    .map(|value| value.as_str().to_owned())
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 fn filter_complexity(filters: &[Filter]) -> u64 {
@@ -1726,10 +1849,11 @@ mod tests {
         AdmissionContext, AdmissionEffect, AdmissionEvent, AdmissionEventKind, AdmissionPolicy,
         AdmissionRejectionKind, EventIngestionEffect, EventIngestionRejectionKind, EventIngestor,
         EventParser, EventValidationRejection, EventValidationRejectionKind, EventValidator,
-        NostrFilterCompileErrorKind, NostrFilterCompiler, ProjectionExclusionReason,
-        QueryExecutionMode, QueryPlan, QueryPlanBranch, QueryPlanBranchSpec, QueryPlanError,
-        QuerySearch, QuerySort, QuerySource, QueryTagFilter, RuntimeLimitConfigError,
-        RuntimeLimitKind, RuntimeLimitValues, RuntimeLimits, UnapprovedSellerAction,
+        Nip50QueryCompileErrorKind, Nip50QueryCompiler, NostrFilterCompileErrorKind,
+        NostrFilterCompiler, ProjectionExclusionReason, QueryExecutionMode, QueryPlan,
+        QueryPlanBranch, QueryPlanBranchSpec, QueryPlanError, QuerySearch, QuerySort, QuerySource,
+        QueryTagFilter, RuntimeLimitConfigError, RuntimeLimitKind, RuntimeLimitValues,
+        RuntimeLimits, UnapprovedSellerAction,
     };
     use tangle_nips::{ListingProjection, evaluate_listing_projection, parse_deletion_request};
     use tangle_protocol::{
@@ -3296,6 +3420,12 @@ mod tests {
                 QueryExecutionMode::Historical,
             )
             .expect_err("blank search");
+        let empty_tag = NostrFilterCompiler::default()
+            .compile(
+                &[filter_from_value(&serde_json::json!({ "#t": [""] })).expect("filter")],
+                QueryExecutionMode::Historical,
+            )
+            .expect_err("empty tag");
 
         assert_eq!(empty_filters.kind(), NostrFilterCompileErrorKind::QueryPlan);
         assert_eq!(
@@ -3307,6 +3437,7 @@ mod tests {
             NostrFilterCompileErrorKind::RuntimeLimit
         );
         assert_eq!(blank_search.kind(), NostrFilterCompileErrorKind::QueryPlan);
+        assert_eq!(empty_tag.kind(), NostrFilterCompileErrorKind::QueryPlan);
         assert_eq!(
             empty_filters.to_string(),
             "query plan: query plan must include at least one branch"
@@ -3316,6 +3447,172 @@ mod tests {
         assert_eq!(
             blank_search.to_string(),
             "query plan: search query must include terms"
+        );
+        assert_eq!(
+            empty_tag.to_string(),
+            "query plan: tag filter `t` values must not be empty"
+        );
+    }
+
+    #[test]
+    fn nip50_query_compiler_builds_search_document_plan_from_plain_terms() {
+        let filter = filter_from_value(&serde_json::json!({
+            "authors": ["1111111111111111111111111111111111111111111111111111111111111111"],
+            "kinds": [30402],
+            "#t": ["carrots", "vegetables"],
+            "since": 10,
+            "until": 20,
+            "limit": 10,
+            "search": "fresh seller:ignored carrots status:ignored carrots"
+        }))
+        .expect("filter");
+        let compiler = Nip50QueryCompiler::default();
+        let plan = compiler
+            .compile(&[filter], QueryExecutionMode::Historical)
+            .expect("plan");
+        let branch = &plan.branches()[0];
+
+        assert_eq!(compiler.limits(), RuntimeLimits::default());
+        assert_eq!(plan.source(), QuerySource::SearchDocuments);
+        assert_eq!(plan.sort(), QuerySort::ScoreDescCreatedAtDescEventIdAsc);
+        assert_eq!(plan.mode(), QueryExecutionMode::Historical);
+        assert!(plan.requires_historical_query());
+        assert!(!plan.subscribes_to_live_events());
+        assert_eq!(branch.authors()[0], pubkey("1"));
+        assert_eq!(branch.kinds(), &[Kind::new(30_402).expect("kind")]);
+        assert_eq!(
+            branch.tag_filters().get(&'t').expect("tag"),
+            &["carrots".to_owned(), "vegetables".to_owned()]
+        );
+        assert_eq!(branch.since(), Some(UnixTimestamp::new(10)));
+        assert_eq!(branch.until(), Some(UnixTimestamp::new(20)));
+        assert_eq!(branch.limit(), Some(10));
+        assert_eq!(
+            branch.search().expect("search").raw(),
+            "fresh carrots carrots"
+        );
+        assert_eq!(
+            branch.search().expect("search").terms(),
+            &["carrots".to_owned(), "fresh".to_owned()]
+        );
+    }
+
+    #[test]
+    fn nip50_query_compiler_ignores_extension_only_filters() {
+        let extension_only = filter_from_value(&serde_json::json!({
+            "search": "seller:ignored status:ignored",
+            "limit": 0
+        }))
+        .expect("extension");
+        let searchable = filter_from_value(&serde_json::json!({
+            "search": "greens",
+            "kinds": [1]
+        }))
+        .expect("search");
+        let plan = Nip50QueryCompiler::default()
+            .compile(
+                &[extension_only, tangle_protocol::Filter::empty(), searchable],
+                QueryExecutionMode::HistoricalThenLive,
+            )
+            .expect("plan");
+
+        assert_eq!(plan.branches().len(), 1);
+        assert_eq!(plan.branches()[0].search().expect("search").raw(), "greens");
+        assert_eq!(plan.branches()[0].kinds(), &[Kind::new(1).expect("kind")]);
+        assert!(plan.requires_historical_query());
+        assert!(plan.subscribes_to_live_events());
+    }
+
+    #[test]
+    fn nip50_query_compiler_rejects_missing_terms_limits_and_bad_plans() {
+        let empty = Nip50QueryCompiler::default()
+            .compile(&[], QueryExecutionMode::Historical)
+            .expect_err("empty");
+        let extension_only = Nip50QueryCompiler::default()
+            .compile(
+                &[filter_from_value(&serde_json::json!({
+                    "search": "seller:ignored status:ignored"
+                }))
+                .expect("filter")],
+                QueryExecutionMode::Historical,
+            )
+            .expect_err("extension only");
+        let too_many_filters = Nip50QueryCompiler::new(limits_with(|values| {
+            values.max_filters_per_subscription = 1;
+        }))
+        .compile(
+            &[
+                filter_from_value(&serde_json::json!({ "search": "carrots" })).expect("filter"),
+                filter_from_value(&serde_json::json!({ "search": "greens" })).expect("filter"),
+            ],
+            QueryExecutionMode::Historical,
+        )
+        .expect_err("filter count");
+        let too_many_tokens = Nip50QueryCompiler::new(limits_with(|values| {
+            values.max_search_tokens = 1;
+        }))
+        .compile(
+            &[
+                filter_from_value(&serde_json::json!({ "search": "fresh carrots" }))
+                    .expect("filter"),
+            ],
+            QueryExecutionMode::Historical,
+        )
+        .expect_err("tokens");
+        let bad_plan = Nip50QueryCompiler::default()
+            .compile(
+                &[filter_from_value(&serde_json::json!({
+                    "search": "carrots",
+                    "since": 20,
+                    "until": 10
+                }))
+                .expect("filter")],
+                QueryExecutionMode::Historical,
+            )
+            .expect_err("plan");
+        let empty_tag = Nip50QueryCompiler::default()
+            .compile(
+                &[filter_from_value(&serde_json::json!({
+                    "search": "carrots",
+                    "#t": [""]
+                }))
+                .expect("filter")],
+                QueryExecutionMode::Historical,
+            )
+            .expect_err("tag");
+
+        assert_eq!(empty.kind(), Nip50QueryCompileErrorKind::MissingSearchTerms);
+        assert_eq!(
+            extension_only.kind(),
+            Nip50QueryCompileErrorKind::MissingSearchTerms
+        );
+        assert_eq!(
+            too_many_filters.kind(),
+            Nip50QueryCompileErrorKind::RuntimeLimit
+        );
+        assert_eq!(
+            too_many_tokens.kind(),
+            Nip50QueryCompileErrorKind::RuntimeLimit
+        );
+        assert_eq!(bad_plan.kind(), Nip50QueryCompileErrorKind::QueryPlan);
+        assert_eq!(empty_tag.kind(), Nip50QueryCompileErrorKind::QueryPlan);
+        assert_eq!(
+            empty.to_string(),
+            "nip50 query must include plain search terms"
+        );
+        assert!(
+            too_many_filters
+                .to_string()
+                .contains("filters per subscription")
+        );
+        assert!(too_many_tokens.to_string().contains("search tokens"));
+        assert_eq!(
+            bad_plan.to_string(),
+            "query plan: query time range is invalid: since 20 > until 10"
+        );
+        assert_eq!(
+            empty_tag.to_string(),
+            "query plan: tag filter `t` values must not be empty"
         );
     }
 
