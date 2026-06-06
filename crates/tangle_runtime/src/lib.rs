@@ -15,7 +15,7 @@ use tangle_core::{
 };
 use tangle_nips::{FulfillmentMethod, ListingUnit};
 use tangle_protocol::{EventId, PublicKeyHex};
-use tangle_store_surreal::{ListingProjectionQuery, SurrealStore};
+use tangle_store_surreal::{ListingProjectionQuery, SearchDocumentQuery, SurrealStore};
 use url::form_urlencoded;
 
 pub const TANGLE_SUPPORTED_NIPS: [u16; 8] = [1, 9, 11, 16, 33, 42, 50, 99];
@@ -294,6 +294,27 @@ impl ListingHttpQuery {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketplaceSearchHttpQuery {
+    text: Option<String>,
+    seller: Option<PublicKeyHex>,
+    limit: u64,
+}
+
+impl MarketplaceSearchHttpQuery {
+    pub fn text(&self) -> Option<&str> {
+        self.text.as_deref()
+    }
+
+    pub fn seller(&self) -> Option<&PublicKeyHex> {
+        self.seller.as_ref()
+    }
+
+    pub fn limit(&self) -> u64 {
+        self.limit
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ListingsHttpState {
     store: SurrealStore,
@@ -433,6 +454,69 @@ pub fn parse_listing_query(
     })
 }
 
+pub fn parse_marketplace_search_query(
+    query: &str,
+    limits: RuntimeLimits,
+) -> Result<MarketplaceSearchHttpQuery, ApiError> {
+    let mut text = None;
+    let mut seller = None;
+    let mut status = None;
+    let mut sort = None;
+    let mut limit = None;
+    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+        let value = value.into_owned();
+        match key.as_ref() {
+            "q" => set_once("q", &mut text, required_value("q", &value)?)?,
+            "seller" => set_once("seller", &mut seller, parse_pubkey("seller", &value)?)?,
+            "status" => set_once("status", &mut status, parse_status(&value)?)?,
+            "sort" => set_once("sort", &mut sort, parse_sort(&value)?)?,
+            "limit" => set_once("limit", &mut limit, parse_limit(&value)?)?,
+            "category" | "currency" | "unit" | "min_price" | "max_price" | "fulfillment"
+            | "delivery_only" | "pickup" | "lat" | "lon" | "radius_km" | "near" | "cursor" => {
+                return Err(ApiError::invalid_request(format!(
+                    "{} is not supported by marketplace search",
+                    key.as_ref()
+                )));
+            }
+            unsupported => {
+                return Err(ApiError::invalid_request(format!(
+                    "query parameter `{unsupported}` is unsupported"
+                )));
+            }
+        }
+    }
+    limits
+        .validate_search_query(text.as_deref().unwrap_or_default())
+        .map_err(|violation| ApiError::invalid_request(format!("runtime limit: {violation}")))?;
+    let status = status.unwrap_or(MarketplaceListingStatus::Active);
+    if status != MarketplaceListingStatus::Active {
+        return Err(invalid_parameter(
+            "status",
+            "must be active for marketplace search",
+        ));
+    }
+    let expected_sort = if text.is_some() {
+        MarketplaceSort::Relevance
+    } else {
+        MarketplaceSort::Freshness
+    };
+    if sort.is_some_and(|sort| sort != expected_sort) {
+        return Err(invalid_parameter(
+            "sort",
+            "does not match marketplace search mode",
+        ));
+    }
+    let limit = limit.unwrap_or(MarketplaceQuery::DEFAULT_LIMIT);
+    if limit == 0 || limit > MarketplaceQuery::MAX_LIMIT {
+        return Err(invalid_parameter("limit", "must be between 1 and 100"));
+    }
+    Ok(MarketplaceSearchHttpQuery {
+        text,
+        seller,
+        limit,
+    })
+}
+
 pub fn health_router(readiness: ReadinessState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -450,6 +534,7 @@ pub fn listings_router(state: ListingsHttpState) -> Router {
     Router::new()
         .route("/api/listings", get(listings))
         .route("/api/listings/{pubkey}/{d}", get(listing_detail))
+        .route("/api/search", get(marketplace_search))
         .with_state(state)
 }
 
@@ -537,6 +622,42 @@ async fn listing_detail(
     Ok(Json(ListingDetailDocument {
         listing: listing_item_document(&row)?,
         raw_event,
+    }))
+}
+
+async fn marketplace_search(
+    State(state): State<ListingsHttpState>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<ListingsDocument>, ApiError> {
+    let parsed =
+        parse_marketplace_search_query(query.as_deref().unwrap_or_default(), state.limits)?;
+    let search_query = search_document_query(&parsed);
+    let docs = state
+        .store
+        .query_search_documents(&search_query)
+        .await
+        .map_err(|_| ApiError::internal())?;
+    let mut items = Vec::new();
+    for doc in docs {
+        let Some(address_key) = optional_string_field(&doc, "address_key")? else {
+            continue;
+        };
+        let Some(row) = state
+            .store
+            .listing_current_row(&address_key)
+            .await
+            .map_err(|_| ApiError::internal())?
+        else {
+            continue;
+        };
+        if bool_field(&row, "hidden")? || bool_field(&row, "deleted")? {
+            continue;
+        }
+        items.push(listing_item_document(&row)?);
+    }
+    Ok(Json(ListingsDocument {
+        items,
+        next_cursor: None,
     }))
 }
 
@@ -640,6 +761,22 @@ fn listing_projection_query(parsed: &ListingHttpQuery) -> Result<ListingProjecti
         store_query = store_query.with_max_price_minor(price_minor_units(&price.raw)?);
     }
     Ok(store_query.with_limit(query.limit))
+}
+
+fn search_document_query(parsed: &MarketplaceSearchHttpQuery) -> SearchDocumentQuery {
+    let mut query = SearchDocumentQuery::new()
+        .with_doc_type("listing")
+        .with_kind(30_402)
+        .with_visible(true)
+        .with_status("active")
+        .with_limit(parsed.limit());
+    if let Some(text) = parsed.text() {
+        query = query.with_text(text);
+    }
+    if let Some(seller) = parsed.seller() {
+        query = query.with_pubkey(seller.as_str());
+    }
+    query
 }
 
 fn listing_item_document(row: &serde_json::Value) -> Result<ListingItemDocument, ApiError> {
@@ -972,7 +1109,8 @@ mod tests {
         ApiError, ApiErrorBody, ApiErrorCode, ApiErrorEnvelope, ListingsHttpState,
         ReadinessCheckStatus, ReadinessState, RelayInfoDocument, TANGLE_RELAY_SOFTWARE,
         TANGLE_SUPPORTED_NIPS, health_router, listing_item_document, listing_projection_query,
-        listings_router, parse_listing_query, relay_info_router,
+        listings_router, parse_listing_query, parse_marketplace_search_query, relay_info_router,
+        search_document_query,
     };
     use axum::{body::Body, response::IntoResponse};
     use http::{HeaderValue, Request, StatusCode, header};
@@ -1504,6 +1642,72 @@ mod tests {
     }
 
     #[test]
+    fn marketplace_search_query_parser_accepts_supported_modes() {
+        let seller = "1".repeat(64);
+        let text = parse_marketplace_search_query(
+            &format!("q=carrot&seller={seller}&sort=relevance&limit=25"),
+            RuntimeLimits::default(),
+        )
+        .expect("text search");
+        assert_eq!(text.text(), Some("carrot"));
+        assert_eq!(text.seller().expect("seller").as_str(), seller);
+        assert_eq!(text.limit(), 25);
+
+        let browse = parse_marketplace_search_query("sort=freshness", RuntimeLimits::default())
+            .expect("browse");
+        assert_eq!(browse.text(), None);
+        assert_eq!(browse.seller(), None);
+        assert_eq!(browse.limit(), 50);
+
+        let query = search_document_query(&text);
+        assert_eq!(format!("{query:?}").contains("SearchDocumentQuery"), true);
+    }
+
+    #[test]
+    fn marketplace_search_query_parser_rejects_invalid_parameters() {
+        let long_query = format!("q={}", "a".repeat(300));
+        let cases = [
+            ("q=".to_owned(), "q must not be empty"),
+            ("q=carrot&q=roots".to_owned(), "q must not be repeated"),
+            (
+                long_query,
+                "runtime limit: search query bytes exceeded: 300 > 256",
+            ),
+            (
+                "category=vegetables".to_owned(),
+                "category is not supported by marketplace search",
+            ),
+            (
+                "status=sold".to_owned(),
+                "status must be active for marketplace search",
+            ),
+            (
+                "q=carrot&sort=freshness".to_owned(),
+                "sort does not match marketplace search mode",
+            ),
+            (
+                "sort=relevance".to_owned(),
+                "sort does not match marketplace search mode",
+            ),
+            (
+                "sort=price_asc".to_owned(),
+                "sort does not match marketplace search mode",
+            ),
+            ("limit=0".to_owned(), "limit must be between 1 and 100"),
+            (
+                "banana=1".to_owned(),
+                "query parameter `banana` is unsupported",
+            ),
+        ];
+        for (raw, expected) in cases {
+            let error =
+                parse_marketplace_search_query(&raw, RuntimeLimits::default()).expect_err(&raw);
+            assert_eq!(error.code(), ApiErrorCode::InvalidRequest);
+            assert_eq!(error.message(), expected);
+        }
+    }
+
+    #[test]
     fn listing_item_document_maps_projection_rows_and_rejects_malformed_rows() {
         let row = serde_json::json!({
             "listing_key": "30402:pubkey:listing-a",
@@ -1815,6 +2019,75 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn marketplace_search_endpoint_queries_search_docs_and_hydrates_listings() {
+        let store = runtime_memory_store().await;
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let listing_key = format!("30402:{}:listing-a", listing.unsigned().pubkey().as_str());
+        store
+            .project_current_listing(&listing, UnixTimestamp::new(1_714_125_400))
+            .await
+            .expect("project listing");
+        store
+            .index_listing_search_document(&listing)
+            .await
+            .expect("index listing");
+
+        let uri = format!(
+            "/api/search?q=carrot&seller={}&sort=relevance&limit=5",
+            listing.unsigned().pubkey().as_str()
+        );
+        let response = listings_router(ListingsHttpState::new(
+            store.clone(),
+            RuntimeLimits::default(),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json = serde_json::from_slice::<serde_json::Value>(&body).expect("json");
+        assert_eq!(json["items"][0]["listing_key"], listing_key);
+        assert_eq!(json["items"][0]["title"], "Carrot bunches");
+        assert_eq!(json["next_cursor"], serde_json::Value::Null);
+
+        store
+            .database()
+            .query("UPDATE listing_current SET hidden = true WHERE listing_key = $listing_key;")
+            .bind(("listing_key", listing_key.as_str()))
+            .await
+            .expect("hide listing")
+            .check()
+            .expect("hide check");
+        let response = listings_router(ListingsHttpState::new(store, RuntimeLimits::default()))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/search?q=carrot")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
+            serde_json::json!({
+                "items": [],
+                "next_cursor": null
+            })
+        );
     }
 
     async fn runtime_memory_store() -> SurrealStore {
