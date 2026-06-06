@@ -463,6 +463,86 @@ pub async fn run_rebuild_benchmark(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreDrillSmokeReport {
+    pub exported: u64,
+    pub restored: u64,
+    pub source_checksum: String,
+    pub restored_checksum: String,
+    pub checksum_matches: bool,
+}
+
+pub async fn run_restore_drill_smoke(
+    config: BenchDatasetConfig,
+) -> Result<RestoreDrillSmokeReport, String> {
+    let dataset = BenchDataset::generate(config)?;
+    let source = materialize_listing_workload(&dataset).await?;
+    let source_rows = source
+        .store()
+        .query_current_listings(&ListingProjectionQuery::new().with_effective_status("active"))
+        .await
+        .map_err(|error| error.to_string())?;
+    let source_checksum = listing_rows_checksum(&source_rows);
+    let exported_rows = source
+        .store()
+        .query_raw_events(&Filter::empty())
+        .await
+        .map_err(|error| error.to_string())?;
+    let exported = exported_rows
+        .iter()
+        .map(|row| {
+            row.get("raw_json")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| "raw event row is missing raw_json".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let restored_store = bench_memory_store("restore_drill_smoke").await?;
+    let mut restored = 0;
+    for raw in &exported {
+        let raw = RawEventJson::new(raw).map_err(|error| error.to_string())?;
+        let event = parse_event_json(&raw)
+            .map_err(|error| format!("restored event JSON is invalid: {error}"))?;
+        let now = event.unsigned().created_at();
+        if restored_store
+            .store_raw_event(&StoredEvent::new(event.clone(), now))
+            .await
+            .map_err(|error| error.to_string())?
+            == StoreEventOutcome::Inserted
+        {
+            restored += 1;
+        }
+        restored_store
+            .maintain_current_event(&event)
+            .await
+            .map_err(|error| error.to_string())?;
+        restored_store
+            .store_listing_revision(&event, now)
+            .await
+            .map_err(|error| error.to_string())?;
+        restored_store
+            .project_current_listing(&event, now)
+            .await
+            .map_err(|error| error.to_string())?;
+        restored_store
+            .project_listing_helpers(&event)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    let restored_rows = restored_store
+        .query_current_listings(&ListingProjectionQuery::new().with_effective_status("active"))
+        .await
+        .map_err(|error| error.to_string())?;
+    let restored_checksum = listing_rows_checksum(&restored_rows);
+    Ok(RestoreDrillSmokeReport {
+        exported: exported.len() as u64,
+        restored,
+        checksum_matches: source_checksum == restored_checksum,
+        source_checksum,
+        restored_checksum,
+    })
+}
+
 async fn explain_query(
     store: &SurrealStore,
     query: &str,
@@ -778,5 +858,17 @@ mod tests {
         assert_eq!(first.listing_rows, 7);
         assert_eq!(first.checksum, second.checksum);
         assert!(first.elapsed_micros > 0);
+    }
+
+    #[tokio::test]
+    async fn restore_drill_smoke_replays_exported_raw_events() {
+        let report = super::run_restore_drill_smoke(BenchDatasetConfig::new(6, 0))
+            .await
+            .expect("restore drill");
+
+        assert_eq!(report.exported, 6);
+        assert_eq!(report.restored, 6);
+        assert_eq!(report.source_checksum, report.restored_checksum);
+        assert!(report.checksum_matches);
     }
 }
