@@ -182,6 +182,110 @@ impl TryFrom<u64> for Kind {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Tag {
+    values: Vec<String>,
+}
+
+impl Tag {
+    pub fn new(values: Vec<String>) -> Result<Self, String> {
+        let Some(name) = values.first() else {
+            return Err(empty_error("tag"));
+        };
+        TagName::new(name)?;
+        Ok(Self { values })
+    }
+
+    pub fn from_parts(name: &str, values: &[&str]) -> Result<Self, String> {
+        let values = core::iter::once(name)
+            .chain(values.iter().copied())
+            .map(str::to_owned)
+            .collect();
+        Self::new(values)
+    }
+
+    pub fn name(&self) -> TagName {
+        TagName(self.values[0].clone())
+    }
+
+    pub fn value(&self) -> Option<TagValue> {
+        self.values.get(1).map(|value| TagValue(value.clone()))
+    }
+
+    pub fn values(&self) -> &[String] {
+        &self.values
+    }
+
+    pub fn indexed_pair(&self) -> Option<(&str, &str)> {
+        let name = self.values[0].as_str();
+        if !TagName::is_indexable_name(name) {
+            return None;
+        }
+        self.values.get(1).map(|value| (name, value.as_str()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TagName(String);
+
+impl TagName {
+    pub fn new(value: &str) -> Result<Self, String> {
+        if value.is_empty() {
+            return Err(empty_error("tag name"));
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_indexable(&self) -> bool {
+        Self::is_indexable_name(self.as_str())
+    }
+
+    pub fn is_indexable_name(value: &str) -> bool {
+        let mut bytes = value.bytes();
+        let Some(byte) = bytes.next() else {
+            return false;
+        };
+        bytes.next().is_none() && byte.is_ascii_alphabetic()
+    }
+}
+
+impl fmt::Display for TagName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for TagName {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TagValue(String);
+
+impl TagValue {
+    pub fn new(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for TagValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 fn require_lowercase_hex(scalar: &'static str, value: &str, expected: usize) -> Result<(), String> {
     let actual = value.chars().count();
     if actual != expected {
@@ -219,8 +323,9 @@ fn kind_out_of_range_error(value: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        EventId, Kind, PublicKeyHex, SignatureHex, SubscriptionId, UnixTimestamp, empty_error,
-        invalid_length_error, kind_out_of_range_error, non_lowercase_hex_error, too_long_error,
+        EventId, Kind, PublicKeyHex, SignatureHex, SubscriptionId, Tag, TagName, TagValue,
+        UnixTimestamp, empty_error, invalid_length_error, kind_out_of_range_error,
+        non_lowercase_hex_error, too_long_error,
     };
     use core::str::FromStr;
     use std::collections::hash_map::DefaultHasher;
@@ -342,5 +447,59 @@ mod tests {
             "id must be at most 64 characters, got 65"
         );
         assert_eq!(non_lowercase_hex_error("id"), "id must be lowercase hex");
+    }
+
+    #[test]
+    fn tag_model_preserves_tag_arrays_and_extracts_first_values() {
+        let tag = Tag::from_parts("e", &["event-id", "wss://relay.example"]).expect("tag");
+
+        assert_eq!(tag.name(), TagName::new("e").expect("name"));
+        assert_eq!(tag.value(), Some(TagValue::new("event-id")));
+        assert_eq!(
+            tag.values(),
+            &[
+                "e".to_owned(),
+                "event-id".to_owned(),
+                "wss://relay.example".to_owned()
+            ]
+        );
+        assert_eq!(tag.indexed_pair(), Some(("e", "event-id")));
+        assert_eq!(tag.name().to_string(), "e");
+        assert_eq!(tag.value().expect("value").to_string(), "event-id");
+    }
+
+    #[test]
+    fn tag_model_rejects_empty_arrays_and_names() {
+        assert_eq!(
+            Tag::new(Vec::new()),
+            Err("tag must not be empty".to_owned())
+        );
+        assert_eq!(
+            Tag::new(vec![String::new()]),
+            Err("tag name must not be empty".to_owned())
+        );
+        assert_eq!(
+            TagName::new(""),
+            Err("tag name must not be empty".to_owned())
+        );
+    }
+
+    #[test]
+    fn tag_indexing_is_limited_to_single_ascii_letters() {
+        let uppercase = Tag::from_parts("E", &["root"]).expect("uppercase");
+        let missing_value = Tag::from_parts("p", &[]).expect("missing value");
+        let long_name = Tag::from_parts("alt", &["reply"]).expect("long name");
+        let non_ascii = Tag::from_parts("é", &["value"]).expect("non ascii");
+
+        assert!(TagName::from_str("A").expect("name").is_indexable());
+        assert!(TagName::is_indexable_name("z"));
+        assert_eq!(uppercase.indexed_pair(), Some(("E", "root")));
+        assert_eq!(missing_value.indexed_pair(), None);
+        assert_eq!(long_name.indexed_pair(), None);
+        assert_eq!(non_ascii.indexed_pair(), None);
+        assert!(!TagName::is_indexable_name(""));
+        assert!(!TagName::is_indexable_name("aa"));
+        assert!(!TagName::is_indexable_name("1"));
+        assert_eq!(TagValue::new("").as_str(), "");
     }
 }
