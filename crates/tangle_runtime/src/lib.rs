@@ -563,26 +563,34 @@ async fn import_single_event(
     if raw_outcome == StoreEventOutcome::Duplicate {
         return Ok(RuntimeEventImportOutcome::Duplicate);
     }
-    if store.index_event_tags(&event).await.is_err()
-        || store.maintain_current_event(&event).await.is_err()
-        || store.apply_deletion_markers(&event).await.is_err()
-        || store.store_listing_revision(&event, now).await.is_err()
+    let projected =
+        project_stored_event(store, &event, validated.admission().effect(), now).await?;
+    Ok(RuntimeEventImportOutcome::Inserted { projected })
+}
+
+async fn project_stored_event(
+    store: &SurrealStore,
+    event: &Event,
+    effect: AdmissionEffect,
+    now: UnixTimestamp,
+) -> Result<bool, RuntimeCommandError> {
+    if store.index_event_tags(event).await.is_err()
+        || store.maintain_current_event(event).await.is_err()
+        || store.apply_deletion_markers(event).await.is_err()
+        || store.store_listing_revision(event, now).await.is_err()
     {
         return Err(RuntimeCommandError::store("event projection failed"));
     }
-    let projected =
-        if validated.admission().effect() == AdmissionEffect::StoreRawAndProjectPublicListing {
-            if store.project_current_listing(&event, now).await.is_err()
-                || store.project_listing_helpers(&event).await.is_err()
-                || store.index_listing_search_document(&event).await.is_err()
-            {
-                return Err(RuntimeCommandError::store("event projection failed"));
-            }
-            true
-        } else {
-            false
-        };
-    Ok(RuntimeEventImportOutcome::Inserted { projected })
+    if effect == AdmissionEffect::StoreRawAndProjectPublicListing {
+        if store.project_current_listing(event, now).await.is_err()
+            || store.project_listing_helpers(event).await.is_err()
+            || store.index_listing_search_document(event).await.is_err()
+        {
+            return Err(RuntimeCommandError::store("event projection failed"));
+        }
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn parse_event_import_document(raw: &str) -> Result<Vec<Event>, RuntimeCommandError> {
@@ -689,6 +697,121 @@ fn runtime_row_string(
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| RuntimeCommandError::store(format!("stored row field `{field}` is invalid")))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeProjectionRebuildReport {
+    scanned: u64,
+    rebuilt: u64,
+    projected: u64,
+    skipped: u64,
+}
+
+impl RuntimeProjectionRebuildReport {
+    pub fn new(scanned: u64, rebuilt: u64, projected: u64, skipped: u64) -> Self {
+        Self {
+            scanned,
+            rebuilt,
+            projected,
+            skipped,
+        }
+    }
+
+    pub fn scanned(self) -> u64 {
+        self.scanned
+    }
+
+    pub fn rebuilt(self) -> u64 {
+        self.rebuilt
+    }
+
+    pub fn projected(self) -> u64 {
+        self.projected
+    }
+
+    pub fn skipped(self) -> u64 {
+        self.skipped
+    }
+
+    fn record(&mut self, outcome: RuntimeProjectionRebuildOutcome) {
+        self.scanned += 1;
+        match outcome {
+            RuntimeProjectionRebuildOutcome::Rebuilt { projected } => {
+                self.rebuilt += 1;
+                if projected {
+                    self.projected += 1;
+                }
+            }
+            RuntimeProjectionRebuildOutcome::Skipped => {
+                self.skipped += 1;
+            }
+        }
+    }
+}
+
+impl Default for RuntimeProjectionRebuildReport {
+    fn default() -> Self {
+        Self::new(0, 0, 0, 0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeProjectionRebuildOutcome {
+    Rebuilt { projected: bool },
+    Skipped,
+}
+
+pub async fn rebuild_projections(
+    config: &TangleRuntimeConfig,
+) -> Result<RuntimeProjectionRebuildReport, RuntimeCommandError> {
+    let store = connect_runtime_store(config).await?;
+    store
+        .apply_plan(&base_migration_plan())
+        .await
+        .map_err(|error| RuntimeCommandError::store(error.to_string()))?;
+    let rows = store
+        .query_raw_events(&Filter::empty())
+        .await
+        .map_err(|error| RuntimeCommandError::store(error.to_string()))?;
+    let validator = EventValidator::new(
+        config.limits(),
+        config
+            .admission_policy()
+            .clone()
+            .with_write_auth_required(false),
+    );
+    let now = now_timestamp();
+    let mut report = RuntimeProjectionRebuildReport::default();
+    for row in rows {
+        let raw = RawEventJson::new(&runtime_row_string(&row, "raw_json")?)
+            .map_err(|error| RuntimeCommandError::store(error.to_string()))?;
+        let event = parse_event_json(&raw)
+            .map_err(|error| RuntimeCommandError::store(error.to_string()))?;
+        let outcome = rebuild_single_event_projection(&store, &validator, event, now).await?;
+        report.record(outcome);
+    }
+    Ok(report)
+}
+
+async fn rebuild_single_event_projection(
+    store: &SurrealStore,
+    validator: &EventValidator,
+    event: Event,
+    now: UnixTimestamp,
+) -> Result<RuntimeProjectionRebuildOutcome, RuntimeCommandError> {
+    let validated = match validator.validate(&event, &AdmissionContext::unauthenticated(), now) {
+        Ok(validated) => validated,
+        Err(_) => return Ok(RuntimeProjectionRebuildOutcome::Skipped),
+    };
+    if validated.admission().effect() == AdmissionEffect::AuthenticateOnly {
+        return Ok(RuntimeProjectionRebuildOutcome::Skipped);
+    }
+    if event.unsigned().kind().is_ephemeral() {
+        return Ok(RuntimeProjectionRebuildOutcome::Skipped);
+    }
+    let projected =
+        project_stored_event(store, &event, validated.admission().effect(), now).await?;
+    Ok(RuntimeProjectionRebuildOutcome::Rebuilt { projected })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -956,11 +1079,13 @@ async fn handle_websocket(mut socket: WebSocket, state: RuntimeRelayState) {
                         if handle_client_message(
                             &mut socket,
                             &mut loop_state,
-                            &event_handler,
-                            &auth_handler,
-                            &req_handler,
-                            &close_handler,
-                            &state.event_tx,
+                            ClientMessageHandlers {
+                                event: &event_handler,
+                                auth: &auth_handler,
+                                req: &req_handler,
+                                close: &close_handler,
+                                event_tx: &state.event_tx,
+                            },
                             message,
                         )
                         .await
@@ -982,20 +1107,26 @@ async fn handle_websocket(mut socket: WebSocket, state: RuntimeRelayState) {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ClientMessageHandlers<'a> {
+    event: &'a EventMessageHandler,
+    auth: &'a AuthMessageHandler,
+    req: &'a ReqMessageHandler,
+    close: &'a CloseMessageHandler,
+    event_tx: &'a broadcast::Sender<Event>,
+}
+
 async fn handle_client_message(
     socket: &mut WebSocket,
     loop_state: &mut ClientMessageLoop,
-    event_handler: &EventMessageHandler,
-    auth_handler: &AuthMessageHandler,
-    req_handler: &ReqMessageHandler,
-    close_handler: &CloseMessageHandler,
-    event_tx: &broadcast::Sender<Event>,
+    handlers: ClientMessageHandlers<'_>,
     message: ClientMessage,
 ) -> Result<(), axum::Error> {
     match message {
         ClientMessage::Event(event) => {
             let accepted_event = event.clone();
-            let response = event_handler
+            let response = handlers
+                .event
                 .handle_event(
                     loop_state.connection(),
                     event,
@@ -1006,11 +1137,11 @@ async fn handle_client_message(
             let accepted = matches!(response, RelayMessage::Ok { accepted: true, .. });
             send_relay_message(socket, &response).await?;
             if accepted {
-                let _ = event_tx.send(accepted_event);
+                let _ = handlers.event_tx.send(accepted_event);
             }
         }
         ClientMessage::Auth(event) => {
-            let response = auth_handler.handle_auth(
+            let response = handlers.auth.handle_auth(
                 loop_state.connection_mut(),
                 event.clone(),
                 event.unsigned().created_at(),
@@ -1021,7 +1152,8 @@ async fn handle_client_message(
             subscription_id,
             filters,
         } => {
-            for response in req_handler
+            for response in handlers
+                .req
                 .handle_req(loop_state.connection_mut(), subscription_id, filters)
                 .await
             {
@@ -1029,7 +1161,9 @@ async fn handle_client_message(
             }
         }
         ClientMessage::Close(subscription_id) => {
-            close_handler.handle_close(loop_state.connection_mut(), &subscription_id);
+            handlers
+                .close
+                .handle_close(loop_state.connection_mut(), &subscription_id);
         }
     }
     Ok(())
@@ -3140,7 +3274,7 @@ mod tests {
                 .expires_at,
             UnixTimestamp::new(130)
         );
-        assert_eq!(decision.allowed(), true);
+        assert!(decision.allowed());
         assert_eq!(decision.remaining(), 1);
         assert_eq!(connection.rate_limiter().tracked_key_count(), 1);
         assert_eq!(connection.subscriptions_mut().active_count(), 0);
@@ -3163,11 +3297,8 @@ mod tests {
             default_state.connection_config().relay_url(),
             "wss://relay.radroots.test"
         );
-        assert_eq!(state.shutdown_signal().is_shutdown_requested(), false);
-        assert_eq!(
-            default_state.shutdown_signal().is_shutdown_requested(),
-            false
-        );
+        assert!(!state.shutdown_signal().is_shutdown_requested());
+        assert!(!default_state.shutdown_signal().is_shutdown_requested());
     }
 
     #[tokio::test]
@@ -3175,17 +3306,17 @@ mod tests {
         let (shutdown, mut first) = GracefulShutdownSignal::new();
         let mut second = shutdown.subscribe();
 
-        assert_eq!(shutdown.is_shutdown_requested(), false);
-        assert_eq!(first.is_shutdown_requested(), false);
-        assert_eq!(second.is_shutdown_requested(), false);
+        assert!(!shutdown.is_shutdown_requested());
+        assert!(!first.is_shutdown_requested());
+        assert!(!second.is_shutdown_requested());
 
-        assert_eq!(shutdown.request_shutdown(), true);
+        assert!(shutdown.request_shutdown());
         first.wait_for_shutdown().await;
         second.wait_for_shutdown().await;
 
-        assert_eq!(shutdown.is_shutdown_requested(), true);
-        assert_eq!(first.is_shutdown_requested(), true);
-        assert_eq!(second.is_shutdown_requested(), true);
+        assert!(shutdown.is_shutdown_requested());
+        assert!(first.is_shutdown_requested());
+        assert!(second.is_shutdown_requested());
     }
 
     #[test]
@@ -4077,8 +4208,8 @@ mod tests {
         assert_eq!(relay_info.supported_nips, TANGLE_SUPPORTED_NIPS);
         assert_eq!(relay_info.software, TANGLE_RELAY_SOFTWARE);
         assert_eq!(relay_info.version, "0.1.0");
-        assert_eq!(relay_info.limitation.payment_required, false);
-        assert_eq!(relay_info.limitation.restricted_writes, true);
+        assert!(!relay_info.limitation.payment_required);
+        assert!(relay_info.limitation.restricted_writes);
         assert_eq!(
             serde_json::to_value(relay_info).expect("json"),
             serde_json::json!({
@@ -4443,7 +4574,7 @@ mod tests {
         assert_eq!(browse.limit(), 50);
 
         let query = search_document_query(&text);
-        assert_eq!(format!("{query:?}").contains("SearchDocumentQuery"), true);
+        assert!(format!("{query:?}").contains("SearchDocumentQuery"));
     }
 
     #[test]

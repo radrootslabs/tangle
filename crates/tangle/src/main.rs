@@ -58,10 +58,16 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
-        command => {
-            eprintln!("command not implemented: {}", command.as_str());
-            ExitCode::from(2)
-        }
+        tangle::TangleCommand::ProjectionRebuild => match run_projection_rebuild(&invocation) {
+            Ok(output) => {
+                println!("{output}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::from(2)
+            }
+        },
     }
 }
 
@@ -101,4 +107,13 @@ fn run_event_export(invocation: &tangle::TangleInvocation) -> Result<String, Str
         .build()
         .map_err(|error| format!("failed to start runtime: {error}"))?;
     runtime.block_on(tangle::event_export_with_config(config_path, output_path))
+}
+
+fn run_projection_rebuild(invocation: &tangle::TangleInvocation) -> Result<String, String> {
+    let config_path = tangle::require_config_path(invocation).map_err(|error| error.to_string())?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("failed to start runtime: {error}"))?;
+    runtime.block_on(tangle::projection_rebuild_with_config(config_path))
 }

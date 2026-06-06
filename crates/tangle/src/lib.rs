@@ -46,6 +46,7 @@ impl TangleCommand {
                 | Self::Run
                 | Self::EventImport
                 | Self::EventExport
+                | Self::ProjectionRebuild
         )
     }
 }
@@ -283,6 +284,16 @@ pub fn event_export_output(report: tangle_runtime::RuntimeEventExportReport) -> 
     format!("events exported: {}", report.exported())
 }
 
+pub fn projection_rebuild_output(report: tangle_runtime::RuntimeProjectionRebuildReport) -> String {
+    format!(
+        "events scanned: {}\nevents rebuilt: {}\nlistings projected: {}\nevents skipped: {}",
+        report.scanned(),
+        report.rebuilt(),
+        report.projected(),
+        report.skipped()
+    )
+}
+
 pub async fn migrate_with_config(path: &str) -> Result<String, String> {
     let config = tangle_runtime::load_runtime_config(path).map_err(|error| error.to_string())?;
     let report = tangle_runtime::migrate_runtime_database(&config)
@@ -315,6 +326,15 @@ pub async fn event_export_with_config(
     Ok(event_export_output(report))
 }
 
+pub async fn projection_rebuild_with_config(config_path: &str) -> Result<String, String> {
+    let config =
+        tangle_runtime::load_runtime_config(config_path).map_err(|error| error.to_string())?;
+    let report = tangle_runtime::rebuild_projections(&config)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(projection_rebuild_output(report))
+}
+
 pub async fn run_with_config(path: &str) -> Result<(), String> {
     let config = tangle_runtime::load_runtime_config(path).map_err(|error| error.to_string())?;
     let (shutdown, _) = tangle_runtime::GracefulShutdownSignal::new();
@@ -335,11 +355,12 @@ mod tests {
     use super::{
         PACKAGE_NAME, PACKAGE_VERSION, TangleCliError, TangleCommand, TangleInvocation,
         event_export_output, event_import_output, migrate_output, parse_tangle_command,
-        parse_tangle_invocation, require_config_path, require_input_path, require_output_path,
-        usage_output, version_output,
+        parse_tangle_invocation, projection_rebuild_output, require_config_path,
+        require_input_path, require_output_path, usage_output, version_output,
     };
     use tangle_runtime::{
         RuntimeEventExportReport, RuntimeEventImportReport, RuntimeMigrationReport,
+        RuntimeProjectionRebuildReport,
     };
 
     #[test]
@@ -395,6 +416,7 @@ mod tests {
                         | TangleCommand::Run
                         | TangleCommand::EventImport
                         | TangleCommand::EventExport
+                        | TangleCommand::ProjectionRebuild
                 )
             );
         }
@@ -560,6 +582,14 @@ mod tests {
         assert_eq!(
             event_export_output(RuntimeEventExportReport::new(3)),
             "events exported: 3"
+        );
+    }
+
+    #[test]
+    fn projection_rebuild_output_reports_outcome_counts() {
+        assert_eq!(
+            projection_rebuild_output(RuntimeProjectionRebuildReport::new(4, 3, 2, 1)),
+            "events scanned: 4\nevents rebuilt: 3\nlistings projected: 2\nevents skipped: 1"
         );
     }
 }

@@ -157,6 +157,32 @@ async fn tangle_event_import_command_imports_canonical_jsonl() {
         format!("{}\n", event_to_value(&listing))
     );
 
+    let rebuild = Command::new(env!("CARGO_BIN_EXE_tangle"))
+        .args(["projection", "rebuild", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("run tangle projection rebuild");
+
+    assert!(rebuild.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&rebuild.stdout),
+        "events scanned: 1\nevents rebuilt: 1\nlistings projected: 1\nevents skipped: 0\n"
+    );
+    assert!(rebuild.stderr.is_empty());
+
+    let second_rebuild = Command::new(env!("CARGO_BIN_EXE_tangle"))
+        .args(["projection", "rebuild", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("rerun tangle projection rebuild");
+
+    assert!(second_rebuild.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&second_rebuild.stdout),
+        "events scanned: 1\nevents rebuilt: 1\nlistings projected: 1\nevents skipped: 0\n"
+    );
+    assert!(second_rebuild.stderr.is_empty());
+
     let seller = FixtureKey::Seller.public_key();
     let listing_key = format!("30402:{}:listing-a", seller.as_str());
     let store_config = SurrealConnectionConfig::rocksdb(
@@ -208,17 +234,17 @@ fn tangle_migrate_requires_config_path() {
 }
 
 #[test]
-fn tangle_known_future_commands_report_not_implemented() {
+fn tangle_projection_rebuild_requires_config_path() {
     let output = Command::new(env!("CARGO_BIN_EXE_tangle"))
         .args(["projection", "rebuild"])
         .output()
-        .expect("run tangle projection rebuild");
+        .expect("run tangle projection rebuild without config");
 
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
-        "command not implemented: projection rebuild\n"
+        "--config requires a value\n"
     );
 }
 
