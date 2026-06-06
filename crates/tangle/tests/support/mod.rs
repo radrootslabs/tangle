@@ -66,11 +66,17 @@ impl RelayHarness {
 }
 
 pub async fn connect_client(port: u16) -> RelayClient {
+    let (client, challenge) = connect_client_with_challenge(port).await;
+    assert_eq!(challenge[0], "AUTH");
+    client
+}
+
+pub async fn connect_client_with_challenge(port: u16) -> (RelayClient, Value) {
     let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
         .await
         .expect("client connect");
-    assert_eq!(next_label(&mut client).await, "AUTH");
-    client
+    let challenge = next_json(&mut client).await;
+    (client, challenge)
 }
 
 pub async fn send_event(client: &mut RelayClient, event: &Event) -> Value {
