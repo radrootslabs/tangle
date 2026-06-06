@@ -15,7 +15,7 @@ use tangle_core::{
     MarketplaceListingStatus, MarketplaceQuery, MarketplaceQueryError, MarketplaceQuerySpec,
     MarketplaceSort, RateLimitConfig, RuntimeLimits, SubscriptionManager, SubscriptionMatcher,
 };
-use tangle_nips::{FulfillmentMethod, ListingUnit};
+use tangle_nips::{FulfillmentMethod, ListingUnit, parse_relay_auth_event};
 use tangle_protocol::{
     ClientMessage, Event, EventId, PublicKeyHex, RelayMessage, UnixTimestamp, parse_client_message,
 };
@@ -322,6 +322,46 @@ impl EventMessageHandler {
             return ok_rejected(event_id, "error: projection failed".to_owned());
         }
         ok_accepted(event_id)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AuthMessageHandler;
+
+impl AuthMessageHandler {
+    pub fn issue_challenge(
+        &self,
+        connection: &mut RelayConnection,
+        challenge: &str,
+        issued_at: UnixTimestamp,
+    ) -> RelayMessage {
+        match connection.auth_mut().issue_challenge(challenge, issued_at) {
+            Ok(challenge) => RelayMessage::Auth(challenge.value),
+            Err(error) => RelayMessage::Notice(format!("error: {error}")),
+        }
+    }
+
+    pub fn handle_auth(
+        &self,
+        connection: &mut RelayConnection,
+        event: Event,
+        now: UnixTimestamp,
+    ) -> RelayMessage {
+        let event_id = event.id().clone();
+        let auth = match parse_relay_auth_event(&event) {
+            Ok(Some(auth)) => auth,
+            Ok(None) => {
+                return ok_rejected(
+                    event_id,
+                    "invalid: AUTH message must contain kind 22242".to_owned(),
+                );
+            }
+            Err(error) => return ok_rejected(event_id, format!("invalid: {error}")),
+        };
+        match connection.auth_mut().authenticate(&auth, now) {
+            Ok(_) => ok_accepted(event_id),
+            Err(error) => ok_rejected(event_id, format!("auth-required: {error}")),
+        }
     }
 }
 
@@ -1510,12 +1550,12 @@ fn invalid_parameter(field: &'static str, requirement: &str) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiError, ApiErrorBody, ApiErrorCode, ApiErrorEnvelope, ClientFrame, ClientFrameOutcome,
-        ClientMessageLoop, EventMessageHandler, ListingsHttpState, ReadinessCheckStatus,
-        ReadinessState, RelayConnection, RelayConnectionConfig, RelayConnectionId,
-        RelayInfoDocument, TANGLE_RELAY_SOFTWARE, TANGLE_SUPPORTED_NIPS, WebSocketHttpState,
-        health_router, listing_item_document, listing_projection_query, listings_router,
-        parse_listing_query, parse_marketplace_search_query, relay_info_router,
+        ApiError, ApiErrorBody, ApiErrorCode, ApiErrorEnvelope, AuthMessageHandler, ClientFrame,
+        ClientFrameOutcome, ClientMessageLoop, EventMessageHandler, ListingsHttpState,
+        ReadinessCheckStatus, ReadinessState, RelayConnection, RelayConnectionConfig,
+        RelayConnectionId, RelayInfoDocument, TANGLE_RELAY_SOFTWARE, TANGLE_SUPPORTED_NIPS,
+        WebSocketHttpState, health_router, listing_item_document, listing_projection_query,
+        listings_router, parse_listing_query, parse_marketplace_search_query, relay_info_router,
         search_document_query, websocket_router,
     };
     use axum::{body::Body, response::IntoResponse};
@@ -1909,6 +1949,85 @@ mod tests {
                 message,
                 ..
             } => assert!(message.contains("write authentication required")),
+            outcome => panic!("unexpected outcome: {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_message_handler_issues_and_accepts_auth_events() {
+        let handler = AuthMessageHandler;
+        let mut connection = RelayConnection::new(
+            RelayConnectionId::new("auth").expect("connection id"),
+            RelayConnectionConfig::default(),
+        );
+        let auth = build_fixture_event(&auth_event_spec()).expect("auth");
+
+        assert_eq!(
+            handler.issue_challenge(
+                &mut connection,
+                " challenge-001 ",
+                UnixTimestamp::new(1_714_124_430)
+            ),
+            RelayMessage::Auth("challenge-001".to_owned())
+        );
+        assert_eq!(
+            handler.handle_auth(
+                &mut connection,
+                auth.clone(),
+                UnixTimestamp::new(1_714_124_435)
+            ),
+            RelayMessage::Ok {
+                event_id: auth.id().clone(),
+                accepted: true,
+                message: String::new()
+            }
+        );
+        assert_eq!(
+            connection.auth().authenticated_pubkey(),
+            Some(auth.unsigned().pubkey())
+        );
+        assert_eq!(
+            handler.issue_challenge(&mut connection, " ", UnixTimestamp::new(1_714_124_436)),
+            RelayMessage::Notice("error: auth challenge must not be empty".to_owned())
+        );
+    }
+
+    #[test]
+    fn auth_message_handler_rejects_invalid_auth_messages() {
+        let handler = AuthMessageHandler;
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let auth = build_fixture_event(&auth_event_spec()).expect("auth");
+        let mut missing_challenge = RelayConnection::new(
+            RelayConnectionId::new("missing-challenge").expect("connection id"),
+            RelayConnectionConfig::default(),
+        );
+        let mut wrong_kind = RelayConnection::new(
+            RelayConnectionId::new("wrong-kind").expect("connection id"),
+            RelayConnectionConfig::default(),
+        );
+
+        match handler.handle_auth(
+            &mut missing_challenge,
+            auth.clone(),
+            UnixTimestamp::new(1_714_124_435),
+        ) {
+            RelayMessage::Ok {
+                accepted: false,
+                message,
+                ..
+            } => assert_eq!(message, "auth-required: auth challenge is missing"),
+            outcome => panic!("unexpected outcome: {outcome:?}"),
+        }
+        match handler.handle_auth(
+            &mut wrong_kind,
+            listing.clone(),
+            UnixTimestamp::new(1_714_124_435),
+        ) {
+            RelayMessage::Ok {
+                accepted: false,
+                message,
+                ..
+            } => assert_eq!(message, "invalid: AUTH message must contain kind 22242"),
             outcome => panic!("unexpected outcome: {outcome:?}"),
         }
     }
