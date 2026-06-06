@@ -1,6 +1,11 @@
 #![forbid(unsafe_code)]
 
 use tangle_protocol::Event;
+use tangle_store::{StoreEventOutcome, StoredEvent};
+use tangle_store_surreal::{
+    ListingCurrentOutcome, ListingProjectionQuery, SurrealConnectionConfig, SurrealStore,
+    base_migration_plan,
+};
 use tangle_test_support::{FixtureKey, build_fixture_event_from_parts};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +57,100 @@ impl BenchDataset {
             .cloned()
             .collect()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListingWorkloadReport {
+    pub attempted: u64,
+    pub inserted: u64,
+    pub projected: u64,
+    pub listing_rows: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct MaterializedListingWorkload {
+    store: SurrealStore,
+    report: ListingWorkloadReport,
+}
+
+impl MaterializedListingWorkload {
+    pub fn store(&self) -> &SurrealStore {
+        &self.store
+    }
+
+    pub fn report(&self) -> ListingWorkloadReport {
+        self.report
+    }
+}
+
+pub async fn materialize_listing_workload(
+    dataset: &BenchDataset,
+) -> Result<MaterializedListingWorkload, String> {
+    let store = bench_memory_store("listing_workload").await?;
+    let mut inserted = 0;
+    let mut projected = 0;
+    for event in dataset.listings() {
+        let now = event.unsigned().created_at();
+        if store
+            .store_raw_event(&StoredEvent::new(event.clone(), now))
+            .await
+            .map_err(|error| error.to_string())?
+            == StoreEventOutcome::Inserted
+        {
+            inserted += 1;
+        }
+        store
+            .index_event_tags(event)
+            .await
+            .map_err(|error| error.to_string())?;
+        store
+            .maintain_current_event(event)
+            .await
+            .map_err(|error| error.to_string())?;
+        store
+            .store_listing_revision(event, now)
+            .await
+            .map_err(|error| error.to_string())?;
+        if store
+            .project_current_listing(event, now)
+            .await
+            .map_err(|error| error.to_string())?
+            == ListingCurrentOutcome::Projected
+        {
+            projected += 1;
+        }
+        store
+            .project_listing_helpers(event)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    let listing_rows = store
+        .query_current_listings(&ListingProjectionQuery::new().with_effective_status("active"))
+        .await
+        .map_err(|error| error.to_string())?
+        .len() as u64;
+    Ok(MaterializedListingWorkload {
+        store,
+        report: ListingWorkloadReport {
+            attempted: dataset.listings().len() as u64,
+            inserted,
+            projected,
+            listing_rows,
+        },
+    })
+}
+
+async fn bench_memory_store(database: &str) -> Result<SurrealStore, String> {
+    let config = SurrealConnectionConfig::memory("tangle_bench", database)
+        .map_err(|error| error.to_string())?;
+    let store = SurrealStore::connect_memory(&config)
+        .await
+        .map_err(|error| error.to_string())?;
+    store
+        .apply_plan(&base_migration_plan())
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(store)
 }
 
 fn bench_listing(index: usize) -> Result<Event, String> {
@@ -158,6 +257,38 @@ mod tests {
                 .notes()
                 .iter()
                 .all(|event| event.unsigned().kind().as_u32() == 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_workload_materializes_projected_listing_rows() {
+        let dataset = BenchDataset::generate(BenchDatasetConfig::new(8, 3)).expect("dataset");
+        let materialized = super::materialize_listing_workload(&dataset)
+            .await
+            .expect("listing workload");
+        let report = materialized.report();
+
+        assert_eq!(
+            report,
+            super::ListingWorkloadReport {
+                attempted: 8,
+                inserted: 8,
+                projected: 8,
+                listing_rows: 8
+            }
+        );
+        assert_eq!(
+            materialized
+                .store()
+                .query_current_listings(
+                    &tangle_store_surreal::ListingProjectionQuery::new()
+                        .with_effective_status("active")
+                        .with_limit(3)
+                )
+                .await
+                .expect("listing rows")
+                .len(),
+            3
         );
     }
 }

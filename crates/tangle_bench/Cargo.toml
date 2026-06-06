@@ -10,7 +10,12 @@ description = "Benchmark suite for the Tangle relay"
 [dependencies]
 tangle_nips = { path = "../tangle_nips" }
 tangle_protocol = { path = "../tangle_protocol" }
+tangle_store = { path = "../tangle_store" }
+tangle_store_surreal = { path = "../tangle_store_surreal" }
 tangle_test_support = { path = "../tangle_test_support" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
 
 [lints]
 workspace = true
