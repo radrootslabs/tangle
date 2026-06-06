@@ -8,7 +8,7 @@ use tangle_nips::{
     DeletionTarget, ListingProjection, ListingProjectionEvaluation, NIP99_DRAFT_LISTING_KIND,
     NIP99_PUBLIC_LISTING_KIND, evaluate_listing_projection, parse_deletion_request,
 };
-use tangle_protocol::{AddressCoordinate, Event, EventId, UnixTimestamp, event_to_value};
+use tangle_protocol::{AddressCoordinate, Event, EventId, Filter, UnixTimestamp, event_to_value};
 use tangle_store::{StoreEventOutcome, StoredEvent};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -864,6 +864,80 @@ CREATE type::record('nostr_event', $event_id) CONTENT {
             .db
             .query("SELECT * FROM ONLY type::record('nostr_event', $event_id);")
             .bind(("event_id", event_id.as_str()))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
+    pub async fn query_raw_events(
+        &self,
+        filter: &Filter,
+    ) -> Result<Vec<serde_json::Value>, SurrealStoreError> {
+        let mut statement =
+            "SELECT * FROM nostr_event WHERE deleted = false AND hidden = false".to_owned();
+        if !filter.ids().is_empty() {
+            statement.push_str(" AND event_id IN $ids");
+        }
+        if !filter.authors().is_empty() {
+            statement.push_str(" AND pubkey IN $authors");
+        }
+        if !filter.kinds().is_empty() {
+            statement.push_str(" AND kind IN $kinds");
+        }
+        if filter.since().is_some() {
+            statement.push_str(" AND created_at >= $since");
+        }
+        if filter.until().is_some() {
+            statement.push_str(" AND created_at <= $until");
+        }
+        statement.push_str(" ORDER BY created_at DESC, event_id ASC");
+        if filter.limit().is_some() {
+            statement.push_str(" LIMIT $limit");
+        }
+        statement.push(';');
+        let mut query = self.db.query(statement);
+        if !filter.ids().is_empty() {
+            query = query.bind((
+                "ids",
+                filter
+                    .ids()
+                    .iter()
+                    .map(|id| id.as_str().to_owned())
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        if !filter.authors().is_empty() {
+            query = query.bind((
+                "authors",
+                filter
+                    .authors()
+                    .iter()
+                    .map(|pubkey| pubkey.as_str().to_owned())
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        if !filter.kinds().is_empty() {
+            query = query.bind((
+                "kinds",
+                filter
+                    .kinds()
+                    .iter()
+                    .map(|kind| kind.as_u32())
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        if let Some(since) = filter.since() {
+            query = query.bind(("since", since.as_u64()));
+        }
+        if let Some(until) = filter.until() {
+            query = query.bind(("until", until.as_u64()));
+        }
+        if let Some(limit) = filter.limit() {
+            query = query.bind(("limit", limit));
+        }
+        let mut response = query
             .await
             .map_err(SurrealStoreError::from)?
             .check()
@@ -1949,6 +2023,7 @@ mod tests {
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
+        filter_from_value,
     };
     use tangle_store::{StoreEventOutcome, StoredEvent};
     use tangle_test_support::{build_fixture_event, valid_public_listing_spec};
@@ -2640,6 +2715,70 @@ mod tests {
             event.id().as_str()
         );
         assert_eq!(row["tags"].as_array().expect("tags").len(), 10);
+    }
+
+    #[tokio::test]
+    async fn query_raw_events_applies_core_filter_constraints() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let pubkey_a = "1".repeat(PublicKeyHex::HEX_LENGTH);
+        let pubkey_b = "2".repeat(PublicKeyHex::HEX_LENGTH);
+        let first = synthetic_event("1", "b", &pubkey_a, 100, 1, Vec::new(), "first");
+        let second = synthetic_event("2", "c", &pubkey_a, 101, 1, Vec::new(), "second");
+        let third = synthetic_event("3", "d", &pubkey_a, 102, 2, Vec::new(), "third");
+        let fourth = synthetic_event("4", "e", &pubkey_b, 103, 1, Vec::new(), "fourth");
+        for event in [&first, &second, &third, &fourth] {
+            assert_eq!(
+                store
+                    .store_raw_event(&StoredEvent::new(event.clone(), UnixTimestamp::new(200)))
+                    .await
+                    .expect("insert"),
+                StoreEventOutcome::Inserted
+            );
+        }
+
+        let filtered = filter_from_value(&serde_json::json!({
+            "authors": [pubkey_a],
+            "kinds": [1],
+            "since": 100,
+            "until": 101,
+            "limit": 1
+        }))
+        .expect("filter");
+        let rows = store
+            .query_raw_events(&filtered)
+            .await
+            .expect("filtered rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["event_id"], second.id().as_str());
+
+        let id_filter = filter_from_value(&serde_json::json!({
+            "ids": [first.id().as_str()]
+        }))
+        .expect("id filter");
+        assert_eq!(
+            store.query_raw_events(&id_filter).await.expect("id rows")[0]["event_id"],
+            first.id().as_str()
+        );
+
+        store
+            .database()
+            .query("UPDATE nostr_event SET deleted = true WHERE event_id = $event_id;")
+            .bind(("event_id", first.id().as_str()))
+            .await
+            .expect("delete marker")
+            .check()
+            .expect("delete check");
+        assert!(
+            store
+                .query_raw_events(&id_filter)
+                .await
+                .expect("deleted rows")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
