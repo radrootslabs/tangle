@@ -845,6 +845,176 @@ fn normalize_taxonomy_value(name: &str, value: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListingProjection {
+    identity: ListingIdentity,
+    text: ListingText,
+    price: ListingPrice,
+    unit: ListingUnitTag,
+    fulfillment: ListingFulfillment,
+    status: ListingStatus,
+    location: ListingLocation,
+    taxonomy: ListingTaxonomy,
+}
+
+impl ListingProjection {
+    pub fn identity(&self) -> &ListingIdentity {
+        &self.identity
+    }
+
+    pub fn text(&self) -> &ListingText {
+        &self.text
+    }
+
+    pub fn price(&self) -> &ListingPrice {
+        &self.price
+    }
+
+    pub fn unit(&self) -> &ListingUnitTag {
+        &self.unit
+    }
+
+    pub fn fulfillment(&self) -> &ListingFulfillment {
+        &self.fulfillment
+    }
+
+    pub fn status(&self) -> &ListingStatus {
+        &self.status
+    }
+
+    pub fn location(&self) -> &ListingLocation {
+        &self.location
+    }
+
+    pub fn taxonomy(&self) -> &ListingTaxonomy {
+        &self.taxonomy
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListingProjectionRejection {
+    event_id: EventId,
+    reasons: Vec<String>,
+}
+
+impl ListingProjectionRejection {
+    pub fn event_id(&self) -> &EventId {
+        &self.event_id
+    }
+
+    pub fn reasons(&self) -> &[String] {
+        &self.reasons
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListingProjectionEvaluation {
+    NotListing,
+    Eligible(Box<ListingProjection>),
+    Ineligible(ListingProjectionRejection),
+}
+
+impl ListingProjectionEvaluation {
+    pub fn is_eligible(&self) -> bool {
+        matches!(self, Self::Eligible(_))
+    }
+
+    pub fn projection(&self) -> Option<&ListingProjection> {
+        match self {
+            Self::Eligible(projection) => Some(projection),
+            Self::NotListing | Self::Ineligible(_) => None,
+        }
+    }
+
+    pub fn rejection(&self) -> Option<&ListingProjectionRejection> {
+        match self {
+            Self::Ineligible(rejection) => Some(rejection),
+            Self::NotListing | Self::Eligible(_) => None,
+        }
+    }
+}
+
+pub fn evaluate_listing_projection(event: &Event) -> ListingProjectionEvaluation {
+    if listing_kind_for_event(event).is_none() {
+        return ListingProjectionEvaluation::NotListing;
+    }
+    let mut reasons = Vec::new();
+    let identity = parse_listing_identity(event)
+        .map_err(|reason| reasons.push(reason))
+        .ok()
+        .flatten();
+    let text = parse_listing_text(event)
+        .map_err(|reason| reasons.push(reason))
+        .ok()
+        .flatten();
+    let price = parse_listing_price(event)
+        .map_err(|reason| reasons.push(reason))
+        .ok()
+        .flatten();
+    let unit = parse_listing_unit(event)
+        .map_err(|reason| reasons.push(reason))
+        .ok()
+        .flatten();
+    let fulfillment = parse_listing_fulfillment(event)
+        .map_err(|reason| reasons.push(reason))
+        .ok()
+        .flatten();
+    let status = parse_listing_status(event)
+        .map_err(|reason| reasons.push(reason))
+        .ok()
+        .flatten();
+    let location = parse_listing_location(event)
+        .map_err(|reason| reasons.push(reason))
+        .ok()
+        .flatten();
+    let taxonomy = parse_listing_taxonomy(event)
+        .map_err(|reason| reasons.push(reason))
+        .ok()
+        .flatten();
+    if identity
+        .as_ref()
+        .is_some_and(|identity| identity.listing_kind() == ListingKind::Draft)
+    {
+        reasons.push("draft listing is not public projection eligible".to_owned());
+    }
+    match (
+        identity,
+        text,
+        price,
+        unit,
+        fulfillment,
+        status,
+        location,
+        taxonomy,
+    ) {
+        (
+            Some(identity),
+            Some(text),
+            Some(price),
+            Some(unit),
+            Some(fulfillment),
+            Some(status),
+            Some(location),
+            Some(taxonomy),
+        ) if reasons.is_empty() => {
+            ListingProjectionEvaluation::Eligible(Box::new(ListingProjection {
+                identity,
+                text,
+                price,
+                unit,
+                fulfillment,
+                status,
+                location,
+                taxonomy,
+            }))
+        }
+        _ => ListingProjectionEvaluation::Ineligible(ListingProjectionRejection {
+            event_id: event.id().clone(),
+            reasons,
+        }),
+    }
+}
+
 fn listing_kind_for_event(event: &Event) -> Option<ListingKind> {
     match event.unsigned().kind().as_u32() {
         NIP99_PUBLIC_LISTING_KIND => Some(ListingKind::Public),
@@ -856,8 +1026,9 @@ fn listing_kind_for_event(event: &Event) -> Option<ListingKind> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeletionTarget, FulfillmentMethod, ListingEffectiveStatus, ListingKind, ListingUnit,
-        NIP99_PUBLIC_LISTING_KIND, matching_tags, optional_tag_value, optional_tag_values,
+        DeletionTarget, FulfillmentMethod, ListingEffectiveStatus, ListingKind,
+        ListingProjectionEvaluation, ListingUnit, NIP99_PUBLIC_LISTING_KIND,
+        evaluate_listing_projection, matching_tags, optional_tag_value, optional_tag_values,
         parse_deletion_request, parse_listing_fulfillment, parse_listing_identity,
         parse_listing_location, parse_listing_price, parse_listing_status, parse_listing_taxonomy,
         parse_listing_text, parse_listing_unit, parse_nip50_filter_search, parse_nip50_search,
@@ -2040,6 +2211,122 @@ mod tests {
         );
     }
 
+    #[test]
+    fn listing_projection_contract_accepts_complete_public_listing() {
+        let event = event_with_kind_tags_and_content(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            complete_listing_tags(),
+            "Sweet storage carrots.",
+        );
+
+        let evaluation = evaluate_listing_projection(&event);
+
+        assert!(evaluation.is_eligible());
+        assert_eq!(evaluation.rejection(), None);
+        let projection = evaluation.projection().expect("projection");
+
+        assert_eq!(projection.identity().d().as_str(), "listing-a");
+        assert_eq!(projection.text().title(), "Carrot bunches");
+        assert_eq!(projection.price().amount().raw(), "12.50");
+        assert_eq!(projection.unit().unit(), ListingUnit::Lb);
+        assert_eq!(projection.unit().canonical(), "lb");
+        assert!(projection.fulfillment().pickup_available());
+        assert_eq!(
+            projection.status().effective_status(),
+            ListingEffectiveStatus::Active
+        );
+        assert_eq!(projection.location().geohash4(), Some("c22y"));
+        assert_eq!(
+            projection.taxonomy().categories(),
+            &["vegetables".to_owned()]
+        );
+    }
+
+    #[test]
+    fn listing_projection_contract_ignores_non_listing_events() {
+        let event = event_with_kind_and_tags(1, complete_listing_tags());
+        let evaluation = evaluate_listing_projection(&event);
+
+        assert_eq!(evaluation, ListingProjectionEvaluation::NotListing);
+        assert!(!evaluation.is_eligible());
+        assert_eq!(evaluation.projection(), None);
+        assert_eq!(evaluation.rejection(), None);
+    }
+
+    #[test]
+    fn listing_projection_contract_rejects_draft_projection() {
+        let event = event_with_kind_and_tags(30_403, complete_listing_tags());
+        let evaluation = evaluate_listing_projection(&event);
+
+        assert!(!evaluation.is_eligible());
+        let rejection = evaluation.rejection().expect("rejection");
+
+        assert_eq!(rejection.event_id(), event.id());
+        assert_eq!(
+            rejection.reasons(),
+            &["draft listing is not public projection eligible".to_owned()]
+        );
+    }
+
+    #[test]
+    fn listing_projection_contract_accumulates_required_parser_failures() {
+        let event = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("d", &["listing-a"]).expect("d")],
+        );
+        let evaluation = evaluate_listing_projection(&event);
+
+        let rejection = evaluation.rejection().expect("rejection");
+
+        assert_eq!(
+            rejection.reasons(),
+            &[
+                "tag `title` is required".to_owned(),
+                "tag `price` is required".to_owned(),
+                "tag `unit` is required".to_owned(),
+                "tag `fulfillment` is required".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn listing_projection_contract_accumulates_optional_parser_failures() {
+        let mut tags = complete_listing_tags();
+        tags.push(Tag::from_parts("location", &[""]).expect("location"));
+        tags.push(Tag::from_parts("category", &["vegetables", "extra"]).expect("category"));
+        let event = event_with_kind_and_tags(u64::from(NIP99_PUBLIC_LISTING_KIND), tags);
+        let evaluation = evaluate_listing_projection(&event);
+
+        let rejection = evaluation.rejection().expect("rejection");
+
+        assert_eq!(
+            rejection.reasons(),
+            &[
+                "listing location tag must not be empty".to_owned(),
+                "tag `category` must include exactly one value".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn listing_projection_contract_accumulates_identity_and_status_failures() {
+        let mut tags = complete_listing_tags();
+        tags.retain(|tag| tag.name().as_str() != "d");
+        tags.push(Tag::from_parts("status", &["inactive"]).expect("status"));
+        let event = event_with_kind_and_tags(u64::from(NIP99_PUBLIC_LISTING_KIND), tags);
+        let evaluation = evaluate_listing_projection(&event);
+
+        let rejection = evaluation.rejection().expect("rejection");
+
+        assert_eq!(
+            rejection.reasons(),
+            &[
+                "tag `d` is required".to_owned(),
+                "listing status `inactive` is unsupported".to_owned(),
+            ]
+        );
+    }
+
     fn event_with_tags(tags: Vec<Tag>) -> Event {
         event_with_kind_and_tags(30_402, tags)
     }
@@ -2060,5 +2347,20 @@ mod tests {
             ),
             SignatureHex::new(&"b".repeat(SignatureHex::HEX_LENGTH)).expect("sig"),
         )
+    }
+
+    fn complete_listing_tags() -> Vec<Tag> {
+        vec![
+            Tag::from_parts("d", &["listing-a"]).expect("d"),
+            Tag::from_parts("title", &["Carrot bunches"]).expect("title"),
+            Tag::from_parts("price", &["12.50", "USD"]).expect("price"),
+            Tag::from_parts("unit", &["lb"]).expect("unit"),
+            Tag::from_parts("fulfillment", &["pickup"]).expect("fulfillment"),
+            Tag::from_parts("g", &["c22yzug"]).expect("g"),
+            Tag::from_parts("category", &["vegetables"]).expect("category"),
+            Tag::from_parts("t", &["carrots"]).expect("topic"),
+            Tag::from_parts("practice", &["no spray"]).expect("practice"),
+            Tag::from_parts("certification", &["organic"]).expect("certification"),
+        ]
     }
 }
