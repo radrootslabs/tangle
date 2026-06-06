@@ -639,6 +639,59 @@ fn event_from_import_line(line: &str, index: usize) -> Result<Event, RuntimeComm
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeEventExportReport {
+    exported: u64,
+}
+
+impl RuntimeEventExportReport {
+    pub fn new(exported: u64) -> Self {
+        Self { exported }
+    }
+
+    pub fn exported(self) -> u64 {
+        self.exported
+    }
+}
+
+pub async fn export_events_to_path(
+    config: &TangleRuntimeConfig,
+    path: impl AsRef<FsPath>,
+) -> Result<RuntimeEventExportReport, RuntimeCommandError> {
+    let store = connect_runtime_store(config).await?;
+    store
+        .apply_plan(&base_migration_plan())
+        .await
+        .map_err(|error| RuntimeCommandError::store(error.to_string()))?;
+    let rows = store
+        .query_raw_events(&Filter::empty())
+        .await
+        .map_err(|error| RuntimeCommandError::store(error.to_string()))?;
+    let mut output = String::new();
+    for row in &rows {
+        output.push_str(&runtime_row_string(row, "raw_json")?);
+        output.push('\n');
+    }
+    let path = path.as_ref();
+    fs::write(path, output).map_err(|error| {
+        RuntimeCommandError::input(format!(
+            "failed to write event export file `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(RuntimeEventExportReport::new(rows.len() as u64))
+}
+
+fn runtime_row_string(
+    row: &serde_json::Value,
+    field: &'static str,
+) -> Result<String, RuntimeCommandError> {
+    row.get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| RuntimeCommandError::store(format!("stored row field `{field}` is invalid")))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeServerReport {
     listen_addr: SocketAddr,
 }

@@ -27,7 +27,7 @@ fn tangle_without_args_reports_usage() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "usage:\n  tangle [--version]\n  tangle migrate --config PATH\n  tangle run --config PATH\n  tangle event import --config PATH --input PATH\n  tangle event export --config PATH\n  tangle projection rebuild --config PATH\n"
+        "usage:\n  tangle [--version]\n  tangle migrate --config PATH\n  tangle run --config PATH\n  tangle event import --config PATH --input PATH\n  tangle event export --config PATH --output PATH\n  tangle projection rebuild --config PATH\n"
     );
     assert!(output.stderr.is_empty());
 }
@@ -43,7 +43,7 @@ fn tangle_unknown_arg_reports_usage_error() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
-        "unknown command: --unknown\nusage:\n  tangle [--version]\n  tangle migrate --config PATH\n  tangle run --config PATH\n  tangle event import --config PATH --input PATH\n  tangle event export --config PATH\n  tangle projection rebuild --config PATH\n"
+        "unknown command: --unknown\nusage:\n  tangle [--version]\n  tangle migrate --config PATH\n  tangle run --config PATH\n  tangle event import --config PATH --input PATH\n  tangle event export --config PATH --output PATH\n  tangle projection rebuild --config PATH\n"
     );
 }
 
@@ -102,6 +102,7 @@ async fn tangle_event_import_command_imports_canonical_jsonl() {
     let db_path = root.join("db");
     let config_path = root.join("runtime.json");
     let input_path = root.join("events.jsonl");
+    let output_path = root.join("exported.jsonl");
     std::fs::create_dir_all(&root).expect("runtime root");
     write_rocksdb_config(&config_path, &db_path, "tangle_cli_import");
     std::fs::write(&input_path, format!("{}\n", event_to_value(&listing)))
@@ -136,6 +137,25 @@ async fn tangle_event_import_command_imports_canonical_jsonl() {
         "events total: 1\nevents inserted: 0\nevents duplicate: 1\nevents projected: 0\nevents skipped: 0\n"
     );
     assert!(second.stderr.is_empty());
+
+    let export = Command::new(env!("CARGO_BIN_EXE_tangle"))
+        .args(["event", "export", "--config"])
+        .arg(&config_path)
+        .args(["--output"])
+        .arg(&output_path)
+        .output()
+        .expect("run tangle event export");
+
+    assert!(export.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&export.stdout),
+        "events exported: 1\n"
+    );
+    assert!(export.stderr.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(&output_path).expect("export file"),
+        format!("{}\n", event_to_value(&listing))
+    );
 
     let seller = FixtureKey::Seller.public_key();
     let listing_key = format!("30402:{}:listing-a", seller.as_str());
@@ -190,15 +210,15 @@ fn tangle_migrate_requires_config_path() {
 #[test]
 fn tangle_known_future_commands_report_not_implemented() {
     let output = Command::new(env!("CARGO_BIN_EXE_tangle"))
-        .args(["event", "export"])
+        .args(["projection", "rebuild"])
         .output()
-        .expect("run tangle event export");
+        .expect("run tangle projection rebuild");
 
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
-        "command not implemented: event export\n"
+        "command not implemented: projection rebuild\n"
     );
 }
 
