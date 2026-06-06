@@ -2128,7 +2128,7 @@ impl NostrFilterCompiler {
             .map_err(NostrFilterCompileError::RuntimeLimit)?;
         let branches = filters
             .iter()
-            .map(compile_filter_branch)
+            .map(|filter| compile_filter_branch(filter, self.limits))
             .collect::<Result<Vec<_>, _>>()?;
         let source = if branches.iter().any(|branch| branch.search().is_some()) {
             QuerySource::SearchDocuments
@@ -2894,12 +2894,18 @@ pub enum RateLimitErrorKind {
     CostExceedsLimit,
 }
 
-fn compile_filter_branch(filter: &Filter) -> Result<QueryPlanBranch, NostrFilterCompileError> {
+fn compile_filter_branch(
+    filter: &Filter,
+    limits: RuntimeLimits,
+) -> Result<QueryPlanBranch, NostrFilterCompileError> {
     let tag_filters =
         compile_filter_tag_constraints(filter).map_err(NostrFilterCompileError::QueryPlan)?;
     let search = filter
         .search()
         .map(|raw| {
+            limits
+                .validate_search_query(raw)
+                .map_err(NostrFilterCompileError::RuntimeLimit)?;
             QuerySearch::new(
                 raw,
                 raw.split_whitespace()
@@ -5106,6 +5112,17 @@ mod tests {
                 QueryExecutionMode::Historical,
             )
             .expect_err("blank search");
+        let too_many_search_tokens = NostrFilterCompiler::new(limits_with(|values| {
+            values.max_search_tokens = 1;
+        }))
+        .compile(
+            &[
+                filter_from_value(&serde_json::json!({ "search": "fresh carrots" }))
+                    .expect("filter"),
+            ],
+            QueryExecutionMode::Historical,
+        )
+        .expect_err("search tokens");
         let empty_tag = NostrFilterCompiler::default()
             .compile(
                 &[filter_from_value(&serde_json::json!({ "#t": [""] })).expect("filter")],
@@ -5123,6 +5140,10 @@ mod tests {
             NostrFilterCompileErrorKind::RuntimeLimit
         );
         assert_eq!(blank_search.kind(), NostrFilterCompileErrorKind::QueryPlan);
+        assert_eq!(
+            too_many_search_tokens.kind(),
+            NostrFilterCompileErrorKind::RuntimeLimit
+        );
         assert_eq!(empty_tag.kind(), NostrFilterCompileErrorKind::QueryPlan);
         assert_eq!(
             empty_filters.to_string(),
@@ -5134,6 +5155,7 @@ mod tests {
             blank_search.to_string(),
             "query plan: search query must include terms"
         );
+        assert!(too_many_search_tokens.to_string().contains("search tokens"));
         assert_eq!(
             empty_tag.to_string(),
             "query plan: tag filter `t` values must not be empty"

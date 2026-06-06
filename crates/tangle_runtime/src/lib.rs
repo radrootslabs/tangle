@@ -1890,7 +1890,10 @@ async fn handle_websocket(mut socket: WebSocket, state: RuntimeRelayState) {
     let event_handler = EventMessageHandler::new(state.store.clone(), state.validator())
         .with_durable_write_rate_limit(state.config.durable_write_rate_limit());
     let auth_handler = AuthMessageHandler;
-    let req_handler = ReqMessageHandler::new(state.store.clone(), NostrFilterCompiler::default());
+    let req_handler = ReqMessageHandler::new(
+        state.store.clone(),
+        NostrFilterCompiler::new(state.config.limits()),
+    );
     let close_handler = CloseMessageHandler;
     let fanout = LiveEventFanout;
     let challenge = auth_handler.issue_challenge(

@@ -4398,6 +4398,9 @@ UPDATE search_doc SET visible = false WHERE event_id = $event_id OR current_even
                 "UPDATE event_current SET deleted = true WHERE address_key = $address_key AND pubkey = $author_pubkey;",
             )
             .query(
+                "UPDATE listing_current SET deleted = true WHERE listing_key = $address_key AND seller_pubkey = $author_pubkey;",
+            )
+            .query(
                 "UPDATE long_form_current SET deleted = true WHERE long_form_key = $address_key AND author_pubkey = $author_pubkey;",
             )
             .query("UPDATE long_form_topic SET deleted = true WHERE long_form_key = $address_key;")

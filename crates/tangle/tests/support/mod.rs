@@ -25,6 +25,14 @@ pub struct RelayHarness {
 
 impl RelayHarness {
     pub fn start(namespace: &str, policy: Value) -> Self {
+        Self::start_with_runtime_limits(namespace, policy, serde_json::json!({}))
+    }
+
+    pub fn start_with_runtime_limits(
+        namespace: &str,
+        policy: Value,
+        runtime_limits: Value,
+    ) -> Self {
         let port = free_port();
         let root = std::env::temp_dir().join(format!(
             "tangle-conformance-{namespace}-{}-{port}",
@@ -33,7 +41,14 @@ impl RelayHarness {
         let db_path = root.join("surrealdb");
         let config_path = root.join("runtime.json");
         fs::create_dir_all(&root).expect("runtime root");
-        write_runtime_config(&config_path, &db_path, port, namespace, policy);
+        write_runtime_config(
+            &config_path,
+            &db_path,
+            port,
+            namespace,
+            policy,
+            runtime_limits,
+        );
         let mut child = Command::new(env!("CARGO_BIN_EXE_tangle"))
             .args(["run", "--config"])
             .arg(&config_path)
@@ -191,6 +206,29 @@ pub fn http_get_admin(port: u16, path: &str, admin_pubkey: &str) -> String {
     response
 }
 
+pub fn http_post_json(port: u16, path: &str, admin_pubkey: Option<&str>, body: Value) -> String {
+    let body = body.to_string();
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("http connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .expect("write timeout");
+    let admin_header = admin_pubkey
+        .map(|pubkey| format!("x-tangle-admin-pubkey: {pubkey}\r\n"))
+        .unwrap_or_default();
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{admin_header}Connection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .expect("http post");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("http read");
+    response
+}
+
 pub async fn reopen_store(config: &SurrealConnectionConfig) -> SurrealStore {
     let started = Instant::now();
     loop {
@@ -205,7 +243,14 @@ pub async fn reopen_store(config: &SurrealConnectionConfig) -> SurrealStore {
     }
 }
 
-fn write_runtime_config(path: &Path, db_path: &Path, port: u16, namespace: &str, policy: Value) {
+fn write_runtime_config(
+    path: &Path,
+    db_path: &Path,
+    port: u16,
+    namespace: &str,
+    policy: Value,
+    runtime_limits: Value,
+) {
     let config = serde_json::json!({
         "server": {
             "listen_addr": format!("127.0.0.1:{port}"),
@@ -224,7 +269,8 @@ fn write_runtime_config(path: &Path, db_path: &Path, port: u16, namespace: &str,
             "message_rate_limit": {
                 "limit": 120,
                 "window_seconds": 60
-            }
+            },
+            "runtime": runtime_limits
         },
         "policy": policy
     });
