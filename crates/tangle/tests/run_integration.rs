@@ -26,7 +26,15 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
     let db_path = root.join("surrealdb");
     let config_path = root.join("runtime.json");
     fs::create_dir_all(&root).expect("runtime root");
-    write_runtime_config(&config_path, &db_path, port);
+    write_runtime_config(
+        &config_path,
+        &db_path,
+        port,
+        "tangle_it",
+        serde_json::json!({
+            "approved_sellers": [FixtureKey::Seller.public_key().as_str()]
+        }),
+    );
 
     let mut relay = Command::new(env!("CARGO_BIN_EXE_tangle"))
         .args(["run", "--config"])
@@ -195,7 +203,162 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
     fs::remove_dir_all(&root).expect("remove runtime root");
 }
 
-fn write_runtime_config(path: &Path, db_path: &Path, port: u16) {
+#[tokio::test]
+async fn tangle_run_enforces_seller_projection_policy() {
+    let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+    let auth = build_fixture_event(&auth_event_spec()).expect("auth");
+    let seller = FixtureKey::Seller.public_key();
+    let listing_key = format!("30402:{}:listing-a", seller.as_str());
+
+    let raw_only = run_policy_write_scenario(
+        "raw-only",
+        "tangle_policy_raw_only",
+        serde_json::json!({}),
+        &listing,
+        &auth,
+    )
+    .await;
+    assert_ok(&raw_only.event_response, true);
+    assert!(raw_only.listing_response.contains("200 OK"));
+    assert!(!raw_only.listing_response.contains(listing.id().as_str()));
+    let raw_only_store = reopen_store(&raw_only.store_config).await;
+    assert!(
+        raw_only_store
+            .raw_event_row(listing.id())
+            .await
+            .expect("raw row")
+            .is_some()
+    );
+    assert!(
+        raw_only_store
+            .listing_current_row(&listing_key)
+            .await
+            .expect("listing row")
+            .is_none()
+    );
+    assert!(
+        raw_only_store
+            .search_document_row(&listing_key)
+            .await
+            .expect("search row")
+            .is_none()
+    );
+    drop(raw_only_store);
+    fs::remove_dir_all(&raw_only.root).expect("remove raw-only root");
+
+    let reject_write = run_policy_write_scenario(
+        "reject-write",
+        "tangle_policy_reject_write",
+        serde_json::json!({
+            "unapproved_seller_action": "reject_write"
+        }),
+        &listing,
+        &auth,
+    )
+    .await;
+    assert_ok(&reject_write.event_response, false);
+    assert!(
+        reject_write.event_response[3]
+            .as_str()
+            .expect("rejection message")
+            .contains("seller is not approved")
+    );
+    assert!(reject_write.listing_response.contains("200 OK"));
+    assert!(
+        !reject_write
+            .listing_response
+            .contains(listing.id().as_str())
+    );
+    let reject_store = reopen_store(&reject_write.store_config).await;
+    assert!(
+        reject_store
+            .raw_event_row(listing.id())
+            .await
+            .expect("raw row")
+            .is_none()
+    );
+    assert!(
+        reject_store
+            .listing_current_row(&listing_key)
+            .await
+            .expect("listing row")
+            .is_none()
+    );
+    drop(reject_store);
+    fs::remove_dir_all(&reject_write.root).expect("remove reject root");
+}
+
+struct PolicyWriteScenario {
+    root: std::path::PathBuf,
+    store_config: SurrealConnectionConfig,
+    event_response: Value,
+    listing_response: String,
+}
+
+async fn run_policy_write_scenario(
+    name: &str,
+    namespace: &str,
+    policy: Value,
+    listing: &tangle_protocol::Event,
+    auth: &tangle_protocol::Event,
+) -> PolicyWriteScenario {
+    let port = free_port();
+    let root = std::env::temp_dir().join(format!(
+        "tangle-policy-{name}-{}-{port}",
+        std::process::id()
+    ));
+    let db_path = root.join("surrealdb");
+    let config_path = root.join("runtime.json");
+    fs::create_dir_all(&root).expect("runtime root");
+    write_runtime_config(&config_path, &db_path, port, namespace, policy);
+    let mut relay = spawn_relay(&config_path);
+    wait_for_http(port, &mut relay);
+    let (mut client, _) = connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("client connect");
+    assert_eq!(next_label(&mut client).await, "AUTH");
+    client
+        .send(Message::Text(
+            serde_json::json!(["AUTH", event_to_value(auth)])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("auth send");
+    assert_ok(&next_json(&mut client).await, true);
+    client
+        .send(Message::Text(
+            serde_json::json!(["EVENT", event_to_value(listing)])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("event send");
+    let event_response = next_json(&mut client).await;
+    let listing_response = http_get(port, "/api/listings?limit=5");
+    stop_relay(relay);
+    let store_config =
+        SurrealConnectionConfig::rocksdb(db_path.to_str().expect("db path"), namespace, "relay")
+            .expect("store config");
+    PolicyWriteScenario {
+        root,
+        store_config,
+        event_response,
+        listing_response,
+    }
+}
+
+fn spawn_relay(config_path: &Path) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_tangle"))
+        .args(["run", "--config"])
+        .arg(config_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn tangle run")
+}
+
+fn write_runtime_config(path: &Path, db_path: &Path, port: u16, namespace: &str, policy: Value) {
     let config = serde_json::json!({
         "server": {
             "listen_addr": format!("127.0.0.1:{port}"),
@@ -204,7 +367,7 @@ fn write_runtime_config(path: &Path, db_path: &Path, port: u16) {
         "database": {
             "mode": "rocks_db",
             "path": db_path.to_str().expect("db path"),
-            "namespace": "tangle_it",
+            "namespace": namespace,
             "database": "relay"
         },
         "auth": {
@@ -216,9 +379,7 @@ fn write_runtime_config(path: &Path, db_path: &Path, port: u16) {
                 "window_seconds": 60
             }
         },
-        "policy": {
-            "approved_sellers": [FixtureKey::Seller.public_key().as_str()]
-        }
+        "policy": policy
     });
     fs::write(
         path,
