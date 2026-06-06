@@ -4043,6 +4043,7 @@ dependencies = [
 name = "tangle_bench"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "tangle_nips",
  "tangle_protocol",
  "tangle_store",

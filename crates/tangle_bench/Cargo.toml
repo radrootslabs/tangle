@@ -8,6 +8,7 @@ license.workspace = true
 description = "Benchmark suite for the Tangle relay"
 
 [dependencies]
+serde_json = "1"
 tangle_nips = { path = "../tangle_nips" }
 tangle_protocol = { path = "../tangle_protocol" }
 tangle_store = { path = "../tangle_store" }

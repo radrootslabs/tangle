@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use tangle_protocol::Event;
+use tangle_protocol::{Event, filter_from_value};
 use tangle_store::{StoreEventOutcome, StoredEvent};
 use tangle_store_surreal::{
     ListingCurrentOutcome, ListingProjectionQuery, SearchDocumentOutcome, SearchDocumentQuery,
@@ -188,6 +188,63 @@ pub async fn run_search_workload(dataset: &BenchDataset) -> Result<SearchWorkloa
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenericRelayWorkloadReport {
+    pub attempted: u64,
+    pub inserted: u64,
+    pub note_results: u64,
+    pub all_results: u64,
+}
+
+pub async fn run_generic_relay_workload(
+    dataset: &BenchDataset,
+) -> Result<GenericRelayWorkloadReport, String> {
+    let store = bench_memory_store("generic_relay_workload").await?;
+    let events = dataset.events();
+    let mut inserted = 0;
+    for event in &events {
+        if store
+            .store_raw_event(&StoredEvent::new(
+                event.clone(),
+                event.unsigned().created_at(),
+            ))
+            .await
+            .map_err(|error| error.to_string())?
+            == StoreEventOutcome::Inserted
+        {
+            inserted += 1;
+        }
+        store
+            .index_event_tags(event)
+            .await
+            .map_err(|error| error.to_string())?;
+        store
+            .maintain_current_event(event)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    let note_filter = filter_from_value(&serde_json::json!({
+        "kinds": [1],
+        "limit": dataset.notes().len()
+    }))?;
+    let note_results = store
+        .query_raw_events(&note_filter)
+        .await
+        .map_err(|error| error.to_string())?
+        .len() as u64;
+    let all_results = store
+        .query_raw_events(&tangle_protocol::Filter::empty())
+        .await
+        .map_err(|error| error.to_string())?
+        .len() as u64;
+    Ok(GenericRelayWorkloadReport {
+        attempted: events.len() as u64,
+        inserted,
+        note_results,
+        all_results,
+    })
+}
+
 async fn bench_memory_store(database: &str) -> Result<SurrealStore, String> {
     let config = SurrealConnectionConfig::memory("tangle_bench", database)
         .map_err(|error| error.to_string())?;
@@ -353,6 +410,24 @@ mod tests {
                 indexed: 12,
                 carrot_results: 12,
                 browse_results: 5
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_relay_workload_stores_and_queries_non_marketplace_events() {
+        let dataset = BenchDataset::generate(BenchDatasetConfig::new(5, 7)).expect("dataset");
+        let report = super::run_generic_relay_workload(&dataset)
+            .await
+            .expect("generic workload");
+
+        assert_eq!(
+            report,
+            super::GenericRelayWorkloadReport {
+                attempted: 12,
+                inserted: 12,
+                note_results: 7,
+                all_results: 12
             }
         );
     }
