@@ -3895,6 +3895,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "surrealdb",
+ "tangle_nips",
  "tangle_protocol",
  "tangle_store",
  "tangle_test_support",

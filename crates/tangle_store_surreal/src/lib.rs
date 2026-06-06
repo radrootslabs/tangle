@@ -4,6 +4,7 @@ use core::fmt;
 use sha2::{Digest, Sha256};
 use surrealdb::Surreal;
 use surrealdb::engine::local::{Db, Mem};
+use tangle_nips::{DeletionTarget, parse_deletion_request};
 use tangle_protocol::{AddressCoordinate, Event, EventId, event_to_value};
 use tangle_store::{StoreEventOutcome, StoredEvent};
 
@@ -657,6 +658,12 @@ pub enum CurrentEventOutcome {
     Unchanged,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeletionMarkerOutcome {
+    NotDeletion,
+    Applied { targets: usize },
+}
+
 #[derive(Clone)]
 pub struct SurrealStore {
     db: Surreal<Db>,
@@ -952,6 +959,77 @@ UPSERT type::record('event_current', $address_key) CONTENT {
         response.take(0).map_err(SurrealStoreError::from)
     }
 
+    pub async fn apply_deletion_markers(
+        &self,
+        event: &Event,
+    ) -> Result<DeletionMarkerOutcome, SurrealStoreError> {
+        let Some(request) =
+            parse_deletion_request(event).map_err(|message| SurrealStoreError::new(&message))?
+        else {
+            return Ok(DeletionMarkerOutcome::NotDeletion);
+        };
+        for target in request.targets() {
+            let (target_type, target_ref) = deletion_target_parts(target);
+            let marker_id = format!("{}:{}:{}", event.id().as_str(), target_type, target_ref);
+            self.db
+                .query(
+                    r#"
+UPSERT type::record('deletion_marker', $marker_id) CONTENT {
+    deletion_event_id: $deletion_event_id,
+    target_type: $target_type,
+    target_ref: $target_ref,
+    author_pubkey: $author_pubkey,
+    deletion_created_at: $deletion_created_at
+};
+"#,
+                )
+                .bind(("marker_id", marker_id))
+                .bind(("deletion_event_id", event.id().as_str()))
+                .bind(("target_type", target_type))
+                .bind(("target_ref", target_ref.as_str()))
+                .bind(("author_pubkey", event.unsigned().pubkey().as_str()))
+                .bind((
+                    "deletion_created_at",
+                    event.unsigned().created_at().as_u64(),
+                ))
+                .await
+                .map_err(SurrealStoreError::from)?
+                .check()
+                .map_err(SurrealStoreError::from)?;
+            match target_type {
+                "event" => {
+                    self.mark_raw_event_deleted(&target_ref, event.unsigned().pubkey().as_str())
+                        .await?;
+                }
+                "address" => {
+                    self.mark_address_deleted(&target_ref, event.unsigned().pubkey().as_str())
+                        .await?;
+                }
+                _ => {}
+            }
+        }
+        Ok(DeletionMarkerOutcome::Applied {
+            targets: request.targets().len(),
+        })
+    }
+
+    pub async fn deletion_marker_rows(
+        &self,
+        deletion_event_id: &EventId,
+    ) -> Result<Vec<serde_json::Value>, SurrealStoreError> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT * FROM deletion_marker WHERE deletion_event_id = $deletion_event_id ORDER BY target_type ASC, target_ref ASC;",
+            )
+            .bind(("deletion_event_id", deletion_event_id.as_str()))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
     async fn applied_migration(
         &self,
         name: &str,
@@ -976,6 +1054,45 @@ UPSERT type::record('event_current', $address_key) CONTENT {
         Ok(info
             .map(|value| format!("{value:?}").contains("migration"))
             .unwrap_or(false))
+    }
+
+    async fn mark_raw_event_deleted(
+        &self,
+        event_id: &str,
+        author_pubkey: &str,
+    ) -> Result<(), SurrealStoreError> {
+        self.db
+            .query(
+                "UPDATE nostr_event SET deleted = true WHERE event_id = $event_id AND pubkey = $author_pubkey;",
+            )
+            .bind(("event_id", event_id))
+            .bind(("author_pubkey", author_pubkey))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        Ok(())
+    }
+
+    async fn mark_address_deleted(
+        &self,
+        address_key: &str,
+        author_pubkey: &str,
+    ) -> Result<(), SurrealStoreError> {
+        self.db
+            .query(
+                "UPDATE nostr_event SET deleted = true WHERE address_key = $address_key AND pubkey = $author_pubkey;",
+            )
+            .query(
+                "UPDATE event_current SET deleted = true WHERE address_key = $address_key AND pubkey = $author_pubkey;",
+            )
+            .bind(("address_key", address_key))
+            .bind(("author_pubkey", author_pubkey))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        Ok(())
     }
 
     async fn record_migration(
@@ -1067,6 +1184,13 @@ fn current_event_replacement_outcome(
     }
 }
 
+fn deletion_target_parts(target: &DeletionTarget) -> (&'static str, String) {
+    match target {
+        DeletionTarget::Event(event_id) => ("event", event_id.as_str().to_owned()),
+        DeletionTarget::Address(address) => ("address", address.key().to_string()),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SurrealStoreError {
     message: String,
@@ -1101,9 +1225,9 @@ impl From<surrealdb::Error> for SurrealStoreError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CurrentEventOutcome, MigrationApplyOutcome, SurrealConfigError, SurrealConnectionConfig,
-        SurrealConnectionMode, SurrealMigration, SurrealMigrationError, SurrealMigrationPlan,
-        SurrealStore, base_migration_plan, migration_tracking_schema,
+        CurrentEventOutcome, DeletionMarkerOutcome, MigrationApplyOutcome, SurrealConfigError,
+        SurrealConnectionConfig, SurrealConnectionMode, SurrealMigration, SurrealMigrationError,
+        SurrealMigrationPlan, SurrealStore, base_migration_plan, migration_tracking_schema,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -1986,6 +2110,153 @@ mod tests {
         assert_eq!(addressable_row["kind"], 30_402_u64);
         assert_eq!(addressable_row["d"], "listing-a");
         assert_eq!(addressable_row["event_id"], addressable.id().as_str());
+    }
+
+    #[tokio::test]
+    async fn apply_deletion_markers_persists_markers_and_author_scoped_deletes() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let pubkey = "a".repeat(PublicKeyHex::HEX_LENGTH);
+        let other_pubkey = "b".repeat(PublicKeyHex::HEX_LENGTH);
+        let raw = synthetic_event("7", "3", &pubkey, 1_714_124_800, 1, Vec::new(), "delete me");
+        let foreign_target =
+            synthetic_event("8", "4", &pubkey, 1_714_124_801, 1, Vec::new(), "keep me");
+        let addressable_key = format!("30402:{pubkey}:listing-delete");
+        let addressable = synthetic_event(
+            "9",
+            "5",
+            &pubkey,
+            1_714_124_802,
+            30_402,
+            vec![Tag::from_parts("d", &["listing-delete"]).expect("d tag")],
+            "delete listing",
+        );
+        for event in [&raw, &foreign_target, &addressable] {
+            assert_eq!(
+                store
+                    .store_raw_event(&StoredEvent::new(
+                        event.clone(),
+                        UnixTimestamp::new(1_714_124_900)
+                    ))
+                    .await
+                    .expect("raw insert"),
+                StoreEventOutcome::Inserted
+            );
+        }
+        assert_eq!(
+            store
+                .maintain_current_event(&addressable)
+                .await
+                .expect("current"),
+            CurrentEventOutcome::Inserted
+        );
+
+        let deletion = synthetic_event(
+            "b",
+            "6",
+            &pubkey,
+            1_714_124_903,
+            5,
+            vec![
+                Tag::from_parts("e", &[raw.id().as_str()]).expect("e tag"),
+                Tag::from_parts("a", &[&addressable_key]).expect("a tag"),
+            ],
+            "remove stale events",
+        );
+        let not_deletion = synthetic_event(
+            "c",
+            "7",
+            &pubkey,
+            1_714_124_904,
+            1,
+            Vec::new(),
+            "plain note",
+        );
+        let unauthorized = synthetic_event(
+            "d",
+            "8",
+            &other_pubkey,
+            1_714_124_905,
+            5,
+            vec![Tag::from_parts("e", &[foreign_target.id().as_str()]).expect("foreign e")],
+            "foreign delete",
+        );
+
+        assert_eq!(
+            store
+                .apply_deletion_markers(&not_deletion)
+                .await
+                .expect("not deletion"),
+            DeletionMarkerOutcome::NotDeletion
+        );
+        assert_eq!(
+            store
+                .apply_deletion_markers(&deletion)
+                .await
+                .expect("delete"),
+            DeletionMarkerOutcome::Applied { targets: 2 }
+        );
+        assert_eq!(
+            store
+                .apply_deletion_markers(&unauthorized)
+                .await
+                .expect("unauthorized"),
+            DeletionMarkerOutcome::Applied { targets: 1 }
+        );
+
+        let markers = store
+            .deletion_marker_rows(deletion.id())
+            .await
+            .expect("markers");
+        assert_eq!(markers.len(), 2);
+        assert_eq!(markers[0]["target_type"], "address");
+        assert_eq!(markers[0]["target_ref"], addressable_key);
+        assert_eq!(markers[0]["author_pubkey"], pubkey);
+        assert_eq!(markers[1]["target_type"], "event");
+        assert_eq!(markers[1]["target_ref"], raw.id().as_str());
+        assert_eq!(markers[1]["deletion_created_at"], 1_714_124_903_u64);
+
+        let unauthorized_markers = store
+            .deletion_marker_rows(unauthorized.id())
+            .await
+            .expect("unauthorized markers");
+        assert_eq!(unauthorized_markers.len(), 1);
+
+        assert_eq!(
+            store
+                .raw_event_row(raw.id())
+                .await
+                .expect("raw row")
+                .expect("raw exists")["deleted"],
+            true
+        );
+        assert_eq!(
+            store
+                .raw_event_row(addressable.id())
+                .await
+                .expect("address row")
+                .expect("address exists")["deleted"],
+            true
+        );
+        assert_eq!(
+            store
+                .current_event_row(&addressable_key)
+                .await
+                .expect("current row")
+                .expect("current exists")["deleted"],
+            true
+        );
+        assert_eq!(
+            store
+                .raw_event_row(foreign_target.id())
+                .await
+                .expect("foreign row")
+                .expect("foreign exists")["deleted"],
+            false
+        );
     }
 
     fn synthetic_event(
