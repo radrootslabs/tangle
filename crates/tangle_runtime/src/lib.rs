@@ -371,6 +371,7 @@ impl RuntimeMigrationReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeCommandErrorKind {
     Unsupported,
+    Input,
     Store,
 }
 
@@ -390,6 +391,10 @@ impl RuntimeCommandError {
 
     pub fn unsupported(message: impl Into<String>) -> Self {
         Self::new(RuntimeCommandErrorKind::Unsupported, message)
+    }
+
+    pub fn input(message: impl Into<String>) -> Self {
+        Self::new(RuntimeCommandErrorKind::Input, message)
     }
 
     pub fn store(message: impl Into<String>) -> Self {
@@ -434,6 +439,203 @@ pub async fn migrate_runtime_database(
         already_applied,
         outcomes.len() as u64,
     ))
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeEventImportReport {
+    total: u64,
+    inserted: u64,
+    duplicate: u64,
+    projected: u64,
+    skipped: u64,
+}
+
+impl RuntimeEventImportReport {
+    pub fn new(total: u64, inserted: u64, duplicate: u64, projected: u64, skipped: u64) -> Self {
+        Self {
+            total,
+            inserted,
+            duplicate,
+            projected,
+            skipped,
+        }
+    }
+
+    pub fn total(self) -> u64 {
+        self.total
+    }
+
+    pub fn inserted(self) -> u64 {
+        self.inserted
+    }
+
+    pub fn duplicate(self) -> u64 {
+        self.duplicate
+    }
+
+    pub fn projected(self) -> u64 {
+        self.projected
+    }
+
+    pub fn skipped(self) -> u64 {
+        self.skipped
+    }
+
+    fn record(&mut self, outcome: RuntimeEventImportOutcome) {
+        self.total += 1;
+        match outcome {
+            RuntimeEventImportOutcome::Inserted { projected } => {
+                self.inserted += 1;
+                if projected {
+                    self.projected += 1;
+                }
+            }
+            RuntimeEventImportOutcome::Duplicate => {
+                self.duplicate += 1;
+            }
+            RuntimeEventImportOutcome::Skipped => {
+                self.skipped += 1;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeEventImportOutcome {
+    Inserted { projected: bool },
+    Duplicate,
+    Skipped,
+}
+
+pub async fn import_events_from_path(
+    config: &TangleRuntimeConfig,
+    path: impl AsRef<FsPath>,
+) -> Result<RuntimeEventImportReport, RuntimeCommandError> {
+    let path = path.as_ref();
+    let raw = fs::read_to_string(path).map_err(|error| {
+        RuntimeCommandError::input(format!(
+            "failed to read event import file `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    let events = parse_event_import_document(&raw)?;
+    let store = connect_runtime_store(config).await?;
+    store
+        .apply_plan(&base_migration_plan())
+        .await
+        .map_err(|error| RuntimeCommandError::store(error.to_string()))?;
+    let validator = EventValidator::new(
+        config.limits(),
+        config
+            .admission_policy()
+            .clone()
+            .with_write_auth_required(false),
+    );
+    let mut report = RuntimeEventImportReport::default();
+    let now = now_timestamp();
+    for event in events {
+        let outcome = import_single_event(&store, &validator, event, now).await?;
+        report.record(outcome);
+    }
+    Ok(report)
+}
+
+async fn import_single_event(
+    store: &SurrealStore,
+    validator: &EventValidator,
+    event: Event,
+    now: UnixTimestamp,
+) -> Result<RuntimeEventImportOutcome, RuntimeCommandError> {
+    let validated = match validator.validate(&event, &AdmissionContext::unauthenticated(), now) {
+        Ok(validated) => validated,
+        Err(_) => return Ok(RuntimeEventImportOutcome::Skipped),
+    };
+    if validated.admission().effect() == AdmissionEffect::AuthenticateOnly {
+        return Ok(RuntimeEventImportOutcome::Skipped);
+    }
+    if event.unsigned().kind().is_ephemeral() {
+        return Ok(RuntimeEventImportOutcome::Skipped);
+    }
+    let raw_outcome = store
+        .store_raw_event(&StoredEvent::new(event.clone(), now))
+        .await
+        .map_err(|error| RuntimeCommandError::store(error.to_string()))?;
+    if raw_outcome == StoreEventOutcome::Duplicate {
+        return Ok(RuntimeEventImportOutcome::Duplicate);
+    }
+    if store.index_event_tags(&event).await.is_err()
+        || store.maintain_current_event(&event).await.is_err()
+        || store.apply_deletion_markers(&event).await.is_err()
+        || store.store_listing_revision(&event, now).await.is_err()
+    {
+        return Err(RuntimeCommandError::store("event projection failed"));
+    }
+    let projected =
+        if validated.admission().effect() == AdmissionEffect::StoreRawAndProjectPublicListing {
+            if store.project_current_listing(&event, now).await.is_err()
+                || store.project_listing_helpers(&event).await.is_err()
+                || store.index_listing_search_document(&event).await.is_err()
+            {
+                return Err(RuntimeCommandError::store("event projection failed"));
+            }
+            true
+        } else {
+            false
+        };
+    Ok(RuntimeEventImportOutcome::Inserted { projected })
+}
+
+fn parse_event_import_document(raw: &str) -> Result<Vec<Event>, RuntimeCommandError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(serde_json::Value::Array(events)) => events
+            .iter()
+            .enumerate()
+            .map(|(index, value)| event_from_import_value(value, index + 1))
+            .collect(),
+        Ok(value @ serde_json::Value::Object(_)) => {
+            event_from_import_value(&value, 1).map(|event| vec![event])
+        }
+        Ok(_) => Err(RuntimeCommandError::input(
+            "event import file must contain event objects",
+        )),
+        Err(_) => trimmed
+            .lines()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                let line = line.trim();
+                if line.is_empty() {
+                    None
+                } else {
+                    Some(event_from_import_line(line, index + 1))
+                }
+            })
+            .collect(),
+    }
+}
+
+fn event_from_import_value(
+    value: &serde_json::Value,
+    index: usize,
+) -> Result<Event, RuntimeCommandError> {
+    let raw = RawEventJson::new(&value.to_string()).map_err(|error| {
+        RuntimeCommandError::input(format!("event import item {index} is invalid: {error}"))
+    })?;
+    parse_event_json(&raw).map_err(|error| {
+        RuntimeCommandError::input(format!("event import item {index} is invalid: {error}"))
+    })
+}
+
+fn event_from_import_line(line: &str, index: usize) -> Result<Event, RuntimeCommandError> {
+    let raw = RawEventJson::new(line).map_err(|error| {
+        RuntimeCommandError::input(format!("event import line {index} is invalid: {error}"))
+    })?;
+    parse_event_json(&raw).map_err(|error| {
+        RuntimeCommandError::input(format!("event import line {index} is invalid: {error}"))
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

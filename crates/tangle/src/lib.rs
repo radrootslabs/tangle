@@ -5,14 +5,13 @@ use std::fmt;
 pub const PACKAGE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const USAGE: &str = "\
-usage: tangle [--version] <command> [--config PATH]
-
-commands:
-  migrate
-  run
-  event import
-  event export
-  projection rebuild";
+usage:
+  tangle [--version]
+  tangle migrate --config PATH
+  tangle run --config PATH
+  tangle event import --config PATH --input PATH
+  tangle event export --config PATH
+  tangle projection rebuild --config PATH";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TangleCommand {
@@ -39,7 +38,10 @@ impl TangleCommand {
     }
 
     pub fn implemented(self) -> bool {
-        matches!(self, Self::Version | Self::Help | Self::Migrate | Self::Run)
+        matches!(
+            self,
+            Self::Version | Self::Help | Self::Migrate | Self::Run | Self::EventImport
+        )
     }
 }
 
@@ -47,6 +49,7 @@ impl TangleCommand {
 pub struct TangleInvocation {
     command: TangleCommand,
     config_path: Option<String>,
+    input_path: Option<String>,
 }
 
 impl TangleInvocation {
@@ -54,7 +57,13 @@ impl TangleInvocation {
         Self {
             command,
             config_path,
+            input_path: None,
         }
+    }
+
+    pub fn with_input_path(mut self, input_path: Option<String>) -> Self {
+        self.input_path = input_path;
+        self
     }
 
     pub fn command(&self) -> TangleCommand {
@@ -63,6 +72,10 @@ impl TangleInvocation {
 
     pub fn config_path(&self) -> Option<&str> {
         self.config_path.as_deref()
+    }
+
+    pub fn input_path(&self) -> Option<&str> {
+        self.input_path.as_deref()
     }
 }
 
@@ -156,6 +169,7 @@ where
         _ => return Err(TangleCliError::UnknownCommand(first)),
     };
     let mut config_path = None;
+    let mut input_path = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--config" => {
@@ -167,6 +181,15 @@ where
                 };
                 config_path = Some(path);
             }
+            "--input" => {
+                if input_path.is_some() {
+                    return Err(TangleCliError::RepeatedOption("--input"));
+                }
+                let Some(path) = args.next() else {
+                    return Err(TangleCliError::MissingOptionValue("--input"));
+                };
+                input_path = Some(path);
+            }
             _ => {
                 return Err(TangleCliError::UnexpectedArgument {
                     command: command.as_str().to_owned(),
@@ -175,13 +198,25 @@ where
             }
         }
     }
-    Ok(TangleInvocation::new(command, config_path))
+    if input_path.is_some() && command != TangleCommand::EventImport {
+        return Err(TangleCliError::UnexpectedArgument {
+            command: command.as_str().to_owned(),
+            argument: "--input".to_owned(),
+        });
+    }
+    Ok(TangleInvocation::new(command, config_path).with_input_path(input_path))
 }
 
 pub fn require_config_path(invocation: &TangleInvocation) -> Result<&str, TangleCliError> {
     invocation
         .config_path()
         .ok_or(TangleCliError::MissingOptionValue("--config"))
+}
+
+pub fn require_input_path(invocation: &TangleInvocation) -> Result<&str, TangleCliError> {
+    invocation
+        .input_path()
+        .ok_or(TangleCliError::MissingOptionValue("--input"))
 }
 
 pub fn migrate_output(report: tangle_runtime::RuntimeMigrationReport) -> String {
@@ -193,12 +228,35 @@ pub fn migrate_output(report: tangle_runtime::RuntimeMigrationReport) -> String 
     )
 }
 
+pub fn event_import_output(report: tangle_runtime::RuntimeEventImportReport) -> String {
+    format!(
+        "events total: {}\nevents inserted: {}\nevents duplicate: {}\nevents projected: {}\nevents skipped: {}",
+        report.total(),
+        report.inserted(),
+        report.duplicate(),
+        report.projected(),
+        report.skipped()
+    )
+}
+
 pub async fn migrate_with_config(path: &str) -> Result<String, String> {
     let config = tangle_runtime::load_runtime_config(path).map_err(|error| error.to_string())?;
     let report = tangle_runtime::migrate_runtime_database(&config)
         .await
         .map_err(|error| error.to_string())?;
     Ok(migrate_output(report))
+}
+
+pub async fn event_import_with_config(
+    config_path: &str,
+    input_path: &str,
+) -> Result<String, String> {
+    let config =
+        tangle_runtime::load_runtime_config(config_path).map_err(|error| error.to_string())?;
+    let report = tangle_runtime::import_events_from_path(&config, input_path)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(event_import_output(report))
 }
 
 pub async fn run_with_config(path: &str) -> Result<(), String> {
@@ -220,10 +278,10 @@ pub async fn run_with_config(path: &str) -> Result<(), String> {
 mod tests {
     use super::{
         PACKAGE_NAME, PACKAGE_VERSION, TangleCliError, TangleCommand, TangleInvocation,
-        migrate_output, parse_tangle_command, parse_tangle_invocation, require_config_path,
-        usage_output, version_output,
+        event_import_output, migrate_output, parse_tangle_command, parse_tangle_invocation,
+        require_config_path, require_input_path, usage_output, version_output,
     };
-    use tangle_runtime::RuntimeMigrationReport;
+    use tangle_runtime::{RuntimeEventImportReport, RuntimeMigrationReport};
 
     #[test]
     fn package_name_is_tangle() {
@@ -244,7 +302,7 @@ mod tests {
     fn usage_output_lists_supported_command_model() {
         assert_eq!(
             usage_output(),
-            "usage: tangle [--version] <command> [--config PATH]\n\ncommands:\n  migrate\n  run\n  event import\n  event export\n  projection rebuild"
+            "usage:\n  tangle [--version]\n  tangle migrate --config PATH\n  tangle run --config PATH\n  tangle event import --config PATH --input PATH\n  tangle event export --config PATH\n  tangle projection rebuild --config PATH"
         );
     }
 
@@ -276,6 +334,7 @@ mod tests {
                         | TangleCommand::Help
                         | TangleCommand::Migrate
                         | TangleCommand::Run
+                        | TangleCommand::EventImport
                 )
             );
         }
@@ -299,6 +358,33 @@ mod tests {
             require_config_path(&TangleInvocation::new(TangleCommand::Migrate, None))
                 .expect_err("config"),
             TangleCliError::MissingOptionValue("--config")
+        );
+    }
+
+    #[test]
+    fn command_model_parses_import_input_option() {
+        let invocation = parse_tangle_invocation([
+            "event",
+            "import",
+            "--config",
+            "runtime.json",
+            "--input",
+            "events.jsonl",
+        ])
+        .expect("invocation");
+        assert_eq!(invocation.command(), TangleCommand::EventImport);
+        assert_eq!(
+            require_config_path(&invocation).expect("config"),
+            "runtime.json"
+        );
+        assert_eq!(
+            require_input_path(&invocation).expect("input"),
+            "events.jsonl"
+        );
+        assert_eq!(
+            require_input_path(&TangleInvocation::new(TangleCommand::EventImport, None))
+                .expect_err("input"),
+            TangleCliError::MissingOptionValue("--input")
         );
     }
 
@@ -332,6 +418,22 @@ mod tests {
                 .expect_err("repeated config"),
             TangleCliError::RepeatedOption("--config")
         );
+        assert_eq!(
+            parse_tangle_invocation(["migrate", "--input", "events.jsonl"]).expect_err("input"),
+            TangleCliError::UnexpectedArgument {
+                command: "migrate".to_owned(),
+                argument: "--input".to_owned()
+            }
+        );
+        assert_eq!(
+            parse_tangle_invocation(["event", "import", "--input"]).expect_err("missing input"),
+            TangleCliError::MissingOptionValue("--input")
+        );
+        assert_eq!(
+            parse_tangle_invocation(["event", "import", "--input", "a", "--input", "b"])
+                .expect_err("repeated input"),
+            TangleCliError::RepeatedOption("--input")
+        );
     }
 
     #[test]
@@ -339,6 +441,14 @@ mod tests {
         assert_eq!(
             migrate_output(RuntimeMigrationReport::new(8, 2, 10)),
             "migrations applied: 8\nmigrations already applied: 2\nmigrations total: 10"
+        );
+    }
+
+    #[test]
+    fn event_import_output_reports_outcome_counts() {
+        assert_eq!(
+            event_import_output(RuntimeEventImportReport::new(5, 2, 1, 2, 2)),
+            "events total: 5\nevents inserted: 2\nevents duplicate: 1\nevents projected: 2\nevents skipped: 2"
         );
     }
 }
