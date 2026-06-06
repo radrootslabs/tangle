@@ -12,6 +12,7 @@ pub const NIP25_REACTION_KIND: u32 = 7;
 pub const NIP23_LONG_FORM_KIND: u32 = 30_023;
 pub const NIP23_LONG_FORM_DRAFT_KIND: u32 = 30_024;
 pub const NIP7D_THREAD_KIND: u32 = 11;
+pub const NIP32_LABEL_KIND: u32 = 1_985;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedTag {
@@ -952,6 +953,196 @@ pub fn parse_forum_thread_event(event: &Event) -> Result<Option<ForumThreadEvent
     }))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelTarget {
+    Event(EventId),
+    Pubkey(PublicKeyHex),
+    Address(AddressCoordinate),
+    Relay(String),
+    Topic(String),
+}
+
+impl LabelTarget {
+    pub fn target_type(&self) -> &'static str {
+        match self {
+            Self::Event(_) => "event",
+            Self::Pubkey(_) => "pubkey",
+            Self::Address(_) => "address",
+            Self::Relay(_) => "relay",
+            Self::Topic(_) => "topic",
+        }
+    }
+
+    pub fn target_ref(&self) -> String {
+        match self {
+            Self::Event(event_id) => event_id.as_str().to_owned(),
+            Self::Pubkey(pubkey) => pubkey.as_str().to_owned(),
+            Self::Address(address) => address.key().to_string(),
+            Self::Relay(relay) | Self::Topic(relay) => relay.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelValue {
+    value: String,
+    namespace: String,
+}
+
+impl LabelValue {
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelEvent {
+    event_id: EventId,
+    pubkey: PublicKeyHex,
+    created_at: UnixTimestamp,
+    content: String,
+    namespaces: Vec<String>,
+    labels: Vec<LabelValue>,
+    targets: Vec<LabelTarget>,
+}
+
+impl LabelEvent {
+    pub fn event_id(&self) -> &EventId {
+        &self.event_id
+    }
+
+    pub fn pubkey(&self) -> &PublicKeyHex {
+        &self.pubkey
+    }
+
+    pub fn created_at(&self) -> UnixTimestamp {
+        self.created_at
+    }
+
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
+    pub fn namespaces(&self) -> &[String] {
+        &self.namespaces
+    }
+
+    pub fn labels(&self) -> &[LabelValue] {
+        &self.labels
+    }
+
+    pub fn targets(&self) -> &[LabelTarget] {
+        &self.targets
+    }
+}
+
+pub fn parse_label_event(event: &Event) -> Result<Option<LabelEvent>, String> {
+    if event.unsigned().kind().as_u32() != NIP32_LABEL_KIND {
+        return Ok(None);
+    }
+    let namespaces = parse_label_namespaces(event)?;
+    let labels = parse_label_values(event, &namespaces)?;
+    if labels.is_empty() {
+        return Err("label event must include at least one l tag".to_owned());
+    }
+    let targets = parse_label_targets(event)?;
+    if targets.is_empty() {
+        return Err("label event must target at least one e p a r or t tag".to_owned());
+    }
+    Ok(Some(LabelEvent {
+        event_id: event.id().clone(),
+        pubkey: event.unsigned().pubkey().clone(),
+        created_at: event.unsigned().created_at(),
+        content: event.unsigned().content().to_owned(),
+        namespaces,
+        labels,
+        targets,
+    }))
+}
+
+fn parse_label_namespaces(event: &Event) -> Result<Vec<String>, String> {
+    let mut namespaces = Vec::new();
+    for tag in matching_tags(event, "L") {
+        match tag.values() {
+            [value] if !value.is_empty() => namespaces.push(value.clone()),
+            [..] => {
+                return Err(
+                    "label namespace L tag must include exactly one non-empty value".to_owned(),
+                );
+            }
+        }
+    }
+    namespaces.sort();
+    namespaces.dedup();
+    Ok(namespaces)
+}
+
+fn parse_label_values(event: &Event, namespaces: &[String]) -> Result<Vec<LabelValue>, String> {
+    let mut labels = Vec::new();
+    for tag in matching_tags(event, "l") {
+        let values = tag.values();
+        let value = values
+            .first()
+            .ok_or_else(|| "label l tag must include a value".to_owned())?;
+        if value.is_empty() {
+            return Err("label l value must not be empty".to_owned());
+        }
+        if values.len() > 2 {
+            return Err("label l tag must include at most value and namespace".to_owned());
+        }
+        let namespace = match values.get(1) {
+            Some(namespace) if namespace.is_empty() => {
+                return Err("label l namespace must not be empty".to_owned());
+            }
+            Some(namespace) => namespace.clone(),
+            None if namespaces.is_empty() => "ugc".to_owned(),
+            None => return Err("label l tag must include a namespace matching an L tag".to_owned()),
+        };
+        if !namespaces.is_empty() && !namespaces.contains(&namespace) {
+            return Err("label l namespace must match an L tag".to_owned());
+        }
+        labels.push(LabelValue {
+            value: value.clone(),
+            namespace,
+        });
+    }
+    Ok(labels)
+}
+
+fn parse_label_targets(event: &Event) -> Result<Vec<LabelTarget>, String> {
+    let mut targets = Vec::new();
+    for value in single_letter_values_for(event, "e")? {
+        targets.push(LabelTarget::Event(EventId::new(&value)?));
+    }
+    for value in single_letter_values_for(event, "p")? {
+        targets.push(LabelTarget::Pubkey(parse_pubkey_value(
+            &value,
+            "label target",
+            "pubkey",
+        )?));
+    }
+    for value in single_letter_values_for(event, "a")? {
+        targets.push(LabelTarget::Address(AddressCoordinate::from_str(&value)?));
+    }
+    for value in single_letter_values_for(event, "r")? {
+        if value.is_empty() {
+            return Err("label relay target must not be empty".to_owned());
+        }
+        targets.push(LabelTarget::Relay(value));
+    }
+    for value in single_letter_values_for(event, "t")? {
+        if value.is_empty() {
+            return Err("label topic target must not be empty".to_owned());
+        }
+        targets.push(LabelTarget::Topic(value));
+    }
+    Ok(targets)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListingKind {
     Public,
@@ -1705,17 +1896,18 @@ fn listing_kind_for_event(event: &Event) -> Option<ListingKind> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommentTarget, DeletionTarget, FulfillmentMethod, ListingEffectiveStatus, ListingKind,
-        ListingProjectionEvaluation, ListingUnit, LongFormKind, NIP7D_THREAD_KIND,
+        CommentTarget, DeletionTarget, FulfillmentMethod, LabelTarget, ListingEffectiveStatus,
+        ListingKind, ListingProjectionEvaluation, ListingUnit, LongFormKind, NIP7D_THREAD_KIND,
         NIP22_COMMENT_KIND, NIP23_LONG_FORM_DRAFT_KIND, NIP23_LONG_FORM_KIND, NIP25_REACTION_KIND,
-        NIP99_PUBLIC_LISTING_KIND, ReactionValue, evaluate_listing_projection, matching_tags,
-        optional_tag_value, optional_tag_values, parse_comment_event, parse_deletion_request,
-        parse_forum_thread_event, parse_listing_fulfillment, parse_listing_identity,
-        parse_listing_location, parse_listing_price, parse_listing_status, parse_listing_taxonomy,
-        parse_listing_text, parse_listing_unit, parse_long_form_event, parse_nip50_filter_search,
-        parse_nip50_search, parse_reaction_event, parse_relay_auth_event, parse_required_u64_tag,
-        parse_u64_field, repeated_or_missing_policy_boundary, required_tag_value,
-        required_tag_values, single_letter_tag_values, single_letter_values_for, tag_count,
+        NIP32_LABEL_KIND, NIP99_PUBLIC_LISTING_KIND, ReactionValue, evaluate_listing_projection,
+        matching_tags, optional_tag_value, optional_tag_values, parse_comment_event,
+        parse_deletion_request, parse_forum_thread_event, parse_label_event,
+        parse_listing_fulfillment, parse_listing_identity, parse_listing_location,
+        parse_listing_price, parse_listing_status, parse_listing_taxonomy, parse_listing_text,
+        parse_listing_unit, parse_long_form_event, parse_nip50_filter_search, parse_nip50_search,
+        parse_reaction_event, parse_relay_auth_event, parse_required_u64_tag, parse_u64_field,
+        repeated_or_missing_policy_boundary, required_tag_value, required_tag_values,
+        single_letter_tag_values, single_letter_values_for, tag_count,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -2373,6 +2565,122 @@ mod tests {
         assert_eq!(
             parse_forum_thread_event(&bad_pubkey_reference).expect_err("bad pubkey"),
             "forum thread reference pubkey is invalid: public key must be 64 characters, got 3"
+        );
+    }
+
+    #[test]
+    fn label_parser_extracts_namespaced_labels_and_targets() {
+        let event_id = "8".repeat(EventId::HEX_LENGTH);
+        let pubkey = "9".repeat(PublicKeyHex::HEX_LENGTH);
+        let address = format!("30023:{pubkey}:harvest-notes");
+        let event = event_with_kind_tags_and_content(
+            NIP32_LABEL_KIND.into(),
+            vec![
+                Tag::from_parts("L", &["com.radroots.moderation"]).expect("L"),
+                Tag::from_parts("l", &["approve", "com.radroots.moderation"]).expect("l"),
+                Tag::from_parts("e", &[&event_id, "wss://relay.radroots.test"]).expect("e"),
+                Tag::from_parts("p", &[&pubkey, "wss://relay.radroots.test"]).expect("p"),
+                Tag::from_parts("a", &[&address]).expect("a"),
+                Tag::from_parts("r", &["wss://relay.radroots.test"]).expect("r"),
+                Tag::from_parts("t", &["market"]).expect("t"),
+            ],
+            "moderator note",
+        );
+
+        let label = parse_label_event(&event).expect("parse").expect("label");
+
+        assert_eq!(label.event_id(), event.id());
+        assert_eq!(label.pubkey(), event.unsigned().pubkey());
+        assert_eq!(label.created_at(), event.unsigned().created_at());
+        assert_eq!(label.content(), "moderator note");
+        assert_eq!(label.namespaces(), &["com.radroots.moderation".to_owned()]);
+        assert_eq!(label.labels()[0].value(), "approve");
+        assert_eq!(label.labels()[0].namespace(), "com.radroots.moderation");
+        assert_eq!(label.targets().len(), 5);
+        assert_eq!(label.targets()[0].target_type(), "event");
+        assert_eq!(label.targets()[0].target_ref(), event_id);
+        assert_eq!(label.targets()[1].target_type(), "pubkey");
+        assert_eq!(label.targets()[1].target_ref(), pubkey);
+        assert!(
+            matches!(&label.targets()[2], LabelTarget::Address(parsed) if parsed.key().to_string() == address)
+        );
+        assert_eq!(label.targets()[3].target_type(), "relay");
+        assert_eq!(label.targets()[4].target_type(), "topic");
+    }
+
+    #[test]
+    fn label_parser_defaults_to_ugc_namespace_and_ignores_other_kinds() {
+        let target = "8".repeat(EventId::HEX_LENGTH);
+        let event = event_with_kind_and_tags(
+            NIP32_LABEL_KIND.into(),
+            vec![
+                Tag::from_parts("l", &["needs-review"]).expect("l"),
+                Tag::from_parts("e", &[&target]).expect("e"),
+            ],
+        );
+        let note = event_with_kind_and_tags(1, vec![Tag::from_parts("l", &["topic"]).expect("l")]);
+
+        let label = parse_label_event(&event).expect("parse").expect("label");
+
+        assert_eq!(label.namespaces(), &[] as &[String]);
+        assert_eq!(label.labels()[0].namespace(), "ugc");
+        assert_eq!(parse_label_event(&note), Ok(None));
+    }
+
+    #[test]
+    fn label_parser_rejects_missing_labels_targets_and_bad_namespaces() {
+        let target = "8".repeat(EventId::HEX_LENGTH);
+        let missing_label = event_with_kind_and_tags(
+            NIP32_LABEL_KIND.into(),
+            vec![Tag::from_parts("e", &[&target]).expect("e")],
+        );
+        let missing_target = event_with_kind_and_tags(
+            NIP32_LABEL_KIND.into(),
+            vec![Tag::from_parts("l", &["approve"]).expect("l")],
+        );
+        let unmatched_namespace = event_with_kind_and_tags(
+            NIP32_LABEL_KIND.into(),
+            vec![
+                Tag::from_parts("L", &["one"]).expect("L"),
+                Tag::from_parts("l", &["approve", "two"]).expect("l"),
+                Tag::from_parts("e", &[&target]).expect("e"),
+            ],
+        );
+        let missing_label_namespace = event_with_kind_and_tags(
+            NIP32_LABEL_KIND.into(),
+            vec![
+                Tag::from_parts("L", &["one"]).expect("L"),
+                Tag::from_parts("l", &["approve"]).expect("l"),
+                Tag::from_parts("e", &[&target]).expect("e"),
+            ],
+        );
+        let bad_target = event_with_kind_and_tags(
+            NIP32_LABEL_KIND.into(),
+            vec![
+                Tag::from_parts("l", &["approve"]).expect("l"),
+                Tag::from_parts("e", &["bad"]).expect("e"),
+            ],
+        );
+
+        assert_eq!(
+            parse_label_event(&missing_label).expect_err("missing label"),
+            "label event must include at least one l tag"
+        );
+        assert_eq!(
+            parse_label_event(&missing_target).expect_err("missing target"),
+            "label event must target at least one e p a r or t tag"
+        );
+        assert_eq!(
+            parse_label_event(&unmatched_namespace).expect_err("unmatched namespace"),
+            "label l namespace must match an L tag"
+        );
+        assert_eq!(
+            parse_label_event(&missing_label_namespace).expect_err("missing namespace"),
+            "label l tag must include a namespace matching an L tag"
+        );
+        assert_eq!(
+            parse_label_event(&bad_target).expect_err("bad target"),
+            "event id must be 64 characters, got 3"
         );
     }
 
