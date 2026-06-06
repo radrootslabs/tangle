@@ -1835,6 +1835,17 @@ CREATE type::record('nostr_event', $event_id) CONTENT {
         response.take(0).map_err(SurrealStoreError::from)
     }
 
+    pub async fn backup_raw_events(&self) -> Result<Vec<serde_json::Value>, SurrealStoreError> {
+        let mut response = self
+            .db
+            .query("SELECT * FROM nostr_event ORDER BY created_at ASC, event_id ASC;")
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
     pub async fn index_event_tags(&self, event: &Event) -> Result<(), SurrealStoreError> {
         self.db
             .query("DELETE event_tag_index WHERE event_id = $event_id;")
@@ -6430,6 +6441,12 @@ mod tests {
                 .await
                 .expect("deleted rows")
                 .is_empty()
+        );
+        let backup_rows = store.backup_raw_events().await.expect("backup rows");
+        assert!(
+            backup_rows
+                .iter()
+                .any(|row| row["event_id"] == first.id().as_str())
         );
     }
 

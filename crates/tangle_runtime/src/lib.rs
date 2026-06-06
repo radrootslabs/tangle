@@ -10,11 +10,12 @@ use axum::{
 use core::fmt;
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs,
     net::SocketAddr,
-    path::Path as FsPath,
+    path::{Path as FsPath, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -853,6 +854,189 @@ pub async fn export_events_to_path(
     Ok(RuntimeEventExportReport::new(rows.len() as u64))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeBackupReport {
+    output_dir: PathBuf,
+    raw_events_path: PathBuf,
+    raw_event_count: u64,
+    raw_events_sha256: String,
+    manifest_path: PathBuf,
+    manifest_sha256: String,
+    surrealdb_export_available: bool,
+}
+
+impl RuntimeBackupReport {
+    pub fn new(
+        output_dir: PathBuf,
+        raw_events_path: PathBuf,
+        raw_event_count: u64,
+        raw_events_sha256: String,
+        manifest_path: PathBuf,
+        manifest_sha256: String,
+        surrealdb_export_available: bool,
+    ) -> Self {
+        Self {
+            output_dir,
+            raw_events_path,
+            raw_event_count,
+            raw_events_sha256,
+            manifest_path,
+            manifest_sha256,
+            surrealdb_export_available,
+        }
+    }
+
+    pub fn output_dir(&self) -> &FsPath {
+        &self.output_dir
+    }
+
+    pub fn raw_events_path(&self) -> &FsPath {
+        &self.raw_events_path
+    }
+
+    pub fn raw_event_count(&self) -> u64 {
+        self.raw_event_count
+    }
+
+    pub fn raw_events_sha256(&self) -> &str {
+        &self.raw_events_sha256
+    }
+
+    pub fn manifest_path(&self) -> &FsPath {
+        &self.manifest_path
+    }
+
+    pub fn manifest_sha256(&self) -> &str {
+        &self.manifest_sha256
+    }
+
+    pub fn surrealdb_export_available(&self) -> bool {
+        self.surrealdb_export_available
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RuntimeBackupManifestDocument {
+    format: String,
+    database: RuntimeBackupDatabaseDocument,
+    raw_events: RuntimeBackupArtifactDocument,
+    surrealdb_export: RuntimeBackupOptionalArtifactDocument,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RuntimeBackupDatabaseDocument {
+    namespace: String,
+    database: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RuntimeBackupArtifactDocument {
+    path: String,
+    count: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RuntimeBackupOptionalArtifactDocument {
+    available: bool,
+    path: Option<String>,
+    sha256: Option<String>,
+}
+
+pub async fn backup_runtime_database(
+    config: &TangleRuntimeConfig,
+    output_dir: impl AsRef<FsPath>,
+) -> Result<RuntimeBackupReport, RuntimeCommandError> {
+    let output_dir = output_dir.as_ref();
+    tracing::info!(
+        command = "ops backup",
+        output_dir = output_dir.display().to_string(),
+        "starting runtime backup"
+    );
+    let store = connect_runtime_store(config).await?;
+    let report = backup_runtime_store(config, &store, output_dir).await?;
+    tracing::info!(
+        command = "ops backup",
+        raw_event_count = report.raw_event_count(),
+        raw_events_sha256 = report.raw_events_sha256(),
+        manifest_sha256 = report.manifest_sha256(),
+        "finished runtime backup"
+    );
+    Ok(report)
+}
+
+async fn backup_runtime_store(
+    config: &TangleRuntimeConfig,
+    store: &SurrealStore,
+    output_dir: &FsPath,
+) -> Result<RuntimeBackupReport, RuntimeCommandError> {
+    fs::create_dir_all(output_dir).map_err(|error| {
+        RuntimeCommandError::input(format!(
+            "failed to create backup directory `{}`: {error}",
+            output_dir.display()
+        ))
+    })?;
+    store
+        .apply_plan(&base_migration_plan())
+        .await
+        .map_err(|error| RuntimeCommandError::store(error.to_string()))?;
+    let rows = store
+        .backup_raw_events()
+        .await
+        .map_err(|error| RuntimeCommandError::store(error.to_string()))?;
+    let mut raw_events = String::new();
+    for row in &rows {
+        raw_events.push_str(&runtime_row_string(row, "raw_json")?);
+        raw_events.push('\n');
+    }
+    let raw_events_path = output_dir.join("raw-events.jsonl");
+    fs::write(&raw_events_path, raw_events.as_bytes()).map_err(|error| {
+        RuntimeCommandError::input(format!(
+            "failed to write backup raw events file `{}`: {error}",
+            raw_events_path.display()
+        ))
+    })?;
+    let raw_events_sha256 = sha256_hex(raw_events.as_bytes());
+    let manifest = RuntimeBackupManifestDocument {
+        format: "tangle-backup-v1".to_owned(),
+        database: RuntimeBackupDatabaseDocument {
+            namespace: config.database_config().namespace().to_owned(),
+            database: config.database_config().database().to_owned(),
+        },
+        raw_events: RuntimeBackupArtifactDocument {
+            path: "raw-events.jsonl".to_owned(),
+            count: rows.len() as u64,
+            sha256: raw_events_sha256.clone(),
+        },
+        surrealdb_export: RuntimeBackupOptionalArtifactDocument {
+            available: false,
+            path: None,
+            sha256: None,
+        },
+    };
+    let mut manifest_json = serde_json::to_vec_pretty(&manifest).map_err(|error| {
+        RuntimeCommandError::store(format!("failed to serialize backup manifest: {error}"))
+    })?;
+    manifest_json.push(b'\n');
+    let manifest_path = output_dir.join("manifest.json");
+    fs::write(&manifest_path, &manifest_json).map_err(|error| {
+        RuntimeCommandError::input(format!(
+            "failed to write backup manifest file `{}`: {error}",
+            manifest_path.display()
+        ))
+    })?;
+    let manifest_sha256 = sha256_hex(&manifest_json);
+    Ok(RuntimeBackupReport::new(
+        output_dir.to_path_buf(),
+        raw_events_path,
+        rows.len() as u64,
+        raw_events_sha256,
+        manifest_path,
+        manifest_sha256,
+        false,
+    ))
+}
+
 fn runtime_row_string(
     row: &serde_json::Value,
     field: &'static str,
@@ -861,6 +1045,13 @@ fn runtime_row_string(
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| RuntimeCommandError::store(format!("stored row field `{field}` is invalid")))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4529,10 +4720,10 @@ mod tests {
         EventMessageHandler, GracefulShutdownSignal, ListingsHttpState, LiveEventFanout,
         MetricsHttpState, ReadinessCheckStatus, ReadinessState, RelayConnection,
         RelayConnectionConfig, RelayConnectionId, RelayInfoDocument, ReqMessageHandler,
-        RuntimeCommandErrorKind, RuntimeConfigErrorKind, RuntimeTracingFormat,
-        TANGLE_RELAY_SOFTWARE, TANGLE_RELAY_VERSION, TANGLE_SUPPORTED_NIPS, WebSocketHttpState,
-        health_router, listing_item_document, listing_projection_query, listings_router,
-        load_runtime_config, metrics_router, migrate_runtime_database, parse_listing_query,
+        RuntimeConfigErrorKind, RuntimeTracingFormat, TANGLE_RELAY_SOFTWARE, TANGLE_RELAY_VERSION,
+        TANGLE_SUPPORTED_NIPS, WebSocketHttpState, backup_runtime_store, health_router,
+        listing_item_document, listing_projection_query, listings_router, load_runtime_config,
+        metrics_router, migrate_runtime_database, parse_listing_query,
         parse_marketplace_search_query, parse_runtime_config_json, relay_info_router,
         search_document_query, websocket_router,
     };
@@ -4549,7 +4740,7 @@ mod tests {
         ClientMessage, EventId, PublicKeyHex, RelayMessage, SubscriptionId, UnixTimestamp,
         event_to_value, filter_from_value,
     };
-    use tangle_store::StoredEvent;
+    use tangle_store::{StoreEventOutcome, StoredEvent};
     use tangle_store_surreal::{
         SurrealConnectionConfig, SurrealConnectionMode, SurrealStore, base_migration_plan,
     };
@@ -5176,41 +5367,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_migration_command_rejects_remote_database_modes() {
-        let config = parse_runtime_config_json(
-            r#"{
-                "server": {
-                    "listen_addr": "127.0.0.1:7301",
-                    "relay_url": "ws://127.0.0.1:7301"
-                },
-                "database": {
-                    "mode": "http",
-                    "endpoint": "http://127.0.0.1:8000",
-                    "namespace": "tangle",
-                    "database": "relay"
-                },
-                "auth": {
-                    "challenge_ttl_seconds": 300
-                },
-                "limits": {
-                    "message_rate_limit": {
-                        "limit": 120,
-                        "window_seconds": 60
-                    }
+    async fn runtime_backup_command_writes_manifest_and_raw_event_jsonl() {
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let root = std::env::temp_dir().join(format!(
+            "tangle-runtime-backup-{}-{}",
+            std::process::id(),
+            &listing.id().as_str()[..8]
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let db_path = root.join("db");
+        let backup_path = root.join("backup");
+        std::fs::create_dir_all(&root).expect("runtime root");
+        let config_json = serde_json::json!({
+            "server": {
+                "listen_addr": "127.0.0.1:7301",
+                "relay_url": "ws://127.0.0.1:7301"
+            },
+            "database": {
+                "mode": "rocks_db",
+                "path": db_path.to_str().expect("db path"),
+                "namespace": "tangle_backup",
+                "database": "relay"
+            },
+            "auth": {
+                "challenge_ttl_seconds": 300
+            },
+            "limits": {
+                "message_rate_limit": {
+                    "limit": 120,
+                    "window_seconds": 60
                 }
-            }"#,
+            },
+            "policy": {
+                "approved_sellers": [FixtureKey::Seller.public_key().as_str()]
+            }
+        });
+        let config = parse_runtime_config_json(
+            &serde_json::to_string(&config_json).expect("runtime config JSON"),
         )
         .expect("runtime config");
-
-        let error = migrate_runtime_database(&config)
+        let store = SurrealStore::connect(config.database_config())
             .await
-            .expect_err("remote unsupported");
-
-        assert_eq!(error.kind(), RuntimeCommandErrorKind::Unsupported);
+            .expect("store");
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
         assert_eq!(
-            error.message(),
-            "runtime commands currently support memory or rocksdb SurrealDB configs only"
+            store
+                .store_raw_event(&StoredEvent::new(
+                    listing.clone(),
+                    UnixTimestamp::new(1_714_124_500)
+                ))
+                .await
+                .expect("store raw"),
+            StoreEventOutcome::Inserted
         );
+        let report = backup_runtime_store(&config, &store, &backup_path)
+            .await
+            .expect("backup");
+
+        assert_eq!(report.output_dir(), backup_path.as_path());
+        assert_eq!(
+            report.raw_events_path(),
+            backup_path.join("raw-events.jsonl")
+        );
+        assert_eq!(report.raw_event_count(), 1);
+        assert_eq!(report.raw_events_sha256().len(), 64);
+        assert_eq!(report.manifest_path(), backup_path.join("manifest.json"));
+        assert_eq!(report.manifest_sha256().len(), 64);
+        assert!(!report.surrealdb_export_available());
+        assert_eq!(
+            std::fs::read_to_string(report.raw_events_path()).expect("raw events"),
+            format!("{}\n", event_to_value(&listing))
+        );
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(report.manifest_path()).expect("manifest"),
+        )
+        .expect("manifest JSON");
+        assert_eq!(manifest["format"], "tangle-backup-v1");
+        assert_eq!(manifest["database"]["namespace"], "tangle_backup");
+        assert_eq!(manifest["database"]["database"], "relay");
+        assert_eq!(manifest["raw_events"]["path"], "raw-events.jsonl");
+        assert_eq!(manifest["raw_events"]["count"], 1);
+        assert_eq!(manifest["raw_events"]["sha256"], report.raw_events_sha256());
+        assert_eq!(manifest["surrealdb_export"]["available"], false);
+        assert!(manifest["surrealdb_export"]["path"].is_null());
+        assert!(manifest["surrealdb_export"]["sha256"].is_null());
+
+        assert!(
+            store
+                .raw_event_row(listing.id())
+                .await
+                .expect("raw row")
+                .is_some()
+        );
+        drop(store);
+        std::fs::remove_dir_all(&root).expect("remove runtime root");
     }
 
     #[tokio::test]

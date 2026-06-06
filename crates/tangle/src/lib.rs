@@ -11,7 +11,8 @@ usage:
   tangle run --config PATH
   tangle event import --config PATH --input PATH
   tangle event export --config PATH --output PATH
-  tangle projection rebuild --config PATH";
+  tangle projection rebuild --config PATH
+  tangle ops backup --config PATH --output DIR";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TangleCommand {
@@ -22,6 +23,7 @@ pub enum TangleCommand {
     EventImport,
     EventExport,
     ProjectionRebuild,
+    OpsBackup,
 }
 
 impl TangleCommand {
@@ -34,6 +36,7 @@ impl TangleCommand {
             Self::EventImport => "event import",
             Self::EventExport => "event export",
             Self::ProjectionRebuild => "projection rebuild",
+            Self::OpsBackup => "ops backup",
         }
     }
 
@@ -47,6 +50,7 @@ impl TangleCommand {
                 | Self::EventImport
                 | Self::EventExport
                 | Self::ProjectionRebuild
+                | Self::OpsBackup
         )
     }
 }
@@ -183,6 +187,15 @@ where
                 }
             }
         }
+        "ops" => {
+            let Some(nested) = args.next() else {
+                return Err(TangleCliError::MissingNestedCommand("ops"));
+            };
+            match nested.as_str() {
+                "backup" => TangleCommand::OpsBackup,
+                _ => return Err(TangleCliError::UnknownCommand(format!("ops {nested}"))),
+            }
+        }
         _ => return Err(TangleCliError::UnknownCommand(first)),
     };
     let mut config_path = None;
@@ -231,7 +244,12 @@ where
             argument: "--input".to_owned(),
         });
     }
-    if output_path.is_some() && command != TangleCommand::EventExport {
+    if output_path.is_some()
+        && !matches!(
+            command,
+            TangleCommand::EventExport | TangleCommand::OpsBackup
+        )
+    {
         return Err(TangleCliError::UnexpectedArgument {
             command: command.as_str().to_owned(),
             argument: "--output".to_owned(),
@@ -294,6 +312,18 @@ pub fn projection_rebuild_output(report: tangle_runtime::RuntimeProjectionRebuil
     )
 }
 
+pub fn ops_backup_output(report: &tangle_runtime::RuntimeBackupReport) -> String {
+    format!(
+        "backup directory: {}\nraw events: {}\nraw events sha256: {}\nsurrealdb export available: {}\nmanifest: {}\nmanifest sha256: {}",
+        report.output_dir().display(),
+        report.raw_event_count(),
+        report.raw_events_sha256(),
+        report.surrealdb_export_available(),
+        report.manifest_path().display(),
+        report.manifest_sha256()
+    )
+}
+
 pub async fn migrate_with_config(path: &str) -> Result<String, String> {
     let config = tangle_runtime::load_runtime_config(path).map_err(|error| error.to_string())?;
     initialize_tracing(config.tracing_config())?;
@@ -337,6 +367,16 @@ pub async fn projection_rebuild_with_config(config_path: &str) -> Result<String,
         .await
         .map_err(|error| error.to_string())?;
     Ok(projection_rebuild_output(report))
+}
+
+pub async fn ops_backup_with_config(config_path: &str, output_dir: &str) -> Result<String, String> {
+    let config =
+        tangle_runtime::load_runtime_config(config_path).map_err(|error| error.to_string())?;
+    initialize_tracing(config.tracing_config())?;
+    let report = tangle_runtime::backup_runtime_database(&config, output_dir)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(ops_backup_output(&report))
 }
 
 pub async fn run_with_config(path: &str) -> Result<(), String> {
@@ -389,12 +429,15 @@ mod tests {
     use super::{
         PACKAGE_NAME, PACKAGE_VERSION, TangleCliError, TangleCommand, TangleInvocation,
         event_export_output, event_import_output, initialize_tracing, migrate_output,
-        parse_tangle_command, parse_tangle_invocation, projection_rebuild_output,
-        require_config_path, require_input_path, require_output_path, usage_output, version_output,
+        ops_backup_output, parse_tangle_command, parse_tangle_invocation,
+        projection_rebuild_output, require_config_path, require_input_path, require_output_path,
+        usage_output, version_output,
     };
+    use std::path::PathBuf;
     use tangle_runtime::{
-        RuntimeEventExportReport, RuntimeEventImportReport, RuntimeMigrationReport,
-        RuntimeProjectionRebuildReport, RuntimeTracingConfig, RuntimeTracingFormat,
+        RuntimeBackupReport, RuntimeEventExportReport, RuntimeEventImportReport,
+        RuntimeMigrationReport, RuntimeProjectionRebuildReport, RuntimeTracingConfig,
+        RuntimeTracingFormat,
     };
 
     #[test]
@@ -431,7 +474,7 @@ mod tests {
     fn usage_output_lists_supported_command_model() {
         assert_eq!(
             usage_output(),
-            "usage:\n  tangle [--version]\n  tangle migrate --config PATH\n  tangle run --config PATH\n  tangle event import --config PATH --input PATH\n  tangle event export --config PATH --output PATH\n  tangle projection rebuild --config PATH"
+            "usage:\n  tangle [--version]\n  tangle migrate --config PATH\n  tangle run --config PATH\n  tangle event import --config PATH --input PATH\n  tangle event export --config PATH --output PATH\n  tangle projection rebuild --config PATH\n  tangle ops backup --config PATH --output DIR"
         );
     }
 
@@ -451,6 +494,7 @@ mod tests {
                 vec!["projection", "rebuild"],
                 TangleCommand::ProjectionRebuild,
             ),
+            (vec!["ops", "backup"], TangleCommand::OpsBackup),
         ];
 
         for (args, expected) in cases {
@@ -466,9 +510,32 @@ mod tests {
                         | TangleCommand::EventImport
                         | TangleCommand::EventExport
                         | TangleCommand::ProjectionRebuild
+                        | TangleCommand::OpsBackup
                 )
             );
         }
+    }
+
+    #[test]
+    fn command_model_parses_ops_backup_output_option() {
+        let invocation = parse_tangle_invocation([
+            "ops",
+            "backup",
+            "--config",
+            "runtime.json",
+            "--output",
+            "backup-dir",
+        ])
+        .expect("invocation");
+        assert_eq!(invocation.command(), TangleCommand::OpsBackup);
+        assert_eq!(
+            require_config_path(&invocation).expect("config"),
+            "runtime.json"
+        );
+        assert_eq!(
+            require_output_path(&invocation).expect("output"),
+            "backup-dir"
+        );
     }
 
     #[test]
@@ -561,6 +628,14 @@ mod tests {
             TangleCliError::UnknownCommand("projection bad".to_owned())
         );
         assert_eq!(
+            parse_tangle_command(["ops"]).expect_err("ops nested"),
+            TangleCliError::MissingNestedCommand("ops")
+        );
+        assert_eq!(
+            parse_tangle_command(["ops", "bad"]).expect_err("ops bad"),
+            TangleCliError::UnknownCommand("ops bad".to_owned())
+        );
+        assert_eq!(
             parse_tangle_command(["run", "--extra"]).expect_err("extra"),
             TangleCliError::UnexpectedArgument {
                 command: "run".to_owned(),
@@ -639,6 +714,28 @@ mod tests {
         assert_eq!(
             projection_rebuild_output(RuntimeProjectionRebuildReport::new(4, 3, 2, 1)),
             "events scanned: 4\nevents rebuilt: 3\nlistings projected: 2\nevents skipped: 1"
+        );
+    }
+
+    #[test]
+    fn ops_backup_output_reports_paths_counts_and_checksums() {
+        let report = RuntimeBackupReport::new(
+            PathBuf::from("backup"),
+            PathBuf::from("backup/raw-events.jsonl"),
+            3,
+            "a".repeat(64),
+            PathBuf::from("backup/manifest.json"),
+            "b".repeat(64),
+            false,
+        );
+
+        assert_eq!(
+            ops_backup_output(&report),
+            format!(
+                "backup directory: backup\nraw events: 3\nraw events sha256: {}\nsurrealdb export available: false\nmanifest: backup/manifest.json\nmanifest sha256: {}",
+                "a".repeat(64),
+                "b".repeat(64)
+            )
         );
     }
 }
