@@ -5432,22 +5432,9 @@ mod tests {
             .await
             .expect("project listing");
         store
-            .database()
-            .query(
-                "CREATE relay_user CONTENT {
-                    pubkey: $pubkey,
-                    role: 'seller',
-                    seller_approved: true,
-                    blocked: false,
-                    created_at: 1,
-                    updated_at: 2
-                };",
-            )
-            .bind(("pubkey", seller.as_str()))
+            .set_seller_approved(seller.as_str(), true, UnixTimestamp::new(2))
             .await
-            .expect("seller row")
-            .check()
-            .expect("seller check");
+            .expect("seller row");
 
         let response = listings_router(ListingsHttpState::new(
             store.clone(),
