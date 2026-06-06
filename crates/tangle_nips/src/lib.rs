@@ -5,6 +5,7 @@ use tangle_protocol::{
     AddressCoordinate, DTag, Event, EventId, Filter, PublicKeyHex, TagName, UnixTimestamp,
 };
 
+pub const NIP01_METADATA_KIND: u32 = 0;
 pub const NIP99_PUBLIC_LISTING_KIND: u32 = 30_402;
 pub const NIP99_DRAFT_LISTING_KIND: u32 = 30_403;
 pub const NIP22_COMMENT_KIND: u32 = 1_111;
@@ -1367,6 +1368,141 @@ fn parse_label_targets(event: &Event) -> Result<Vec<LabelTarget>, String> {
     Ok(targets)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SellerProfileMetadata {
+    name: Option<String>,
+    display_name: Option<String>,
+    about: Option<String>,
+    picture: Option<String>,
+    website: Option<String>,
+    nip05: Option<String>,
+    lud16: Option<String>,
+}
+
+impl SellerProfileMetadata {
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    pub fn display_name(&self) -> Option<&str> {
+        self.display_name.as_deref()
+    }
+
+    pub fn about(&self) -> Option<&str> {
+        self.about.as_deref()
+    }
+
+    pub fn picture(&self) -> Option<&str> {
+        self.picture.as_deref()
+    }
+
+    pub fn website(&self) -> Option<&str> {
+        self.website.as_deref()
+    }
+
+    pub fn nip05(&self) -> Option<&str> {
+        self.nip05.as_deref()
+    }
+
+    pub fn lud16(&self) -> Option<&str> {
+        self.lud16.as_deref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SellerProfileEvent {
+    event_id: EventId,
+    pubkey: PublicKeyHex,
+    created_at: UnixTimestamp,
+    metadata: SellerProfileMetadata,
+    regions: Vec<String>,
+    categories: Vec<String>,
+    trust_markers: Vec<String>,
+}
+
+impl SellerProfileEvent {
+    pub fn event_id(&self) -> &EventId {
+        &self.event_id
+    }
+
+    pub fn pubkey(&self) -> &PublicKeyHex {
+        &self.pubkey
+    }
+
+    pub fn created_at(&self) -> UnixTimestamp {
+        self.created_at
+    }
+
+    pub fn metadata(&self) -> &SellerProfileMetadata {
+        &self.metadata
+    }
+
+    pub fn regions(&self) -> &[String] {
+        &self.regions
+    }
+
+    pub fn categories(&self) -> &[String] {
+        &self.categories
+    }
+
+    pub fn trust_markers(&self) -> &[String] {
+        &self.trust_markers
+    }
+}
+
+pub fn parse_seller_profile_event(event: &Event) -> Result<Option<SellerProfileEvent>, String> {
+    if event.unsigned().kind().as_u32() != NIP01_METADATA_KIND {
+        return Ok(None);
+    }
+    let metadata = parse_seller_profile_metadata(event.unsigned().content())?;
+    Ok(Some(SellerProfileEvent {
+        event_id: event.id().clone(),
+        pubkey: event.unsigned().pubkey().clone(),
+        created_at: event.unsigned().created_at(),
+        metadata,
+        regions: collect_normalized_tag_values(event, "region", "seller profile region")?,
+        categories: collect_normalized_tag_values(event, "category", "seller profile category")?,
+        trust_markers: collect_normalized_tag_values(event, "trust", "seller profile trust")?,
+    }))
+}
+
+fn parse_seller_profile_metadata(content: &str) -> Result<SellerProfileMetadata, String> {
+    let value = serde_json::from_str::<serde_json::Value>(content)
+        .map_err(|error| format!("seller profile metadata JSON is invalid: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "seller profile metadata must be a JSON object".to_owned())?;
+    Ok(SellerProfileMetadata {
+        name: optional_metadata_string(object, "name")?,
+        display_name: optional_metadata_string(object, "display_name")?,
+        about: optional_metadata_string(object, "about")?,
+        picture: optional_metadata_string(object, "picture")?,
+        website: optional_metadata_string(object, "website")?,
+        nip05: optional_metadata_string(object, "nip05")?,
+        lud16: optional_metadata_string(object, "lud16")?,
+    })
+}
+
+fn optional_metadata_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+) -> Result<Option<String>, String> {
+    match object.get(field) {
+        Some(value) if value.is_null() => Ok(None),
+        Some(value) => {
+            let value = value
+                .as_str()
+                .ok_or_else(|| format!("seller profile metadata `{field}` must be a string"))?
+                .trim();
+            if value.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(value.to_owned()))
+        }
+        None => Ok(None),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListingKind {
     Public,
@@ -2121,16 +2257,17 @@ fn listing_kind_for_event(event: &Event) -> Option<ListingKind> {
 mod tests {
     use super::{
         CommentTarget, DeletionTarget, FulfillmentMethod, LabelTarget, ListingEffectiveStatus,
-        ListingKind, ListingProjectionEvaluation, ListingUnit, LongFormKind, NIP7D_THREAD_KIND,
-        NIP22_COMMENT_KIND, NIP23_LONG_FORM_DRAFT_KIND, NIP23_LONG_FORM_KIND, NIP25_REACTION_KIND,
-        NIP32_LABEL_KIND, NIP56_REPORT_KIND, NIP99_PUBLIC_LISTING_KIND, ReactionValue,
-        ReportTarget, ReportType, evaluate_listing_projection, matching_tags, optional_tag_value,
-        optional_tag_values, parse_comment_event, parse_deletion_request, parse_forum_thread_event,
-        parse_label_event, parse_listing_fulfillment, parse_listing_identity,
-        parse_listing_location, parse_listing_price, parse_listing_status, parse_listing_taxonomy,
-        parse_listing_text, parse_listing_unit, parse_long_form_event, parse_nip50_filter_search,
-        parse_nip50_search, parse_reaction_event, parse_relay_auth_event, parse_report_event,
-        parse_required_u64_tag, parse_u64_field, repeated_or_missing_policy_boundary,
+        ListingKind, ListingProjectionEvaluation, ListingUnit, LongFormKind, NIP01_METADATA_KIND,
+        NIP7D_THREAD_KIND, NIP22_COMMENT_KIND, NIP23_LONG_FORM_DRAFT_KIND, NIP23_LONG_FORM_KIND,
+        NIP25_REACTION_KIND, NIP32_LABEL_KIND, NIP56_REPORT_KIND, NIP99_PUBLIC_LISTING_KIND,
+        ReactionValue, ReportTarget, ReportType, evaluate_listing_projection, matching_tags,
+        optional_tag_value, optional_tag_values, parse_comment_event, parse_deletion_request,
+        parse_forum_thread_event, parse_label_event, parse_listing_fulfillment,
+        parse_listing_identity, parse_listing_location, parse_listing_price, parse_listing_status,
+        parse_listing_taxonomy, parse_listing_text, parse_listing_unit, parse_long_form_event,
+        parse_nip50_filter_search, parse_nip50_search, parse_reaction_event,
+        parse_relay_auth_event, parse_report_event, parse_required_u64_tag,
+        parse_seller_profile_event, parse_u64_field, repeated_or_missing_policy_boundary,
         required_tag_value, required_tag_values, single_letter_tag_values,
         single_letter_values_for, tag_count,
     };
@@ -3260,6 +3397,113 @@ mod tests {
             "farmstand tomatoes"
         );
         assert_eq!(parse_nip50_filter_search(&missing), Ok(None));
+    }
+
+    #[test]
+    fn seller_profile_parser_extracts_metadata_tags_and_trust_markers() {
+        let event = event_with_kind_tags_and_content(
+            u64::from(NIP01_METADATA_KIND),
+            vec![
+                Tag::from_parts("region", &[" Vancouver Island "]).expect("region"),
+                Tag::from_parts("category", &["Vegetables"]).expect("category"),
+                Tag::from_parts("category", &[" vegetables "]).expect("category duplicate"),
+                Tag::from_parts("trust", &["verified-local"]).expect("trust"),
+            ],
+            r#"{
+                "name": "sunrise-farm",
+                "display_name": "Sunrise Farm",
+                "about": "Certified organic farm stand.",
+                "picture": "https://radroots.test/sunrise.jpg",
+                "website": "https://sunrise.radroots.test",
+                "nip05": "sunrise@radroots.test",
+                "lud16": "sunrise@wallet.radroots.test"
+            }"#,
+        );
+
+        let profile = parse_seller_profile_event(&event)
+            .expect("parse")
+            .expect("profile");
+
+        assert_eq!(profile.event_id(), event.id());
+        assert_eq!(profile.pubkey(), event.unsigned().pubkey());
+        assert_eq!(profile.created_at(), event.unsigned().created_at());
+        assert_eq!(profile.metadata().name(), Some("sunrise-farm"));
+        assert_eq!(profile.metadata().display_name(), Some("Sunrise Farm"));
+        assert_eq!(
+            profile.metadata().about(),
+            Some("Certified organic farm stand.")
+        );
+        assert_eq!(
+            profile.metadata().picture(),
+            Some("https://radroots.test/sunrise.jpg")
+        );
+        assert_eq!(
+            profile.metadata().website(),
+            Some("https://sunrise.radroots.test")
+        );
+        assert_eq!(profile.metadata().nip05(), Some("sunrise@radroots.test"));
+        assert_eq!(
+            profile.metadata().lud16(),
+            Some("sunrise@wallet.radroots.test")
+        );
+        assert_eq!(profile.regions(), &["vancouver island".to_owned()]);
+        assert_eq!(profile.categories(), &["vegetables".to_owned()]);
+        assert_eq!(profile.trust_markers(), &["verified-local".to_owned()]);
+    }
+
+    #[test]
+    fn seller_profile_parser_ignores_other_kinds_and_trims_empty_metadata() {
+        let profile = event_with_kind_tags_and_content(
+            u64::from(NIP01_METADATA_KIND),
+            Vec::new(),
+            r#"{"name":"   ","display_name":null,"about":"  Market seller.  "}"#,
+        );
+        let note = event_with_kind_tags_and_content(1, Vec::new(), r#"{"name":"not-a-profile"}"#);
+
+        let profile = parse_seller_profile_event(&profile)
+            .expect("parse")
+            .expect("profile");
+
+        assert_eq!(profile.metadata().name(), None);
+        assert_eq!(profile.metadata().display_name(), None);
+        assert_eq!(profile.metadata().about(), Some("Market seller."));
+        assert_eq!(parse_seller_profile_event(&note), Ok(None));
+    }
+
+    #[test]
+    fn seller_profile_parser_rejects_bad_metadata_and_tags() {
+        let invalid_json =
+            event_with_kind_tags_and_content(u64::from(NIP01_METADATA_KIND), Vec::new(), "{");
+        let non_object =
+            event_with_kind_tags_and_content(u64::from(NIP01_METADATA_KIND), Vec::new(), "[]");
+        let non_string = event_with_kind_tags_and_content(
+            u64::from(NIP01_METADATA_KIND),
+            Vec::new(),
+            r#"{"name":1}"#,
+        );
+        let empty_region = event_with_kind_tags_and_content(
+            u64::from(NIP01_METADATA_KIND),
+            vec![Tag::from_parts("region", &[" "]).expect("region")],
+            "{}",
+        );
+
+        assert!(
+            parse_seller_profile_event(&invalid_json)
+                .expect_err("invalid json")
+                .contains("seller profile metadata JSON is invalid")
+        );
+        assert_eq!(
+            parse_seller_profile_event(&non_object).expect_err("non object"),
+            "seller profile metadata must be a JSON object"
+        );
+        assert_eq!(
+            parse_seller_profile_event(&non_string).expect_err("non string"),
+            "seller profile metadata `name` must be a string"
+        );
+        assert_eq!(
+            parse_seller_profile_event(&empty_region).expect_err("empty region"),
+            "seller profile region value must not be empty"
+        );
     }
 
     #[test]
