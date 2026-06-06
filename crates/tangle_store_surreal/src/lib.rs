@@ -4,7 +4,8 @@ use core::fmt;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use surrealdb::Surreal;
-use surrealdb::engine::local::{Db, Mem, RocksDb};
+use surrealdb::engine::any::{Any, connect as connect_any};
+use surrealdb::opt::auth::Root;
 use tangle_nips::{
     CommentEvent, DeletionTarget, ForumThreadEvent, LabelEvent, ListingProjection,
     ListingProjectionEvaluation, LongFormEvent, LongFormKind, NIP99_DRAFT_LISTING_KIND,
@@ -29,6 +30,7 @@ pub struct SurrealConnectionConfig {
     mode: SurrealConnectionMode,
     namespace: String,
     database: String,
+    root_credentials: Option<SurrealRootCredentials>,
 }
 
 impl SurrealConnectionConfig {
@@ -83,6 +85,19 @@ impl SurrealConnectionConfig {
         &self.database
     }
 
+    pub fn root_credentials(&self) -> Option<&SurrealRootCredentials> {
+        self.root_credentials.as_ref()
+    }
+
+    pub fn with_root_credentials(
+        mut self,
+        username: &str,
+        password: &str,
+    ) -> Result<Self, SurrealConfigError> {
+        self.root_credentials = Some(SurrealRootCredentials::new(username, password)?);
+        Ok(self)
+    }
+
     fn new(
         mode: SurrealConnectionMode,
         namespace: &str,
@@ -92,7 +107,31 @@ impl SurrealConnectionConfig {
             mode,
             namespace: normalized_identifier(namespace, "namespace")?,
             database: normalized_identifier(database, "database")?,
+            root_credentials: None,
         })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurrealRootCredentials {
+    username: String,
+    password: String,
+}
+
+impl SurrealRootCredentials {
+    pub fn new(username: &str, password: &str) -> Result<Self, SurrealConfigError> {
+        Ok(Self {
+            username: normalized_secret(username, "username")?,
+            password: normalized_secret(password, "password")?,
+        })
+    }
+
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub fn password(&self) -> &str {
+        &self.password
     }
 }
 
@@ -203,6 +242,20 @@ fn normalized_endpoint(value: &str, field: &str) -> Result<String, SurrealConfig
         )));
     }
     Ok(trimmed.to_owned())
+}
+
+fn normalized_secret(value: &str, field: &str) -> Result<String, SurrealConfigError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(SurrealConfigError::new(&format!(
+            "surreal root {field} must not be empty"
+        )));
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn rocksdb_endpoint(path: &str) -> String {
+    format!("rocksdb://{path}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1421,7 +1474,7 @@ impl SellerProfileQuery {
 
 #[derive(Clone)]
 pub struct SurrealStore {
-    db: Surreal<Db>,
+    db: Surreal<Any>,
 }
 
 impl fmt::Debug for SurrealStore {
@@ -1433,13 +1486,25 @@ impl fmt::Debug for SurrealStore {
 }
 
 impl SurrealStore {
+    pub async fn connect(config: &SurrealConnectionConfig) -> Result<Self, SurrealStoreError> {
+        match config.mode() {
+            SurrealConnectionMode::Memory | SurrealConnectionMode::RocksDb { .. } => {
+                Self::connect_local(config).await
+            }
+            SurrealConnectionMode::Http { endpoint }
+            | SurrealConnectionMode::WebSocket { endpoint } => {
+                Self::connect_remote(config, endpoint).await
+            }
+        }
+    }
+
     pub async fn connect_local(
         config: &SurrealConnectionConfig,
     ) -> Result<Self, SurrealStoreError> {
         match config.mode() {
             SurrealConnectionMode::Memory => Self::connect_memory(config).await,
             SurrealConnectionMode::RocksDb { path } => {
-                let db = Surreal::new::<RocksDb>(path)
+                let db = connect_any(rocksdb_endpoint(path))
                     .await
                     .map_err(SurrealStoreError::from)?;
                 db.use_ns(config.namespace())
@@ -1464,7 +1529,7 @@ impl SurrealStore {
                 "surreal memory connection requires memory mode config",
             ));
         }
-        let db = Surreal::new::<Mem>(())
+        let db = connect_any("memory")
             .await
             .map_err(SurrealStoreError::from)?;
         db.use_ns(config.namespace())
@@ -1474,7 +1539,30 @@ impl SurrealStore {
         Ok(Self { db })
     }
 
-    pub fn database(&self) -> &Surreal<Db> {
+    async fn connect_remote(
+        config: &SurrealConnectionConfig,
+        endpoint: &str,
+    ) -> Result<Self, SurrealStoreError> {
+        let credentials = config.root_credentials().ok_or_else(|| {
+            SurrealStoreError::new("surreal remote connection requires root credentials")
+        })?;
+        let db = connect_any(endpoint)
+            .await
+            .map_err(SurrealStoreError::from)?;
+        db.signin(Root {
+            username: credentials.username().to_owned(),
+            password: credentials.password().to_owned(),
+        })
+        .await
+        .map_err(SurrealStoreError::from)?;
+        db.use_ns(config.namespace())
+            .use_db(config.database())
+            .await
+            .map_err(SurrealStoreError::from)?;
+        Ok(Self { db })
+    }
+
+    pub fn database(&self) -> &Surreal<Any> {
         &self.db
     }
 
@@ -5228,7 +5316,9 @@ mod tests {
         let rocksdb = SurrealConnectionConfig::rocksdb(" /tmp/tangle-rocksdb ", "ns", "db")
             .expect("rocksdb config");
         let http = SurrealConnectionConfig::http(" http://127.0.0.1:8000 ", "ns", "db")
-            .expect("http config");
+            .expect("http config")
+            .with_root_credentials(" root ", " root ")
+            .expect("http credentials");
         let websocket = SurrealConnectionConfig::websocket(" ws://127.0.0.1:8000 ", "ns", "db")
             .expect("websocket config");
 
@@ -5244,6 +5334,9 @@ mod tests {
                 endpoint: "http://127.0.0.1:8000".to_owned()
             }
         );
+        let credentials = http.root_credentials().expect("http credentials");
+        assert_eq!(credentials.username(), "root");
+        assert_eq!(credentials.password(), "root");
         assert_eq!(
             websocket.mode(),
             &SurrealConnectionMode::WebSocket {
@@ -5283,6 +5376,22 @@ mod tests {
                 .expect_err("websocket endpoint error")
                 .to_string(),
             "surreal websocket endpoint must not be empty"
+        );
+        assert_eq!(
+            SurrealConnectionConfig::http("http://127.0.0.1:8000", "ns", "db")
+                .expect("http config")
+                .with_root_credentials("", "root")
+                .expect_err("username error")
+                .to_string(),
+            "surreal root username must not be empty"
+        );
+        assert_eq!(
+            SurrealConnectionConfig::http("http://127.0.0.1:8000", "ns", "db")
+                .expect("http config")
+                .with_root_credentials("root", " ")
+                .expect_err("password error")
+                .to_string(),
+            "surreal root password must not be empty"
         );
     }
 
@@ -5398,6 +5507,20 @@ mod tests {
         assert_eq!(
             local_error.message(),
             "surreal local connection requires memory or rocksdb mode config"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_connection_requires_root_credentials_before_network_use() {
+        let config =
+            SurrealConnectionConfig::http("http://127.0.0.1:8000", "ns", "db").expect("config");
+        let error = SurrealStore::connect(&config)
+            .await
+            .expect_err("missing credentials");
+
+        assert_eq!(
+            error.message(),
+            "surreal remote connection requires root credentials"
         );
     }
 

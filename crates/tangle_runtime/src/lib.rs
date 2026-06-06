@@ -39,8 +39,8 @@ use tangle_store_surreal::{
     ForumThreadProjectionOutcome, ForumThreadProjectionQuery, LabelProjectionOutcome,
     LabelProjectionQuery, ListingProjectionQuery, LongFormProjectionOutcome, MigrationApplyOutcome,
     ReactionProjectionOutcome, ReportProjectionOutcome, ReportProjectionQuery, SearchDocumentQuery,
-    SellerProfileProjectionOutcome, SurrealConnectionConfig, SurrealConnectionMode,
-    SurrealMetricsSnapshot, SurrealStore, base_migration_plan,
+    SellerProfileProjectionOutcome, SurrealConnectionConfig, SurrealMetricsSnapshot, SurrealStore,
+    base_migration_plan,
 };
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -1065,18 +1065,9 @@ pub async fn run_runtime_server(
 async fn connect_runtime_store(
     config: &TangleRuntimeConfig,
 ) -> Result<SurrealStore, RuntimeCommandError> {
-    match config.database_config().mode() {
-        SurrealConnectionMode::Memory | SurrealConnectionMode::RocksDb { .. } => {
-            SurrealStore::connect_local(config.database_config())
-                .await
-                .map_err(|error| RuntimeCommandError::store(error.to_string()))
-        }
-        SurrealConnectionMode::Http { .. } | SurrealConnectionMode::WebSocket { .. } => {
-            Err(RuntimeCommandError::unsupported(
-                "runtime commands currently support memory or rocksdb SurrealDB configs only",
-            ))
-        }
-    }
+    SurrealStore::connect(config.database_config())
+        .await
+        .map_err(|error| RuntimeCommandError::store(error.to_string()))
 }
 
 #[derive(Clone)]
@@ -1671,6 +1662,8 @@ struct RuntimeDatabaseConfigDocument {
     mode: RuntimeDatabaseModeDocument,
     endpoint: Option<String>,
     path: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
     namespace: String,
     database: String,
 }
@@ -1832,6 +1825,11 @@ fn database_config_from_document(
                     "database.path must be omitted for memory mode",
                 ));
             }
+            if document.username.is_some() || document.password.is_some() {
+                return Err(RuntimeConfigError::invalid(
+                    "database credentials must be omitted for memory mode",
+                ));
+            }
             SurrealConnectionConfig::memory(&document.namespace, &document.database)
         }
         RuntimeDatabaseModeDocument::RocksDb => {
@@ -1840,22 +1838,33 @@ fn database_config_from_document(
                     "database.endpoint must be omitted for rocksdb mode",
                 ));
             }
+            if document.username.is_some() || document.password.is_some() {
+                return Err(RuntimeConfigError::invalid(
+                    "database credentials must be omitted for rocksdb mode",
+                ));
+            }
             SurrealConnectionConfig::rocksdb(
                 &required_path(document.path, "rocksdb")?,
                 &document.namespace,
                 &document.database,
             )
         }
-        RuntimeDatabaseModeDocument::Http => SurrealConnectionConfig::http(
-            &required_endpoint(document.endpoint, "http")?,
-            &document.namespace,
-            &document.database,
-        ),
-        RuntimeDatabaseModeDocument::WebSocket => SurrealConnectionConfig::websocket(
-            &required_endpoint(document.endpoint, "websocket")?,
-            &document.namespace,
-            &document.database,
-        ),
+        RuntimeDatabaseModeDocument::Http => {
+            let endpoint = required_endpoint(document.endpoint, "http")?;
+            let username = required_database_credential(document.username, "username", "http")?;
+            let password = required_database_credential(document.password, "password", "http")?;
+            SurrealConnectionConfig::http(&endpoint, &document.namespace, &document.database)
+                .and_then(|config| config.with_root_credentials(&username, &password))
+        }
+        RuntimeDatabaseModeDocument::WebSocket => {
+            let endpoint = required_endpoint(document.endpoint, "websocket")?;
+            let username =
+                required_database_credential(document.username, "username", "websocket")?;
+            let password =
+                required_database_credential(document.password, "password", "websocket")?;
+            SurrealConnectionConfig::websocket(&endpoint, &document.namespace, &document.database)
+                .and_then(|config| config.with_root_credentials(&username, &password))
+        }
     }
     .map_err(|error| RuntimeConfigError::invalid(error.to_string()))
 }
@@ -1869,6 +1878,16 @@ fn required_endpoint(value: Option<String>, mode: &str) -> Result<String, Runtim
 fn required_path(value: Option<String>, mode: &str) -> Result<String, RuntimeConfigError> {
     value.ok_or_else(|| {
         RuntimeConfigError::invalid(format!("database.path is required for {mode} mode"))
+    })
+}
+
+fn required_database_credential(
+    value: Option<String>,
+    field: &str,
+    mode: &str,
+) -> Result<String, RuntimeConfigError> {
+    value.ok_or_else(|| {
+        RuntimeConfigError::invalid(format!("database.{field} is required for {mode} mode"))
     })
 }
 
@@ -4838,6 +4857,8 @@ mod tests {
                 "database": {
                     "mode": "web_socket",
                     "endpoint": "ws://127.0.0.1:8000",
+                    "username": "root",
+                    "password": "root",
                     "namespace": "tangle",
                     "database": "relay"
                 },
@@ -4860,7 +4881,44 @@ mod tests {
                 endpoint: "ws://127.0.0.1:8000".to_owned()
             }
         );
+        let credentials = config
+            .database_config()
+            .root_credentials()
+            .expect("root credentials");
+        assert_eq!(credentials.username(), "root");
+        assert_eq!(credentials.password(), "root");
         assert_eq!(config.limits(), RuntimeLimits::default());
+    }
+
+    #[test]
+    fn runtime_config_loader_parses_local_surrealdb_stack_config() {
+        let config = parse_runtime_config_json(include_str!(
+            "../../../ops/local/surrealdb/tangle-runtime.json"
+        ))
+        .expect("local stack config");
+
+        assert_eq!(config.listen_addr().to_string(), "127.0.0.1:7000");
+        assert_eq!(
+            config.database_config().mode(),
+            &SurrealConnectionMode::Http {
+                endpoint: "http://127.0.0.1:8000".to_owned()
+            }
+        );
+        let credentials = config
+            .database_config()
+            .root_credentials()
+            .expect("root credentials");
+        assert_eq!(credentials.username(), "root");
+        assert_eq!(credentials.password(), "root");
+        assert_eq!(config.database_config().namespace(), "tangle_local");
+        assert_eq!(config.database_config().database(), "relay");
+        assert!(config.tracing_config().enabled());
+        assert_eq!(config.tracing_config().format(), RuntimeTracingFormat::Json);
+        assert_eq!(
+            config.durable_write_rate_limit(),
+            Some(RateLimitConfig::new(60, 60).expect("write limit"))
+        );
+        assert!(config.admission_policy().require_write_auth());
     }
 
     #[test]
@@ -4953,6 +5011,30 @@ mod tests {
             }"#,
         )
         .expect_err("endpoint");
+        let missing_credentials = parse_runtime_config_json(
+            r#"{
+                "server": {
+                    "listen_addr": "127.0.0.1:7000",
+                    "relay_url": "ws://127.0.0.1:7000"
+                },
+                "database": {
+                    "mode": "http",
+                    "endpoint": "http://127.0.0.1:8000",
+                    "namespace": "tangle",
+                    "database": "relay"
+                },
+                "auth": {
+                    "challenge_ttl_seconds": 300
+                },
+                "limits": {
+                    "message_rate_limit": {
+                        "limit": 120,
+                        "window_seconds": 60
+                    }
+                }
+            }"#,
+        )
+        .expect_err("credentials");
         let empty_tracing_filter = parse_runtime_config_json(
             r#"{
                 "server": {
@@ -4999,6 +5081,11 @@ mod tests {
         assert_eq!(
             missing_endpoint.message(),
             "database.endpoint is required for http mode"
+        );
+        assert_eq!(missing_credentials.kind(), RuntimeConfigErrorKind::Invalid);
+        assert_eq!(
+            missing_credentials.message(),
+            "database.username is required for http mode"
         );
         assert_eq!(empty_tracing_filter.kind(), RuntimeConfigErrorKind::Invalid);
         assert_eq!(
