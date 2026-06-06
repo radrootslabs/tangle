@@ -695,6 +695,58 @@ pub enum SearchDocumentOutcome {
     Indexed,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListingProjectionQuery {
+    effective_status: Option<String>,
+    seller_pubkey: Option<String>,
+    unit: Option<String>,
+    currency_norm: Option<String>,
+    min_price_minor: Option<i64>,
+    max_price_minor: Option<i64>,
+    limit: Option<u64>,
+}
+
+impl ListingProjectionQuery {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_effective_status(mut self, value: &str) -> Self {
+        self.effective_status = Some(value.to_owned());
+        self
+    }
+
+    pub fn with_seller_pubkey(mut self, value: &str) -> Self {
+        self.seller_pubkey = Some(value.to_owned());
+        self
+    }
+
+    pub fn with_unit(mut self, value: &str) -> Self {
+        self.unit = Some(value.to_owned());
+        self
+    }
+
+    pub fn with_currency_norm(mut self, value: &str) -> Self {
+        self.currency_norm = Some(value.to_owned());
+        self
+    }
+
+    pub fn with_min_price_minor(mut self, value: i64) -> Self {
+        self.min_price_minor = Some(value);
+        self
+    }
+
+    pub fn with_max_price_minor(mut self, value: i64) -> Self {
+        self.max_price_minor = Some(value);
+        self
+    }
+
+    pub fn with_limit(mut self, value: u64) -> Self {
+        self.limit = Some(value);
+        self
+    }
+}
+
 #[derive(Clone)]
 pub struct SurrealStore {
     db: Surreal<Db>,
@@ -1443,6 +1495,65 @@ UPSERT type::record('listing_current', $listing_key) CONTENT {
             .db
             .query("SELECT * FROM ONLY type::record('listing_current', $listing_key);")
             .bind(("listing_key", listing_key))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
+    pub async fn query_current_listings(
+        &self,
+        query: &ListingProjectionQuery,
+    ) -> Result<Vec<serde_json::Value>, SurrealStoreError> {
+        let mut statement =
+            "SELECT * FROM listing_current WHERE hidden = false AND deleted = false".to_owned();
+        if query.effective_status.is_some() {
+            statement.push_str(" AND effective_status = $effective_status");
+        }
+        if query.seller_pubkey.is_some() {
+            statement.push_str(" AND seller_pubkey = $seller_pubkey");
+        }
+        if query.unit.is_some() {
+            statement.push_str(" AND unit = $unit");
+        }
+        if query.currency_norm.is_some() {
+            statement.push_str(" AND currency_norm = $currency_norm");
+        }
+        if query.min_price_minor.is_some() {
+            statement.push_str(" AND price_minor >= $min_price_minor");
+        }
+        if query.max_price_minor.is_some() {
+            statement.push_str(" AND price_minor <= $max_price_minor");
+        }
+        statement.push_str(" ORDER BY updated_at DESC, event_id ASC");
+        if query.limit.is_some() {
+            statement.push_str(" LIMIT $limit");
+        }
+        statement.push(';');
+        let mut surreal_query = self.db.query(statement);
+        if let Some(value) = &query.effective_status {
+            surreal_query = surreal_query.bind(("effective_status", value.as_str()));
+        }
+        if let Some(value) = &query.seller_pubkey {
+            surreal_query = surreal_query.bind(("seller_pubkey", value.as_str()));
+        }
+        if let Some(value) = &query.unit {
+            surreal_query = surreal_query.bind(("unit", value.as_str()));
+        }
+        if let Some(value) = &query.currency_norm {
+            surreal_query = surreal_query.bind(("currency_norm", value.as_str()));
+        }
+        if let Some(value) = query.min_price_minor {
+            surreal_query = surreal_query.bind(("min_price_minor", value));
+        }
+        if let Some(value) = query.max_price_minor {
+            surreal_query = surreal_query.bind(("max_price_minor", value));
+        }
+        if let Some(value) = query.limit {
+            surreal_query = surreal_query.bind(("limit", value));
+        }
+        let mut response = surreal_query
             .await
             .map_err(SurrealStoreError::from)?
             .check()
@@ -2207,9 +2318,10 @@ impl From<surrealdb::Error> for SurrealStoreError {
 mod tests {
     use super::{
         CurrentEventOutcome, DeletionMarkerOutcome, ListingCurrentOutcome, ListingHelperOutcome,
-        ListingRevisionOutcome, MigrationApplyOutcome, SearchDocumentOutcome, SurrealConfigError,
-        SurrealConnectionConfig, SurrealConnectionMode, SurrealMigration, SurrealMigrationError,
-        SurrealMigrationPlan, SurrealStore, base_migration_plan, migration_tracking_schema,
+        ListingProjectionQuery, ListingRevisionOutcome, MigrationApplyOutcome,
+        SearchDocumentOutcome, SurrealConfigError, SurrealConnectionConfig, SurrealConnectionMode,
+        SurrealMigration, SurrealMigrationError, SurrealMigrationPlan, SurrealStore,
+        base_migration_plan, migration_tracking_schema,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -3691,6 +3803,65 @@ mod tests {
                 .await
                 .expect("invalid row")
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn query_current_listings_applies_projection_filters() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let listing_key = format!("30402:{}:listing-a", listing.unsigned().pubkey().as_str());
+        store
+            .project_current_listing(&listing, UnixTimestamp::new(1_714_125_400))
+            .await
+            .expect("project listing");
+
+        let query = ListingProjectionQuery::new()
+            .with_effective_status("active")
+            .with_seller_pubkey(listing.unsigned().pubkey().as_str())
+            .with_unit("lb")
+            .with_currency_norm("USD")
+            .with_min_price_minor(1_000)
+            .with_max_price_minor(2_000)
+            .with_limit(5);
+        let rows = store
+            .query_current_listings(&query)
+            .await
+            .expect("listing query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["listing_key"], listing_key);
+
+        let no_match = ListingProjectionQuery::new()
+            .with_effective_status("active")
+            .with_min_price_minor(2_000);
+        assert!(
+            store
+                .query_current_listings(&no_match)
+                .await
+                .expect("no match")
+                .is_empty()
+        );
+
+        store
+            .database()
+            .query("UPDATE listing_current SET hidden = true WHERE listing_key = $listing_key;")
+            .bind(("listing_key", listing_key.as_str()))
+            .await
+            .expect("hide listing")
+            .check()
+            .expect("hide check");
+        assert!(
+            store
+                .query_current_listings(
+                    &ListingProjectionQuery::new().with_effective_status("active")
+                )
+                .await
+                .expect("hidden query")
+                .is_empty()
         );
     }
 
