@@ -284,6 +284,7 @@ pub fn base_migration_plan() -> SurrealMigrationPlan {
         current_event_schema(),
         deletion_marker_schema(),
         listing_revision_schema(),
+        listing_current_schema(),
     ])
     .expect("base migration plan is strictly ordered")
 }
@@ -408,6 +409,64 @@ DEFINE INDEX IF NOT EXISTS listing_revision_seller_created ON TABLE listing_revi
 "#,
     )
     .expect("listing revision schema is valid")
+}
+
+pub fn listing_current_schema() -> SurrealMigration {
+    SurrealMigration::new(
+        "0007_listing_current",
+        r#"
+DEFINE TABLE IF NOT EXISTS listing_current SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS listing_key ON TABLE listing_current TYPE string;
+DEFINE FIELD IF NOT EXISTS listing_key_hash ON TABLE listing_current TYPE string;
+DEFINE FIELD IF NOT EXISTS event_id ON TABLE listing_current TYPE string;
+DEFINE FIELD IF NOT EXISTS seller_pubkey ON TABLE listing_current TYPE string;
+DEFINE FIELD IF NOT EXISTS d ON TABLE listing_current TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON TABLE listing_current TYPE int;
+DEFINE FIELD IF NOT EXISTS updated_at ON TABLE listing_current TYPE int;
+DEFINE FIELD IF NOT EXISTS published_at ON TABLE listing_current TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS title ON TABLE listing_current TYPE string;
+DEFINE FIELD IF NOT EXISTS summary ON TABLE listing_current TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS content ON TABLE listing_current TYPE string;
+DEFINE FIELD IF NOT EXISTS price_decimal ON TABLE listing_current TYPE string;
+DEFINE FIELD IF NOT EXISTS price_minor ON TABLE listing_current TYPE int;
+DEFINE FIELD IF NOT EXISTS currency_raw ON TABLE listing_current TYPE string;
+DEFINE FIELD IF NOT EXISTS currency_norm ON TABLE listing_current TYPE string;
+DEFINE FIELD IF NOT EXISTS price_frequency ON TABLE listing_current TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS unit ON TABLE listing_current TYPE string;
+DEFINE FIELD IF NOT EXISTS unit_family ON TABLE listing_current TYPE string;
+DEFINE FIELD IF NOT EXISTS location_text ON TABLE listing_current TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS geohash ON TABLE listing_current TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS geohash4 ON TABLE listing_current TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS geohash5 ON TABLE listing_current TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS geohash6 ON TABLE listing_current TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS geohash7 ON TABLE listing_current TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS point ON TABLE listing_current TYPE option<array>;
+DEFINE FIELD IF NOT EXISTS status_tag ON TABLE listing_current TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS effective_status ON TABLE listing_current TYPE string;
+DEFINE FIELD IF NOT EXISTS categories ON TABLE listing_current TYPE array;
+DEFINE FIELD IF NOT EXISTS tags ON TABLE listing_current TYPE array;
+DEFINE FIELD IF NOT EXISTS practices ON TABLE listing_current TYPE array;
+DEFINE FIELD IF NOT EXISTS certifications ON TABLE listing_current TYPE array;
+DEFINE FIELD IF NOT EXISTS image_urls ON TABLE listing_current TYPE array;
+DEFINE FIELD IF NOT EXISTS pickup_available ON TABLE listing_current TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS delivery_available ON TABLE listing_current TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS shipping_available ON TABLE listing_current TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS delivery_only ON TABLE listing_current TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS seller_trust_score ON TABLE listing_current TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS hidden ON TABLE listing_current TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS deleted ON TABLE listing_current TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS projected_at ON TABLE listing_current TYPE int;
+DEFINE INDEX IF NOT EXISTS listing_key_uid ON TABLE listing_current COLUMNS listing_key UNIQUE;
+DEFINE INDEX IF NOT EXISTS listing_event_uid ON TABLE listing_current COLUMNS event_id UNIQUE;
+DEFINE INDEX IF NOT EXISTS listing_status_updated ON TABLE listing_current COLUMNS effective_status, updated_at, event_id;
+DEFINE INDEX IF NOT EXISTS listing_seller_status_updated ON TABLE listing_current COLUMNS seller_pubkey, effective_status, updated_at, event_id;
+DEFINE INDEX IF NOT EXISTS listing_price_lookup ON TABLE listing_current COLUMNS effective_status, currency_norm, unit, price_minor, event_id;
+DEFINE INDEX IF NOT EXISTS listing_geo4_status ON TABLE listing_current COLUMNS effective_status, geohash4, updated_at, event_id;
+DEFINE INDEX IF NOT EXISTS listing_geo5_status ON TABLE listing_current COLUMNS effective_status, geohash5, updated_at, event_id;
+DEFINE INDEX IF NOT EXISTS listing_geo6_status ON TABLE listing_current COLUMNS effective_status, geohash6, updated_at, event_id;
+"#,
+    )
+    .expect("listing current schema is valid")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1001,6 +1060,68 @@ mod tests {
             "listing_revision_event_uid",
             "listing_revision_listing_created",
             "listing_revision_seller_created",
+        ] {
+            assert!(info.contains(expected), "missing {expected} in {info}");
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_current_schema_defines_marketplace_projection_table() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let info = store
+            .table_info("listing_current")
+            .await
+            .expect("table info");
+
+        for expected in [
+            "listing_key",
+            "listing_key_hash",
+            "event_id",
+            "seller_pubkey",
+            "d",
+            "created_at",
+            "updated_at",
+            "published_at",
+            "title",
+            "summary",
+            "content",
+            "price_decimal",
+            "price_minor",
+            "currency_raw",
+            "currency_norm",
+            "price_frequency",
+            "unit",
+            "unit_family",
+            "location_text",
+            "geohash",
+            "geohash4",
+            "geohash5",
+            "geohash6",
+            "geohash7",
+            "point",
+            "status_tag",
+            "effective_status",
+            "categories",
+            "tags",
+            "practices",
+            "certifications",
+            "image_urls",
+            "pickup_available",
+            "delivery_available",
+            "shipping_available",
+            "delivery_only",
+            "seller_trust_score",
+            "hidden",
+            "deleted",
+            "projected_at",
+            "listing_key_uid",
+            "listing_event_uid",
+            "listing_price_lookup",
+            "listing_geo6_status",
         ] {
             assert!(info.contains(expected), "missing {expected} in {info}");
         }
