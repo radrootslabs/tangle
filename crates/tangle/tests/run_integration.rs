@@ -41,6 +41,13 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
                 "window_seconds": 60
             }
         }),
+        Some(serde_json::json!({
+            "tracing": {
+                "enabled": true,
+                "filter": "info,tangle=info,tangle_runtime=info",
+                "format": "json"
+            }
+        })),
     );
 
     let mut relay = Command::new(env!("CARGO_BIN_EXE_tangle"))
@@ -404,7 +411,10 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
     assert!(seller_detail.contains("\"display_name\":\"Radroots Market\""));
     assert!(seller_detail.contains("\"regions\":[\"cascadia\",\"pnw\"]"));
 
-    stop_relay(relay);
+    let trace_output = stop_relay_with_stderr(relay);
+    assert!(trace_output.contains("tracing initialized"));
+    assert!(trace_output.contains("starting runtime server"));
+    assert!(trace_output.contains("\"format\":\"json\""));
 
     let store_config =
         SurrealConnectionConfig::rocksdb(db_path.to_str().expect("db path"), "tangle_it", "relay")
@@ -638,6 +648,7 @@ async fn tangle_run_persists_durable_write_rate_limits() {
                 "window_seconds": 60
             }
         }),
+        None,
     );
     let mut relay = spawn_relay(&config_path);
     wait_for_http(port, &mut relay);
@@ -735,6 +746,7 @@ async fn tangle_run_serves_admin_policy_api() {
         serde_json::json!({
             "admin_pubkeys": [admin.as_str()]
         }),
+        None,
     );
     let mut relay = spawn_relay(&config_path);
     wait_for_http(port, &mut relay);
@@ -887,7 +899,7 @@ async fn run_policy_write_scenario(
     let db_path = root.join("surrealdb");
     let config_path = root.join("runtime.json");
     fs::create_dir_all(&root).expect("runtime root");
-    write_runtime_config(&config_path, &db_path, port, namespace, policy);
+    write_runtime_config(&config_path, &db_path, port, namespace, policy, None);
     let mut relay = spawn_relay(&config_path);
     wait_for_http(port, &mut relay);
     let (mut client, _) = connect_async(format!("ws://127.0.0.1:{port}/ws"))
@@ -935,8 +947,15 @@ fn spawn_relay(config_path: &Path) -> Child {
         .expect("spawn tangle run")
 }
 
-fn write_runtime_config(path: &Path, db_path: &Path, port: u16, namespace: &str, policy: Value) {
-    let config = serde_json::json!({
+fn write_runtime_config(
+    path: &Path,
+    db_path: &Path,
+    port: u16,
+    namespace: &str,
+    policy: Value,
+    observability: Option<Value>,
+) {
+    let mut config = serde_json::json!({
         "server": {
             "listen_addr": format!("127.0.0.1:{port}"),
             "relay_url": "wss://relay.radroots.test"
@@ -958,6 +977,9 @@ fn write_runtime_config(path: &Path, db_path: &Path, port: u16, namespace: &str,
         },
         "policy": policy
     });
+    if let Some(observability) = observability {
+        config["observability"] = observability;
+    }
     fs::write(
         path,
         serde_json::to_string_pretty(&config).expect("config JSON"),
@@ -1292,10 +1314,15 @@ fn forum_thread_comment(
     .expect("forum comment event")
 }
 
-fn stop_relay(mut relay: Child) {
+fn stop_relay(relay: Child) {
+    let _ = stop_relay_with_stderr(relay);
+}
+
+fn stop_relay_with_stderr(mut relay: Child) -> String {
     stop_child(&mut relay);
-    let status = relay.wait().expect("relay exit");
-    assert!(status.success());
+    let output = relay.wait_with_output().expect("relay exit");
+    assert!(output.status.success());
+    String::from_utf8_lossy(&output.stderr).to_string()
 }
 
 #[cfg(unix)]

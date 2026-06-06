@@ -18,6 +18,7 @@ tangle_protocol = { path = "../tangle_protocol" }
 tangle_store = { path = "../tangle_store" }
 tangle_store_surreal = { path = "../tangle_store_surreal" }
 tokio = { version = "1", features = ["net", "sync"] }
+tracing = "0.1"
 url = "2"
 
 [dev-dependencies]

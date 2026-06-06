@@ -11,6 +11,8 @@ readme = "../../README"
 [dependencies]
 tangle_runtime = { path = "../tangle_runtime" }
 tokio = { version = "1", features = ["rt", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
 [dev-dependencies]
 futures-util = "0.3"

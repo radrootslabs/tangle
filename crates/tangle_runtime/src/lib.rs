@@ -243,6 +243,7 @@ pub struct TangleRuntimeConfig {
     durable_write_rate_limit: Option<RateLimitConfig>,
     admin_pubkeys: BTreeSet<PublicKeyHex>,
     limits: RuntimeLimits,
+    tracing: RuntimeTracingConfig,
 }
 
 impl TangleRuntimeConfig {
@@ -274,12 +275,78 @@ impl TangleRuntimeConfig {
         self.limits
     }
 
+    pub fn tracing_config(&self) -> &RuntimeTracingConfig {
+        &self.tracing
+    }
+
     pub fn websocket_state(&self, shutdown_signal: GracefulShutdownSignal) -> WebSocketHttpState {
         WebSocketHttpState::with_shutdown(self.relay_connection.clone(), shutdown_signal)
     }
 
     pub fn listings_state(&self, store: SurrealStore) -> ListingsHttpState {
         ListingsHttpState::new(store, self.limits)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeTracingFormat {
+    Compact,
+    Json,
+}
+
+impl RuntimeTracingFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Json => "json",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeTracingConfig {
+    enabled: bool,
+    filter: String,
+    format: RuntimeTracingFormat,
+}
+
+impl RuntimeTracingConfig {
+    pub fn new(
+        enabled: bool,
+        filter: impl Into<String>,
+        format: RuntimeTracingFormat,
+    ) -> Result<Self, RuntimeConfigError> {
+        let filter = filter.into();
+        if filter.trim().is_empty() {
+            return Err(RuntimeConfigError::invalid(
+                "observability.tracing.filter must not be empty",
+            ));
+        }
+        Ok(Self {
+            enabled,
+            filter: filter.trim().to_owned(),
+            format,
+        })
+    }
+
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            filter: "info,tangle=info,tangle_runtime=info".to_owned(),
+            format: RuntimeTracingFormat::Compact,
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    pub fn format(&self) -> RuntimeTracingFormat {
+        self.format
     }
 }
 
@@ -435,6 +502,12 @@ impl std::error::Error for RuntimeCommandError {}
 pub async fn migrate_runtime_database(
     config: &TangleRuntimeConfig,
 ) -> Result<RuntimeMigrationReport, RuntimeCommandError> {
+    tracing::info!(
+        command = "migrate",
+        namespace = config.database_config().namespace(),
+        database = config.database_config().database(),
+        "starting runtime database migration"
+    );
     let store = connect_runtime_store(config).await?;
     let outcomes = store
         .apply_plan(&base_migration_plan())
@@ -448,6 +521,13 @@ pub async fn migrate_runtime_database(
         .iter()
         .filter(|outcome| **outcome == MigrationApplyOutcome::AlreadyApplied)
         .count() as u64;
+    tracing::info!(
+        command = "migrate",
+        applied,
+        already_applied,
+        total = outcomes.len() as u64,
+        "finished runtime database migration"
+    );
     Ok(RuntimeMigrationReport::new(
         applied,
         already_applied,
@@ -526,6 +606,11 @@ pub async fn import_events_from_path(
     path: impl AsRef<FsPath>,
 ) -> Result<RuntimeEventImportReport, RuntimeCommandError> {
     let path = path.as_ref();
+    tracing::info!(
+        command = "event import",
+        input_path = path.display().to_string(),
+        "starting event import"
+    );
     let raw = fs::read_to_string(path).map_err(|error| {
         RuntimeCommandError::input(format!(
             "failed to read event import file `{}`: {error}",
@@ -551,6 +636,15 @@ pub async fn import_events_from_path(
         let outcome = import_single_event(&store, &validator, event, now).await?;
         report.record(outcome);
     }
+    tracing::info!(
+        command = "event import",
+        total = report.total(),
+        inserted = report.inserted(),
+        duplicate = report.duplicate(),
+        projected = report.projected(),
+        skipped = report.skipped(),
+        "finished event import"
+    );
     Ok(report)
 }
 
@@ -724,6 +818,12 @@ pub async fn export_events_to_path(
     config: &TangleRuntimeConfig,
     path: impl AsRef<FsPath>,
 ) -> Result<RuntimeEventExportReport, RuntimeCommandError> {
+    let path = path.as_ref();
+    tracing::info!(
+        command = "event export",
+        output_path = path.display().to_string(),
+        "starting event export"
+    );
     let store = connect_runtime_store(config).await?;
     store
         .apply_plan(&base_migration_plan())
@@ -738,13 +838,17 @@ pub async fn export_events_to_path(
         output.push_str(&runtime_row_string(row, "raw_json")?);
         output.push('\n');
     }
-    let path = path.as_ref();
     fs::write(path, output).map_err(|error| {
         RuntimeCommandError::input(format!(
             "failed to write event export file `{}`: {error}",
             path.display()
         ))
     })?;
+    tracing::info!(
+        command = "event export",
+        exported = rows.len() as u64,
+        "finished event export"
+    );
     Ok(RuntimeEventExportReport::new(rows.len() as u64))
 }
 
@@ -823,6 +927,10 @@ enum RuntimeProjectionRebuildOutcome {
 pub async fn rebuild_projections(
     config: &TangleRuntimeConfig,
 ) -> Result<RuntimeProjectionRebuildReport, RuntimeCommandError> {
+    tracing::info!(
+        command = "projection rebuild",
+        "starting projection rebuild"
+    );
     let store = connect_runtime_store(config).await?;
     store
         .apply_plan(&base_migration_plan())
@@ -849,6 +957,14 @@ pub async fn rebuild_projections(
         let outcome = rebuild_single_event_projection(&store, &validator, event, now).await?;
         report.record(outcome);
     }
+    tracing::info!(
+        command = "projection rebuild",
+        scanned = report.scanned(),
+        rebuilt = report.rebuilt(),
+        projected = report.projected(),
+        skipped = report.skipped(),
+        "finished projection rebuild"
+    );
     Ok(report)
 }
 
@@ -903,6 +1019,13 @@ impl RuntimeServer {
     }
 
     pub async fn run(&self) -> Result<RuntimeServerReport, RuntimeCommandError> {
+        tracing::info!(
+            command = "run",
+            listen_addr = self.config.listen_addr().to_string(),
+            namespace = self.config.database_config().namespace(),
+            database = self.config.database_config().database(),
+            "starting runtime server"
+        );
         let store = connect_runtime_store(&self.config).await?;
         store
             .apply_plan(&base_migration_plan())
@@ -922,6 +1045,11 @@ impl RuntimeServer {
             })
             .await
             .map_err(|error| RuntimeCommandError::store(format!("server failed: {error}")))?;
+        tracing::info!(
+            command = "run",
+            listen_addr = listen_addr.to_string(),
+            "runtime server stopped"
+        );
         Ok(RuntimeServerReport::new(listen_addr))
     }
 }
@@ -1522,6 +1650,8 @@ struct RuntimeConfigDocument {
     limits: RuntimeLimitsConfigDocument,
     #[serde(default)]
     policy: RuntimePolicyConfigDocument,
+    #[serde(default)]
+    observability: RuntimeObservabilityConfigDocument,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1597,6 +1727,26 @@ struct RuntimePolicyConfigDocument {
     blocked_pubkeys: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+struct RuntimeObservabilityConfigDocument {
+    #[serde(default)]
+    tracing: RuntimeTracingConfigDocument,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+struct RuntimeTracingConfigDocument {
+    enabled: Option<bool>,
+    filter: Option<String>,
+    format: Option<RuntimeTracingFormatDocument>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RuntimeTracingFormatDocument {
+    Compact,
+    Json,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum RuntimeUnapprovedSellerActionDocument {
@@ -1626,6 +1776,7 @@ fn runtime_config_from_document(
     let durable_write_rate_limit = durable_write_rate_limit_from_document(&document.policy)?;
     let admin_pubkeys = admin_pubkeys_from_document(&document.policy)?;
     let admission_policy = admission_policy_from_document(&document.policy)?;
+    let tracing = tracing_config_from_document(document.observability.tracing)?;
     Ok(TangleRuntimeConfig {
         listen_addr,
         relay_connection,
@@ -1634,6 +1785,7 @@ fn runtime_config_from_document(
         durable_write_rate_limit,
         admin_pubkeys,
         limits: limits.runtime,
+        tracing,
     })
 }
 
@@ -1725,6 +1877,24 @@ fn durable_write_rate_limit_from_document(
                 .map_err(|error| RuntimeConfigError::invalid(error.to_string()))
         })
         .transpose()
+}
+
+fn tracing_config_from_document(
+    document: RuntimeTracingConfigDocument,
+) -> Result<RuntimeTracingConfig, RuntimeConfigError> {
+    let default = RuntimeTracingConfig::disabled();
+    let format = match document.format {
+        Some(RuntimeTracingFormatDocument::Compact) => RuntimeTracingFormat::Compact,
+        Some(RuntimeTracingFormatDocument::Json) => RuntimeTracingFormat::Json,
+        None => default.format(),
+    };
+    RuntimeTracingConfig::new(
+        document.enabled.unwrap_or(default.enabled()),
+        document
+            .filter
+            .unwrap_or_else(|| default.filter().to_owned()),
+        format,
+    )
 }
 
 fn admin_pubkeys_from_document(
@@ -4201,9 +4371,9 @@ mod tests {
         EventMessageHandler, GracefulShutdownSignal, ListingsHttpState, LiveEventFanout,
         ReadinessCheckStatus, ReadinessState, RelayConnection, RelayConnectionConfig,
         RelayConnectionId, RelayInfoDocument, ReqMessageHandler, RuntimeCommandErrorKind,
-        RuntimeConfigErrorKind, TANGLE_RELAY_SOFTWARE, TANGLE_SUPPORTED_NIPS, WebSocketHttpState,
-        health_router, listing_item_document, listing_projection_query, listings_router,
-        load_runtime_config, migrate_runtime_database, parse_listing_query,
+        RuntimeConfigErrorKind, RuntimeTracingFormat, TANGLE_RELAY_SOFTWARE, TANGLE_SUPPORTED_NIPS,
+        WebSocketHttpState, health_router, listing_item_document, listing_projection_query,
+        listings_router, load_runtime_config, migrate_runtime_database, parse_listing_query,
         parse_marketplace_search_query, parse_runtime_config_json, relay_info_router,
         search_document_query, websocket_router,
     };
@@ -4506,6 +4676,15 @@ mod tests {
             websocket_state.connection_config(),
             config.relay_connection_config()
         );
+        assert!(!config.tracing_config().enabled());
+        assert_eq!(
+            config.tracing_config().filter(),
+            "info,tangle=info,tangle_runtime=info"
+        );
+        assert_eq!(
+            config.tracing_config().format(),
+            RuntimeTracingFormat::Compact
+        );
     }
 
     #[test]
@@ -4542,6 +4721,47 @@ mod tests {
             }
         );
         assert_eq!(config.limits(), RuntimeLimits::default());
+    }
+
+    #[test]
+    fn runtime_config_loader_parses_observability_tracing_config() {
+        let config = parse_runtime_config_json(
+            r#"{
+                "server": {
+                    "listen_addr": "127.0.0.1:7101",
+                    "relay_url": "wss://relay.radroots.test"
+                },
+                "database": {
+                    "mode": "memory",
+                    "namespace": "tangle",
+                    "database": "relay"
+                },
+                "auth": {
+                    "challenge_ttl_seconds": 300
+                },
+                "limits": {
+                    "message_rate_limit": {
+                        "limit": 120,
+                        "window_seconds": 60
+                    }
+                },
+                "observability": {
+                    "tracing": {
+                        "enabled": true,
+                        "filter": "info,tangle=debug,tangle_runtime=debug",
+                        "format": "json"
+                    }
+                }
+            }"#,
+        )
+        .expect("runtime config");
+
+        assert!(config.tracing_config().enabled());
+        assert_eq!(
+            config.tracing_config().filter(),
+            "info,tangle=debug,tangle_runtime=debug"
+        );
+        assert_eq!(config.tracing_config().format(), RuntimeTracingFormat::Json);
     }
 
     #[test]
@@ -4593,6 +4813,35 @@ mod tests {
             }"#,
         )
         .expect_err("endpoint");
+        let empty_tracing_filter = parse_runtime_config_json(
+            r#"{
+                "server": {
+                    "listen_addr": "127.0.0.1:7000",
+                    "relay_url": "ws://127.0.0.1:7000"
+                },
+                "database": {
+                    "mode": "memory",
+                    "namespace": "tangle",
+                    "database": "relay"
+                },
+                "auth": {
+                    "challenge_ttl_seconds": 300
+                },
+                "limits": {
+                    "message_rate_limit": {
+                        "limit": 120,
+                        "window_seconds": 60
+                    }
+                },
+                "observability": {
+                    "tracing": {
+                        "enabled": true,
+                        "filter": " "
+                    }
+                }
+            }"#,
+        )
+        .expect_err("tracing filter");
 
         assert_eq!(parse_error.kind(), RuntimeConfigErrorKind::Parse);
         assert!(
@@ -4610,6 +4859,11 @@ mod tests {
         assert_eq!(
             missing_endpoint.message(),
             "database.endpoint is required for http mode"
+        );
+        assert_eq!(empty_tracing_filter.kind(), RuntimeConfigErrorKind::Invalid);
+        assert_eq!(
+            empty_tracing_filter.message(),
+            "observability.tracing.filter must not be empty"
         );
     }
 

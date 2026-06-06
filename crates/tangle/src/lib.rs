@@ -296,6 +296,7 @@ pub fn projection_rebuild_output(report: tangle_runtime::RuntimeProjectionRebuil
 
 pub async fn migrate_with_config(path: &str) -> Result<String, String> {
     let config = tangle_runtime::load_runtime_config(path).map_err(|error| error.to_string())?;
+    initialize_tracing(config.tracing_config())?;
     let report = tangle_runtime::migrate_runtime_database(&config)
         .await
         .map_err(|error| error.to_string())?;
@@ -308,6 +309,7 @@ pub async fn event_import_with_config(
 ) -> Result<String, String> {
     let config =
         tangle_runtime::load_runtime_config(config_path).map_err(|error| error.to_string())?;
+    initialize_tracing(config.tracing_config())?;
     let report = tangle_runtime::import_events_from_path(&config, input_path)
         .await
         .map_err(|error| error.to_string())?;
@@ -320,6 +322,7 @@ pub async fn event_export_with_config(
 ) -> Result<String, String> {
     let config =
         tangle_runtime::load_runtime_config(config_path).map_err(|error| error.to_string())?;
+    initialize_tracing(config.tracing_config())?;
     let report = tangle_runtime::export_events_to_path(&config, output_path)
         .await
         .map_err(|error| error.to_string())?;
@@ -329,6 +332,7 @@ pub async fn event_export_with_config(
 pub async fn projection_rebuild_with_config(config_path: &str) -> Result<String, String> {
     let config =
         tangle_runtime::load_runtime_config(config_path).map_err(|error| error.to_string())?;
+    initialize_tracing(config.tracing_config())?;
     let report = tangle_runtime::rebuild_projections(&config)
         .await
         .map_err(|error| error.to_string())?;
@@ -337,6 +341,7 @@ pub async fn projection_rebuild_with_config(config_path: &str) -> Result<String,
 
 pub async fn run_with_config(path: &str) -> Result<(), String> {
     let config = tangle_runtime::load_runtime_config(path).map_err(|error| error.to_string())?;
+    initialize_tracing(config.tracing_config())?;
     let (shutdown, _) = tangle_runtime::GracefulShutdownSignal::new();
     let signal = shutdown.clone();
     tokio::spawn(async move {
@@ -350,17 +355,46 @@ pub async fn run_with_config(path: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+fn initialize_tracing(config: &tangle_runtime::RuntimeTracingConfig) -> Result<(), String> {
+    if !config.enabled() {
+        return Ok(());
+    }
+    let filter = tracing_subscriber::EnvFilter::try_new(config.filter())
+        .map_err(|error| format!("tracing filter is invalid: {error}"))?;
+    match config.format() {
+        tangle_runtime::RuntimeTracingFormat::Compact => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .try_init();
+        }
+        tangle_runtime::RuntimeTracingFormat::Json => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .json()
+                .try_init();
+        }
+    }
+    tracing::info!(
+        filter = config.filter(),
+        format = config.format().as_str(),
+        "tracing initialized"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         PACKAGE_NAME, PACKAGE_VERSION, TangleCliError, TangleCommand, TangleInvocation,
-        event_export_output, event_import_output, migrate_output, parse_tangle_command,
-        parse_tangle_invocation, projection_rebuild_output, require_config_path,
-        require_input_path, require_output_path, usage_output, version_output,
+        event_export_output, event_import_output, initialize_tracing, migrate_output,
+        parse_tangle_command, parse_tangle_invocation, projection_rebuild_output,
+        require_config_path, require_input_path, require_output_path, usage_output, version_output,
     };
     use tangle_runtime::{
         RuntimeEventExportReport, RuntimeEventImportReport, RuntimeMigrationReport,
-        RuntimeProjectionRebuildReport,
+        RuntimeProjectionRebuildReport, RuntimeTracingConfig, RuntimeTracingFormat,
     };
 
     #[test]
@@ -376,6 +410,21 @@ mod tests {
     #[test]
     fn version_output_contains_package_and_version() {
         assert_eq!(version_output(), "tangle 0.1.0");
+    }
+
+    #[test]
+    fn tracing_setup_ignores_disabled_config_and_rejects_bad_filters() {
+        assert_eq!(
+            initialize_tracing(&RuntimeTracingConfig::disabled()),
+            Ok(())
+        );
+        let invalid =
+            RuntimeTracingConfig::new(true, "bad[", RuntimeTracingFormat::Compact).expect("config");
+        assert!(
+            initialize_tracing(&invalid)
+                .expect_err("invalid filter")
+                .starts_with("tracing filter is invalid:")
+        );
     }
 
     #[test]
