@@ -313,6 +313,7 @@ pub fn base_migration_plan() -> SurrealMigrationPlan {
         long_form_projection_schema(),
         forum_thread_schema(),
         label_projection_schema(),
+        report_projection_schema(),
     ])
     .expect("base migration plan is strictly ordered")
 }
@@ -825,6 +826,35 @@ DEFINE INDEX IF NOT EXISTS label_projection_visibility ON TABLE label_projection
 "#,
     )
     .expect("label projection schema is valid")
+}
+
+pub fn report_projection_schema() -> SurrealMigration {
+    SurrealMigration::new(
+        "0016_report_projection",
+        r#"
+DEFINE TABLE IF NOT EXISTS report_projection SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS report_id ON TABLE report_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS event_id ON TABLE report_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS pubkey ON TABLE report_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON TABLE report_projection TYPE int;
+DEFINE FIELD IF NOT EXISTS content ON TABLE report_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS target_type ON TABLE report_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS target_ref ON TABLE report_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS report_type ON TABLE report_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS reported_pubkeys ON TABLE report_projection TYPE array;
+DEFINE FIELD IF NOT EXISTS server_urls ON TABLE report_projection TYPE array;
+DEFINE FIELD IF NOT EXISTS hidden ON TABLE report_projection TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS deleted ON TABLE report_projection TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS projected_at ON TABLE report_projection TYPE int;
+DEFINE INDEX IF NOT EXISTS report_projection_report_uid ON TABLE report_projection COLUMNS report_id UNIQUE;
+DEFINE INDEX IF NOT EXISTS report_projection_event ON TABLE report_projection COLUMNS event_id;
+DEFINE INDEX IF NOT EXISTS report_projection_target_lookup ON TABLE report_projection COLUMNS target_type, target_ref, report_type, created_at, event_id;
+DEFINE INDEX IF NOT EXISTS report_projection_type_created ON TABLE report_projection COLUMNS report_type, created_at, event_id;
+DEFINE INDEX IF NOT EXISTS report_projection_author_created ON TABLE report_projection COLUMNS pubkey, created_at, event_id;
+DEFINE INDEX IF NOT EXISTS report_projection_visibility ON TABLE report_projection COLUMNS hidden, deleted, created_at, event_id;
+"#,
+    )
+    .expect("report projection schema is valid")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5151,6 +5181,43 @@ mod tests {
             "label_projection_namespace_lookup",
             "label_projection_author_created",
             "label_projection_visibility",
+        ] {
+            assert!(info.contains(expected), "missing {expected} in {info}");
+        }
+    }
+
+    #[tokio::test]
+    async fn report_projection_schema_defines_reviewable_report_table() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let info = store
+            .table_info("report_projection")
+            .await
+            .expect("report info");
+
+        for expected in [
+            "report_id",
+            "event_id",
+            "pubkey",
+            "created_at",
+            "content",
+            "target_type",
+            "target_ref",
+            "report_type",
+            "reported_pubkeys",
+            "server_urls",
+            "hidden",
+            "deleted",
+            "projected_at",
+            "report_projection_report_uid",
+            "report_projection_event",
+            "report_projection_target_lookup",
+            "report_projection_type_created",
+            "report_projection_author_created",
+            "report_projection_visibility",
         ] {
             assert!(info.contains(expected), "missing {expected} in {info}");
         }
