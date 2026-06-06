@@ -8,5 +8,9 @@ license.workspace = true
 description = "Radroots Nostr relay implementation"
 readme = "../../README"
 
+[dependencies]
+tangle_runtime = { path = "../tangle_runtime" }
+tokio = { version = "1", features = ["rt"] }
+
 [lints]
 workspace = true

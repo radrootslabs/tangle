@@ -3883,6 +3883,10 @@ dependencies = [
 [[package]]
 name = "tangle"
 version = "0.1.0"
+dependencies = [
+ "tangle_runtime",
+ "tokio",
+]
 
 [[package]]
 name = "tangle_core"

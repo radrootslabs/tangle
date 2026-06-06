@@ -5,7 +5,7 @@ use std::fmt;
 pub const PACKAGE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const USAGE: &str = "\
-usage: tangle [--version] <command>
+usage: tangle [--version] <command> [--config PATH]
 
 commands:
   migrate
@@ -39,7 +39,30 @@ impl TangleCommand {
     }
 
     pub fn implemented(self) -> bool {
-        matches!(self, Self::Version | Self::Help)
+        matches!(self, Self::Version | Self::Help | Self::Migrate)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TangleInvocation {
+    command: TangleCommand,
+    config_path: Option<String>,
+}
+
+impl TangleInvocation {
+    pub fn new(command: TangleCommand, config_path: Option<String>) -> Self {
+        Self {
+            command,
+            config_path,
+        }
+    }
+
+    pub fn command(&self) -> TangleCommand {
+        self.command
+    }
+
+    pub fn config_path(&self) -> Option<&str> {
+        self.config_path.as_deref()
     }
 }
 
@@ -47,6 +70,8 @@ impl TangleCommand {
 pub enum TangleCliError {
     UnknownCommand(String),
     MissingNestedCommand(&'static str),
+    MissingOptionValue(&'static str),
+    RepeatedOption(&'static str),
     UnexpectedArgument { command: String, argument: String },
 }
 
@@ -56,6 +81,12 @@ impl fmt::Display for TangleCliError {
             Self::UnknownCommand(command) => write!(formatter, "unknown command: {command}"),
             Self::MissingNestedCommand(command) => {
                 write!(formatter, "{command} command requires a nested command")
+            }
+            Self::MissingOptionValue(option) => {
+                write!(formatter, "{option} requires a value")
+            }
+            Self::RepeatedOption(option) => {
+                write!(formatter, "{option} must not be repeated")
             }
             Self::UnexpectedArgument { command, argument } => {
                 write!(
@@ -82,9 +113,17 @@ where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
+    parse_tangle_invocation(args).map(|invocation| invocation.command)
+}
+
+pub fn parse_tangle_invocation<I, S>(args: I) -> Result<TangleInvocation, TangleCliError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
     let mut args = args.into_iter().map(Into::into);
     let Some(first) = args.next() else {
-        return Ok(TangleCommand::Help);
+        return Ok(TangleInvocation::new(TangleCommand::Help, None));
     };
     let command = match first.as_str() {
         "--version" | "-V" => TangleCommand::Version,
@@ -116,21 +155,60 @@ where
         }
         _ => return Err(TangleCliError::UnknownCommand(first)),
     };
-    if let Some(argument) = args.next() {
-        return Err(TangleCliError::UnexpectedArgument {
-            command: command.as_str().to_owned(),
-            argument,
-        });
+    let mut config_path = None;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--config" => {
+                if config_path.is_some() {
+                    return Err(TangleCliError::RepeatedOption("--config"));
+                }
+                let Some(path) = args.next() else {
+                    return Err(TangleCliError::MissingOptionValue("--config"));
+                };
+                config_path = Some(path);
+            }
+            _ => {
+                return Err(TangleCliError::UnexpectedArgument {
+                    command: command.as_str().to_owned(),
+                    argument,
+                });
+            }
+        }
     }
-    Ok(command)
+    Ok(TangleInvocation::new(command, config_path))
+}
+
+pub fn require_config_path(invocation: &TangleInvocation) -> Result<&str, TangleCliError> {
+    invocation
+        .config_path()
+        .ok_or(TangleCliError::MissingOptionValue("--config"))
+}
+
+pub fn migrate_output(report: tangle_runtime::RuntimeMigrationReport) -> String {
+    format!(
+        "migrations applied: {}\nmigrations already applied: {}\nmigrations total: {}",
+        report.applied(),
+        report.already_applied(),
+        report.total()
+    )
+}
+
+pub async fn migrate_with_config(path: &str) -> Result<String, String> {
+    let config = tangle_runtime::load_runtime_config(path).map_err(|error| error.to_string())?;
+    let report = tangle_runtime::migrate_runtime_database(&config)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(migrate_output(report))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        PACKAGE_NAME, PACKAGE_VERSION, TangleCliError, TangleCommand, parse_tangle_command,
+        PACKAGE_NAME, PACKAGE_VERSION, TangleCliError, TangleCommand, TangleInvocation,
+        migrate_output, parse_tangle_command, parse_tangle_invocation, require_config_path,
         usage_output, version_output,
     };
+    use tangle_runtime::RuntimeMigrationReport;
 
     #[test]
     fn package_name_is_tangle() {
@@ -151,7 +229,7 @@ mod tests {
     fn usage_output_lists_supported_command_model() {
         assert_eq!(
             usage_output(),
-            "usage: tangle [--version] <command>\n\ncommands:\n  migrate\n  run\n  event import\n  event export\n  projection rebuild"
+            "usage: tangle [--version] <command> [--config PATH]\n\ncommands:\n  migrate\n  run\n  event import\n  event export\n  projection rebuild"
         );
     }
 
@@ -177,9 +255,33 @@ mod tests {
             assert_eq!(parse_tangle_command(args).expect("command"), expected);
             assert_eq!(
                 expected.implemented(),
-                matches!(expected, TangleCommand::Version | TangleCommand::Help)
+                matches!(
+                    expected,
+                    TangleCommand::Version | TangleCommand::Help | TangleCommand::Migrate
+                )
             );
         }
+    }
+
+    #[test]
+    fn command_model_parses_common_config_option() {
+        assert_eq!(
+            parse_tangle_invocation(["migrate", "--config", "runtime.json"]).expect("invocation"),
+            TangleInvocation::new(TangleCommand::Migrate, Some("runtime.json".to_owned()))
+        );
+        assert_eq!(
+            require_config_path(&TangleInvocation::new(
+                TangleCommand::Migrate,
+                Some("runtime.json".to_owned())
+            ))
+            .expect("config"),
+            "runtime.json"
+        );
+        assert_eq!(
+            require_config_path(&TangleInvocation::new(TangleCommand::Migrate, None))
+                .expect_err("config"),
+            TangleCliError::MissingOptionValue("--config")
+        );
     }
 
     #[test]
@@ -202,6 +304,23 @@ mod tests {
                 command: "run".to_owned(),
                 argument: "--extra".to_owned()
             }
+        );
+        assert_eq!(
+            parse_tangle_invocation(["migrate", "--config"]).expect_err("missing config"),
+            TangleCliError::MissingOptionValue("--config")
+        );
+        assert_eq!(
+            parse_tangle_invocation(["migrate", "--config", "a", "--config", "b"])
+                .expect_err("repeated config"),
+            TangleCliError::RepeatedOption("--config")
+        );
+    }
+
+    #[test]
+    fn migrate_output_reports_outcome_counts() {
+        assert_eq!(
+            migrate_output(RuntimeMigrationReport::new(8, 2, 10)),
+            "migrations applied: 8\nmigrations already applied: 2\nmigrations total: 10"
         );
     }
 }

@@ -25,7 +25,8 @@ use tangle_protocol::{
 };
 use tangle_store::{StoreEventOutcome, StoredEvent};
 use tangle_store_surreal::{
-    ListingProjectionQuery, SearchDocumentQuery, SurrealConnectionConfig, SurrealStore,
+    ListingProjectionQuery, MigrationApplyOutcome, SearchDocumentQuery, SurrealConnectionConfig,
+    SurrealConnectionMode, SurrealStore, base_migration_plan,
 };
 use url::form_urlencoded;
 
@@ -319,6 +320,110 @@ pub fn parse_runtime_config_json(raw: &str) -> Result<TangleRuntimeConfig, Runti
         RuntimeConfigError::parse(format!("runtime config JSON is invalid: {error}"))
     })?;
     runtime_config_from_document(document)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeMigrationReport {
+    applied: u64,
+    already_applied: u64,
+    total: u64,
+}
+
+impl RuntimeMigrationReport {
+    pub fn new(applied: u64, already_applied: u64, total: u64) -> Self {
+        Self {
+            applied,
+            already_applied,
+            total,
+        }
+    }
+
+    pub fn applied(self) -> u64 {
+        self.applied
+    }
+
+    pub fn already_applied(self) -> u64 {
+        self.already_applied
+    }
+
+    pub fn total(self) -> u64 {
+        self.total
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeCommandErrorKind {
+    Unsupported,
+    Store,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeCommandError {
+    kind: RuntimeCommandErrorKind,
+    message: String,
+}
+
+impl RuntimeCommandError {
+    pub fn new(kind: RuntimeCommandErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub fn unsupported(message: impl Into<String>) -> Self {
+        Self::new(RuntimeCommandErrorKind::Unsupported, message)
+    }
+
+    pub fn store(message: impl Into<String>) -> Self {
+        Self::new(RuntimeCommandErrorKind::Store, message)
+    }
+
+    pub fn kind(&self) -> RuntimeCommandErrorKind {
+        self.kind
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for RuntimeCommandError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:?}: {}", self.kind, self.message)
+    }
+}
+
+impl std::error::Error for RuntimeCommandError {}
+
+pub async fn migrate_runtime_database(
+    config: &TangleRuntimeConfig,
+) -> Result<RuntimeMigrationReport, RuntimeCommandError> {
+    if config.database_config().mode() != &SurrealConnectionMode::Memory {
+        return Err(RuntimeCommandError::unsupported(
+            "migrate currently supports memory SurrealDB configs only",
+        ));
+    }
+    let store = SurrealStore::connect_memory(config.database_config())
+        .await
+        .map_err(|error| RuntimeCommandError::store(error.to_string()))?;
+    let outcomes = store
+        .apply_plan(&base_migration_plan())
+        .await
+        .map_err(|error| RuntimeCommandError::store(error.to_string()))?;
+    let applied = outcomes
+        .iter()
+        .filter(|outcome| **outcome == MigrationApplyOutcome::Applied)
+        .count() as u64;
+    let already_applied = outcomes
+        .iter()
+        .filter(|outcome| **outcome == MigrationApplyOutcome::AlreadyApplied)
+        .count() as u64;
+    Ok(RuntimeMigrationReport::new(
+        applied,
+        already_applied,
+        outcomes.len() as u64,
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -2137,11 +2242,12 @@ mod tests {
         ClientFrameOutcome, ClientMessageLoop, CloseMessageHandler, CloseMessageOutcome,
         EventMessageHandler, GracefulShutdownSignal, ListingsHttpState, LiveEventFanout,
         ReadinessCheckStatus, ReadinessState, RelayConnection, RelayConnectionConfig,
-        RelayConnectionId, RelayInfoDocument, ReqMessageHandler, RuntimeConfigErrorKind,
-        TANGLE_RELAY_SOFTWARE, TANGLE_SUPPORTED_NIPS, WebSocketHttpState, health_router,
-        listing_item_document, listing_projection_query, listings_router, load_runtime_config,
-        parse_listing_query, parse_marketplace_search_query, parse_runtime_config_json,
-        relay_info_router, search_document_query, websocket_router,
+        RelayConnectionId, RelayInfoDocument, ReqMessageHandler, RuntimeCommandErrorKind,
+        RuntimeConfigErrorKind, TANGLE_RELAY_SOFTWARE, TANGLE_SUPPORTED_NIPS, WebSocketHttpState,
+        health_router, listing_item_document, listing_projection_query, listings_router,
+        load_runtime_config, migrate_runtime_database, parse_listing_query,
+        parse_marketplace_search_query, parse_runtime_config_json, relay_info_router,
+        search_document_query, websocket_router,
     };
     use axum::{body::Body, response::IntoResponse};
     use http::{HeaderValue, Request, StatusCode, header};
@@ -2565,6 +2671,83 @@ mod tests {
         assert_eq!(
             load_runtime_config(&path).expect_err("missing").kind(),
             RuntimeConfigErrorKind::Read
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_migration_command_applies_memory_database_plan() {
+        let config = parse_runtime_config_json(
+            r#"{
+                "server": {
+                    "listen_addr": "127.0.0.1:7300",
+                    "relay_url": "ws://127.0.0.1:7300"
+                },
+                "database": {
+                    "mode": "memory",
+                    "namespace": "tangle_migrate",
+                    "database": "relay"
+                },
+                "auth": {
+                    "challenge_ttl_seconds": 300
+                },
+                "limits": {
+                    "message_rate_limit": {
+                        "limit": 120,
+                        "window_seconds": 60
+                    }
+                }
+            }"#,
+        )
+        .expect("runtime config");
+
+        let report = migrate_runtime_database(&config).await.expect("migrate");
+
+        assert_eq!(
+            report.applied(),
+            base_migration_plan().migrations().len() as u64
+        );
+        assert_eq!(report.already_applied(), 0);
+        assert_eq!(
+            report.total(),
+            base_migration_plan().migrations().len() as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_migration_command_rejects_remote_database_modes() {
+        let config = parse_runtime_config_json(
+            r#"{
+                "server": {
+                    "listen_addr": "127.0.0.1:7301",
+                    "relay_url": "ws://127.0.0.1:7301"
+                },
+                "database": {
+                    "mode": "http",
+                    "endpoint": "http://127.0.0.1:8000",
+                    "namespace": "tangle",
+                    "database": "relay"
+                },
+                "auth": {
+                    "challenge_ttl_seconds": 300
+                },
+                "limits": {
+                    "message_rate_limit": {
+                        "limit": 120,
+                        "window_seconds": 60
+                    }
+                }
+            }"#,
+        )
+        .expect("runtime config");
+
+        let error = migrate_runtime_database(&config)
+            .await
+            .expect_err("remote unsupported");
+
+        assert_eq!(error.kind(), RuntimeCommandErrorKind::Unsupported);
+        assert_eq!(
+            error.message(),
+            "migrate currently supports memory SurrealDB configs only"
         );
     }
 

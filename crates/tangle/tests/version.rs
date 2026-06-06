@@ -23,7 +23,7 @@ fn tangle_without_args_reports_usage() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "usage: tangle [--version] <command>\n\ncommands:\n  migrate\n  run\n  event import\n  event export\n  projection rebuild\n"
+        "usage: tangle [--version] <command> [--config PATH]\n\ncommands:\n  migrate\n  run\n  event import\n  event export\n  projection rebuild\n"
     );
     assert!(output.stderr.is_empty());
 }
@@ -39,7 +39,65 @@ fn tangle_unknown_arg_reports_usage_error() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
-        "unknown command: --unknown\nusage: tangle [--version] <command>\n\ncommands:\n  migrate\n  run\n  event import\n  event export\n  projection rebuild\n"
+        "unknown command: --unknown\nusage: tangle [--version] <command> [--config PATH]\n\ncommands:\n  migrate\n  run\n  event import\n  event export\n  projection rebuild\n"
+    );
+}
+
+#[test]
+fn tangle_migrate_command_applies_configured_migrations() {
+    let path = std::env::temp_dir().join(format!("tangle-cli-migrate-{}.json", std::process::id()));
+    std::fs::write(
+        &path,
+        r#"{
+            "server": {
+                "listen_addr": "127.0.0.1:7400",
+                "relay_url": "ws://127.0.0.1:7400"
+            },
+            "database": {
+                "mode": "memory",
+                "namespace": "tangle_cli_migrate",
+                "database": "relay"
+            },
+            "auth": {
+                "challenge_ttl_seconds": 300
+            },
+            "limits": {
+                "message_rate_limit": {
+                    "limit": 120,
+                    "window_seconds": 60
+                }
+            }
+        }"#,
+    )
+    .expect("write config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tangle"))
+        .args(["migrate", "--config"])
+        .arg(&path)
+        .output()
+        .expect("run tangle migrate");
+    std::fs::remove_file(&path).expect("remove config");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "migrations applied: 10\nmigrations already applied: 0\nmigrations total: 10\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn tangle_migrate_requires_config_path() {
+    let output = Command::new(env!("CARGO_BIN_EXE_tangle"))
+        .arg("migrate")
+        .output()
+        .expect("run tangle migrate without config");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "--config requires a value\n"
     );
 }
 
