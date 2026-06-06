@@ -706,6 +706,17 @@ pub struct ListingProjectionQuery {
     limit: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchDocumentQuery {
+    text: Option<String>,
+    doc_type: Option<String>,
+    kind: Option<u32>,
+    pubkey: Option<String>,
+    visible: Option<bool>,
+    status: Option<String>,
+    limit: Option<u64>,
+}
+
 impl ListingProjectionQuery {
     pub fn new() -> Self {
         Self::default()
@@ -738,6 +749,47 @@ impl ListingProjectionQuery {
 
     pub fn with_max_price_minor(mut self, value: i64) -> Self {
         self.max_price_minor = Some(value);
+        self
+    }
+
+    pub fn with_limit(mut self, value: u64) -> Self {
+        self.limit = Some(value);
+        self
+    }
+}
+
+impl SearchDocumentQuery {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_text(mut self, value: &str) -> Self {
+        self.text = Some(value.to_owned());
+        self
+    }
+
+    pub fn with_doc_type(mut self, value: &str) -> Self {
+        self.doc_type = Some(value.to_owned());
+        self
+    }
+
+    pub fn with_kind(mut self, value: u32) -> Self {
+        self.kind = Some(value);
+        self
+    }
+
+    pub fn with_pubkey(mut self, value: &str) -> Self {
+        self.pubkey = Some(value.to_owned());
+        self
+    }
+
+    pub fn with_visible(mut self, value: bool) -> Self {
+        self.visible = Some(value);
+        self
+    }
+
+    pub fn with_status(mut self, value: &str) -> Self {
+        self.status = Some(value.to_owned());
         self
     }
 
@@ -1763,6 +1815,72 @@ UPSERT type::record('search_doc', $doc_key) CONTENT {
         response.take(0).map_err(SurrealStoreError::from)
     }
 
+    pub async fn query_search_documents(
+        &self,
+        query: &SearchDocumentQuery,
+    ) -> Result<Vec<serde_json::Value>, SurrealStoreError> {
+        let mut statement = if query.text.is_some() {
+            "SELECT *, search::score(0) AS score FROM search_doc WHERE true".to_owned()
+        } else {
+            "SELECT * FROM search_doc WHERE true".to_owned()
+        };
+        if query.text.is_some() {
+            statement.push_str(" AND (title @0@ $text OR summary @1@ $text OR body @2@ $text)");
+        }
+        if query.doc_type.is_some() {
+            statement.push_str(" AND doc_type = $doc_type");
+        }
+        if query.kind.is_some() {
+            statement.push_str(" AND kind = $kind");
+        }
+        if query.pubkey.is_some() {
+            statement.push_str(" AND pubkey = $pubkey");
+        }
+        if query.visible.is_some() {
+            statement.push_str(" AND visible = $visible");
+        }
+        if query.status.is_some() {
+            statement.push_str(" AND status = $status");
+        }
+        if query.text.is_some() {
+            statement.push_str(" ORDER BY score DESC, updated_at DESC, event_id ASC");
+        } else {
+            statement.push_str(" ORDER BY updated_at DESC, event_id ASC");
+        }
+        if query.limit.is_some() {
+            statement.push_str(" LIMIT $limit");
+        }
+        statement.push(';');
+        let mut surreal_query = self.db.query(statement);
+        if let Some(value) = &query.text {
+            surreal_query = surreal_query.bind(("text", value.as_str()));
+        }
+        if let Some(value) = &query.doc_type {
+            surreal_query = surreal_query.bind(("doc_type", value.as_str()));
+        }
+        if let Some(value) = query.kind {
+            surreal_query = surreal_query.bind(("kind", value));
+        }
+        if let Some(value) = &query.pubkey {
+            surreal_query = surreal_query.bind(("pubkey", value.as_str()));
+        }
+        if let Some(value) = query.visible {
+            surreal_query = surreal_query.bind(("visible", value));
+        }
+        if let Some(value) = &query.status {
+            surreal_query = surreal_query.bind(("status", value.as_str()));
+        }
+        if let Some(value) = query.limit {
+            surreal_query = surreal_query.bind(("limit", value));
+        }
+        let mut response = surreal_query
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
     async fn replace_listing_helper_rows(
         &self,
         table: &str,
@@ -2319,9 +2437,9 @@ mod tests {
     use super::{
         CurrentEventOutcome, DeletionMarkerOutcome, ListingCurrentOutcome, ListingHelperOutcome,
         ListingProjectionQuery, ListingRevisionOutcome, MigrationApplyOutcome,
-        SearchDocumentOutcome, SurrealConfigError, SurrealConnectionConfig, SurrealConnectionMode,
-        SurrealMigration, SurrealMigrationError, SurrealMigrationPlan, SurrealStore,
-        base_migration_plan, migration_tracking_schema,
+        SearchDocumentOutcome, SearchDocumentQuery, SurrealConfigError, SurrealConnectionConfig,
+        SurrealConnectionMode, SurrealMigration, SurrealMigrationError, SurrealMigrationPlan,
+        SurrealStore, base_migration_plan, migration_tracking_schema,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -4060,6 +4178,81 @@ mod tests {
                 .await
                 .expect("invalid row")
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn query_search_documents_applies_full_text_and_structured_filters() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let doc_key = format!("30402:{}:listing-a", listing.unsigned().pubkey().as_str());
+        store
+            .index_listing_search_document(&listing)
+            .await
+            .expect("index search");
+
+        let query = SearchDocumentQuery::new()
+            .with_text("carrot")
+            .with_doc_type("listing")
+            .with_kind(30_402)
+            .with_pubkey(listing.unsigned().pubkey().as_str())
+            .with_visible(true)
+            .with_status("active")
+            .with_limit(5);
+        let rows = store
+            .query_search_documents(&query)
+            .await
+            .expect("search rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["doc_key"], doc_key);
+        assert!(rows[0]["score"].is_number());
+
+        let miss = SearchDocumentQuery::new()
+            .with_text("turnip")
+            .with_visible(true);
+        assert!(
+            store
+                .query_search_documents(&miss)
+                .await
+                .expect("miss rows")
+                .is_empty()
+        );
+
+        let structured = SearchDocumentQuery::new()
+            .with_doc_type("listing")
+            .with_visible(true)
+            .with_status("active")
+            .with_limit(1);
+        assert_eq!(
+            store
+                .query_search_documents(&structured)
+                .await
+                .expect("structured rows")[0]["doc_key"],
+            doc_key
+        );
+
+        store
+            .database()
+            .query("UPDATE search_doc SET visible = false WHERE doc_key = $doc_key;")
+            .bind(("doc_key", doc_key.as_str()))
+            .await
+            .expect("hide search doc")
+            .check()
+            .expect("hide check");
+        assert!(
+            store
+                .query_search_documents(
+                    &SearchDocumentQuery::new()
+                        .with_doc_type("listing")
+                        .with_visible(true)
+                )
+                .await
+                .expect("hidden rows")
+                .is_empty()
         );
     }
 
