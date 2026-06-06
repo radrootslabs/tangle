@@ -410,6 +410,12 @@ async fn tangle_run_serves_relay_clients_and_persists_surreal_state() {
     assert!(seller_detail.contains(profile.id().as_str()));
     assert!(seller_detail.contains("\"display_name\":\"Radroots Market\""));
     assert!(seller_detail.contains("\"regions\":[\"cascadia\",\"pnw\"]"));
+    let readiness = http_get(port, "/readyz");
+    assert!(readiness.contains("200 OK"));
+    assert!(readiness.contains("\"status\":\"ready\""));
+    assert!(readiness.contains("\"database\":\"ready\""));
+    assert!(readiness.contains("\"migrations\":\"ready\""));
+    assert!(readiness.contains("\"repository\":\"ready\""));
     let metrics = http_get(port, "/metrics");
     assert!(metrics.contains("200 OK"));
     assert!(metrics.contains("text/plain; version=0.0.4"));

@@ -1555,8 +1555,54 @@ async fn runtime_healthz() -> Json<HealthDocument> {
     healthz().await
 }
 
-async fn runtime_readyz() -> (StatusCode, Json<ReadinessDocument>) {
-    readyz(State(ReadinessState::ready())).await
+async fn runtime_readyz(
+    State(state): State<RuntimeRelayState>,
+) -> (StatusCode, Json<ReadinessDocument>) {
+    readyz(State(runtime_readiness_state(&state.store).await)).await
+}
+
+async fn runtime_readiness_state(store: &SurrealStore) -> ReadinessState {
+    let database = readiness_status(store.ping().await);
+    let migrations = if database.is_ready() {
+        readiness_status(runtime_migrations_ready(store).await)
+    } else {
+        ReadinessCheckStatus::NotReady
+    };
+    let repository = if database.is_ready() && migrations.is_ready() {
+        readiness_status(store.metrics_snapshot().await.map(|_| ()))
+    } else {
+        ReadinessCheckStatus::NotReady
+    };
+    ReadinessState::new(database, migrations, repository)
+}
+
+async fn runtime_migrations_ready(store: &SurrealStore) -> Result<(), RuntimeCommandError> {
+    let applied = store
+        .applied_migrations()
+        .await
+        .map_err(|error| RuntimeCommandError::store(error.to_string()))?;
+    let plan = base_migration_plan();
+    if applied.len() != plan.migrations().len() {
+        return Err(RuntimeCommandError::store(
+            "runtime migrations are incomplete",
+        ));
+    }
+    for (applied, expected) in applied.iter().zip(plan.migrations()) {
+        if applied.name() != expected.name() || applied.checksum() != expected.checksum() {
+            return Err(RuntimeCommandError::store(
+                "runtime migrations do not match",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn readiness_status<E>(result: Result<(), E>) -> ReadinessCheckStatus {
+    if result.is_ok() {
+        ReadinessCheckStatus::Ready
+    } else {
+        ReadinessCheckStatus::NotReady
+    }
 }
 
 async fn runtime_metrics(State(state): State<RuntimeRelayState>) -> Result<Response, ApiError> {
@@ -4897,7 +4943,7 @@ mod tests {
         listing_item_document, listing_projection_query, listings_router, load_runtime_config,
         metrics_router, migrate_runtime_database, parse_listing_query,
         parse_marketplace_search_query, parse_runtime_config_json, relay_info_router,
-        restore_runtime_store, search_document_query, websocket_router,
+        restore_runtime_store, runtime_readiness_state, search_document_query, websocket_router,
     };
     use axum::{body::Body, response::IntoResponse};
     use http::{HeaderValue, Request, StatusCode, header};
@@ -6490,6 +6536,34 @@ mod tests {
                     "repository": "not_ready"
                 }
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_readiness_checks_database_migrations_and_repository() {
+        let config = SurrealConnectionConfig::memory("tangle_runtime", "readiness_gates")
+            .expect("memory config");
+        let store = SurrealStore::connect_memory(&config)
+            .await
+            .expect("memory store");
+
+        let missing = runtime_readiness_state(&store).await;
+        assert_eq!(
+            missing,
+            ReadinessState::new(
+                ReadinessCheckStatus::Ready,
+                ReadinessCheckStatus::NotReady,
+                ReadinessCheckStatus::NotReady
+            )
+        );
+
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        assert_eq!(
+            runtime_readiness_state(&store).await,
+            ReadinessState::ready()
         );
     }
 

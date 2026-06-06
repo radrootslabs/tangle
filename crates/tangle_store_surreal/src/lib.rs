@@ -1566,6 +1566,16 @@ impl SurrealStore {
         &self.db
     }
 
+    pub async fn ping(&self) -> Result<(), SurrealStoreError> {
+        self.db
+            .query("RETURN true;")
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        Ok(())
+    }
+
     pub async fn apply_plan(
         &self,
         plan: &SurrealMigrationPlan,
@@ -5560,6 +5570,13 @@ mod tests {
             assert_eq!(applied.checksum(), expected.checksum());
         }
         assert!(format!("{:?}", store.database()).contains("Surreal"));
+    }
+
+    #[tokio::test]
+    async fn store_ping_confirms_database_connectivity() {
+        let store = memory_store().await;
+
+        store.ping().await.expect("ping");
     }
 
     #[tokio::test]
