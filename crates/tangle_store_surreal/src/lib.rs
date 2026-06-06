@@ -705,6 +705,13 @@ pub enum SearchDocumentOutcome {
     Indexed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HiddenEventOutcome {
+    NotFound,
+    Hidden,
+    Unhidden,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ListingProjectionQuery {
     effective_status: Option<String>,
@@ -1896,6 +1903,147 @@ UPSERT type::record('search_doc', $doc_key) CONTENT {
         response.take(0).map_err(SurrealStoreError::from)
     }
 
+    pub async fn hide_event(
+        &self,
+        event_id: &EventId,
+        reason: &str,
+        source: &str,
+        admin_pubkey: &str,
+        created_at: UnixTimestamp,
+    ) -> Result<HiddenEventOutcome, SurrealStoreError> {
+        if self.raw_event_row(event_id).await?.is_none() {
+            return Ok(HiddenEventOutcome::NotFound);
+        }
+        let reason = required_policy_text(reason, "hidden event reason")?;
+        let source = required_policy_text(source, "hidden event source")?;
+        let admin_pubkey = required_policy_text(admin_pubkey, "admin pubkey")?;
+        self.db
+            .query(
+                r#"
+UPSERT type::record('hidden_event', $event_id) CONTENT {
+    event_id: $event_id,
+    reason: $reason,
+    source: $source,
+    created_at: $created_at,
+    admin_pubkey: $admin_pubkey
+};
+CREATE moderation_action CONTENT {
+    action_id: $action_id,
+    admin_pubkey: $admin_pubkey,
+    target_type: "event",
+    target_ref: $event_id,
+    action: "hide",
+    reason: $reason,
+    created_at: $created_at
+};
+UPDATE nostr_event SET hidden = true WHERE event_id = $event_id;
+UPDATE event_current SET hidden = true WHERE event_id = $event_id;
+UPDATE listing_current SET hidden = true WHERE event_id = $event_id;
+UPDATE search_doc SET visible = false WHERE event_id = $event_id OR current_event_id = $event_id;
+"#,
+            )
+            .bind(("event_id", event_id.as_str()))
+            .bind(("reason", reason.as_str()))
+            .bind(("source", source.as_str()))
+            .bind(("created_at", created_at.as_u64()))
+            .bind(("admin_pubkey", admin_pubkey.as_str()))
+            .bind((
+                "action_id",
+                moderation_action_id("hide", event_id.as_str(), admin_pubkey.as_str(), created_at),
+            ))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        Ok(HiddenEventOutcome::Hidden)
+    }
+
+    pub async fn unhide_event(
+        &self,
+        event_id: &EventId,
+        reason: &str,
+        admin_pubkey: &str,
+        created_at: UnixTimestamp,
+    ) -> Result<HiddenEventOutcome, SurrealStoreError> {
+        if self.raw_event_row(event_id).await?.is_none() {
+            return Ok(HiddenEventOutcome::NotFound);
+        }
+        let reason = required_policy_text(reason, "hidden event reason")?;
+        let admin_pubkey = required_policy_text(admin_pubkey, "admin pubkey")?;
+        self.db
+            .query(
+                r#"
+DELETE type::record('hidden_event', $event_id);
+CREATE moderation_action CONTENT {
+    action_id: $action_id,
+    admin_pubkey: $admin_pubkey,
+    target_type: "event",
+    target_ref: $event_id,
+    action: "unhide",
+    reason: $reason,
+    created_at: $created_at
+};
+UPDATE nostr_event SET hidden = false WHERE event_id = $event_id;
+UPDATE event_current SET hidden = false WHERE event_id = $event_id;
+UPDATE listing_current SET hidden = false WHERE event_id = $event_id;
+UPDATE search_doc SET visible = true WHERE (event_id = $event_id OR current_event_id = $event_id) AND status = "active";
+UPDATE search_doc SET visible = false WHERE (event_id = $event_id OR current_event_id = $event_id) AND status != "active";
+"#,
+            )
+            .bind(("event_id", event_id.as_str()))
+            .bind(("reason", reason.as_str()))
+            .bind(("created_at", created_at.as_u64()))
+            .bind(("admin_pubkey", admin_pubkey.as_str()))
+            .bind((
+                "action_id",
+                moderation_action_id(
+                    "unhide",
+                    event_id.as_str(),
+                    admin_pubkey.as_str(),
+                    created_at,
+                ),
+            ))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        Ok(HiddenEventOutcome::Unhidden)
+    }
+
+    pub async fn hidden_event_row(
+        &self,
+        event_id: &EventId,
+    ) -> Result<Option<serde_json::Value>, SurrealStoreError> {
+        let mut response = self
+            .db
+            .query("SELECT * FROM ONLY type::record('hidden_event', $event_id);")
+            .bind(("event_id", event_id.as_str()))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
+    pub async fn moderation_action_rows(
+        &self,
+        target_type: &str,
+        target_ref: &str,
+    ) -> Result<Vec<serde_json::Value>, SurrealStoreError> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT * FROM moderation_action WHERE target_type = $target_type AND target_ref = $target_ref ORDER BY created_at ASC, action_id ASC;",
+            )
+            .bind(("target_type", target_type))
+            .bind(("target_ref", target_ref))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
     async fn replace_listing_helper_rows(
         &self,
         table: &str,
@@ -2107,6 +2255,28 @@ fn event_tags_json(event: &Event) -> Vec<serde_json::Value> {
             )
         })
         .collect()
+}
+
+fn required_policy_text(value: &str, field: &str) -> Result<String, SurrealStoreError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(SurrealStoreError::new(&format!(
+            "{field} must not be empty"
+        )));
+    }
+    Ok(value.to_owned())
+}
+
+fn moderation_action_id(
+    action: &str,
+    target_ref: &str,
+    admin_pubkey: &str,
+    created_at: UnixTimestamp,
+) -> String {
+    checksum(&format!(
+        "{action}:{target_ref}:{admin_pubkey}:{}",
+        created_at.as_u64()
+    ))
 }
 
 fn d_tag_value(event: &Event) -> Option<String> {
@@ -2454,11 +2624,12 @@ impl From<surrealdb::Error> for SurrealStoreError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CurrentEventOutcome, DeletionMarkerOutcome, ListingCurrentOutcome, ListingHelperOutcome,
-        ListingProjectionQuery, ListingRevisionOutcome, MigrationApplyOutcome,
-        SearchDocumentOutcome, SearchDocumentQuery, SurrealConfigError, SurrealConnectionConfig,
-        SurrealConnectionMode, SurrealMigration, SurrealMigrationError, SurrealMigrationPlan,
-        SurrealStore, SurrealStoreError, base_migration_plan, migration_tracking_schema,
+        CurrentEventOutcome, DeletionMarkerOutcome, HiddenEventOutcome, ListingCurrentOutcome,
+        ListingHelperOutcome, ListingProjectionQuery, ListingRevisionOutcome,
+        MigrationApplyOutcome, SearchDocumentOutcome, SearchDocumentQuery, SurrealConfigError,
+        SurrealConnectionConfig, SurrealConnectionMode, SurrealMigration, SurrealMigrationError,
+        SurrealMigrationPlan, SurrealStore, SurrealStoreError, base_migration_plan,
+        migration_tracking_schema,
     };
     use tangle_nips::ListingProjectionEvaluation;
     use tangle_protocol::{
@@ -4337,6 +4508,249 @@ mod tests {
                 .await
                 .expect("hidden rows")
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn hidden_event_overlay_excludes_events_from_public_read_models() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let listing_key = format!("30402:{}:listing-a", listing.unsigned().pubkey().as_str());
+        let admin_pubkey = "a".repeat(PublicKeyHex::HEX_LENGTH);
+        let id_filter = filter_from_value(&serde_json::json!({
+            "ids": [listing.id().as_str()]
+        }))
+        .expect("id filter");
+
+        store
+            .store_raw_event(&StoredEvent::new(
+                listing.clone(),
+                UnixTimestamp::new(1_714_125_500),
+            ))
+            .await
+            .expect("raw event");
+        store
+            .maintain_current_event(&listing)
+            .await
+            .expect("current event");
+        store
+            .project_current_listing(&listing, UnixTimestamp::new(1_714_125_501))
+            .await
+            .expect("listing projection");
+        store
+            .index_listing_search_document(&listing)
+            .await
+            .expect("search document");
+
+        assert_eq!(
+            store
+                .query_raw_events(&id_filter)
+                .await
+                .expect("raw query")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .query_current_events(&id_filter)
+                .await
+                .expect("current query")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .query_current_listings(
+                    &ListingProjectionQuery::new().with_effective_status("active")
+                )
+                .await
+                .expect("listing query")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .query_search_documents(
+                    &SearchDocumentQuery::new()
+                        .with_text("carrot")
+                        .with_doc_type("listing")
+                        .with_visible(true)
+                )
+                .await
+                .expect("search query")
+                .len(),
+            1
+        );
+
+        assert_eq!(
+            store
+                .hide_event(
+                    listing.id(),
+                    "policy proof",
+                    "admin_api",
+                    &admin_pubkey,
+                    UnixTimestamp::new(1_714_125_600),
+                )
+                .await
+                .expect("hide"),
+            HiddenEventOutcome::Hidden
+        );
+
+        let hidden = store
+            .hidden_event_row(listing.id())
+            .await
+            .expect("hidden row")
+            .expect("hidden row exists");
+        assert_eq!(hidden["event_id"], listing.id().as_str());
+        assert_eq!(hidden["reason"], "policy proof");
+        assert_eq!(hidden["source"], "admin_api");
+        assert_eq!(hidden["created_at"], 1_714_125_600_u64);
+        assert_eq!(hidden["admin_pubkey"], admin_pubkey);
+        assert_eq!(
+            store
+                .raw_event_row(listing.id())
+                .await
+                .expect("raw row")
+                .expect("raw row exists")["hidden"],
+            true
+        );
+        assert_eq!(
+            store
+                .current_event_row(&listing_key)
+                .await
+                .expect("current row")
+                .expect("current row exists")["hidden"],
+            true
+        );
+        assert_eq!(
+            store
+                .listing_current_row(&listing_key)
+                .await
+                .expect("listing row")
+                .expect("listing row exists")["hidden"],
+            true
+        );
+        assert_eq!(
+            store
+                .search_document_row(&listing_key)
+                .await
+                .expect("search row")
+                .expect("search row exists")["visible"],
+            false
+        );
+        assert!(
+            store
+                .query_raw_events(&id_filter)
+                .await
+                .expect("hidden raw query")
+                .is_empty()
+        );
+        assert!(
+            store
+                .query_current_events(&id_filter)
+                .await
+                .expect("hidden current query")
+                .is_empty()
+        );
+        assert!(
+            store
+                .query_current_listings(
+                    &ListingProjectionQuery::new().with_effective_status("active")
+                )
+                .await
+                .expect("hidden listing query")
+                .is_empty()
+        );
+        assert!(
+            store
+                .query_search_documents(
+                    &SearchDocumentQuery::new()
+                        .with_text("carrot")
+                        .with_doc_type("listing")
+                        .with_visible(true)
+                )
+                .await
+                .expect("hidden search query")
+                .is_empty()
+        );
+        let actions = store
+            .moderation_action_rows("event", listing.id().as_str())
+            .await
+            .expect("actions");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0]["action"], "hide");
+        assert_eq!(actions[0]["target_ref"], listing.id().as_str());
+
+        assert_eq!(
+            store
+                .unhide_event(
+                    listing.id(),
+                    "policy proof complete",
+                    &admin_pubkey,
+                    UnixTimestamp::new(1_714_125_700),
+                )
+                .await
+                .expect("unhide"),
+            HiddenEventOutcome::Unhidden
+        );
+        assert!(
+            store
+                .hidden_event_row(listing.id())
+                .await
+                .expect("hidden row removed")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .raw_event_row(listing.id())
+                .await
+                .expect("raw row")
+                .expect("raw row exists")["hidden"],
+            false
+        );
+        assert_eq!(
+            store
+                .search_document_row(&listing_key)
+                .await
+                .expect("search row")
+                .expect("search row exists")["visible"],
+            true
+        );
+        assert_eq!(
+            store
+                .query_search_documents(
+                    &SearchDocumentQuery::new()
+                        .with_text("carrot")
+                        .with_doc_type("listing")
+                        .with_visible(true)
+                )
+                .await
+                .expect("visible search query")
+                .len(),
+            1
+        );
+        let actions = store
+            .moderation_action_rows("event", listing.id().as_str())
+            .await
+            .expect("actions");
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[1]["action"], "unhide");
+        assert_eq!(
+            store
+                .hide_event(
+                    &EventId::new(&"b".repeat(EventId::HEX_LENGTH)).expect("missing id"),
+                    "missing",
+                    "admin_api",
+                    &admin_pubkey,
+                    UnixTimestamp::new(1_714_125_800),
+                )
+                .await
+                .expect("missing hide"),
+            HiddenEventOutcome::NotFound
         );
     }
 
