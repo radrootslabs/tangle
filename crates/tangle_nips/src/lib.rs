@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use tangle_protocol::Event;
+use tangle_protocol::{Event, TagName};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedTag {
@@ -85,12 +85,60 @@ pub fn repeated_or_missing_policy_boundary(
     optional_tag_value(event, name)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SingleLetterTagValue {
+    name: String,
+    value: String,
+}
+
+impl SingleLetterTagValue {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+pub fn single_letter_tag_values(event: &Event) -> Vec<SingleLetterTagValue> {
+    event
+        .unsigned()
+        .tags()
+        .iter()
+        .filter_map(|tag| {
+            tag.indexed_pair()
+                .map(|(name, value)| SingleLetterTagValue {
+                    name: name.to_owned(),
+                    value: value.to_owned(),
+                })
+        })
+        .collect()
+}
+
+pub fn single_letter_values_for(event: &Event, name: &str) -> Result<Vec<String>, String> {
+    if !TagName::is_indexable_name(name) {
+        return Err(format!(
+            "single-letter tag name `{name}` must be one ASCII letter"
+        ));
+    }
+    Ok(single_letter_tag_values(event)
+        .into_iter()
+        .filter(|tag| tag.name() == name)
+        .map(|tag| tag.value)
+        .collect())
+}
+
+pub fn first_single_letter_value(event: &Event, name: &str) -> Result<Option<String>, String> {
+    Ok(single_letter_values_for(event, name)?.into_iter().next())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         matching_tags, optional_tag_value, optional_tag_values, parse_required_u64_tag,
         parse_u64_field, repeated_or_missing_policy_boundary, required_tag_value,
-        required_tag_values, tag_count,
+        required_tag_values, single_letter_tag_values, single_letter_values_for, tag_count,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -172,6 +220,61 @@ mod tests {
         assert_eq!(parse_u64_field("published_at", "42"), Ok(42));
         assert_eq!(parse_required_u64_tag(&event, "published_at"), Ok(42));
         assert_eq!(repeated_or_missing_policy_boundary(&missing, "d"), Ok(None));
+    }
+
+    #[test]
+    fn single_letter_tag_extraction_indexes_first_values_only() {
+        let event = event_with_tags(vec![
+            Tag::from_parts("e", &["root", "relay"]).expect("e"),
+            Tag::from_parts("p", &["peer"]).expect("p"),
+            Tag::from_parts("E", &["uppercase-root"]).expect("E"),
+            Tag::from_parts("t", &["carrots"]).expect("t"),
+            Tag::from_parts("alt", &["not indexed"]).expect("alt"),
+            Tag::from_parts("1", &["not indexed"]).expect("number"),
+            Tag::from_parts("g", &[]).expect("missing value"),
+        ]);
+        let values = single_letter_tag_values(&event);
+
+        assert_eq!(values.len(), 4);
+        assert_eq!(values[0].name(), "e");
+        assert_eq!(values[0].value(), "root");
+        assert_eq!(values[2].name(), "E");
+        assert_eq!(
+            single_letter_values_for(&event, "e"),
+            Ok(vec!["root".to_owned()])
+        );
+        assert_eq!(
+            single_letter_values_for(&event, "E"),
+            Ok(vec!["uppercase-root".to_owned()])
+        );
+        assert_eq!(single_letter_values_for(&event, "g"), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn single_letter_tag_extraction_handles_repeated_missing_and_malformed_names() {
+        let repeated = event_with_tags(vec![
+            Tag::from_parts("t", &["carrots"]).expect("t"),
+            Tag::from_parts("t", &["greens"]).expect("t"),
+        ]);
+        let missing = event_with_tags(Vec::new());
+
+        assert_eq!(
+            single_letter_values_for(&repeated, "t"),
+            Ok(vec!["carrots".to_owned(), "greens".to_owned()])
+        );
+        assert_eq!(
+            super::first_single_letter_value(&repeated, "t"),
+            Ok(Some("carrots".to_owned()))
+        );
+        assert_eq!(super::first_single_letter_value(&missing, "t"), Ok(None));
+        assert_eq!(
+            single_letter_values_for(&missing, "topic").expect_err("long"),
+            "single-letter tag name `topic` must be one ASCII letter"
+        );
+        assert_eq!(
+            single_letter_values_for(&missing, "é").expect_err("non ascii"),
+            "single-letter tag name `é` must be one ASCII letter"
+        );
     }
 
     fn event_with_tags(tags: Vec<Tag>) -> Event {
