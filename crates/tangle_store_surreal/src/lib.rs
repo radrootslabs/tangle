@@ -9,9 +9,9 @@ use tangle_nips::{
     CommentEvent, DeletionTarget, ForumThreadEvent, LabelEvent, ListingProjection,
     ListingProjectionEvaluation, LongFormEvent, LongFormKind, NIP99_DRAFT_LISTING_KIND,
     NIP99_PUBLIC_LISTING_KIND, ReactionEvent, ReactionValue, ReportEvent, ReportTarget,
-    evaluate_listing_projection, parse_comment_event, parse_deletion_request,
+    SellerProfileEvent, evaluate_listing_projection, parse_comment_event, parse_deletion_request,
     parse_forum_thread_event, parse_label_event, parse_long_form_event, parse_reaction_event,
-    parse_report_event,
+    parse_report_event, parse_seller_profile_event,
 };
 use tangle_protocol::{AddressCoordinate, Event, EventId, Filter, UnixTimestamp, event_to_value};
 use tangle_store::{StoreEventOutcome, StoredEvent};
@@ -999,6 +999,13 @@ pub enum ReportProjectionOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SellerProfileProjectionOutcome {
+    NotProfile,
+    Ineligible,
+    Projected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HiddenEventOutcome {
     NotFound,
     Hidden,
@@ -1313,6 +1320,40 @@ impl ReportProjectionQuery {
 
     pub fn with_pubkey(mut self, pubkey: &str) -> Self {
         self.pubkey = Some(pubkey.to_owned());
+        self
+    }
+
+    pub fn with_limit(mut self, limit: u64) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SellerProfileQuery {
+    pubkey: Option<String>,
+    approved: Option<bool>,
+    blocked: Option<bool>,
+    limit: Option<u64>,
+}
+
+impl SellerProfileQuery {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_pubkey(mut self, pubkey: &str) -> Self {
+        self.pubkey = Some(pubkey.to_owned());
+        self
+    }
+
+    pub fn with_approved(mut self, approved: bool) -> Self {
+        self.approved = Some(approved);
+        self
+    }
+
+    pub fn with_blocked(mut self, blocked: bool) -> Self {
+        self.blocked = Some(blocked);
         self
     }
 
@@ -2958,6 +2999,140 @@ UPSERT type::record('report_projection', $report_id) CONTENT {
         response.take(0).map_err(SurrealStoreError::from)
     }
 
+    pub async fn project_seller_profile(
+        &self,
+        event: &Event,
+        projected_at: UnixTimestamp,
+    ) -> Result<SellerProfileProjectionOutcome, SurrealStoreError> {
+        let profile = match parse_seller_profile_event(event) {
+            Ok(Some(profile)) => profile,
+            Ok(None) => return Ok(SellerProfileProjectionOutcome::NotProfile),
+            Err(_) => return Ok(SellerProfileProjectionOutcome::Ineligible),
+        };
+        let pubkey = profile.pubkey().as_str().to_owned();
+        let existing = self.seller_profile_row(&pubkey).await?;
+        if existing
+            .as_ref()
+            .is_some_and(|row| !seller_profile_should_replace(&profile, row))
+        {
+            return Ok(SellerProfileProjectionOutcome::Ineligible);
+        }
+        let policy = self
+            .seller_profile_policy_state(&pubkey, existing.as_ref())
+            .await?;
+        let fields = seller_profile_fields(
+            &profile,
+            policy.seller_approved,
+            policy.blocked,
+            projected_at,
+        );
+        self.db
+            .query(
+                r#"
+UPSERT type::record('seller_profile', $pubkey) CONTENT {
+    pubkey: $pubkey,
+    event_id: $event_id,
+    created_at: $created_at,
+    updated_at: $updated_at,
+    name: $name,
+    display_name: $display_name,
+    about: $about,
+    picture: $picture,
+    website: $website,
+    nip05: $nip05,
+    lud16: $lud16,
+    regions: $regions,
+    categories: $categories,
+    trust_markers: $trust_markers,
+    seller_approved: $seller_approved,
+    blocked: $blocked,
+    hidden: false,
+    deleted: false,
+    projected_at: $projected_at
+};
+"#,
+            )
+            .bind(("pubkey", fields.pubkey.as_str()))
+            .bind(("event_id", fields.event_id.as_str()))
+            .bind(("created_at", fields.created_at))
+            .bind(("updated_at", fields.updated_at))
+            .bind(("name", fields.name.as_deref()))
+            .bind(("display_name", fields.display_name.as_deref()))
+            .bind(("about", fields.about.as_deref()))
+            .bind(("picture", fields.picture.as_deref()))
+            .bind(("website", fields.website.as_deref()))
+            .bind(("nip05", fields.nip05.as_deref()))
+            .bind(("lud16", fields.lud16.as_deref()))
+            .bind(("regions", fields.regions))
+            .bind(("categories", fields.categories))
+            .bind(("trust_markers", fields.trust_markers))
+            .bind(("seller_approved", fields.seller_approved))
+            .bind(("blocked", fields.blocked))
+            .bind(("projected_at", fields.projected_at))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        Ok(SellerProfileProjectionOutcome::Projected)
+    }
+
+    pub async fn seller_profile_row(
+        &self,
+        pubkey: &str,
+    ) -> Result<Option<serde_json::Value>, SurrealStoreError> {
+        let pubkey = required_policy_text(pubkey, "seller profile pubkey")?;
+        let mut response = self
+            .db
+            .query("SELECT * FROM ONLY type::record('seller_profile', $pubkey);")
+            .bind(("pubkey", pubkey.as_str()))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
+    pub async fn query_seller_profiles(
+        &self,
+        query: &SellerProfileQuery,
+    ) -> Result<Vec<serde_json::Value>, SurrealStoreError> {
+        let mut statement =
+            "SELECT * FROM seller_profile WHERE hidden = false AND deleted = false".to_owned();
+        if query.pubkey.is_some() {
+            statement.push_str(" AND pubkey = $pubkey");
+        }
+        if query.approved.is_some() {
+            statement.push_str(" AND seller_approved = $approved");
+        }
+        if query.blocked.is_some() {
+            statement.push_str(" AND blocked = $blocked");
+        }
+        statement.push_str(" ORDER BY updated_at DESC, pubkey ASC");
+        if query.limit.is_some() {
+            statement.push_str(" LIMIT $limit");
+        }
+        statement.push(';');
+        let mut surreal_query = self.db.query(statement);
+        if let Some(value) = &query.pubkey {
+            surreal_query = surreal_query.bind(("pubkey", value.as_str()));
+        }
+        if let Some(value) = query.approved {
+            surreal_query = surreal_query.bind(("approved", value));
+        }
+        if let Some(value) = query.blocked {
+            surreal_query = surreal_query.bind(("blocked", value));
+        }
+        if let Some(value) = query.limit {
+            surreal_query = surreal_query.bind(("limit", value));
+        }
+        let mut response = surreal_query
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
     pub async fn project_listing_helpers(
         &self,
         event: &Event,
@@ -3261,6 +3436,7 @@ UPDATE forum_thread_projection SET hidden = true WHERE event_id = $event_id;
 UPDATE forum_thread_topic SET hidden = true WHERE event_id = $event_id;
 UPDATE label_projection SET hidden = true WHERE event_id = $event_id;
 UPDATE report_projection SET hidden = true WHERE event_id = $event_id;
+UPDATE seller_profile SET hidden = true WHERE event_id = $event_id;
 UPDATE search_doc SET visible = false WHERE event_id = $event_id OR current_event_id = $event_id;
 "#,
             )
@@ -3318,6 +3494,7 @@ UPDATE forum_thread_projection SET hidden = false WHERE event_id = $event_id;
 UPDATE forum_thread_topic SET hidden = false WHERE event_id = $event_id;
 UPDATE label_projection SET hidden = false WHERE event_id = $event_id;
 UPDATE report_projection SET hidden = false WHERE event_id = $event_id;
+UPDATE seller_profile SET hidden = false WHERE event_id = $event_id;
 UPDATE search_doc SET visible = true WHERE (event_id = $event_id OR current_event_id = $event_id) AND (status = "active" OR status = "published" OR status = "open");
 UPDATE search_doc SET visible = false WHERE (event_id = $event_id OR current_event_id = $event_id) AND status != "active" AND status != "published" AND status != "open";
 "#,
@@ -3716,6 +3893,7 @@ UPSERT type::record('relay_user', $pubkey) CONTENT {
     created_at: $created_at,
     updated_at: $updated_at
 };
+UPDATE seller_profile SET seller_approved = $seller_approved, blocked = $blocked WHERE pubkey = $pubkey;
 "#,
             )
             .bind(("pubkey", pubkey))
@@ -3729,6 +3907,36 @@ UPSERT type::record('relay_user', $pubkey) CONTENT {
             .check()
             .map_err(SurrealStoreError::from)?;
         Ok(())
+    }
+
+    async fn seller_profile_policy_state(
+        &self,
+        pubkey: &str,
+        existing_profile: Option<&serde_json::Value>,
+    ) -> Result<SellerProfilePolicyState, SurrealStoreError> {
+        let relay_user = self.relay_user_row(pubkey).await?;
+        Ok(SellerProfilePolicyState {
+            seller_approved: relay_user
+                .as_ref()
+                .and_then(|row| row.get("seller_approved"))
+                .and_then(serde_json::Value::as_bool)
+                .or_else(|| {
+                    existing_profile
+                        .and_then(|row| row.get("seller_approved"))
+                        .and_then(serde_json::Value::as_bool)
+                })
+                .unwrap_or(false),
+            blocked: relay_user
+                .as_ref()
+                .and_then(|row| row.get("blocked"))
+                .and_then(serde_json::Value::as_bool)
+                .or_else(|| {
+                    existing_profile
+                        .and_then(|row| row.get("blocked"))
+                        .and_then(serde_json::Value::as_bool)
+                })
+                .unwrap_or(false),
+        })
     }
 
     async fn refresh_reaction_count_for_event(
@@ -3920,6 +4128,7 @@ UPDATE forum_thread_projection SET deleted = true WHERE event_id = $event_id AND
 UPDATE forum_thread_topic SET deleted = true WHERE event_id = $event_id;
 UPDATE label_projection SET deleted = true WHERE event_id = $event_id AND pubkey = $author_pubkey;
 UPDATE report_projection SET deleted = true WHERE event_id = $event_id AND pubkey = $author_pubkey;
+UPDATE seller_profile SET deleted = true WHERE event_id = $event_id AND pubkey = $author_pubkey;
 UPDATE search_doc SET visible = false WHERE event_id = $event_id OR current_event_id = $event_id;
 "#,
             )
@@ -4267,6 +4476,31 @@ struct ReportProjectionFields {
     projected_at: u64,
 }
 
+struct SellerProfilePolicyState {
+    seller_approved: bool,
+    blocked: bool,
+}
+
+struct SellerProfileFields {
+    pubkey: String,
+    event_id: String,
+    created_at: u64,
+    updated_at: u64,
+    name: Option<String>,
+    display_name: Option<String>,
+    about: Option<String>,
+    picture: Option<String>,
+    website: Option<String>,
+    nip05: Option<String>,
+    lud16: Option<String>,
+    regions: Vec<String>,
+    categories: Vec<String>,
+    trust_markers: Vec<String>,
+    seller_approved: bool,
+    blocked: bool,
+    projected_at: u64,
+}
+
 struct ListingCurrentFields {
     listing_key: String,
     listing_key_hash: String,
@@ -4567,6 +4801,43 @@ fn report_projection_id(
     )
 }
 
+fn seller_profile_fields(
+    profile: &SellerProfileEvent,
+    seller_approved: bool,
+    blocked: bool,
+    projected_at: UnixTimestamp,
+) -> SellerProfileFields {
+    let metadata = profile.metadata();
+    SellerProfileFields {
+        pubkey: profile.pubkey().as_str().to_owned(),
+        event_id: profile.event_id().as_str().to_owned(),
+        created_at: profile.created_at().as_u64(),
+        updated_at: profile.created_at().as_u64(),
+        name: metadata.name().map(str::to_owned),
+        display_name: metadata.display_name().map(str::to_owned),
+        about: metadata.about().map(str::to_owned),
+        picture: metadata.picture().map(str::to_owned),
+        website: metadata.website().map(str::to_owned),
+        nip05: metadata.nip05().map(str::to_owned),
+        lud16: metadata.lud16().map(str::to_owned),
+        regions: profile.regions().to_vec(),
+        categories: profile.categories().to_vec(),
+        trust_markers: profile.trust_markers().to_vec(),
+        seller_approved,
+        blocked,
+        projected_at: projected_at.as_u64(),
+    }
+}
+
+fn seller_profile_should_replace(profile: &SellerProfileEvent, row: &serde_json::Value) -> bool {
+    let incoming_created_at = profile.created_at().as_u64();
+    let existing_created_at = row["updated_at"].as_u64().unwrap_or_default();
+    let existing_event_id = row["event_id"].as_str().unwrap_or_default();
+    incoming_created_at > existing_created_at
+        || (incoming_created_at == existing_created_at
+            && profile.event_id().as_str() > existing_event_id)
+}
+
 struct SearchDocumentFields {
     doc_key: String,
     address_key: Option<String>,
@@ -4798,14 +5069,15 @@ mod tests {
         LabelProjectionQuery, ListingCurrentOutcome, ListingHelperOutcome, ListingProjectionQuery,
         ListingRevisionOutcome, LongFormProjectionOutcome, LongFormProjectionQuery,
         MigrationApplyOutcome, ReactionProjectionOutcome, ReportProjectionOutcome,
-        ReportProjectionQuery, SearchDocumentOutcome, SearchDocumentQuery, SurrealConfigError,
+        ReportProjectionQuery, SearchDocumentOutcome, SearchDocumentQuery,
+        SellerProfileProjectionOutcome, SellerProfileQuery, SurrealConfigError,
         SurrealConnectionConfig, SurrealConnectionMode, SurrealMigration, SurrealMigrationError,
         SurrealMigrationPlan, SurrealStore, SurrealStoreError, base_migration_plan,
         migration_tracking_schema,
     };
     use tangle_nips::{
-        ListingProjectionEvaluation, NIP7D_THREAD_KIND, NIP23_LONG_FORM_DRAFT_KIND,
-        NIP23_LONG_FORM_KIND, NIP32_LABEL_KIND, NIP56_REPORT_KIND,
+        ListingProjectionEvaluation, NIP01_METADATA_KIND, NIP7D_THREAD_KIND,
+        NIP23_LONG_FORM_DRAFT_KIND, NIP23_LONG_FORM_KIND, NIP32_LABEL_KIND, NIP56_REPORT_KIND,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -8423,6 +8695,263 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_seller_profiles_persists_current_metadata_and_trust_state() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let profile = seller_profile(
+            1_714_125_140,
+            "radroots-market",
+            Some("Radroots Market"),
+            &["PNW", "pnw", " Cascadia "],
+            &["Produce", "produce"],
+            &["CSA", "regenerative"],
+        );
+        let invalid_profile = build_fixture_event_from_parts(
+            FixtureKey::Seller,
+            1_714_125_139,
+            u64::from(NIP01_METADATA_KIND),
+            Vec::new(),
+            "{\"name\":7}",
+        )
+        .expect("invalid profile");
+
+        store
+            .set_seller_approved(
+                FixtureKey::Seller.public_key().as_str(),
+                true,
+                UnixTimestamp::new(1_714_125_138),
+            )
+            .await
+            .expect("approve seller");
+        assert_eq!(
+            store
+                .project_seller_profile(&listing, UnixTimestamp::new(1_714_125_141))
+                .await
+                .expect("not profile"),
+            SellerProfileProjectionOutcome::NotProfile
+        );
+        assert_eq!(
+            store
+                .project_seller_profile(&invalid_profile, UnixTimestamp::new(1_714_125_141))
+                .await
+                .expect("invalid profile"),
+            SellerProfileProjectionOutcome::Ineligible
+        );
+        assert_eq!(
+            store
+                .project_seller_profile(&profile, UnixTimestamp::new(1_714_125_142))
+                .await
+                .expect("project profile"),
+            SellerProfileProjectionOutcome::Projected
+        );
+
+        let row = store
+            .seller_profile_row(FixtureKey::Seller.public_key().as_str())
+            .await
+            .expect("profile row")
+            .expect("profile exists");
+        assert_eq!(row["pubkey"], FixtureKey::Seller.public_key().as_str());
+        assert_eq!(row["event_id"], profile.id().as_str());
+        assert_eq!(row["created_at"], 1_714_125_140_u64);
+        assert_eq!(row["updated_at"], 1_714_125_140_u64);
+        assert_eq!(row["name"], "radroots-market");
+        assert_eq!(row["display_name"], "Radroots Market");
+        assert_eq!(row["about"], "Local food seller profile");
+        assert_eq!(row["picture"], "https://fixtures.radroots.test/seller.png");
+        assert_eq!(row["website"], "https://seller.radroots.test");
+        assert_eq!(row["nip05"], "seller@radroots.test");
+        assert_eq!(row["lud16"], "seller@pay.radroots.test");
+        assert_eq!(row["regions"], serde_json::json!(["cascadia", "pnw"]));
+        assert_eq!(row["categories"], serde_json::json!(["produce"]));
+        assert_eq!(
+            row["trust_markers"],
+            serde_json::json!(["csa", "regenerative"])
+        );
+        assert_eq!(row["seller_approved"], true);
+        assert_eq!(row["blocked"], false);
+        assert_eq!(row["hidden"], false);
+        assert_eq!(row["deleted"], false);
+        assert_eq!(row["projected_at"], 1_714_125_142_u64);
+
+        let rows = store
+            .query_seller_profiles(
+                &SellerProfileQuery::new()
+                    .with_pubkey(FixtureKey::Seller.public_key().as_str())
+                    .with_approved(true)
+                    .with_blocked(false)
+                    .with_limit(5),
+            )
+            .await
+            .expect("seller query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["event_id"], profile.id().as_str());
+    }
+
+    #[tokio::test]
+    async fn seller_profile_projection_tracks_replacement_moderation_and_deletion() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let older = seller_profile(
+            1_714_125_150,
+            "older-market",
+            None,
+            &["pnw"],
+            &["produce"],
+            &["csa"],
+        );
+        let newer = seller_profile(
+            1_714_125_151,
+            "newer-market",
+            Some("Newer Market"),
+            &["cascadia"],
+            &["fruit"],
+            &["inspected"],
+        );
+        let admin_pubkey = "a".repeat(PublicKeyHex::HEX_LENGTH);
+
+        assert_eq!(
+            store
+                .project_seller_profile(&older, UnixTimestamp::new(1_714_125_152))
+                .await
+                .expect("older profile"),
+            SellerProfileProjectionOutcome::Projected
+        );
+        assert_eq!(
+            store
+                .project_seller_profile(&newer, UnixTimestamp::new(1_714_125_153))
+                .await
+                .expect("newer profile"),
+            SellerProfileProjectionOutcome::Projected
+        );
+        assert_eq!(
+            store
+                .project_seller_profile(&older, UnixTimestamp::new(1_714_125_154))
+                .await
+                .expect("stale profile"),
+            SellerProfileProjectionOutcome::Ineligible
+        );
+        let current = store
+            .seller_profile_row(FixtureKey::Seller.public_key().as_str())
+            .await
+            .expect("profile row")
+            .expect("profile exists");
+        assert_eq!(current["event_id"], newer.id().as_str());
+        assert_eq!(current["name"], "newer-market");
+        assert_eq!(current["categories"], serde_json::json!(["fruit"]));
+
+        store
+            .store_raw_event(&StoredEvent::new(
+                newer.clone(),
+                UnixTimestamp::new(1_714_125_155),
+            ))
+            .await
+            .expect("raw profile");
+        assert_eq!(
+            store
+                .hide_event(
+                    newer.id(),
+                    "profile moderation",
+                    "admin_api",
+                    &admin_pubkey,
+                    UnixTimestamp::new(1_714_125_156),
+                )
+                .await
+                .expect("hide profile"),
+            HiddenEventOutcome::Hidden
+        );
+        assert!(
+            store
+                .query_seller_profiles(&SellerProfileQuery::new())
+                .await
+                .expect("hidden profiles")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .seller_profile_row(FixtureKey::Seller.public_key().as_str())
+                .await
+                .expect("profile row")
+                .expect("profile exists")["hidden"],
+            true
+        );
+        assert_eq!(
+            store
+                .unhide_event(
+                    newer.id(),
+                    "profile restored",
+                    &admin_pubkey,
+                    UnixTimestamp::new(1_714_125_157),
+                )
+                .await
+                .expect("unhide profile"),
+            HiddenEventOutcome::Unhidden
+        );
+        assert_eq!(
+            store
+                .query_seller_profiles(&SellerProfileQuery::new())
+                .await
+                .expect("visible profiles")
+                .len(),
+            1
+        );
+
+        store
+            .set_pubkey_blocked(
+                FixtureKey::Seller.public_key().as_str(),
+                true,
+                UnixTimestamp::new(1_714_125_158),
+            )
+            .await
+            .expect("block seller");
+        assert_eq!(
+            store
+                .seller_profile_row(FixtureKey::Seller.public_key().as_str())
+                .await
+                .expect("profile row")
+                .expect("profile exists")["blocked"],
+            true
+        );
+
+        let deletion = build_fixture_event_from_parts(
+            FixtureKey::Seller,
+            1_714_125_159,
+            5,
+            vec![vec!["e".to_owned(), newer.id().as_str().to_owned()]],
+            "",
+        )
+        .expect("deletion event");
+        assert_eq!(
+            store
+                .apply_deletion_markers(&deletion)
+                .await
+                .expect("delete profile"),
+            DeletionMarkerOutcome::Applied { targets: 1 }
+        );
+        assert!(
+            store
+                .query_seller_profiles(&SellerProfileQuery::new())
+                .await
+                .expect("deleted profiles")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .seller_profile_row(FixtureKey::Seller.public_key().as_str())
+                .await
+                .expect("profile row")
+                .expect("profile exists")["deleted"],
+            true
+        );
+    }
+
+    #[tokio::test]
     async fn hidden_event_overlay_excludes_events_from_public_read_models() {
         let store = memory_store().await;
         store
@@ -8958,6 +9487,51 @@ mod tests {
             error.message(),
             "listing price amount must fit two decimal minor units"
         );
+    }
+
+    fn seller_profile(
+        created_at: u64,
+        name: &str,
+        display_name: Option<&str>,
+        regions: &[&str],
+        categories: &[&str],
+        trust_markers: &[&str],
+    ) -> Event {
+        let mut tags = Vec::new();
+        tags.extend(
+            regions
+                .iter()
+                .map(|region| vec!["region".to_owned(), (*region).to_owned()]),
+        );
+        tags.extend(
+            categories
+                .iter()
+                .map(|category| vec!["category".to_owned(), (*category).to_owned()]),
+        );
+        tags.extend(
+            trust_markers
+                .iter()
+                .map(|trust| vec!["trust".to_owned(), (*trust).to_owned()]),
+        );
+        let mut content = serde_json::json!({
+            "name": name,
+            "about": "Local food seller profile",
+            "picture": "https://fixtures.radroots.test/seller.png",
+            "website": "https://seller.radroots.test",
+            "nip05": "seller@radroots.test",
+            "lud16": "seller@pay.radroots.test"
+        });
+        if let Some(display_name) = display_name {
+            content["display_name"] = serde_json::Value::String(display_name.to_owned());
+        }
+        build_fixture_event_from_parts(
+            FixtureKey::Seller,
+            created_at,
+            u64::from(NIP01_METADATA_KIND),
+            tags,
+            &content.to_string(),
+        )
+        .expect("seller profile")
     }
 
     fn listing_comment(listing: &Event, created_at: u64, content: &str) -> Event {
