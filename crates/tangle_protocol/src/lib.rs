@@ -460,6 +460,84 @@ pub enum ClientMessage {
     Auth(Event),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum RelayMessage {
+    Event {
+        subscription_id: SubscriptionId,
+        event: Event,
+    },
+    Ok {
+        event_id: EventId,
+        accepted: bool,
+        message: String,
+    },
+    Eose(SubscriptionId),
+    Closed {
+        subscription_id: SubscriptionId,
+        message: String,
+    },
+    Notice(String),
+    Auth(String),
+}
+
+impl RelayMessage {
+    pub fn encode(&self) -> String {
+        encode_relay_message(self)
+    }
+}
+
+pub fn encode_relay_message(message: &RelayMessage) -> String {
+    relay_message_to_value(message).to_string()
+}
+
+pub fn relay_message_to_value(message: &RelayMessage) -> serde_json::Value {
+    match message {
+        RelayMessage::Event {
+            subscription_id,
+            event,
+        } => serde_json::json!(["EVENT", subscription_id.as_str(), event_to_value(event)]),
+        RelayMessage::Ok {
+            event_id,
+            accepted,
+            message,
+        } => serde_json::json!(["OK", event_id.as_str(), accepted, message]),
+        RelayMessage::Eose(subscription_id) => {
+            serde_json::json!(["EOSE", subscription_id.as_str()])
+        }
+        RelayMessage::Closed {
+            subscription_id,
+            message,
+        } => serde_json::json!(["CLOSED", subscription_id.as_str(), message]),
+        RelayMessage::Notice(message) => serde_json::json!(["NOTICE", message]),
+        RelayMessage::Auth(challenge) => serde_json::json!(["AUTH", challenge]),
+    }
+}
+
+pub fn event_to_value(event: &Event) -> serde_json::Value {
+    let tags = event
+        .unsigned()
+        .tags()
+        .iter()
+        .map(|tag| {
+            serde_json::Value::Array(
+                tag.values()
+                    .iter()
+                    .map(|value| serde_json::Value::String(value.clone()))
+                    .collect(),
+            )
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "id": event.id().as_str(),
+        "pubkey": event.unsigned().pubkey().as_str(),
+        "created_at": event.unsigned().created_at().as_u64(),
+        "kind": event.unsigned().kind().as_u32(),
+        "tags": tags,
+        "content": event.unsigned().content(),
+        "sig": event.sig().as_str()
+    })
+}
+
 pub fn parse_client_message(raw: &str) -> Result<ClientMessage, String> {
     let value: serde_json::Value = serde_json::from_str(raw)
         .map_err(|source| format!("client message JSON is invalid: {source}"))?;
@@ -652,10 +730,10 @@ fn kind_out_of_range_error(value: u64) -> String {
 mod tests {
     use super::{
         ClientMessage, Event, EventId, EventShapeError, Kind, PublicKeyHex, RawEventJson,
-        SignatureHex, SubscriptionId, Tag, TagName, TagValue, UnixTimestamp, UnsignedEvent,
-        canonical_event_json, empty_error, event_from_value, invalid_length_error,
-        kind_out_of_range_error, non_lowercase_hex_error, parse_client_message, parse_event_json,
-        too_long_error,
+        RelayMessage, SignatureHex, SubscriptionId, Tag, TagName, TagValue, UnixTimestamp,
+        UnsignedEvent, canonical_event_json, empty_error, encode_relay_message, event_from_value,
+        event_to_value, invalid_length_error, kind_out_of_range_error, non_lowercase_hex_error,
+        parse_client_message, parse_event_json, relay_message_to_value, too_long_error,
     };
     use core::str::FromStr;
     use std::collections::hash_map::DefaultHasher;
@@ -1118,6 +1196,92 @@ mod tests {
                 .expect_err("sig scalar")
                 .to_string(),
             "event field `sig` is invalid: signature must be 128 characters, got 3"
+        );
+    }
+
+    #[test]
+    fn relay_message_encoder_emits_nip01_and_nip42_messages() {
+        let event = parse_event_json(
+            &RawEventJson::new(&event_json("a", "b", 1, tags_json())).expect("raw"),
+        )
+        .expect("event");
+        let subscription_id = SubscriptionId::new("sub-a").expect("sub");
+        let accepted_id = EventId::new(&"c".repeat(EventId::HEX_LENGTH)).expect("id");
+        let rejected_id = EventId::new(&"d".repeat(EventId::HEX_LENGTH)).expect("id");
+
+        assert_eq!(
+            relay_message_to_value(&RelayMessage::Event {
+                subscription_id: subscription_id.clone(),
+                event: event.clone()
+            }),
+            serde_json::json!(["EVENT", "sub-a", event_to_value(&event)])
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encode_relay_message(&RelayMessage::Ok {
+                event_id: accepted_id,
+                accepted: true,
+                message: String::new()
+            }))
+            .expect("ok"),
+            serde_json::json!([
+                "OK",
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                true,
+                ""
+            ])
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &RelayMessage::Ok {
+                    event_id: rejected_id,
+                    accepted: false,
+                    message: "invalid: event id mismatch".to_owned()
+                }
+                .encode()
+            )
+            .expect("rejected"),
+            serde_json::json!([
+                "OK",
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                false,
+                "invalid: event id mismatch"
+            ])
+        );
+        assert_eq!(
+            relay_message_to_value(&RelayMessage::Eose(subscription_id.clone())),
+            serde_json::json!(["EOSE", "sub-a"])
+        );
+        assert_eq!(
+            relay_message_to_value(&RelayMessage::Closed {
+                subscription_id,
+                message: "unsupported: filter contains unknown elements".to_owned()
+            }),
+            serde_json::json!([
+                "CLOSED",
+                "sub-a",
+                "unsupported: filter contains unknown elements"
+            ])
+        );
+        assert_eq!(
+            relay_message_to_value(&RelayMessage::Notice("maintenance window".to_owned())),
+            serde_json::json!(["NOTICE", "maintenance window"])
+        );
+        assert_eq!(
+            relay_message_to_value(&RelayMessage::Auth("challenge-a".to_owned())),
+            serde_json::json!(["AUTH", "challenge-a"])
+        );
+    }
+
+    #[test]
+    fn event_to_value_round_trips_with_event_parser() {
+        let event = parse_event_json(
+            &RawEventJson::new(&event_json("e", "f", 30402, tags_json())).expect("raw"),
+        )
+        .expect("event");
+
+        assert_eq!(
+            event_from_value(&event_to_value(&event)).expect("parsed"),
+            event
         );
     }
 
