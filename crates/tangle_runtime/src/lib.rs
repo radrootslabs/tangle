@@ -15,7 +15,7 @@ use std::{
     collections::BTreeSet,
     fs,
     net::SocketAddr,
-    path::{Path as FsPath, PathBuf},
+    path::{Component, Path as FsPath, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -621,6 +621,24 @@ pub async fn import_events_from_path(
     })?;
     let events = parse_event_import_document(&raw)?;
     let store = connect_runtime_store(config).await?;
+    let report = import_events_into_store(config, &store, events).await?;
+    tracing::info!(
+        command = "event import",
+        total = report.total(),
+        inserted = report.inserted(),
+        duplicate = report.duplicate(),
+        projected = report.projected(),
+        skipped = report.skipped(),
+        "finished event import"
+    );
+    Ok(report)
+}
+
+async fn import_events_into_store(
+    config: &TangleRuntimeConfig,
+    store: &SurrealStore,
+    events: Vec<Event>,
+) -> Result<RuntimeEventImportReport, RuntimeCommandError> {
     store
         .apply_plan(&base_migration_plan())
         .await
@@ -635,18 +653,9 @@ pub async fn import_events_from_path(
     let mut report = RuntimeEventImportReport::default();
     let now = now_timestamp();
     for event in events {
-        let outcome = import_single_event(&store, &validator, event, now).await?;
+        let outcome = import_single_event(store, &validator, event, now).await?;
         report.record(outcome);
     }
-    tracing::info!(
-        command = "event import",
-        total = report.total(),
-        inserted = report.inserted(),
-        duplicate = report.duplicate(),
-        projected = report.projected(),
-        skipped = report.skipped(),
-        "finished event import"
-    );
     Ok(report)
 }
 
@@ -1037,6 +1046,161 @@ async fn backup_runtime_store(
     ))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeRestoreReport {
+    input_dir: PathBuf,
+    raw_event_count: u64,
+    raw_events_sha256: String,
+    import_report: RuntimeEventImportReport,
+    rebuild_report: RuntimeProjectionRebuildReport,
+}
+
+impl RuntimeRestoreReport {
+    pub fn new(
+        input_dir: PathBuf,
+        raw_event_count: u64,
+        raw_events_sha256: String,
+        import_report: RuntimeEventImportReport,
+        rebuild_report: RuntimeProjectionRebuildReport,
+    ) -> Self {
+        Self {
+            input_dir,
+            raw_event_count,
+            raw_events_sha256,
+            import_report,
+            rebuild_report,
+        }
+    }
+
+    pub fn input_dir(&self) -> &FsPath {
+        &self.input_dir
+    }
+
+    pub fn raw_event_count(&self) -> u64 {
+        self.raw_event_count
+    }
+
+    pub fn raw_events_sha256(&self) -> &str {
+        &self.raw_events_sha256
+    }
+
+    pub fn import_report(&self) -> RuntimeEventImportReport {
+        self.import_report
+    }
+
+    pub fn rebuild_report(&self) -> RuntimeProjectionRebuildReport {
+        self.rebuild_report
+    }
+}
+
+pub async fn restore_runtime_database(
+    config: &TangleRuntimeConfig,
+    input_dir: impl AsRef<FsPath>,
+) -> Result<RuntimeRestoreReport, RuntimeCommandError> {
+    let input_dir = input_dir.as_ref();
+    tracing::info!(
+        command = "ops restore",
+        input_dir = input_dir.display().to_string(),
+        "starting runtime restore"
+    );
+    let store = connect_runtime_store(config).await?;
+    let report = restore_runtime_store(config, &store, input_dir).await?;
+    tracing::info!(
+        command = "ops restore",
+        raw_event_count = report.raw_event_count(),
+        raw_events_sha256 = report.raw_events_sha256(),
+        inserted = report.import_report().inserted(),
+        duplicate = report.import_report().duplicate(),
+        rebuilt = report.rebuild_report().rebuilt(),
+        "finished runtime restore"
+    );
+    Ok(report)
+}
+
+async fn restore_runtime_store(
+    config: &TangleRuntimeConfig,
+    store: &SurrealStore,
+    input_dir: &FsPath,
+) -> Result<RuntimeRestoreReport, RuntimeCommandError> {
+    let manifest_path = input_dir.join("manifest.json");
+    let manifest_raw = fs::read_to_string(&manifest_path).map_err(|error| {
+        RuntimeCommandError::input(format!(
+            "failed to read backup manifest file `{}`: {error}",
+            manifest_path.display()
+        ))
+    })?;
+    let manifest: RuntimeBackupManifestDocument =
+        serde_json::from_str(&manifest_raw).map_err(|error| {
+            RuntimeCommandError::input(format!("backup manifest JSON is invalid: {error}"))
+        })?;
+    validate_backup_manifest(&manifest)?;
+    let raw_events_path = backup_artifact_path(input_dir, &manifest.raw_events.path)?;
+    let raw_events = fs::read_to_string(&raw_events_path).map_err(|error| {
+        RuntimeCommandError::input(format!(
+            "failed to read backup raw events file `{}`: {error}",
+            raw_events_path.display()
+        ))
+    })?;
+    let raw_events_sha256 = sha256_hex(raw_events.as_bytes());
+    if raw_events_sha256 != manifest.raw_events.sha256 {
+        return Err(RuntimeCommandError::input(format!(
+            "backup raw events checksum mismatch: expected {}, got {}",
+            manifest.raw_events.sha256, raw_events_sha256
+        )));
+    }
+    let events = parse_event_import_document(&raw_events)?;
+    if events.len() as u64 != manifest.raw_events.count {
+        return Err(RuntimeCommandError::input(format!(
+            "backup raw events count mismatch: expected {}, got {}",
+            manifest.raw_events.count,
+            events.len()
+        )));
+    }
+    let import_report = import_events_into_store(config, store, events).await?;
+    let rebuild_report = rebuild_projections_in_store(config, store).await?;
+    Ok(RuntimeRestoreReport::new(
+        input_dir.to_path_buf(),
+        manifest.raw_events.count,
+        raw_events_sha256,
+        import_report,
+        rebuild_report,
+    ))
+}
+
+fn validate_backup_manifest(
+    manifest: &RuntimeBackupManifestDocument,
+) -> Result<(), RuntimeCommandError> {
+    if manifest.format != "tangle-backup-v1" {
+        return Err(RuntimeCommandError::input(format!(
+            "backup manifest format is unsupported: {}",
+            manifest.format
+        )));
+    }
+    if manifest.raw_events.path.trim().is_empty() {
+        return Err(RuntimeCommandError::input(
+            "backup manifest raw_events.path must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+fn backup_artifact_path(
+    input_dir: &FsPath,
+    artifact: &str,
+) -> Result<PathBuf, RuntimeCommandError> {
+    let path = FsPath::new(artifact);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(RuntimeCommandError::input(
+            "backup manifest artifact paths must be relative to the backup directory",
+        ));
+    }
+    Ok(input_dir.join(path))
+}
+
 fn runtime_row_string(
     row: &serde_json::Value,
     field: &'static str,
@@ -1124,6 +1288,22 @@ pub async fn rebuild_projections(
         "starting projection rebuild"
     );
     let store = connect_runtime_store(config).await?;
+    let report = rebuild_projections_in_store(config, &store).await?;
+    tracing::info!(
+        command = "projection rebuild",
+        scanned = report.scanned(),
+        rebuilt = report.rebuilt(),
+        projected = report.projected(),
+        skipped = report.skipped(),
+        "finished projection rebuild"
+    );
+    Ok(report)
+}
+
+async fn rebuild_projections_in_store(
+    config: &TangleRuntimeConfig,
+    store: &SurrealStore,
+) -> Result<RuntimeProjectionRebuildReport, RuntimeCommandError> {
     store
         .apply_plan(&base_migration_plan())
         .await
@@ -1146,17 +1326,9 @@ pub async fn rebuild_projections(
             .map_err(|error| RuntimeCommandError::store(error.to_string()))?;
         let event = parse_event_json(&raw)
             .map_err(|error| RuntimeCommandError::store(error.to_string()))?;
-        let outcome = rebuild_single_event_projection(&store, &validator, event, now).await?;
+        let outcome = rebuild_single_event_projection(store, &validator, event, now).await?;
         report.record(outcome);
     }
-    tracing::info!(
-        command = "projection rebuild",
-        scanned = report.scanned(),
-        rebuilt = report.rebuilt(),
-        projected = report.projected(),
-        skipped = report.skipped(),
-        "finished projection rebuild"
-    );
     Ok(report)
 }
 
@@ -4725,7 +4897,7 @@ mod tests {
         listing_item_document, listing_projection_query, listings_router, load_runtime_config,
         metrics_router, migrate_runtime_database, parse_listing_query,
         parse_marketplace_search_query, parse_runtime_config_json, relay_info_router,
-        search_document_query, websocket_router,
+        restore_runtime_store, search_document_query, websocket_router,
     };
     use axum::{body::Body, response::IntoResponse};
     use http::{HeaderValue, Request, StatusCode, header};
@@ -5463,6 +5635,140 @@ mod tests {
                 .is_some()
         );
         drop(store);
+        std::fs::remove_dir_all(&root).expect("remove runtime root");
+    }
+
+    #[tokio::test]
+    async fn runtime_restore_command_imports_backup_and_rebuilds_projection_state() {
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let root = std::env::temp_dir().join(format!(
+            "tangle-runtime-restore-{}-{}",
+            std::process::id(),
+            &listing.id().as_str()[..8]
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let source_db_path = root.join("source-db");
+        let restore_db_path = root.join("restore-db");
+        let backup_path = root.join("backup");
+        std::fs::create_dir_all(&root).expect("runtime root");
+        let source_config_json = serde_json::json!({
+            "server": {
+                "listen_addr": "127.0.0.1:7302",
+                "relay_url": "ws://127.0.0.1:7302"
+            },
+            "database": {
+                "mode": "rocks_db",
+                "path": source_db_path.to_str().expect("source db path"),
+                "namespace": "tangle_restore_source",
+                "database": "relay"
+            },
+            "auth": {
+                "challenge_ttl_seconds": 300
+            },
+            "limits": {
+                "message_rate_limit": {
+                    "limit": 120,
+                    "window_seconds": 60
+                }
+            },
+            "policy": {
+                "approved_sellers": [FixtureKey::Seller.public_key().as_str()]
+            }
+        });
+        let restore_config_json = serde_json::json!({
+            "server": {
+                "listen_addr": "127.0.0.1:7303",
+                "relay_url": "ws://127.0.0.1:7303"
+            },
+            "database": {
+                "mode": "rocks_db",
+                "path": restore_db_path.to_str().expect("restore db path"),
+                "namespace": "tangle_restore_destination",
+                "database": "relay"
+            },
+            "auth": {
+                "challenge_ttl_seconds": 300
+            },
+            "limits": {
+                "message_rate_limit": {
+                    "limit": 120,
+                    "window_seconds": 60
+                }
+            },
+            "policy": {
+                "approved_sellers": [FixtureKey::Seller.public_key().as_str()]
+            }
+        });
+        let source_config = parse_runtime_config_json(
+            &serde_json::to_string(&source_config_json).expect("source config JSON"),
+        )
+        .expect("source config");
+        let restore_config = parse_runtime_config_json(
+            &serde_json::to_string(&restore_config_json).expect("restore config JSON"),
+        )
+        .expect("restore config");
+        let source_store = SurrealStore::connect(source_config.database_config())
+            .await
+            .expect("source store");
+        source_store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("source migrations");
+        assert_eq!(
+            source_store
+                .store_raw_event(&StoredEvent::new(
+                    listing.clone(),
+                    UnixTimestamp::new(1_714_124_500)
+                ))
+                .await
+                .expect("source raw event"),
+            StoreEventOutcome::Inserted
+        );
+        let backup_report = backup_runtime_store(&source_config, &source_store, &backup_path)
+            .await
+            .expect("backup");
+        assert_eq!(backup_report.raw_event_count(), 1);
+        drop(source_store);
+
+        let restore_store = SurrealStore::connect(restore_config.database_config())
+            .await
+            .expect("restore store");
+        let restore_report = restore_runtime_store(&restore_config, &restore_store, &backup_path)
+            .await
+            .expect("restore");
+        assert_eq!(restore_report.raw_event_count(), 1);
+        assert_eq!(restore_report.import_report().inserted(), 1);
+        assert_eq!(restore_report.import_report().duplicate(), 0);
+        assert_eq!(restore_report.rebuild_report().rebuilt(), 1);
+        assert_eq!(restore_report.rebuild_report().projected(), 1);
+        assert_eq!(
+            restore_report.raw_events_sha256(),
+            backup_report.raw_events_sha256()
+        );
+        let seller = FixtureKey::Seller.public_key();
+        let listing_key = format!("30402:{}:listing-a", seller.as_str());
+        assert!(
+            restore_store
+                .raw_event_row(listing.id())
+                .await
+                .expect("raw row")
+                .is_some()
+        );
+        assert!(
+            restore_store
+                .listing_current_row(&listing_key)
+                .await
+                .expect("listing row")
+                .is_some()
+        );
+        assert!(
+            restore_store
+                .search_document_row(&listing_key)
+                .await
+                .expect("search row")
+                .is_some()
+        );
+        drop(restore_store);
         std::fs::remove_dir_all(&root).expect("remove runtime root");
     }
 

@@ -27,7 +27,7 @@ fn tangle_without_args_reports_usage() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "usage:\n  tangle [--version]\n  tangle migrate --config PATH\n  tangle run --config PATH\n  tangle event import --config PATH --input PATH\n  tangle event export --config PATH --output PATH\n  tangle projection rebuild --config PATH\n  tangle ops backup --config PATH --output DIR\n"
+        "usage:\n  tangle [--version]\n  tangle migrate --config PATH\n  tangle run --config PATH\n  tangle event import --config PATH --input PATH\n  tangle event export --config PATH --output PATH\n  tangle projection rebuild --config PATH\n  tangle ops backup --config PATH --output DIR\n  tangle ops restore --config PATH --input DIR\n"
     );
     assert!(output.stderr.is_empty());
 }
@@ -43,7 +43,7 @@ fn tangle_unknown_arg_reports_usage_error() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
-        "unknown command: --unknown\nusage:\n  tangle [--version]\n  tangle migrate --config PATH\n  tangle run --config PATH\n  tangle event import --config PATH --input PATH\n  tangle event export --config PATH --output PATH\n  tangle projection rebuild --config PATH\n  tangle ops backup --config PATH --output DIR\n"
+        "unknown command: --unknown\nusage:\n  tangle [--version]\n  tangle migrate --config PATH\n  tangle run --config PATH\n  tangle event import --config PATH --input PATH\n  tangle event export --config PATH --output PATH\n  tangle projection rebuild --config PATH\n  tangle ops backup --config PATH --output DIR\n  tangle ops restore --config PATH --input DIR\n"
     );
 }
 
@@ -107,6 +107,8 @@ async fn tangle_event_import_command_imports_canonical_jsonl() {
     let input_path = root.join("events.jsonl");
     let output_path = root.join("exported.jsonl");
     let backup_path = root.join("backup");
+    let restore_db_path = root.join("restore-db");
+    let restore_config_path = root.join("restore-runtime.json");
     std::fs::create_dir_all(&root).expect("runtime root");
     write_rocksdb_config(&config_path, &db_path, "tangle_cli_import");
     std::fs::write(&input_path, format!("{}\n", event_to_value(&listing)))
@@ -204,6 +206,26 @@ async fn tangle_event_import_command_imports_canonical_jsonl() {
     assert!(manifest["surrealdb_export"]["path"].is_null());
     assert!(manifest["surrealdb_export"]["sha256"].is_null());
 
+    write_rocksdb_config(&restore_config_path, &restore_db_path, "tangle_cli_restore");
+    let restore = Command::new(env!("CARGO_BIN_EXE_tangle"))
+        .args(["ops", "restore", "--config"])
+        .arg(&restore_config_path)
+        .args(["--input"])
+        .arg(&backup_path)
+        .output()
+        .expect("run tangle ops restore");
+
+    assert!(restore.status.success());
+    assert!(restore.stderr.is_empty());
+    let restore_stdout = String::from_utf8_lossy(&restore.stdout);
+    assert!(restore_stdout.starts_with(&format!(
+        "restore directory: {}\nraw events: 1\nraw events sha256: ",
+        backup_path.display()
+    )));
+    assert!(restore_stdout.contains(
+        "\nevents inserted: 1\nevents duplicate: 0\nevents rebuilt: 1\nlistings projected: 1\nevents skipped: 0\n"
+    ));
+
     let rebuild = Command::new(env!("CARGO_BIN_EXE_tangle"))
         .args(["projection", "rebuild", "--config"])
         .arg(&config_path)
@@ -232,6 +254,36 @@ async fn tangle_event_import_command_imports_canonical_jsonl() {
 
     let seller = FixtureKey::Seller.public_key();
     let listing_key = format!("30402:{}:listing-a", seller.as_str());
+    let restore_store_config = SurrealConnectionConfig::rocksdb(
+        restore_db_path.to_str().expect("restore db path"),
+        "tangle_cli_restore",
+        "relay",
+    )
+    .expect("restore store config");
+    let restore_store = reopen_store(&restore_store_config).await;
+    assert!(
+        restore_store
+            .raw_event_row(listing.id())
+            .await
+            .expect("restore raw row")
+            .is_some()
+    );
+    assert!(
+        restore_store
+            .listing_current_row(&listing_key)
+            .await
+            .expect("restore listing row")
+            .is_some()
+    );
+    assert!(
+        restore_store
+            .search_document_row(&listing_key)
+            .await
+            .expect("restore search row")
+            .is_some()
+    );
+    drop(restore_store);
+
     let store_config = SurrealConnectionConfig::rocksdb(
         db_path.to_str().expect("db path"),
         "tangle_cli_import",
