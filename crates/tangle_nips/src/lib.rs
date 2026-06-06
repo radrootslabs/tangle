@@ -2,8 +2,11 @@
 
 use core::str::FromStr;
 use tangle_protocol::{
-    AddressCoordinate, Event, EventId, Filter, PublicKeyHex, TagName, UnixTimestamp,
+    AddressCoordinate, DTag, Event, EventId, Filter, PublicKeyHex, TagName, UnixTimestamp,
 };
+
+pub const NIP99_PUBLIC_LISTING_KIND: u32 = 30_402;
+pub const NIP99_DRAFT_LISTING_KIND: u32 = 30_403;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedTag {
@@ -270,14 +273,73 @@ pub fn parse_nip50_filter_search(filter: &Filter) -> Result<Option<Nip50SearchQu
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListingKind {
+    Public,
+    Draft,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListingIdentity {
+    event_id: EventId,
+    listing_kind: ListingKind,
+    address: AddressCoordinate,
+}
+
+impl ListingIdentity {
+    pub fn event_id(&self) -> &EventId {
+        &self.event_id
+    }
+
+    pub fn listing_kind(&self) -> ListingKind {
+        self.listing_kind
+    }
+
+    pub fn address(&self) -> &AddressCoordinate {
+        &self.address
+    }
+
+    pub fn seller_pubkey(&self) -> &PublicKeyHex {
+        self.address.pubkey()
+    }
+
+    pub fn d(&self) -> &DTag {
+        self.address.d()
+    }
+}
+
+pub fn parse_listing_identity(event: &Event) -> Result<Option<ListingIdentity>, String> {
+    let listing_kind = match event.unsigned().kind().as_u32() {
+        NIP99_PUBLIC_LISTING_KIND => ListingKind::Public,
+        NIP99_DRAFT_LISTING_KIND => ListingKind::Draft,
+        _ => return Ok(None),
+    };
+    let d = required_tag_value(event, "d")?;
+    if d.is_empty() {
+        return Err("listing d tag must not be empty".to_owned());
+    }
+    let address = AddressCoordinate::new(
+        event.unsigned().kind(),
+        event.unsigned().pubkey().clone(),
+        DTag::new(&d),
+    )
+    .expect("listing kind must be addressable");
+    Ok(Some(ListingIdentity {
+        event_id: event.id().clone(),
+        listing_kind,
+        address,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        DeletionTarget, matching_tags, optional_tag_value, optional_tag_values,
-        parse_deletion_request, parse_nip50_filter_search, parse_nip50_search,
-        parse_relay_auth_event, parse_required_u64_tag, parse_u64_field,
-        repeated_or_missing_policy_boundary, required_tag_value, required_tag_values,
-        single_letter_tag_values, single_letter_values_for, tag_count,
+        DeletionTarget, ListingKind, NIP99_PUBLIC_LISTING_KIND, matching_tags, optional_tag_value,
+        optional_tag_values, parse_deletion_request, parse_listing_identity,
+        parse_nip50_filter_search, parse_nip50_search, parse_relay_auth_event,
+        parse_required_u64_tag, parse_u64_field, repeated_or_missing_policy_boundary,
+        required_tag_value, required_tag_values, single_letter_tag_values,
+        single_letter_values_for, tag_count,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -638,6 +700,76 @@ mod tests {
             "farmstand tomatoes"
         );
         assert_eq!(parse_nip50_filter_search(&missing), Ok(None));
+    }
+
+    #[test]
+    fn listing_identity_parser_extracts_public_listing_address() {
+        let event = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("d", &["listing-a"]).expect("d")],
+        );
+
+        let identity = parse_listing_identity(&event)
+            .expect("parse")
+            .expect("identity");
+
+        assert_eq!(identity.event_id(), event.id());
+        assert_eq!(identity.listing_kind(), ListingKind::Public);
+        assert_eq!(identity.seller_pubkey(), event.unsigned().pubkey());
+        assert_eq!(identity.d().as_str(), "listing-a");
+        assert_eq!(
+            identity.address().to_string(),
+            format!("30402:{}:listing-a", event.unsigned().pubkey().as_str())
+        );
+    }
+
+    #[test]
+    fn listing_identity_parser_extracts_draft_listing_address() {
+        let event =
+            event_with_kind_and_tags(30_403, vec![Tag::from_parts("d", &["draft-a"]).expect("d")]);
+
+        let identity = parse_listing_identity(&event)
+            .expect("parse")
+            .expect("identity");
+
+        assert_eq!(identity.listing_kind(), ListingKind::Draft);
+        assert_eq!(identity.address().kind().as_u32(), 30_403);
+    }
+
+    #[test]
+    fn listing_identity_parser_ignores_non_listing_kinds() {
+        let event = event_with_kind_and_tags(1, vec![Tag::from_parts("d", &["note"]).expect("d")]);
+
+        assert_eq!(parse_listing_identity(&event), Ok(None));
+    }
+
+    #[test]
+    fn listing_identity_parser_rejects_missing_repeated_and_empty_d_tags() {
+        let missing = event_with_kind_and_tags(u64::from(NIP99_PUBLIC_LISTING_KIND), Vec::new());
+        let repeated = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![
+                Tag::from_parts("d", &["listing-a"]).expect("d"),
+                Tag::from_parts("d", &["listing-b"]).expect("d"),
+            ],
+        );
+        let empty = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("d", &[""]).expect("d")],
+        );
+
+        assert_eq!(
+            parse_listing_identity(&missing).expect_err("missing"),
+            "tag `d` is required"
+        );
+        assert_eq!(
+            parse_listing_identity(&repeated).expect_err("repeated"),
+            "tag `d` must not be repeated"
+        );
+        assert_eq!(
+            parse_listing_identity(&empty).expect_err("empty"),
+            "listing d tag must not be empty"
+        );
     }
 
     fn event_with_tags(tags: Vec<Tag>) -> Event {
