@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::time::Instant;
 use tangle_protocol::{Event, filter_from_value};
 use tangle_store::{StoreEventOutcome, StoredEvent};
 use tangle_store_surreal::{
@@ -245,6 +246,26 @@ pub async fn run_generic_relay_workload(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngestBenchmarkReport {
+    pub attempted: u64,
+    pub inserted: u64,
+    pub elapsed_micros: u128,
+}
+
+pub async fn run_ingest_benchmark(
+    config: BenchDatasetConfig,
+) -> Result<IngestBenchmarkReport, String> {
+    let dataset = BenchDataset::generate(config)?;
+    let started = Instant::now();
+    let report = run_generic_relay_workload(&dataset).await?;
+    Ok(IngestBenchmarkReport {
+        attempted: report.attempted,
+        inserted: report.inserted,
+        elapsed_micros: started.elapsed().as_micros(),
+    })
+}
+
 async fn bench_memory_store(database: &str) -> Result<SurrealStore, String> {
     let config = SurrealConnectionConfig::memory("tangle_bench", database)
         .map_err(|error| error.to_string())?;
@@ -430,5 +451,16 @@ mod tests {
                 all_results: 12
             }
         );
+    }
+
+    #[tokio::test]
+    async fn ingest_benchmark_reports_deterministic_event_counts() {
+        let report = super::run_ingest_benchmark(BenchDatasetConfig::new(6, 4))
+            .await
+            .expect("ingest benchmark");
+
+        assert_eq!(report.attempted, 10);
+        assert_eq!(report.inserted, 10);
+        assert!(report.elapsed_micros > 0);
     }
 }
