@@ -14,7 +14,10 @@ use tangle_nips::{
     parse_forum_thread_event, parse_label_event, parse_long_form_event, parse_reaction_event,
     parse_report_event, parse_seller_profile_event,
 };
-use tangle_protocol::{AddressCoordinate, Event, EventId, Filter, UnixTimestamp, event_to_value};
+use tangle_protocol::{
+    AddressCoordinate, Event, EventId, Filter, RawEventJson, UnixTimestamp, event_to_value,
+    parse_event_json,
+};
 use tangle_store::{StoreEventOutcome, StoredEvent};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2037,9 +2040,6 @@ UPSERT type::record('event_current', $address_key) CONTENT {
             statement.push_str(" AND created_at <= $until");
         }
         statement.push_str(" ORDER BY created_at DESC, event_id ASC");
-        if filter.limit().is_some() {
-            statement.push_str(" LIMIT $limit");
-        }
         statement.push(';');
         let mut query = self.db.query(statement);
         if !filter.ids().is_empty() {
@@ -2078,15 +2078,35 @@ UPSERT type::record('event_current', $address_key) CONTENT {
         if let Some(until) = filter.until() {
             query = query.bind(("until", until.as_u64()));
         }
-        if let Some(limit) = filter.limit() {
-            query = query.bind(("limit", limit));
-        }
         let mut response = query
             .await
             .map_err(SurrealStoreError::from)?
             .check()
             .map_err(SurrealStoreError::from)?;
-        response.take(0).map_err(SurrealStoreError::from)
+        let rows: Vec<serde_json::Value> = response.take(0).map_err(SurrealStoreError::from)?;
+        let mut events = Vec::new();
+        for row in rows {
+            let event_id = EventId::new(&string_row_field(&row, "event_id")?)
+                .map_err(|source| SurrealStoreError::new(&source))?;
+            let Some(raw_row) = self.raw_event_row(&event_id).await? else {
+                continue;
+            };
+            let raw_json = string_row_field(&raw_row, "raw_json")?;
+            let raw = RawEventJson::new(&raw_json)
+                .map_err(|source| SurrealStoreError::new(&source.to_string()))?;
+            let event = parse_event_json(&raw)
+                .map_err(|source| SurrealStoreError::new(&source.to_string()))?;
+            if filter.matches(&event) {
+                events.push(raw_row);
+            }
+            if filter
+                .limit()
+                .is_some_and(|limit| events.len() >= limit as usize)
+            {
+                break;
+            }
+        }
+        Ok(events)
     }
 
     pub async fn apply_deletion_markers(
@@ -6768,6 +6788,10 @@ mod tests {
             "listing",
         );
         for event in [&older, &newer, &other, &addressable] {
+            store
+                .store_raw_event(&StoredEvent::new(event.clone(), UnixTimestamp::new(200)))
+                .await
+                .expect("raw event");
             store.maintain_current_event(event).await.expect("current");
         }
 
@@ -6797,6 +6821,26 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["event_id"], other.id().as_str());
         assert_eq!(rows[1]["event_id"], newer.id().as_str());
+        assert!(
+            rows[0]["raw_json"]
+                .as_str()
+                .expect("raw json")
+                .contains("other")
+        );
+
+        let address_filter = filter_from_value(&serde_json::json!({
+            "kinds": [30402],
+            "authors": [pubkey_a],
+            "#d": ["listing-current"],
+            "limit": 1
+        }))
+        .expect("address filter");
+        let rows = store
+            .query_current_events(&address_filter)
+            .await
+            .expect("address rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["event_id"], addressable.id().as_str());
 
         store
             .database()
