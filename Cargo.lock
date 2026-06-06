@@ -3929,6 +3929,8 @@ dependencies = [
  "tangle_core",
  "tangle_nips",
  "tangle_protocol",
+ "tangle_store_surreal",
+ "tangle_test_support",
  "tokio",
  "tower",
  "url",

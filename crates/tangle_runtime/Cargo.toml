@@ -11,13 +11,15 @@ description = "Service runtime for the Tangle relay"
 axum = "0.8"
 http = "1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tangle_core = { path = "../tangle_core" }
 tangle_nips = { path = "../tangle_nips" }
 tangle_protocol = { path = "../tangle_protocol" }
+tangle_store_surreal = { path = "../tangle_store_surreal" }
 url = "2"
 
 [dev-dependencies]
-serde_json = "1"
+tangle_test_support = { path = "../tangle_test_support" }
 tokio = { version = "1", features = ["macros", "rt"] }
 tower = { version = "0.5", features = ["util"] }
 

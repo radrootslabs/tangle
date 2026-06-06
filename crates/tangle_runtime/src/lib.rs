@@ -2,7 +2,7 @@
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{RawQuery, State},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -15,6 +15,7 @@ use tangle_core::{
 };
 use tangle_nips::{FulfillmentMethod, ListingUnit};
 use tangle_protocol::PublicKeyHex;
+use tangle_store_surreal::{ListingProjectionQuery, SurrealStore};
 use url::form_urlencoded;
 
 pub const TANGLE_SUPPORTED_NIPS: [u16; 8] = [1, 9, 11, 16, 33, 42, 50, 99];
@@ -293,6 +294,52 @@ impl ListingHttpQuery {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ListingsHttpState {
+    store: SurrealStore,
+    limits: RuntimeLimits,
+}
+
+impl ListingsHttpState {
+    pub fn new(store: SurrealStore, limits: RuntimeLimits) -> Self {
+        Self { store, limits }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListingsDocument {
+    pub items: Vec<ListingItemDocument>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListingItemDocument {
+    pub listing_key: String,
+    pub event_id: String,
+    pub seller_pubkey: String,
+    pub d: String,
+    pub title: String,
+    pub summary: Option<String>,
+    pub price: ListingPriceDocument,
+    pub location: ListingLocationDocument,
+    pub fulfillment: Vec<String>,
+    pub status: String,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListingPriceDocument {
+    pub amount: String,
+    pub currency: String,
+    pub unit: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListingLocationDocument {
+    pub text: Option<String>,
+    pub geohash: Option<String>,
+}
+
 pub fn parse_listing_query(
     query: &str,
     limits: RuntimeLimits,
@@ -393,6 +440,12 @@ pub fn relay_info_router(document: RelayInfoDocument) -> Router {
         .with_state(document)
 }
 
+pub fn listings_router(state: ListingsHttpState) -> Router {
+    Router::new()
+        .route("/api/listings", get(listings))
+        .with_state(state)
+}
+
 async fn healthz() -> Json<HealthDocument> {
     Json(HealthDocument {
         status: "ok".to_owned(),
@@ -424,6 +477,27 @@ async fn relay_info(State(relay_info): State<RelayInfoDocument>, headers: Header
         .into_response()
 }
 
+async fn listings(
+    State(state): State<ListingsHttpState>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<ListingsDocument>, ApiError> {
+    let parsed = parse_listing_query(query.as_deref().unwrap_or_default(), state.limits)?;
+    let store_query = listing_projection_query(&parsed)?;
+    let rows = state
+        .store
+        .query_current_listings(&store_query)
+        .await
+        .map_err(|_| ApiError::internal())?;
+    let items = rows
+        .iter()
+        .map(listing_item_document)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(ListingsDocument {
+        items,
+        next_cursor: None,
+    }))
+}
+
 fn accepts_nostr_json(value: Option<&HeaderValue>) -> bool {
     value
         .and_then(|value| value.to_str().ok())
@@ -436,6 +510,195 @@ fn accepts_nostr_json(value: Option<&HeaderValue>) -> bool {
                 })
             })
         })
+}
+
+fn listing_projection_query(parsed: &ListingHttpQuery) -> Result<ListingProjectionQuery, ApiError> {
+    let query = parsed.marketplace();
+    if !query.categories.is_empty() {
+        return Err(invalid_parameter(
+            "category",
+            "is not supported by the listings endpoint",
+        ));
+    }
+    if parsed.geohash().is_some() {
+        return Err(invalid_parameter(
+            "geohash",
+            "is not supported by the listings endpoint",
+        ));
+    }
+    if !query.fulfillment.is_empty() {
+        return Err(invalid_parameter(
+            "fulfillment",
+            "is not supported by the listings endpoint",
+        ));
+    }
+    if query.delivery_only.is_some() {
+        return Err(invalid_parameter(
+            "delivery_only",
+            "is not supported by the listings endpoint",
+        ));
+    }
+    if query.pickup.is_some() {
+        return Err(invalid_parameter(
+            "pickup",
+            "is not supported by the listings endpoint",
+        ));
+    }
+    if query.location.point.is_some()
+        || query.location.radius_meters.is_some()
+        || query.location.near.is_some()
+    {
+        return Err(invalid_parameter(
+            "location",
+            "is not supported by the listings endpoint",
+        ));
+    }
+    if !matches!(
+        query.sort,
+        MarketplaceSort::Relevance | MarketplaceSort::Freshness
+    ) {
+        return Err(invalid_parameter(
+            "sort",
+            "is not supported by the listings endpoint",
+        ));
+    }
+    if query.statuses.len() != 1 {
+        return Err(invalid_parameter(
+            "status",
+            "must contain exactly one value for the listings endpoint",
+        ));
+    }
+    if query.currencies.len() > 1 {
+        return Err(invalid_parameter(
+            "currency",
+            "must contain at most one value for the listings endpoint",
+        ));
+    }
+    if query.units.len() > 1 {
+        return Err(invalid_parameter(
+            "unit",
+            "must contain at most one value for the listings endpoint",
+        ));
+    }
+    let mut store_query =
+        ListingProjectionQuery::new().with_effective_status(query.statuses[0].as_str());
+    if let Some(seller) = &query.seller {
+        store_query = store_query.with_seller_pubkey(seller.as_str());
+    }
+    if let Some(unit) = query.units.first() {
+        store_query = store_query.with_unit(unit.canonical());
+    }
+    if let Some(currency) = query.currencies.first() {
+        store_query = store_query.with_currency_norm(currency);
+    }
+    if let Some(price) = &query.min_price {
+        store_query = store_query.with_min_price_minor(price_minor_units(&price.raw)?);
+    }
+    if let Some(price) = &query.max_price {
+        store_query = store_query.with_max_price_minor(price_minor_units(&price.raw)?);
+    }
+    Ok(store_query.with_limit(query.limit))
+}
+
+fn listing_item_document(row: &serde_json::Value) -> Result<ListingItemDocument, ApiError> {
+    Ok(ListingItemDocument {
+        listing_key: string_field(row, "listing_key")?,
+        event_id: string_field(row, "event_id")?,
+        seller_pubkey: string_field(row, "seller_pubkey")?,
+        d: string_field(row, "d")?,
+        title: string_field(row, "title")?,
+        summary: optional_string_field(row, "summary")?,
+        price: ListingPriceDocument {
+            amount: string_field(row, "price_decimal")?,
+            currency: string_field(row, "currency_norm")?,
+            unit: string_field(row, "unit")?,
+        },
+        location: ListingLocationDocument {
+            text: optional_string_field(row, "location_text")?,
+            geohash: optional_string_field(row, "geohash")?,
+        },
+        fulfillment: fulfillment_document(row)?,
+        status: string_field(row, "effective_status")?,
+        updated_at: u64_field(row, "updated_at")?,
+    })
+}
+
+fn fulfillment_document(row: &serde_json::Value) -> Result<Vec<String>, ApiError> {
+    let mut fulfillment = Vec::new();
+    if bool_field(row, "pickup_available")? {
+        fulfillment.push("pickup".to_owned());
+    }
+    if bool_field(row, "delivery_available")? {
+        fulfillment.push("delivery".to_owned());
+    }
+    if bool_field(row, "shipping_available")? {
+        fulfillment.push("shipping".to_owned());
+    }
+    Ok(fulfillment)
+}
+
+fn price_minor_units(raw: &str) -> Result<i64, ApiError> {
+    let mut parts = raw.split('.');
+    let whole = parts.next().unwrap_or_default();
+    let fraction = parts.next();
+    if parts.next().is_some() || whole.is_empty() {
+        return Err(invalid_parameter(
+            "price",
+            "must fit two decimal minor units",
+        ));
+    }
+    let whole = whole
+        .parse::<i64>()
+        .map_err(|_| invalid_parameter("price", "must fit two decimal minor units"))?;
+    let fraction = match fraction {
+        Some(value) if value.len() <= 2 => format!("{value:0<2}")
+            .parse::<i64>()
+            .map_err(|_| invalid_parameter("price", "must fit two decimal minor units"))?,
+        Some(_) => {
+            return Err(invalid_parameter(
+                "price",
+                "must fit two decimal minor units",
+            ));
+        }
+        None => 0,
+    };
+    whole
+        .checked_mul(100)
+        .and_then(|whole| whole.checked_add(fraction))
+        .ok_or_else(|| invalid_parameter("price", "must fit two decimal minor units"))
+}
+
+fn string_field(row: &serde_json::Value, field: &'static str) -> Result<String, ApiError> {
+    row.get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(ApiError::internal)
+}
+
+fn optional_string_field(
+    row: &serde_json::Value,
+    field: &'static str,
+) -> Result<Option<String>, ApiError> {
+    match row.get(field) {
+        Some(value) if value.is_null() => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(|value| Some(value.to_owned()))
+            .ok_or_else(ApiError::internal),
+        None => Ok(None),
+    }
+}
+
+fn u64_field(row: &serde_json::Value, field: &'static str) -> Result<u64, ApiError> {
+    row.get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(ApiError::internal)
+}
+
+fn bool_field(row: &serde_json::Value, field: &'static str) -> Result<bool, ApiError> {
+    row.get(field)
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(ApiError::internal)
 }
 
 impl From<MarketplaceQueryError> for ApiError {
@@ -664,14 +927,18 @@ fn invalid_parameter(field: &'static str, requirement: &str) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiError, ApiErrorBody, ApiErrorCode, ApiErrorEnvelope, ReadinessCheckStatus,
-        ReadinessState, RelayInfoDocument, TANGLE_RELAY_SOFTWARE, TANGLE_SUPPORTED_NIPS,
-        health_router, parse_listing_query, relay_info_router,
+        ApiError, ApiErrorBody, ApiErrorCode, ApiErrorEnvelope, ListingsHttpState,
+        ReadinessCheckStatus, ReadinessState, RelayInfoDocument, TANGLE_RELAY_SOFTWARE,
+        TANGLE_SUPPORTED_NIPS, health_router, listing_item_document, listing_projection_query,
+        listings_router, parse_listing_query, relay_info_router,
     };
     use axum::{body::Body, response::IntoResponse};
     use http::{HeaderValue, Request, StatusCode, header};
     use tangle_core::{MarketplaceListingStatus, MarketplaceSort, RuntimeLimits};
     use tangle_nips::{FulfillmentMethod, ListingUnit};
+    use tangle_protocol::UnixTimestamp;
+    use tangle_store_surreal::{SurrealConnectionConfig, SurrealStore, base_migration_plan};
+    use tangle_test_support::{build_fixture_event, valid_public_listing_spec};
     use tower::ServiceExt;
 
     #[test]
@@ -1131,5 +1398,263 @@ mod tests {
             assert_eq!(error.code(), ApiErrorCode::InvalidRequest);
             assert_eq!(error.message(), expected);
         }
+    }
+
+    #[test]
+    fn listing_projection_query_rejects_filters_store_cannot_apply() {
+        let cases = [
+            (
+                "category=vegetables",
+                "category is not supported by the listings endpoint",
+            ),
+            (
+                "geohash=c22yzug",
+                "geohash is not supported by the listings endpoint",
+            ),
+            (
+                "fulfillment=pickup",
+                "fulfillment is not supported by the listings endpoint",
+            ),
+            (
+                "delivery_only=true",
+                "delivery_only is not supported by the listings endpoint",
+            ),
+            (
+                "pickup=true",
+                "pickup is not supported by the listings endpoint",
+            ),
+            (
+                "lat=0&lon=0",
+                "location is not supported by the listings endpoint",
+            ),
+            (
+                "sort=price_asc",
+                "sort is not supported by the listings endpoint",
+            ),
+            (
+                "status=active,sold",
+                "status must contain exactly one value for the listings endpoint",
+            ),
+            (
+                "currency=usd,cad",
+                "currency must contain at most one value for the listings endpoint",
+            ),
+            (
+                "unit=lb,kg",
+                "unit must contain at most one value for the listings endpoint",
+            ),
+            ("min_price=1.234", "price must fit two decimal minor units"),
+            (
+                "min_price=999999999999999999999999999999",
+                "price must fit two decimal minor units",
+            ),
+            (
+                "min_price=9223372036854775807",
+                "price must fit two decimal minor units",
+            ),
+        ];
+        for (raw, expected) in cases {
+            let parsed = parse_listing_query(raw, RuntimeLimits::default()).expect("query");
+            let error = listing_projection_query(&parsed).expect_err(raw);
+            assert_eq!(error.message(), expected);
+        }
+    }
+
+    #[test]
+    fn listing_item_document_maps_projection_rows_and_rejects_malformed_rows() {
+        let row = serde_json::json!({
+            "listing_key": "30402:pubkey:listing-a",
+            "event_id": "event",
+            "seller_pubkey": "pubkey",
+            "d": "listing-a",
+            "title": "Carrot bunches",
+            "location_text": "Seattle",
+            "price_decimal": "12.50",
+            "currency_norm": "USD",
+            "unit": "lb",
+            "effective_status": "active",
+            "updated_at": 1714124433_u64,
+            "pickup_available": false,
+            "delivery_available": true,
+            "shipping_available": true
+        });
+        let item = listing_item_document(&row).expect("item");
+
+        assert_eq!(item.summary, None);
+        assert_eq!(item.location.text.as_deref(), Some("Seattle"));
+        assert_eq!(item.location.geohash, None);
+        assert_eq!(
+            item.fulfillment,
+            ["delivery".to_owned(), "shipping".to_owned()]
+        );
+        assert_eq!(item.price.amount, "12.50");
+
+        for row in [
+            serde_json::json!({
+                "event_id": "event",
+                "seller_pubkey": "pubkey",
+                "d": "listing-a",
+                "title": "Carrot bunches",
+                "price_decimal": "12.50",
+                "currency_norm": "USD",
+                "unit": "lb",
+                "effective_status": "active",
+                "updated_at": 1714124433_u64,
+                "pickup_available": false,
+                "delivery_available": true,
+                "shipping_available": true
+            }),
+            serde_json::json!({
+                "listing_key": "30402:pubkey:listing-a",
+                "event_id": "event",
+                "seller_pubkey": "pubkey",
+                "d": "listing-a",
+                "title": "Carrot bunches",
+                "summary": 1,
+                "price_decimal": "12.50",
+                "currency_norm": "USD",
+                "unit": "lb",
+                "effective_status": "active",
+                "updated_at": 1714124433_u64,
+                "pickup_available": false,
+                "delivery_available": true,
+                "shipping_available": true
+            }),
+            serde_json::json!({
+                "listing_key": "30402:pubkey:listing-a",
+                "event_id": "event",
+                "seller_pubkey": "pubkey",
+                "d": "listing-a",
+                "title": "Carrot bunches",
+                "price_decimal": "12.50",
+                "currency_norm": "USD",
+                "unit": "lb",
+                "effective_status": "active",
+                "updated_at": "bad",
+                "pickup_available": false,
+                "delivery_available": true,
+                "shipping_available": true
+            }),
+            serde_json::json!({
+                "listing_key": "30402:pubkey:listing-a",
+                "event_id": "event",
+                "seller_pubkey": "pubkey",
+                "d": "listing-a",
+                "title": "Carrot bunches",
+                "price_decimal": "12.50",
+                "currency_norm": "USD",
+                "unit": "lb",
+                "effective_status": "active",
+                "updated_at": 1714124433_u64,
+                "pickup_available": "bad",
+                "delivery_available": true,
+                "shipping_available": true
+            }),
+        ] {
+            assert_eq!(
+                listing_item_document(&row).expect_err("malformed").code(),
+                ApiErrorCode::Internal
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn listings_endpoint_queries_projection_rows_and_excludes_hidden_rows() {
+        let store = runtime_memory_store().await;
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let listing_key = format!("30402:{}:listing-a", listing.unsigned().pubkey().as_str());
+        store
+            .project_current_listing(&listing, UnixTimestamp::new(1_714_125_400))
+            .await
+            .expect("project listing");
+
+        let uri = format!(
+            "/api/listings?status=active&seller={}&unit=lb&currency=usd&min_price=1.5&max_price=20.25&limit=5",
+            listing.unsigned().pubkey().as_str()
+        );
+        let response = listings_router(ListingsHttpState::new(
+            store.clone(),
+            RuntimeLimits::default(),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
+            serde_json::json!({
+                "items": [{
+                    "listing_key": listing_key,
+                    "event_id": listing.id().as_str(),
+                    "seller_pubkey": listing.unsigned().pubkey().as_str(),
+                    "d": "listing-a",
+                    "title": "Carrot bunches",
+                    "summary": null,
+                    "price": {
+                        "amount": "12.50",
+                        "currency": "USD",
+                        "unit": "lb"
+                    },
+                    "location": {
+                        "text": null,
+                        "geohash": "c22yzug"
+                    },
+                    "fulfillment": ["pickup"],
+                    "status": "active",
+                    "updated_at": 1714124433
+                }],
+                "next_cursor": null
+            })
+        );
+
+        store
+            .database()
+            .query("UPDATE listing_current SET hidden = true WHERE listing_key = $listing_key;")
+            .bind(("listing_key", listing_key.as_str()))
+            .await
+            .expect("hide listing")
+            .check()
+            .expect("hide check");
+        let response = listings_router(ListingsHttpState::new(store, RuntimeLimits::default()))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/listings")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
+            serde_json::json!({
+                "items": [],
+                "next_cursor": null
+            })
+        );
+    }
+
+    async fn runtime_memory_store() -> SurrealStore {
+        let config = SurrealConnectionConfig::memory("tangle_runtime", "listings_endpoint")
+            .expect("memory config");
+        let store = SurrealStore::connect_memory(&config)
+            .await
+            .expect("memory store");
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        store
     }
 }
