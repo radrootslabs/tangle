@@ -315,6 +315,7 @@ pub fn base_migration_plan() -> SurrealMigrationPlan {
         forum_thread_schema(),
         label_projection_schema(),
         report_projection_schema(),
+        seller_profile_schema(),
     ])
     .expect("base migration plan is strictly ordered")
 }
@@ -856,6 +857,40 @@ DEFINE INDEX IF NOT EXISTS report_projection_visibility ON TABLE report_projecti
 "#,
     )
     .expect("report projection schema is valid")
+}
+
+pub fn seller_profile_schema() -> SurrealMigration {
+    SurrealMigration::new(
+        "0017_seller_profile",
+        r#"
+DEFINE TABLE IF NOT EXISTS seller_profile SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS pubkey ON TABLE seller_profile TYPE string;
+DEFINE FIELD IF NOT EXISTS event_id ON TABLE seller_profile TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON TABLE seller_profile TYPE int;
+DEFINE FIELD IF NOT EXISTS updated_at ON TABLE seller_profile TYPE int;
+DEFINE FIELD IF NOT EXISTS name ON TABLE seller_profile TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS display_name ON TABLE seller_profile TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS about ON TABLE seller_profile TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS picture ON TABLE seller_profile TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS website ON TABLE seller_profile TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS nip05 ON TABLE seller_profile TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS lud16 ON TABLE seller_profile TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS regions ON TABLE seller_profile TYPE array;
+DEFINE FIELD IF NOT EXISTS categories ON TABLE seller_profile TYPE array;
+DEFINE FIELD IF NOT EXISTS trust_markers ON TABLE seller_profile TYPE array;
+DEFINE FIELD IF NOT EXISTS seller_approved ON TABLE seller_profile TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS blocked ON TABLE seller_profile TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS hidden ON TABLE seller_profile TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS deleted ON TABLE seller_profile TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS projected_at ON TABLE seller_profile TYPE int;
+DEFINE INDEX IF NOT EXISTS seller_profile_pubkey_uid ON TABLE seller_profile COLUMNS pubkey UNIQUE;
+DEFINE INDEX IF NOT EXISTS seller_profile_event_uid ON TABLE seller_profile COLUMNS event_id UNIQUE;
+DEFINE INDEX IF NOT EXISTS seller_profile_updated ON TABLE seller_profile COLUMNS updated_at, pubkey;
+DEFINE INDEX IF NOT EXISTS seller_profile_approved_blocked ON TABLE seller_profile COLUMNS seller_approved, blocked, updated_at, pubkey;
+DEFINE INDEX IF NOT EXISTS seller_profile_visibility ON TABLE seller_profile COLUMNS hidden, deleted, updated_at, pubkey;
+"#,
+    )
+    .expect("seller profile schema is valid")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5458,6 +5493,48 @@ mod tests {
             "report_projection_type_created",
             "report_projection_author_created",
             "report_projection_visibility",
+        ] {
+            assert!(info.contains(expected), "missing {expected} in {info}");
+        }
+    }
+
+    #[tokio::test]
+    async fn seller_profile_schema_defines_current_seller_profile_table() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let info = store
+            .table_info("seller_profile")
+            .await
+            .expect("seller profile info");
+
+        for expected in [
+            "pubkey",
+            "event_id",
+            "created_at",
+            "updated_at",
+            "name",
+            "display_name",
+            "about",
+            "picture",
+            "website",
+            "nip05",
+            "lud16",
+            "regions",
+            "categories",
+            "trust_markers",
+            "seller_approved",
+            "blocked",
+            "hidden",
+            "deleted",
+            "projected_at",
+            "seller_profile_pubkey_uid",
+            "seller_profile_event_uid",
+            "seller_profile_updated",
+            "seller_profile_approved_blocked",
+            "seller_profile_visibility",
         ] {
             assert!(info.contains(expected), "missing {expected} in {info}");
         }
