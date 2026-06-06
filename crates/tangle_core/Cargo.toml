@@ -8,6 +8,8 @@ license.workspace = true
 description = "Transport-independent relay core policy for tangle"
 
 [dependencies]
+tangle_crypto = { path = "../tangle_crypto" }
+tangle_nips = { path = "../tangle_nips" }
 tangle_protocol = { path = "../tangle_protocol" }
 
 [dev-dependencies]

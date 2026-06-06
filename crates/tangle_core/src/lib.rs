@@ -2,6 +2,11 @@
 
 use core::fmt;
 use std::collections::BTreeSet;
+use tangle_crypto::verify_event_signature;
+use tangle_nips::{
+    DeletionRequest, ListingProjectionEvaluation, RelayAuthEvent, evaluate_listing_projection,
+    parse_deletion_request, parse_relay_auth_event,
+};
 use tangle_protocol::{Event, PublicKeyHex, UnixTimestamp, event_to_value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -734,6 +739,264 @@ impl fmt::Display for AdmissionRejectionKind {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventValidator {
+    limits: RuntimeLimits,
+    admission_policy: AdmissionPolicy,
+}
+
+impl EventValidator {
+    pub fn new(limits: RuntimeLimits, admission_policy: AdmissionPolicy) -> Self {
+        Self {
+            limits,
+            admission_policy,
+        }
+    }
+
+    pub fn limits(&self) -> RuntimeLimits {
+        self.limits
+    }
+
+    pub fn admission_policy(&self) -> &AdmissionPolicy {
+        &self.admission_policy
+    }
+
+    pub fn validate(
+        &self,
+        event: &Event,
+        context: &AdmissionContext,
+        now: UnixTimestamp,
+    ) -> Result<ValidatedEvent, EventValidationRejection> {
+        self.limits
+            .validate_event(event)
+            .map_err(EventValidationRejection::RuntimeLimit)?;
+        self.limits
+            .validate_event_timestamp(event, now)
+            .map_err(EventValidationRejection::RuntimeLimit)?;
+        verify_event_signature(event).map_err(EventValidationRejection::Crypto)?;
+        let payload = validation_payload(event)?;
+        let admission_event =
+            AdmissionEvent::new(event.unsigned().pubkey().clone(), payload.admission_kind());
+        let admission = match self.admission_policy.admit(&admission_event, context) {
+            AdmissionDecision::Accepted(acceptance) => acceptance,
+            AdmissionDecision::Rejected(rejection) => {
+                return Err(EventValidationRejection::Admission(rejection));
+            }
+        };
+        Ok(ValidatedEvent {
+            event_id: event.id().clone(),
+            author_pubkey: event.unsigned().pubkey().clone(),
+            admission_kind: admission_event.kind(),
+            admission,
+            payload,
+        })
+    }
+}
+
+impl Default for EventValidator {
+    fn default() -> Self {
+        Self::new(RuntimeLimits::default(), AdmissionPolicy::default())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedEvent {
+    event_id: tangle_protocol::EventId,
+    author_pubkey: PublicKeyHex,
+    admission_kind: AdmissionEventKind,
+    admission: AdmissionAcceptance,
+    payload: ValidatedEventPayload,
+}
+
+impl ValidatedEvent {
+    pub fn event_id(&self) -> &tangle_protocol::EventId {
+        &self.event_id
+    }
+
+    pub fn author_pubkey(&self) -> &PublicKeyHex {
+        &self.author_pubkey
+    }
+
+    pub fn admission_kind(&self) -> AdmissionEventKind {
+        self.admission_kind
+    }
+
+    pub fn admission(&self) -> &AdmissionAcceptance {
+        &self.admission
+    }
+
+    pub fn payload(&self) -> &ValidatedEventPayload {
+        &self.payload
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidatedEventPayload {
+    RelayAuth(Box<RelayAuthEvent>),
+    Deletion(Box<DeletionRequest>),
+    Listing {
+        admission_kind: AdmissionEventKind,
+        evaluation: Box<ListingProjectionEvaluation>,
+    },
+    Other,
+}
+
+impl ValidatedEventPayload {
+    pub fn admission_kind(&self) -> AdmissionEventKind {
+        match self {
+            Self::RelayAuth(_) => AdmissionEventKind::RelayAuth,
+            Self::Deletion(_) | Self::Other => AdmissionEventKind::Write,
+            Self::Listing { admission_kind, .. } => *admission_kind,
+        }
+    }
+
+    pub fn relay_auth(&self) -> Option<&RelayAuthEvent> {
+        match self {
+            Self::RelayAuth(event) => Some(event),
+            Self::Deletion(_) | Self::Listing { .. } | Self::Other => None,
+        }
+    }
+
+    pub fn deletion_request(&self) -> Option<&DeletionRequest> {
+        match self {
+            Self::Deletion(request) => Some(request),
+            Self::RelayAuth(_) | Self::Listing { .. } | Self::Other => None,
+        }
+    }
+
+    pub fn listing_evaluation(&self) -> Option<&ListingProjectionEvaluation> {
+        match self {
+            Self::Listing { evaluation, .. } => Some(evaluation),
+            Self::RelayAuth(_) | Self::Deletion(_) | Self::Other => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventValidationRejection {
+    RuntimeLimit(RuntimeLimitViolation),
+    Crypto(String),
+    Parser(EventParserRejection),
+    Admission(AdmissionRejection),
+}
+
+impl EventValidationRejection {
+    pub fn kind(&self) -> EventValidationRejectionKind {
+        match self {
+            Self::RuntimeLimit(_) => EventValidationRejectionKind::RuntimeLimit,
+            Self::Crypto(_) => EventValidationRejectionKind::Crypto,
+            Self::Parser(_) => EventValidationRejectionKind::Parser,
+            Self::Admission(_) => EventValidationRejectionKind::Admission,
+        }
+    }
+}
+
+impl fmt::Display for EventValidationRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RuntimeLimit(violation) => write!(formatter, "runtime limit: {violation}"),
+            Self::Crypto(message) => write!(formatter, "crypto: {message}"),
+            Self::Parser(rejection) => write!(formatter, "parser: {rejection}"),
+            Self::Admission(rejection) => write!(formatter, "admission: {rejection}"),
+        }
+    }
+}
+
+impl std::error::Error for EventValidationRejection {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventValidationRejectionKind {
+    RuntimeLimit,
+    Crypto,
+    Parser,
+    Admission,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventParserRejection {
+    parser: EventParser,
+    message: String,
+}
+
+impl EventParserRejection {
+    pub fn new(parser: EventParser, message: String) -> Self {
+        Self { parser, message }
+    }
+
+    pub fn parser(&self) -> EventParser {
+        self.parser
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for EventParserRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.parser, self.message)
+    }
+}
+
+impl std::error::Error for EventParserRejection {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventParser {
+    RelayAuth,
+    Deletion,
+}
+
+impl EventParser {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RelayAuth => "relay auth",
+            Self::Deletion => "deletion",
+        }
+    }
+}
+
+impl fmt::Display for EventParser {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+fn validation_payload(event: &Event) -> Result<ValidatedEventPayload, EventValidationRejection> {
+    if event.unsigned().kind().as_u32() == 22_242 {
+        let auth = parse_relay_auth_event(event)
+            .map_err(|message| {
+                EventValidationRejection::Parser(EventParserRejection::new(
+                    EventParser::RelayAuth,
+                    message,
+                ))
+            })?
+            .expect("relay auth kind must parse as relay auth");
+        return Ok(ValidatedEventPayload::RelayAuth(Box::new(auth)));
+    }
+    if event.unsigned().kind().as_u32() == 5 {
+        let deletion = parse_deletion_request(event)
+            .map_err(|message| {
+                EventValidationRejection::Parser(EventParserRejection::new(
+                    EventParser::Deletion,
+                    message,
+                ))
+            })?
+            .expect("deletion kind must parse as deletion request");
+        return Ok(ValidatedEventPayload::Deletion(Box::new(deletion)));
+    }
+    match event.unsigned().kind().as_u32() {
+        30_402 => Ok(ValidatedEventPayload::Listing {
+            admission_kind: AdmissionEventKind::PublicListing,
+            evaluation: Box::new(evaluate_listing_projection(event)),
+        }),
+        30_403 => Ok(ValidatedEventPayload::Listing {
+            admission_kind: AdmissionEventKind::DraftListing,
+            evaluation: Box::new(evaluate_listing_projection(event)),
+        }),
+        _ => Ok(ValidatedEventPayload::Other),
+    }
+}
+
 fn require_positive(field: &'static str, value: u64) -> Result<(), RuntimeLimitConfigError> {
     if value == 0 {
         Err(RuntimeLimitConfigError::Zero { field })
@@ -758,13 +1021,18 @@ fn require_within(
 mod tests {
     use super::{
         AdmissionContext, AdmissionEffect, AdmissionEvent, AdmissionEventKind, AdmissionPolicy,
-        AdmissionRejectionKind, ProjectionExclusionReason, RuntimeLimitConfigError,
-        RuntimeLimitKind, RuntimeLimitValues, RuntimeLimits, UnapprovedSellerAction,
+        AdmissionRejectionKind, EventParser, EventValidationRejection,
+        EventValidationRejectionKind, EventValidator, ProjectionExclusionReason,
+        RuntimeLimitConfigError, RuntimeLimitKind, RuntimeLimitValues, RuntimeLimits,
+        UnapprovedSellerAction,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
     };
-    use tangle_test_support::{build_fixture_event, valid_public_listing_spec};
+    use tangle_test_support::{
+        FixtureKey, auth_event_spec, build_fixture_event, deletion_event_spec,
+        fixture_spec_from_json, projection_ineligible_listing_spec, valid_public_listing_spec,
+    };
 
     #[test]
     fn default_runtime_limits_expose_reference_aligned_boundaries() {
@@ -1333,6 +1601,302 @@ mod tests {
             rejection.to_string(),
             "authentication required: write authentication required"
         );
+    }
+
+    #[test]
+    fn event_validator_accepts_approved_public_listing_with_projection_payload() {
+        let event = build_fixture_event(&valid_public_listing_spec()).expect("event");
+        let seller = FixtureKey::Seller.public_key();
+        let validator = EventValidator::new(
+            RuntimeLimits::default(),
+            AdmissionPolicy::new().approve_seller(seller.clone()),
+        );
+        let validated = validator
+            .validate(
+                &event,
+                &AdmissionContext::authenticated(seller.clone()),
+                UnixTimestamp::new(1_714_124_500),
+            )
+            .expect("validated");
+
+        assert_eq!(validator.limits(), RuntimeLimits::default());
+        assert!(validator.admission_policy().is_seller_approved(&seller));
+        assert_eq!(validated.event_id(), event.id());
+        assert_eq!(validated.author_pubkey(), &seller);
+        assert_eq!(
+            validated.admission_kind(),
+            AdmissionEventKind::PublicListing
+        );
+        assert_eq!(
+            validated.admission().effect(),
+            AdmissionEffect::StoreRawAndProjectPublicListing
+        );
+        assert!(
+            validated
+                .payload()
+                .listing_evaluation()
+                .expect("listing")
+                .is_eligible()
+        );
+        assert!(validated.payload().relay_auth().is_none());
+        assert!(validated.payload().deletion_request().is_none());
+    }
+
+    #[test]
+    fn event_validator_accepts_projection_ineligible_listing_as_raw_store_candidate() {
+        let event = build_fixture_event(&projection_ineligible_listing_spec()).expect("event");
+        let seller = FixtureKey::Seller.public_key();
+        let validated = EventValidator::new(
+            RuntimeLimits::default(),
+            AdmissionPolicy::new().approve_seller(seller.clone()),
+        )
+        .validate(
+            &event,
+            &AdmissionContext::authenticated(seller),
+            UnixTimestamp::new(1_714_124_500),
+        )
+        .expect("validated");
+        let rejection = validated
+            .payload()
+            .listing_evaluation()
+            .expect("listing")
+            .rejection()
+            .expect("projection rejection");
+
+        assert_eq!(
+            validated.admission_kind(),
+            AdmissionEventKind::PublicListing
+        );
+        assert_eq!(rejection.reasons(), &["tag `title` is required".to_owned()]);
+    }
+
+    #[test]
+    fn event_validator_accepts_auth_deletion_and_other_write_payloads() {
+        let seller = FixtureKey::Seller.public_key();
+        let auth = build_fixture_event(&auth_event_spec()).expect("auth");
+        let deletion = build_fixture_event(&deletion_event_spec()).expect("deletion");
+        let draft_listing = build_fixture_event(
+            &fixture_spec_from_json(
+                r#"{"name":"draft_listing","key":"seller","created_at":1714124438,"kind":30403,"tags":[["d","draft-carrots"],["title","Draft carrots"],["price","3.25","USD"],["unit","lb"],["fulfillment","pickup"]],"content":"Draft storage carrots."}"#,
+            )
+            .expect("draft listing"),
+        )
+        .expect("draft listing event");
+        let note = build_fixture_event(
+            &fixture_spec_from_json(
+                r#"{"name":"note","key":"seller","created_at":1714124437,"kind":1,"tags":[],"content":"hello"}"#,
+            )
+            .expect("note"),
+        )
+        .expect("note event");
+        let validator = EventValidator::default();
+        let auth = validator
+            .validate(
+                &auth,
+                &AdmissionContext::unauthenticated(),
+                UnixTimestamp::new(1_714_124_500),
+            )
+            .expect("auth validated");
+        let deletion = validator
+            .validate(
+                &deletion,
+                &AdmissionContext::authenticated(seller.clone()),
+                UnixTimestamp::new(1_714_124_500),
+            )
+            .expect("deletion validated");
+        let draft_listing = validator
+            .validate(
+                &draft_listing,
+                &AdmissionContext::authenticated(seller.clone()),
+                UnixTimestamp::new(1_714_124_500),
+            )
+            .expect("draft listing validated");
+        let note = validator
+            .validate(
+                &note,
+                &AdmissionContext::authenticated(seller),
+                UnixTimestamp::new(1_714_124_500),
+            )
+            .expect("note validated");
+
+        assert_eq!(auth.admission_kind(), AdmissionEventKind::RelayAuth);
+        assert_eq!(
+            auth.payload().relay_auth().expect("auth").challenge(),
+            "challenge-001"
+        );
+        assert!(auth.payload().listing_evaluation().is_none());
+        assert_eq!(deletion.admission_kind(), AdmissionEventKind::Write);
+        assert_eq!(
+            deletion
+                .payload()
+                .deletion_request()
+                .expect("deletion")
+                .targets()
+                .len(),
+            1
+        );
+        assert_eq!(
+            draft_listing.admission_kind(),
+            AdmissionEventKind::DraftListing
+        );
+        assert_eq!(
+            draft_listing.admission().effect(),
+            AdmissionEffect::StoreRaw
+        );
+        assert!(
+            draft_listing
+                .payload()
+                .listing_evaluation()
+                .expect("draft listing")
+                .rejection()
+                .is_some()
+        );
+        assert_eq!(note.admission_kind(), AdmissionEventKind::Write);
+        assert_eq!(note.payload(), &super::ValidatedEventPayload::Other);
+    }
+
+    #[test]
+    fn event_validator_rejects_limits_crypto_parser_and_admission_failures() {
+        let seller = FixtureKey::Seller.public_key();
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let bad_id = Event::new(
+            EventId::new(&"f".repeat(EventId::HEX_LENGTH)).expect("id"),
+            listing.unsigned().clone(),
+            listing.sig().clone(),
+        );
+        let bad_auth = build_fixture_event(
+            &fixture_spec_from_json(
+                r#"{"name":"bad_auth","key":"seller","created_at":1714124435,"kind":22242,"tags":[["relay","wss://relay.radroots.test"]],"content":""}"#,
+            )
+            .expect("bad auth"),
+        )
+        .expect("bad auth event");
+        let note = build_fixture_event(
+            &fixture_spec_from_json(
+                r#"{"name":"note","key":"seller","created_at":1714124437,"kind":1,"tags":[],"content":"hello"}"#,
+            )
+            .expect("note"),
+        )
+        .expect("note event");
+        let limit_rejection = EventValidator::new(
+            limits_with(|values| {
+                values.max_event_bytes = 1;
+                values.max_content_bytes = 1;
+            }),
+            AdmissionPolicy::new(),
+        )
+        .validate(
+            &listing,
+            &AdmissionContext::authenticated(seller.clone()),
+            UnixTimestamp::new(1_714_124_500),
+        )
+        .expect_err("limit");
+        let crypto_rejection = EventValidator::default()
+            .validate(
+                &bad_id,
+                &AdmissionContext::authenticated(seller.clone()),
+                UnixTimestamp::new(1_714_124_500),
+            )
+            .expect_err("crypto");
+        let parser_rejection = EventValidator::default()
+            .validate(
+                &bad_auth,
+                &AdmissionContext::unauthenticated(),
+                UnixTimestamp::new(1_714_124_500),
+            )
+            .expect_err("parser");
+        let admission_rejection = EventValidator::default()
+            .validate(
+                &note,
+                &AdmissionContext::unauthenticated(),
+                UnixTimestamp::new(1_714_124_500),
+            )
+            .expect_err("admission");
+
+        assert_eq!(
+            limit_rejection.kind(),
+            EventValidationRejectionKind::RuntimeLimit
+        );
+        assert_eq!(
+            crypto_rejection.kind(),
+            EventValidationRejectionKind::Crypto
+        );
+        assert_eq!(
+            parser_rejection.kind(),
+            EventValidationRejectionKind::Parser
+        );
+        assert_eq!(
+            admission_rejection.kind(),
+            EventValidationRejectionKind::Admission
+        );
+        assert!(limit_rejection.to_string().starts_with("runtime limit:"));
+        assert!(crypto_rejection.to_string().starts_with("crypto:"));
+        assert_eq!(
+            parser_rejection.to_string(),
+            "parser: relay auth: tag `challenge` is required"
+        );
+        assert_eq!(
+            admission_rejection.to_string(),
+            "admission: authentication required: write authentication required"
+        );
+        let expected_parser = super::EventParserRejection::new(
+            EventParser::RelayAuth,
+            "tag `challenge` is required".to_owned(),
+        );
+        assert_eq!(expected_parser.parser(), EventParser::RelayAuth);
+        assert_eq!(expected_parser.message(), "tag `challenge` is required");
+        assert_eq!(
+            parser_rejection,
+            EventValidationRejection::Parser(expected_parser)
+        );
+    }
+
+    #[test]
+    fn event_validator_rejects_malformed_deletion_and_future_timestamp() {
+        let seller = FixtureKey::Seller.public_key();
+        let bad_deletion = build_fixture_event(
+            &fixture_spec_from_json(
+                r#"{"name":"bad_deletion","key":"seller","created_at":1714124436,"kind":5,"tags":[],"content":""}"#,
+            )
+            .expect("bad deletion"),
+        )
+        .expect("bad deletion event");
+        let future_note = build_fixture_event(
+            &fixture_spec_from_json(
+                r#"{"name":"future_note","key":"seller","created_at":1714125400,"kind":1,"tags":[],"content":"hello"}"#,
+            )
+            .expect("future note"),
+        )
+        .expect("future note event");
+        let deletion_rejection = EventValidator::default()
+            .validate(
+                &bad_deletion,
+                &AdmissionContext::authenticated(seller.clone()),
+                UnixTimestamp::new(1_714_124_500),
+            )
+            .expect_err("deletion");
+        let future_rejection = EventValidator::default()
+            .validate(
+                &future_note,
+                &AdmissionContext::authenticated(seller),
+                UnixTimestamp::new(1_714_124_433),
+            )
+            .expect_err("future");
+
+        assert_eq!(
+            deletion_rejection.kind(),
+            EventValidationRejectionKind::Parser
+        );
+        assert_eq!(
+            deletion_rejection.to_string(),
+            "parser: deletion: deletion event must target at least one e or a tag"
+        );
+        assert_eq!(
+            future_rejection.kind(),
+            EventValidationRejectionKind::RuntimeLimit
+        );
+        assert_eq!(EventParser::RelayAuth.as_str(), "relay auth");
+        assert_eq!(EventParser::Deletion.to_string(), "deletion");
     }
 
     fn limits_with(update: impl FnOnce(&mut RuntimeLimitValues)) -> RuntimeLimits {
