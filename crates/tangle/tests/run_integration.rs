@@ -387,6 +387,159 @@ async fn tangle_run_persists_durable_write_rate_limits() {
     fs::remove_dir_all(&root).expect("remove runtime root");
 }
 
+#[tokio::test]
+async fn tangle_run_serves_admin_policy_api() {
+    let port = free_port();
+    let root = std::env::temp_dir().join(format!(
+        "tangle-admin-policy-integration-{}-{port}",
+        std::process::id()
+    ));
+    let db_path = root.join("surrealdb");
+    let config_path = root.join("runtime.json");
+    fs::create_dir_all(&root).expect("runtime root");
+    let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+    let auth = build_fixture_event(&auth_event_spec()).expect("auth");
+    let seller = FixtureKey::Seller.public_key();
+    let admin = FixtureKey::Relay.public_key();
+    let listing_key = format!("30402:{}:listing-a", seller.as_str());
+    write_runtime_config(
+        &config_path,
+        &db_path,
+        port,
+        "tangle_admin_policy",
+        serde_json::json!({
+            "admin_pubkeys": [admin.as_str()]
+        }),
+    );
+    let mut relay = spawn_relay(&config_path);
+    wait_for_http(port, &mut relay);
+
+    let unauthorized = http_post_json(
+        port,
+        &format!("/api/admin/sellers/{}/approve", seller.as_str()),
+        None,
+        serde_json::json!({}),
+    );
+    assert!(unauthorized.contains("401 Unauthorized"));
+    let approve = http_post_json(
+        port,
+        &format!("/api/admin/sellers/{}/approve", seller.as_str()),
+        Some(admin.as_str()),
+        serde_json::json!({}),
+    );
+    assert!(approve.contains("200 OK"));
+    assert!(approve.contains("\"status\":\"approved\""));
+    let seller_detail = http_get(port, &format!("/api/sellers/{}", seller.as_str()));
+    assert!(seller_detail.contains("\"approved\":true"));
+
+    let (mut client, _) = connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("client connect");
+    assert_eq!(next_label(&mut client).await, "AUTH");
+    client
+        .send(Message::Text(
+            serde_json::json!(["AUTH", event_to_value(&auth)])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("auth send");
+    assert_ok(&next_json(&mut client).await, true);
+    client
+        .send(Message::Text(
+            serde_json::json!(["EVENT", event_to_value(&listing)])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("event send");
+    assert_ok(&next_json(&mut client).await, true);
+    assert!(http_get(port, "/api/listings?limit=5").contains(listing.id().as_str()));
+
+    let hide = http_post_json(
+        port,
+        &format!("/api/admin/events/{}/hide", listing.id().as_str()),
+        Some(admin.as_str()),
+        serde_json::json!({
+            "reason": "admin policy integration"
+        }),
+    );
+    assert!(hide.contains("200 OK"));
+    assert!(hide.contains("\"status\":\"hidden\""));
+    assert!(!http_get(port, "/api/listings?limit=5").contains(listing.id().as_str()));
+    let unhide = http_post_json(
+        port,
+        &format!("/api/admin/events/{}/unhide", listing.id().as_str()),
+        Some(admin.as_str()),
+        serde_json::json!({
+            "reason": "admin policy integration complete"
+        }),
+    );
+    assert!(unhide.contains("200 OK"));
+    assert!(unhide.contains("\"status\":\"unhidden\""));
+    assert!(http_get(port, "/api/listings?limit=5").contains(listing.id().as_str()));
+    let block = http_post_json(
+        port,
+        &format!("/api/admin/pubkeys/{}/block", seller.as_str()),
+        Some(admin.as_str()),
+        serde_json::json!({}),
+    );
+    assert!(block.contains("200 OK"));
+    assert!(block.contains("\"status\":\"blocked\""));
+    stop_relay(relay);
+
+    let store_config = SurrealConnectionConfig::rocksdb(
+        db_path.to_str().expect("db path"),
+        "tangle_admin_policy",
+        "relay",
+    )
+    .expect("store config");
+    let store = reopen_store(&store_config).await;
+    let user = store
+        .relay_user_row(seller.as_str())
+        .await
+        .expect("relay user")
+        .expect("relay user exists");
+    assert_eq!(user["seller_approved"], true);
+    assert_eq!(user["blocked"], true);
+    assert!(
+        store
+            .hidden_event_row(listing.id())
+            .await
+            .expect("hidden row")
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .raw_event_row(listing.id())
+            .await
+            .expect("raw row")
+            .expect("raw row exists")["hidden"],
+        false
+    );
+    assert_eq!(
+        store
+            .listing_current_row(&listing_key)
+            .await
+            .expect("listing row")
+            .expect("listing row exists")["hidden"],
+        false
+    );
+    let actions = store
+        .moderation_action_rows("event", listing.id().as_str())
+        .await
+        .expect("moderation actions");
+    assert_eq!(actions.len(), 2);
+    let action_labels = actions
+        .iter()
+        .map(|action| action["action"].as_str().expect("action label"))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(action_labels.contains("hide"));
+    assert!(action_labels.contains("unhide"));
+    drop(store);
+    fs::remove_dir_all(&root).expect("remove runtime root");
+}
+
 struct PolicyWriteScenario {
     root: std::path::PathBuf,
     store_config: SurrealConnectionConfig,
@@ -516,6 +669,29 @@ fn wait_for_http(port: u16, child: &mut Child) {
 
 fn http_get(port: u16, path: &str) -> String {
     try_http_get(port, path).expect("http get")
+}
+
+fn http_post_json(port: u16, path: &str, admin_pubkey: Option<&str>, body: Value) -> String {
+    let body = body.to_string();
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("http connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .expect("write timeout");
+    let admin_header = admin_pubkey
+        .map(|pubkey| format!("x-tangle-admin-pubkey: {pubkey}\r\n"))
+        .unwrap_or_default();
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{admin_header}Connection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .expect("http post");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("http read");
+    response
 }
 
 fn try_http_get(port: u16, path: &str) -> Result<String, std::io::Error> {

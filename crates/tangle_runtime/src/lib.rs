@@ -5,7 +5,7 @@ use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::{Path, RawQuery, State},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use core::fmt;
 use http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -237,6 +237,7 @@ pub struct TangleRuntimeConfig {
     database: SurrealConnectionConfig,
     admission_policy: AdmissionPolicy,
     durable_write_rate_limit: Option<RateLimitConfig>,
+    admin_pubkeys: BTreeSet<PublicKeyHex>,
     limits: RuntimeLimits,
 }
 
@@ -259,6 +260,10 @@ impl TangleRuntimeConfig {
 
     pub fn durable_write_rate_limit(&self) -> Option<RateLimitConfig> {
         self.durable_write_rate_limit
+    }
+
+    pub fn admin_pubkeys(&self) -> &BTreeSet<PublicKeyHex> {
+        &self.admin_pubkeys
     }
 
     pub fn limits(&self) -> RuntimeLimits {
@@ -950,6 +955,22 @@ fn runtime_router(
         .route("/api/listings/{pubkey}/{d}", get(runtime_listing_detail))
         .route("/api/search", get(runtime_marketplace_search))
         .route("/api/sellers/{pubkey}", get(runtime_seller_detail))
+        .route(
+            "/api/admin/sellers/{pubkey}/approve",
+            post(runtime_admin_approve_seller),
+        )
+        .route(
+            "/api/admin/pubkeys/{pubkey}/block",
+            post(runtime_admin_block_pubkey),
+        )
+        .route(
+            "/api/admin/events/{event_id}/hide",
+            post(runtime_admin_hide_event),
+        )
+        .route(
+            "/api/admin/events/{event_id}/unhide",
+            post(runtime_admin_unhide_event),
+        )
         .with_state(state)
 }
 
@@ -1034,6 +1055,106 @@ async fn runtime_seller_detail(
         Path(pubkey),
     )
     .await
+}
+
+async fn runtime_admin_approve_seller(
+    State(state): State<RuntimeRelayState>,
+    headers: HeaderMap,
+    Path(pubkey): Path<String>,
+) -> Result<Json<AdminPolicyDocument>, ApiError> {
+    let _admin = require_admin_pubkey(&state.config, &headers)?;
+    let pubkey = parse_pubkey("pubkey", &pubkey)?;
+    state
+        .store
+        .set_seller_approved(pubkey.as_str(), true, now_timestamp())
+        .await
+        .map_err(|_| ApiError::internal())?;
+    Ok(Json(AdminPolicyDocument::new(
+        "approved",
+        "seller",
+        pubkey.as_str(),
+    )))
+}
+
+async fn runtime_admin_block_pubkey(
+    State(state): State<RuntimeRelayState>,
+    headers: HeaderMap,
+    Path(pubkey): Path<String>,
+) -> Result<Json<AdminPolicyDocument>, ApiError> {
+    let _admin = require_admin_pubkey(&state.config, &headers)?;
+    let pubkey = parse_pubkey("pubkey", &pubkey)?;
+    state
+        .store
+        .set_pubkey_blocked(pubkey.as_str(), true, now_timestamp())
+        .await
+        .map_err(|_| ApiError::internal())?;
+    Ok(Json(AdminPolicyDocument::new(
+        "blocked",
+        "pubkey",
+        pubkey.as_str(),
+    )))
+}
+
+async fn runtime_admin_hide_event(
+    State(state): State<RuntimeRelayState>,
+    headers: HeaderMap,
+    Path(event_id): Path<String>,
+    Json(request): Json<AdminEventPolicyRequest>,
+) -> Result<Json<AdminPolicyDocument>, ApiError> {
+    let admin = require_admin_pubkey(&state.config, &headers)?;
+    let event_id = EventId::new(&event_id)
+        .map_err(|_| invalid_parameter("event_id", "must be a 64-character hex event id"))?;
+    let reason = request.reason.unwrap_or_else(|| "admin policy".to_owned());
+    match state
+        .store
+        .hide_event(
+            &event_id,
+            &reason,
+            "admin_api",
+            admin.as_str(),
+            now_timestamp(),
+        )
+        .await
+        .map_err(|_| ApiError::internal())?
+    {
+        tangle_store_surreal::HiddenEventOutcome::Hidden => Ok(Json(AdminPolicyDocument::new(
+            "hidden",
+            "event",
+            event_id.as_str(),
+        ))),
+        tangle_store_surreal::HiddenEventOutcome::NotFound => {
+            Err(ApiError::not_found("event not found"))
+        }
+        tangle_store_surreal::HiddenEventOutcome::Unhidden => Err(ApiError::internal()),
+    }
+}
+
+async fn runtime_admin_unhide_event(
+    State(state): State<RuntimeRelayState>,
+    headers: HeaderMap,
+    Path(event_id): Path<String>,
+    Json(request): Json<AdminEventPolicyRequest>,
+) -> Result<Json<AdminPolicyDocument>, ApiError> {
+    let admin = require_admin_pubkey(&state.config, &headers)?;
+    let event_id = EventId::new(&event_id)
+        .map_err(|_| invalid_parameter("event_id", "must be a 64-character hex event id"))?;
+    let reason = request.reason.unwrap_or_else(|| "admin policy".to_owned());
+    match state
+        .store
+        .unhide_event(&event_id, &reason, admin.as_str(), now_timestamp())
+        .await
+        .map_err(|_| ApiError::internal())?
+    {
+        tangle_store_surreal::HiddenEventOutcome::Unhidden => Ok(Json(AdminPolicyDocument::new(
+            "unhidden",
+            "event",
+            event_id.as_str(),
+        ))),
+        tangle_store_surreal::HiddenEventOutcome::NotFound => {
+            Err(ApiError::not_found("event not found"))
+        }
+        tangle_store_surreal::HiddenEventOutcome::Hidden => Err(ApiError::internal()),
+    }
 }
 
 async fn handle_websocket(mut socket: WebSocket, state: RuntimeRelayState) {
@@ -1277,6 +1398,8 @@ struct RuntimePolicyConfigDocument {
     unapproved_seller_action: Option<RuntimeUnapprovedSellerActionDocument>,
     write_rate_limit: Option<RuntimeRateLimitConfigDocument>,
     #[serde(default)]
+    admin_pubkeys: Vec<String>,
+    #[serde(default)]
     approved_sellers: Vec<String>,
     #[serde(default)]
     blocked_pubkeys: Vec<String>,
@@ -1309,6 +1432,7 @@ fn runtime_config_from_document(
     .map_err(RuntimeConfigError::invalid)?;
     let database = database_config_from_document(document.database)?;
     let durable_write_rate_limit = durable_write_rate_limit_from_document(&document.policy)?;
+    let admin_pubkeys = admin_pubkeys_from_document(&document.policy)?;
     let admission_policy = admission_policy_from_document(&document.policy)?;
     Ok(TangleRuntimeConfig {
         listen_addr,
@@ -1316,6 +1440,7 @@ fn runtime_config_from_document(
         database,
         admission_policy,
         durable_write_rate_limit,
+        admin_pubkeys,
         limits: limits.runtime,
     })
 }
@@ -1408,6 +1533,22 @@ fn durable_write_rate_limit_from_document(
                 .map_err(|error| RuntimeConfigError::invalid(error.to_string()))
         })
         .transpose()
+}
+
+fn admin_pubkeys_from_document(
+    document: &RuntimePolicyConfigDocument,
+) -> Result<BTreeSet<PublicKeyHex>, RuntimeConfigError> {
+    document
+        .admin_pubkeys
+        .iter()
+        .map(|pubkey| {
+            PublicKeyHex::new(pubkey.as_str()).map_err(|error| {
+                RuntimeConfigError::invalid(format!(
+                    "policy.admin_pubkeys contains invalid pubkey: {error}"
+                ))
+            })
+        })
+        .collect()
 }
 
 fn admission_policy_from_document(
@@ -1663,6 +1804,13 @@ impl EventMessageHandler {
         if validated.admission().effect() == AdmissionEffect::AuthenticateOnly {
             return ok_rejected(event_id, "invalid: auth events must use AUTH".to_owned());
         }
+        let effect = match self
+            .effective_admission_effect(&event, validated.admission().effect())
+            .await
+        {
+            Ok(effect) => effect,
+            Err(_) => return ok_rejected(event_id, "error: policy unavailable".to_owned()),
+        };
         if let Some(config) = self.durable_write_rate_limit {
             match self
                 .store
@@ -1715,7 +1863,7 @@ impl EventMessageHandler {
         {
             return ok_rejected(event_id, "error: projection failed".to_owned());
         }
-        if validated.admission().effect() == AdmissionEffect::StoreRawAndProjectPublicListing
+        if effect == AdmissionEffect::StoreRawAndProjectPublicListing
             && (self
                 .store
                 .project_current_listing(&event, now)
@@ -1731,6 +1879,38 @@ impl EventMessageHandler {
             return ok_rejected(event_id, "error: projection failed".to_owned());
         }
         ok_accepted(event_id)
+    }
+
+    async fn effective_admission_effect(
+        &self,
+        event: &Event,
+        fallback: AdmissionEffect,
+    ) -> Result<AdmissionEffect, tangle_store_surreal::SurrealStoreError> {
+        if event.unsigned().kind().as_u32() != 30_402 {
+            return Ok(fallback);
+        }
+        let Some(row) = self
+            .store
+            .relay_user_row(event.unsigned().pubkey().as_str())
+            .await?
+        else {
+            return Ok(fallback);
+        };
+        if row
+            .get("blocked")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Ok(AdmissionEffect::StoreRawWithoutPublicListingProjection);
+        }
+        if row
+            .get("seller_approved")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Ok(AdmissionEffect::StoreRawAndProjectPublicListing);
+        }
+        Ok(fallback)
     }
 }
 
@@ -2344,6 +2524,28 @@ pub struct SellerDocument {
     pub active_listing_count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminPolicyDocument {
+    pub status: String,
+    pub target_type: String,
+    pub target_ref: String,
+}
+
+impl AdminPolicyDocument {
+    pub fn new(status: &str, target_type: &str, target_ref: &str) -> Self {
+        Self {
+            status: status.to_owned(),
+            target_type: target_type.to_owned(),
+            target_ref: target_ref.to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct AdminEventPolicyRequest {
+    pub reason: Option<String>,
+}
+
 pub fn parse_listing_query(
     query: &str,
     limits: RuntimeLimits,
@@ -2662,7 +2864,11 @@ async fn seller_detail(
     Path(pubkey): Path<String>,
 ) -> Result<Json<SellerDocument>, ApiError> {
     let pubkey = parse_pubkey("pubkey", &pubkey)?;
-    let seller = seller_policy_row(&state.store, pubkey.as_str()).await?;
+    let seller = state
+        .store
+        .relay_user_row(pubkey.as_str())
+        .await
+        .map_err(|_| ApiError::internal())?;
     let listings = state
         .store
         .query_current_listings(
@@ -2700,6 +2906,26 @@ fn accepts_nostr_json(value: Option<&HeaderValue>) -> bool {
                 })
             })
         })
+}
+
+fn require_admin_pubkey(
+    config: &TangleRuntimeConfig,
+    headers: &HeaderMap,
+) -> Result<PublicKeyHex, ApiError> {
+    if config.admin_pubkeys().is_empty() {
+        return Err(ApiError::forbidden("admin policy api is disabled"));
+    }
+    let value = headers
+        .get("x-tangle-admin-pubkey")
+        .ok_or_else(|| ApiError::unauthorized("admin pubkey header is required"))?
+        .to_str()
+        .map_err(|_| ApiError::unauthorized("admin pubkey header is invalid"))?;
+    let pubkey = PublicKeyHex::new(value)
+        .map_err(|_| ApiError::unauthorized("admin pubkey header is invalid"))?;
+    if !config.admin_pubkeys().contains(&pubkey) {
+        return Err(ApiError::forbidden("admin pubkey is not authorized"));
+    }
+    Ok(pubkey)
 }
 
 fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
@@ -2811,24 +3037,6 @@ fn search_document_query(parsed: &MarketplaceSearchHttpQuery) -> SearchDocumentQ
         query = query.with_pubkey(seller.as_str());
     }
     query
-}
-
-async fn seller_policy_row(
-    store: &SurrealStore,
-    pubkey: &str,
-) -> Result<Option<serde_json::Value>, ApiError> {
-    let mut response = store
-        .database()
-        .query("SELECT * FROM relay_user WHERE pubkey = $pubkey LIMIT 1;")
-        .bind(("pubkey", pubkey))
-        .await
-        .map_err(|_| ApiError::internal())?
-        .check()
-        .map_err(|_| ApiError::internal())?;
-    let rows = response
-        .take::<Vec<serde_json::Value>>(0)
-        .map_err(|_| ApiError::internal())?;
-    Ok(rows.into_iter().next())
 }
 
 fn listing_item_document(row: &serde_json::Value) -> Result<ListingItemDocument, ApiError> {
@@ -3177,7 +3385,7 @@ mod tests {
     };
     use tangle_nips::{FulfillmentMethod, ListingUnit, parse_relay_auth_event};
     use tangle_protocol::{
-        ClientMessage, RelayMessage, SubscriptionId, UnixTimestamp, event_to_value,
+        ClientMessage, PublicKeyHex, RelayMessage, SubscriptionId, UnixTimestamp, event_to_value,
         filter_from_value,
     };
     use tangle_store::StoredEvent;
@@ -3414,6 +3622,9 @@ mod tests {
                     }
                 },
                 "policy": {
+                    "admin_pubkeys": [
+                        "1111111111111111111111111111111111111111111111111111111111111111"
+                    ],
                     "write_rate_limit": {
                         "limit": 2,
                         "window_seconds": 60
@@ -3441,6 +3652,14 @@ mod tests {
         assert_eq!(
             config.durable_write_rate_limit(),
             Some(RateLimitConfig::new(2, 60).expect("write limit"))
+        );
+        assert!(
+            config.admin_pubkeys().contains(
+                &PublicKeyHex::new(
+                    "1111111111111111111111111111111111111111111111111111111111111111"
+                )
+                .expect("admin pubkey")
+            )
         );
         assert_eq!(config.database_config().namespace(), "tangle_test");
         assert_eq!(config.database_config().database(), "relay");
@@ -3985,6 +4204,58 @@ mod tests {
                 "started_at": 1714125500_u64,
                 "used": 1
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn event_message_handler_applies_dynamic_seller_policy_rows() {
+        let store = runtime_memory_store().await;
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let listing_key = format!("30402:{}:listing-a", listing.unsigned().pubkey().as_str());
+        let connection = authenticated_connection();
+        let handler = EventMessageHandler::new(
+            store.clone(),
+            EventValidator::new(RuntimeLimits::default(), AdmissionPolicy::new()),
+        );
+
+        store
+            .set_seller_approved(
+                listing.unsigned().pubkey().as_str(),
+                true,
+                UnixTimestamp::new(1_714_126_200),
+            )
+            .await
+            .expect("approve seller");
+        let accepted = handler
+            .handle_event(
+                &connection,
+                listing.clone(),
+                UnixTimestamp::new(1_714_126_201),
+                UnixTimestamp::new(1_714_126_201),
+            )
+            .await;
+
+        assert_eq!(
+            accepted,
+            RelayMessage::Ok {
+                event_id: listing.id().clone(),
+                accepted: true,
+                message: String::new()
+            }
+        );
+        assert!(
+            store
+                .listing_current_row(&listing_key)
+                .await
+                .expect("listing row")
+                .is_some()
+        );
+        assert!(
+            store
+                .search_document_row(&listing_key)
+                .await
+                .expect("search row")
+                .is_some()
         );
     }
 

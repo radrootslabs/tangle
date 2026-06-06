@@ -2085,6 +2085,72 @@ UPDATE search_doc SET visible = false WHERE (event_id = $event_id OR current_eve
         response.take(0).map_err(SurrealStoreError::from)
     }
 
+    pub async fn relay_user_row(
+        &self,
+        pubkey: &str,
+    ) -> Result<Option<serde_json::Value>, SurrealStoreError> {
+        let pubkey = required_policy_text(pubkey, "relay user pubkey")?;
+        let mut response = self
+            .db
+            .query("SELECT * FROM ONLY type::record('relay_user', $pubkey);")
+            .bind(("pubkey", pubkey.as_str()))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
+    pub async fn set_seller_approved(
+        &self,
+        pubkey: &str,
+        approved: bool,
+        updated_at: UnixTimestamp,
+    ) -> Result<(), SurrealStoreError> {
+        let pubkey = required_policy_text(pubkey, "relay user pubkey")?;
+        let existing = self.relay_user_row(&pubkey).await?;
+        let blocked = existing
+            .as_ref()
+            .and_then(|row| row.get("blocked"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let created_at = existing
+            .as_ref()
+            .and_then(|row| row.get("created_at"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_else(|| updated_at.as_u64());
+        self.upsert_relay_user(&pubkey, "seller", approved, blocked, created_at, updated_at)
+            .await
+    }
+
+    pub async fn set_pubkey_blocked(
+        &self,
+        pubkey: &str,
+        blocked: bool,
+        updated_at: UnixTimestamp,
+    ) -> Result<(), SurrealStoreError> {
+        let pubkey = required_policy_text(pubkey, "relay user pubkey")?;
+        let existing = self.relay_user_row(&pubkey).await?;
+        let approved = existing
+            .as_ref()
+            .and_then(|row| row.get("seller_approved"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let role = existing
+            .as_ref()
+            .and_then(|row| row.get("role"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("seller")
+            .to_owned();
+        let created_at = existing
+            .as_ref()
+            .and_then(|row| row.get("created_at"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_else(|| updated_at.as_u64());
+        self.upsert_relay_user(&pubkey, &role, approved, blocked, created_at, updated_at)
+            .await
+    }
+
     pub async fn check_durable_rate_limit(
         &self,
         key: &str,
@@ -2254,6 +2320,41 @@ UPSERT type::record('rate_limit_state', $key) CONTENT {
             .bind(("key", key))
             .bind(("state", state.to_json_string()))
             .bind(("expires_at", expires_at.as_u64()))
+            .bind(("created_at", created_at))
+            .bind(("updated_at", updated_at.as_u64()))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        Ok(())
+    }
+
+    async fn upsert_relay_user(
+        &self,
+        pubkey: &str,
+        role: &str,
+        seller_approved: bool,
+        blocked: bool,
+        created_at: u64,
+        updated_at: UnixTimestamp,
+    ) -> Result<(), SurrealStoreError> {
+        self.db
+            .query(
+                r#"
+UPSERT type::record('relay_user', $pubkey) CONTENT {
+    pubkey: $pubkey,
+    role: $role,
+    seller_approved: $seller_approved,
+    blocked: $blocked,
+    created_at: $created_at,
+    updated_at: $updated_at
+};
+"#,
+            )
+            .bind(("pubkey", pubkey))
+            .bind(("role", role))
+            .bind(("seller_approved", seller_approved))
+            .bind(("blocked", blocked))
             .bind(("created_at", created_at))
             .bind(("updated_at", updated_at.as_u64()))
             .await
@@ -5078,6 +5179,60 @@ mod tests {
                 .expect("pruned row")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn relay_user_policy_rows_persist_approval_and_block_state() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let seller = "2".repeat(PublicKeyHex::HEX_LENGTH);
+
+        store
+            .set_seller_approved(&seller, true, UnixTimestamp::new(1_714_125_900))
+            .await
+            .expect("approve seller");
+        let approved = store
+            .relay_user_row(&seller)
+            .await
+            .expect("relay user")
+            .expect("relay user exists");
+        assert_eq!(approved["pubkey"], seller);
+        assert_eq!(approved["role"], "seller");
+        assert_eq!(approved["seller_approved"], true);
+        assert_eq!(approved["blocked"], false);
+        assert_eq!(approved["created_at"], 1_714_125_900_u64);
+        assert_eq!(approved["updated_at"], 1_714_125_900_u64);
+
+        store
+            .set_pubkey_blocked(&seller, true, UnixTimestamp::new(1_714_126_000))
+            .await
+            .expect("block seller");
+        let blocked = store
+            .relay_user_row(&seller)
+            .await
+            .expect("relay user")
+            .expect("relay user exists");
+        assert_eq!(blocked["seller_approved"], true);
+        assert_eq!(blocked["blocked"], true);
+        assert_eq!(blocked["created_at"], 1_714_125_900_u64);
+        assert_eq!(blocked["updated_at"], 1_714_126_000_u64);
+
+        store
+            .set_seller_approved(&seller, false, UnixTimestamp::new(1_714_126_100))
+            .await
+            .expect("unapprove seller");
+        let unapproved = store
+            .relay_user_row(&seller)
+            .await
+            .expect("relay user")
+            .expect("relay user exists");
+        assert_eq!(unapproved["seller_approved"], false);
+        assert_eq!(unapproved["blocked"], true);
+        assert_eq!(unapproved["created_at"], 1_714_125_900_u64);
+        assert_eq!(unapproved["updated_at"], 1_714_126_100_u64);
     }
 
     #[tokio::test]
