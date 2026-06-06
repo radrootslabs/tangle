@@ -277,8 +277,12 @@ DEFINE INDEX IF NOT EXISTS migration_name_uid ON TABLE migration COLUMNS name UN
 }
 
 pub fn base_migration_plan() -> SurrealMigrationPlan {
-    SurrealMigrationPlan::new(vec![migration_tracking_schema(), raw_event_schema()])
-        .expect("base migration plan is strictly ordered")
+    SurrealMigrationPlan::new(vec![
+        migration_tracking_schema(),
+        raw_event_schema(),
+        event_tag_index_schema(),
+    ])
+    .expect("base migration plan is strictly ordered")
 }
 
 pub fn raw_event_schema() -> SurrealMigration {
@@ -311,6 +315,26 @@ DEFINE INDEX IF NOT EXISTS nostr_event_created ON TABLE nostr_event COLUMNS crea
 "#,
     )
     .expect("raw event schema is valid")
+}
+
+pub fn event_tag_index_schema() -> SurrealMigration {
+    SurrealMigration::new(
+        "0003_event_tag_index",
+        r#"
+DEFINE TABLE IF NOT EXISTS event_tag_index SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS event_id ON TABLE event_tag_index TYPE string;
+DEFINE FIELD IF NOT EXISTS kind ON TABLE event_tag_index TYPE int;
+DEFINE FIELD IF NOT EXISTS pubkey ON TABLE event_tag_index TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON TABLE event_tag_index TYPE int;
+DEFINE FIELD IF NOT EXISTS tag ON TABLE event_tag_index TYPE string;
+DEFINE FIELD IF NOT EXISTS value ON TABLE event_tag_index TYPE string;
+DEFINE FIELD IF NOT EXISTS ordinal ON TABLE event_tag_index TYPE int;
+DEFINE INDEX IF NOT EXISTS event_tag_lookup ON TABLE event_tag_index COLUMNS tag, value, created_at, event_id;
+DEFINE INDEX IF NOT EXISTS event_tag_kind_lookup ON TABLE event_tag_index COLUMNS tag, value, kind, created_at, event_id;
+DEFINE INDEX IF NOT EXISTS event_tag_event ON TABLE event_tag_index COLUMNS event_id;
+"#,
+    )
+    .expect("event tag index schema is valid")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -526,7 +550,7 @@ mod tests {
     use super::{
         MigrationApplyOutcome, SurrealConfigError, SurrealConnectionConfig, SurrealConnectionMode,
         SurrealMigration, SurrealMigrationError, SurrealMigrationPlan, SurrealStore,
-        base_migration_plan, migration_tracking_schema, raw_event_schema,
+        base_migration_plan, migration_tracking_schema,
     };
 
     #[test]
@@ -707,28 +731,19 @@ mod tests {
         );
         assert_eq!(
             store.apply_plan(&plan).await.expect("apply"),
-            vec![
-                MigrationApplyOutcome::Applied,
-                MigrationApplyOutcome::Applied
-            ]
+            vec![MigrationApplyOutcome::Applied; plan.migrations().len()]
         );
         assert_eq!(
             store.apply_plan(&plan).await.expect("reapply"),
-            vec![
-                MigrationApplyOutcome::AlreadyApplied,
-                MigrationApplyOutcome::AlreadyApplied
-            ]
+            vec![MigrationApplyOutcome::AlreadyApplied; plan.migrations().len()]
         );
 
         let migrations = store.applied_migrations().await.expect("applied rows");
-        assert_eq!(migrations.len(), 2);
-        assert_eq!(migrations[0].name(), "0001_migration_tracking");
-        assert_eq!(
-            migrations[0].checksum(),
-            migration_tracking_schema().checksum()
-        );
-        assert_eq!(migrations[1].name(), "0002_raw_event");
-        assert_eq!(migrations[1].checksum(), raw_event_schema().checksum());
+        assert_eq!(migrations.len(), plan.migrations().len());
+        for (applied, expected) in migrations.iter().zip(plan.migrations()) {
+            assert_eq!(applied.name(), expected.name());
+            assert_eq!(applied.checksum(), expected.checksum());
+        }
         assert!(format!("{:?}", store.database()).contains("Surreal"));
     }
 
@@ -797,5 +812,33 @@ mod tests {
                 .to_string(),
             "surreal table info target is invalid: surreal table must use ASCII letters, digits, or underscore"
         );
+    }
+
+    #[tokio::test]
+    async fn event_tag_index_schema_defines_single_letter_lookup_table() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let info = store
+            .table_info("event_tag_index")
+            .await
+            .expect("table info");
+
+        for expected in [
+            "event_id",
+            "kind",
+            "pubkey",
+            "created_at",
+            "tag",
+            "value",
+            "ordinal",
+            "event_tag_lookup",
+            "event_tag_kind_lookup",
+            "event_tag_event",
+        ] {
+            assert!(info.contains(expected), "missing {expected} in {info}");
+        }
     }
 }
