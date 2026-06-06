@@ -7,6 +7,7 @@ use tangle_protocol::{
 
 pub const NIP99_PUBLIC_LISTING_KIND: u32 = 30_402;
 pub const NIP99_DRAFT_LISTING_KIND: u32 = 30_403;
+pub const NIP22_COMMENT_KIND: u32 = 1_111;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedTag {
@@ -269,6 +270,287 @@ pub fn parse_nip50_search(search: &str) -> Result<Option<Nip50SearchQuery>, Stri
 pub fn parse_nip50_filter_search(filter: &Filter) -> Result<Option<Nip50SearchQuery>, String> {
     match filter.search() {
         Some(search) => parse_nip50_search(search),
+        None => Ok(None),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommentTarget {
+    Event {
+        event_id: EventId,
+        relay_hint: Option<String>,
+        pubkey_hint: Option<PublicKeyHex>,
+    },
+    Address {
+        address: AddressCoordinate,
+        relay_hint: Option<String>,
+    },
+    External {
+        identity: String,
+        relay_hint: Option<String>,
+    },
+}
+
+impl CommentTarget {
+    pub fn target_type(&self) -> &'static str {
+        match self {
+            Self::Event { .. } => "event",
+            Self::Address { .. } => "address",
+            Self::External { .. } => "external",
+        }
+    }
+
+    pub fn target_ref(&self) -> String {
+        match self {
+            Self::Event { event_id, .. } => event_id.as_str().to_owned(),
+            Self::Address { address, .. } => address.key().to_string(),
+            Self::External { identity, .. } => identity.clone(),
+        }
+    }
+
+    pub fn relay_hint(&self) -> Option<&str> {
+        match self {
+            Self::Event { relay_hint, .. }
+            | Self::Address { relay_hint, .. }
+            | Self::External { relay_hint, .. } => relay_hint.as_deref(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentReference {
+    target: CommentTarget,
+    kind: String,
+    author: Option<PublicKeyHex>,
+}
+
+impl CommentReference {
+    pub fn target(&self) -> &CommentTarget {
+        &self.target
+    }
+
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    pub fn author(&self) -> Option<&PublicKeyHex> {
+        self.author.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentEvent {
+    event_id: EventId,
+    pubkey: PublicKeyHex,
+    created_at: UnixTimestamp,
+    content: String,
+    root: CommentReference,
+    parent: CommentReference,
+    cited_events: Vec<String>,
+    mentioned_pubkeys: Vec<PublicKeyHex>,
+}
+
+impl CommentEvent {
+    pub fn event_id(&self) -> &EventId {
+        &self.event_id
+    }
+
+    pub fn pubkey(&self) -> &PublicKeyHex {
+        &self.pubkey
+    }
+
+    pub fn created_at(&self) -> UnixTimestamp {
+        self.created_at
+    }
+
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
+    pub fn root(&self) -> &CommentReference {
+        &self.root
+    }
+
+    pub fn parent(&self) -> &CommentReference {
+        &self.parent
+    }
+
+    pub fn cited_events(&self) -> &[String] {
+        &self.cited_events
+    }
+
+    pub fn mentioned_pubkeys(&self) -> &[PublicKeyHex] {
+        &self.mentioned_pubkeys
+    }
+}
+
+pub fn parse_comment_event(event: &Event) -> Result<Option<CommentEvent>, String> {
+    if event.unsigned().kind().as_u32() != NIP22_COMMENT_KIND {
+        return Ok(None);
+    }
+    let root_kind = required_tag_value(event, "K")?;
+    let parent_kind = required_tag_value(event, "k")?;
+    if root_kind.is_empty() {
+        return Err("comment root kind tag must not be empty".to_owned());
+    }
+    if parent_kind.is_empty() {
+        return Err("comment parent kind tag must not be empty".to_owned());
+    }
+    if root_kind == "1" || parent_kind == "1" {
+        return Err("NIP-22 comments must not reply to kind 1 notes".to_owned());
+    }
+    Ok(Some(CommentEvent {
+        event_id: event.id().clone(),
+        pubkey: event.unsigned().pubkey().clone(),
+        created_at: event.unsigned().created_at(),
+        content: event.unsigned().content().to_owned(),
+        root: CommentReference {
+            target: parse_scoped_comment_target(event, &["A", "E", "I"], "root")?,
+            kind: root_kind,
+            author: optional_single_pubkey(event, "P", "root author")?,
+        },
+        parent: CommentReference {
+            target: parse_scoped_comment_target(event, &["a", "e", "i"], "parent")?,
+            kind: parent_kind,
+            author: first_optional_pubkey(event, "p", "parent author")?,
+        },
+        cited_events: single_letter_values_for(event, "q")?,
+        mentioned_pubkeys: parse_pubkey_values(event, "p", "mentioned pubkey")?,
+    }))
+}
+
+fn parse_scoped_comment_target(
+    event: &Event,
+    names: &[&str],
+    scope: &str,
+) -> Result<CommentTarget, String> {
+    let mut found = Vec::new();
+    for name in names {
+        for tag in matching_tags(event, name) {
+            found.push((*name, tag));
+        }
+    }
+    match found.len() {
+        0 => Err(format!("comment {scope} target tag is required")),
+        1 => {
+            let (name, tag) = found.remove(0);
+            parse_comment_target_tag(name, &tag, scope)
+        }
+        _ => Err(format!("comment {scope} target tag must not be repeated")),
+    }
+}
+
+fn parse_comment_target_tag(
+    name: &str,
+    tag: &ParsedTag,
+    scope: &str,
+) -> Result<CommentTarget, String> {
+    let values = tag.values();
+    let target = values
+        .first()
+        .ok_or_else(|| format!("comment {scope} target tag `{name}` must include a value"))?;
+    if target.is_empty() {
+        return Err(format!(
+            "comment {scope} target tag `{name}` must not be empty"
+        ));
+    }
+    let relay_hint = normalized_optional_hint(values.get(1), scope, "relay")?;
+    match name {
+        "E" | "e" => {
+            if values.len() > 3 {
+                return Err(format!(
+                    "comment {scope} event target tag `{name}` must include at most event relay and pubkey values"
+                ));
+            }
+            let pubkey_hint = values
+                .get(2)
+                .map(|value| parse_pubkey_value(value, scope, "event pubkey hint"))
+                .transpose()?;
+            Ok(CommentTarget::Event {
+                event_id: EventId::new(target)?,
+                relay_hint,
+                pubkey_hint,
+            })
+        }
+        "A" | "a" => {
+            if values.len() > 2 {
+                return Err(format!(
+                    "comment {scope} address target tag `{name}` must include at most address and relay values"
+                ));
+            }
+            Ok(CommentTarget::Address {
+                address: AddressCoordinate::from_str(target)?,
+                relay_hint,
+            })
+        }
+        "I" | "i" => {
+            if values.len() > 2 {
+                return Err(format!(
+                    "comment {scope} external target tag `{name}` must include at most identity and relay values"
+                ));
+            }
+            Ok(CommentTarget::External {
+                identity: target.to_owned(),
+                relay_hint,
+            })
+        }
+        _ => Err(format!(
+            "comment {scope} target tag `{name}` is unsupported"
+        )),
+    }
+}
+
+fn optional_single_pubkey(
+    event: &Event,
+    name: &str,
+    description: &str,
+) -> Result<Option<PublicKeyHex>, String> {
+    let values = single_letter_values_for(event, name)?;
+    match values.as_slice() {
+        [] => Ok(None),
+        [value] => Ok(Some(parse_pubkey_value(value, description, "pubkey")?)),
+        _ => Err(format!(
+            "comment {description} tag `{name}` must not be repeated"
+        )),
+    }
+}
+
+fn first_optional_pubkey(
+    event: &Event,
+    name: &str,
+    description: &str,
+) -> Result<Option<PublicKeyHex>, String> {
+    match single_letter_values_for(event, name)?.first() {
+        Some(value) => Ok(Some(parse_pubkey_value(value, description, "pubkey")?)),
+        None => Ok(None),
+    }
+}
+
+fn parse_pubkey_values(
+    event: &Event,
+    name: &str,
+    description: &str,
+) -> Result<Vec<PublicKeyHex>, String> {
+    single_letter_values_for(event, name)?
+        .into_iter()
+        .map(|value| parse_pubkey_value(&value, description, "pubkey"))
+        .collect()
+}
+
+fn parse_pubkey_value(value: &str, description: &str, field: &str) -> Result<PublicKeyHex, String> {
+    PublicKeyHex::new(value).map_err(|source| format!("{description} {field} is invalid: {source}"))
+}
+
+fn normalized_optional_hint(
+    value: Option<&String>,
+    scope: &str,
+    field: &str,
+) -> Result<Option<String>, String> {
+    match value {
+        Some(value) if value.is_empty() => Err(format!(
+            "comment {scope} target {field} hint must not be empty"
+        )),
+        Some(value) => Ok(Some(value.clone())),
         None => Ok(None),
     }
 }
@@ -1026,13 +1308,13 @@ fn listing_kind_for_event(event: &Event) -> Option<ListingKind> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeletionTarget, FulfillmentMethod, ListingEffectiveStatus, ListingKind,
-        ListingProjectionEvaluation, ListingUnit, NIP99_PUBLIC_LISTING_KIND,
+        CommentTarget, DeletionTarget, FulfillmentMethod, ListingEffectiveStatus, ListingKind,
+        ListingProjectionEvaluation, ListingUnit, NIP22_COMMENT_KIND, NIP99_PUBLIC_LISTING_KIND,
         evaluate_listing_projection, matching_tags, optional_tag_value, optional_tag_values,
-        parse_deletion_request, parse_listing_fulfillment, parse_listing_identity,
-        parse_listing_location, parse_listing_price, parse_listing_status, parse_listing_taxonomy,
-        parse_listing_text, parse_listing_unit, parse_nip50_filter_search, parse_nip50_search,
-        parse_relay_auth_event, parse_required_u64_tag, parse_u64_field,
+        parse_comment_event, parse_deletion_request, parse_listing_fulfillment,
+        parse_listing_identity, parse_listing_location, parse_listing_price, parse_listing_status,
+        parse_listing_taxonomy, parse_listing_text, parse_listing_unit, parse_nip50_filter_search,
+        parse_nip50_search, parse_relay_auth_event, parse_required_u64_tag, parse_u64_field,
         repeated_or_missing_policy_boundary, required_tag_value, required_tag_values,
         single_letter_tag_values, single_letter_values_for, tag_count,
     };
@@ -1171,6 +1453,165 @@ mod tests {
         assert_eq!(
             single_letter_values_for(&missing, "é").expect_err("non ascii"),
             "single-letter tag name `é` must be one ASCII letter"
+        );
+    }
+
+    #[test]
+    fn comment_parser_extracts_root_parent_authors_and_references() {
+        let root_pubkey = "2".repeat(PublicKeyHex::HEX_LENGTH);
+        let parent_pubkey = "3".repeat(PublicKeyHex::HEX_LENGTH);
+        let comment_event = "4".repeat(EventId::HEX_LENGTH);
+        let mentioned_pubkey = "5".repeat(PublicKeyHex::HEX_LENGTH);
+        let address = format!("30023:{root_pubkey}:article-a");
+        let event = event_with_kind_tags_and_content(
+            NIP22_COMMENT_KIND.into(),
+            vec![
+                Tag::from_parts("A", &[&address, "wss://relay.radroots.test"]).expect("A"),
+                Tag::from_parts("K", &["30023"]).expect("K"),
+                Tag::from_parts("P", &[&root_pubkey]).expect("P"),
+                Tag::from_parts(
+                    "e",
+                    &[&comment_event, "wss://relay.radroots.test", &parent_pubkey],
+                )
+                .expect("e"),
+                Tag::from_parts("k", &["1111"]).expect("k"),
+                Tag::from_parts("p", &[&parent_pubkey]).expect("p"),
+                Tag::from_parts("p", &[&mentioned_pubkey]).expect("mention"),
+                Tag::from_parts("q", &[&comment_event]).expect("q"),
+            ],
+            "That harvest note helped.",
+        );
+
+        let comment = parse_comment_event(&event)
+            .expect("parse")
+            .expect("comment");
+
+        assert_eq!(comment.event_id(), event.id());
+        assert_eq!(comment.pubkey(), event.unsigned().pubkey());
+        assert_eq!(comment.created_at(), event.unsigned().created_at());
+        assert_eq!(comment.content(), "That harvest note helped.");
+        assert_eq!(comment.root().kind(), "30023");
+        assert_eq!(
+            comment.root().author().expect("root author").as_str(),
+            root_pubkey
+        );
+        assert_eq!(comment.parent().kind(), "1111");
+        assert_eq!(
+            comment.parent().author().expect("parent author").as_str(),
+            parent_pubkey
+        );
+        assert_eq!(comment.cited_events(), &[comment_event.clone()]);
+        assert_eq!(comment.mentioned_pubkeys()[0].as_str(), parent_pubkey);
+        assert_eq!(comment.mentioned_pubkeys()[1].as_str(), mentioned_pubkey);
+        match comment.root().target() {
+            CommentTarget::Address {
+                address: parsed,
+                relay_hint,
+            } => {
+                assert_eq!(parsed.key().to_string(), address);
+                assert_eq!(relay_hint.as_deref(), Some("wss://relay.radroots.test"));
+            }
+            other => panic!("unexpected target {other:?}"),
+        }
+        match comment.parent().target() {
+            CommentTarget::Event {
+                event_id,
+                relay_hint,
+                pubkey_hint,
+            } => {
+                assert_eq!(event_id.as_str(), comment_event);
+                assert_eq!(relay_hint.as_deref(), Some("wss://relay.radroots.test"));
+                assert_eq!(pubkey_hint.as_ref().expect("hint").as_str(), parent_pubkey);
+            }
+            other => panic!("unexpected target {other:?}"),
+        }
+    }
+
+    #[test]
+    fn comment_parser_extracts_external_scope_and_ignores_other_kinds() {
+        let event = event_with_kind_and_tags(
+            NIP22_COMMENT_KIND.into(),
+            vec![
+                Tag::from_parts("I", &["https://radroots.test/posts/harvest"]).expect("I"),
+                Tag::from_parts("K", &["web"]).expect("K"),
+                Tag::from_parts("i", &["https://radroots.test/posts/harvest"]).expect("i"),
+                Tag::from_parts("k", &["web"]).expect("k"),
+            ],
+        );
+        let note = event_with_kind_and_tags(1, Vec::new());
+
+        let comment = parse_comment_event(&event)
+            .expect("parse")
+            .expect("comment");
+
+        assert_eq!(parse_comment_event(&note), Ok(None));
+        match comment.root().target() {
+            CommentTarget::External { identity, .. } => {
+                assert_eq!(identity, "https://radroots.test/posts/harvest");
+            }
+            other => panic!("unexpected target {other:?}"),
+        }
+    }
+
+    #[test]
+    fn comment_parser_rejects_missing_repeated_empty_and_kind_one_targets() {
+        let target = "2".repeat(EventId::HEX_LENGTH);
+        let valid = vec![
+            Tag::from_parts("E", &[&target]).expect("E"),
+            Tag::from_parts("K", &["30023"]).expect("K"),
+            Tag::from_parts("e", &[&target]).expect("e"),
+            Tag::from_parts("k", &["30023"]).expect("k"),
+        ];
+        let missing_root = event_with_kind_tags_and_content(
+            NIP22_COMMENT_KIND.into(),
+            valid
+                .iter()
+                .filter(|tag| tag.name().as_str() != "E")
+                .cloned()
+                .collect(),
+            "",
+        );
+        let repeated_root = event_with_kind_tags_and_content(
+            NIP22_COMMENT_KIND.into(),
+            [valid.clone(), vec![Tag::from_parts("A", &["30023:1111111111111111111111111111111111111111111111111111111111111111:article"]).expect("A")]].concat(),
+            "",
+        );
+        let empty_parent = event_with_kind_tags_and_content(
+            NIP22_COMMENT_KIND.into(),
+            vec![
+                Tag::from_parts("E", &[&target]).expect("E"),
+                Tag::from_parts("K", &["30023"]).expect("K"),
+                Tag::from_parts("e", &[""]).expect("e"),
+                Tag::from_parts("k", &["30023"]).expect("k"),
+            ],
+            "",
+        );
+        let kind_one = event_with_kind_tags_and_content(
+            NIP22_COMMENT_KIND.into(),
+            vec![
+                Tag::from_parts("E", &[&target]).expect("E"),
+                Tag::from_parts("K", &["1"]).expect("K"),
+                Tag::from_parts("e", &[&target]).expect("e"),
+                Tag::from_parts("k", &["30023"]).expect("k"),
+            ],
+            "",
+        );
+
+        assert_eq!(
+            parse_comment_event(&missing_root).expect_err("missing"),
+            "comment root target tag is required"
+        );
+        assert_eq!(
+            parse_comment_event(&repeated_root).expect_err("repeated"),
+            "comment root target tag must not be repeated"
+        );
+        assert_eq!(
+            parse_comment_event(&empty_parent).expect_err("empty"),
+            "comment parent target tag `e` must not be empty"
+        );
+        assert_eq!(
+            parse_comment_event(&kind_one).expect_err("kind one"),
+            "NIP-22 comments must not reply to kind 1 notes"
         );
     }
 
