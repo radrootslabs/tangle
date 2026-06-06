@@ -266,6 +266,42 @@ pub async fn run_ingest_benchmark(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListingQueryBenchmarkReport {
+    pub listing_rows: u64,
+    pub limited_rows: u64,
+    pub elapsed_micros: u128,
+}
+
+pub async fn run_listing_query_benchmark(
+    config: BenchDatasetConfig,
+) -> Result<ListingQueryBenchmarkReport, String> {
+    let dataset = BenchDataset::generate(config)?;
+    let materialized = materialize_listing_workload(&dataset).await?;
+    let started = Instant::now();
+    let listing_rows = materialized
+        .store()
+        .query_current_listings(&ListingProjectionQuery::new().with_effective_status("active"))
+        .await
+        .map_err(|error| error.to_string())?
+        .len() as u64;
+    let limited_rows = materialized
+        .store()
+        .query_current_listings(
+            &ListingProjectionQuery::new()
+                .with_effective_status("active")
+                .with_limit(7),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .len() as u64;
+    Ok(ListingQueryBenchmarkReport {
+        listing_rows,
+        limited_rows,
+        elapsed_micros: started.elapsed().as_micros(),
+    })
+}
+
 async fn bench_memory_store(database: &str) -> Result<SurrealStore, String> {
     let config = SurrealConnectionConfig::memory("tangle_bench", database)
         .map_err(|error| error.to_string())?;
@@ -461,6 +497,17 @@ mod tests {
 
         assert_eq!(report.attempted, 10);
         assert_eq!(report.inserted, 10);
+        assert!(report.elapsed_micros > 0);
+    }
+
+    #[tokio::test]
+    async fn listing_query_benchmark_reports_deterministic_row_counts() {
+        let report = super::run_listing_query_benchmark(BenchDatasetConfig::new(18, 0))
+            .await
+            .expect("listing query benchmark");
+
+        assert_eq!(report.listing_rows, 18);
+        assert_eq!(report.limited_rows, 7);
         assert!(report.elapsed_micros > 0);
     }
 }
