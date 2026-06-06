@@ -826,6 +826,62 @@ CREATE type::record('nostr_event', $event_id) CONTENT {
         response.take(0).map_err(SurrealStoreError::from)
     }
 
+    pub async fn index_event_tags(&self, event: &Event) -> Result<(), SurrealStoreError> {
+        self.db
+            .query("DELETE event_tag_index WHERE event_id = $event_id;")
+            .bind(("event_id", event.id().as_str()))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        for (ordinal, tag) in event.unsigned().tags().iter().enumerate() {
+            let Some((name, value)) = tag.indexed_pair() else {
+                continue;
+            };
+            self.db
+                .query(
+                    r#"
+CREATE event_tag_index CONTENT {
+    event_id: $event_id,
+    kind: $kind,
+    pubkey: $pubkey,
+    created_at: $created_at,
+    tag: $tag,
+    value: $value,
+    ordinal: $ordinal
+};
+"#,
+                )
+                .bind(("event_id", event.id().as_str()))
+                .bind(("kind", event.unsigned().kind().as_u32()))
+                .bind(("pubkey", event.unsigned().pubkey().as_str()))
+                .bind(("created_at", event.unsigned().created_at().as_u64()))
+                .bind(("tag", name))
+                .bind(("value", value))
+                .bind(("ordinal", ordinal as u64))
+                .await
+                .map_err(SurrealStoreError::from)?
+                .check()
+                .map_err(SurrealStoreError::from)?;
+        }
+        Ok(())
+    }
+
+    pub async fn tag_index_rows(
+        &self,
+        event_id: &EventId,
+    ) -> Result<Vec<serde_json::Value>, SurrealStoreError> {
+        let mut response = self
+            .db
+            .query("SELECT * FROM event_tag_index WHERE event_id = $event_id ORDER BY ordinal ASC;")
+            .bind(("event_id", event_id.as_str()))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
     async fn applied_migration(
         &self,
         name: &str,
@@ -939,7 +995,9 @@ mod tests {
         SurrealMigration, SurrealMigrationError, SurrealMigrationPlan, SurrealStore,
         base_migration_plan, migration_tracking_schema,
     };
-    use tangle_protocol::UnixTimestamp;
+    use tangle_protocol::{
+        Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
+    };
     use tangle_store::{StoreEventOutcome, StoredEvent};
     use tangle_test_support::{build_fixture_event, valid_public_listing_spec};
 
@@ -1630,5 +1688,50 @@ mod tests {
             event.id().as_str()
         );
         assert_eq!(row["tags"].as_array().expect("tags").len(), 10);
+    }
+
+    #[tokio::test]
+    async fn index_event_tags_persists_single_letter_tag_rows() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let event = Event::new(
+            EventId::new(&"c".repeat(EventId::HEX_LENGTH)).expect("id"),
+            UnsignedEvent::new(
+                PublicKeyHex::new(&"d".repeat(PublicKeyHex::HEX_LENGTH)).expect("pubkey"),
+                UnixTimestamp::new(1_714_124_600),
+                Kind::new(1).expect("kind"),
+                vec![
+                    Tag::from_parts("e", &["target-event"]).expect("e"),
+                    Tag::from_parts("A", &["upper-tag"]).expect("A"),
+                    Tag::from_parts("topic", &["ignored"]).expect("topic"),
+                    Tag::from_parts("p", &["target-pubkey"]).expect("p"),
+                ],
+                "tagged event",
+            ),
+            SignatureHex::new(&"e".repeat(SignatureHex::HEX_LENGTH)).expect("sig"),
+        );
+
+        store.index_event_tags(&event).await.expect("index");
+        store.index_event_tags(&event).await.expect("reindex");
+
+        let rows = store.tag_index_rows(event.id()).await.expect("rows");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["tag"], "e");
+        assert_eq!(rows[0]["value"], "target-event");
+        assert_eq!(rows[0]["ordinal"], 0_u64);
+        assert_eq!(rows[1]["tag"], "A");
+        assert_eq!(rows[1]["value"], "upper-tag");
+        assert_eq!(rows[1]["ordinal"], 1_u64);
+        assert_eq!(rows[2]["tag"], "p");
+        assert_eq!(rows[2]["value"], "target-pubkey");
+        assert_eq!(rows[2]["kind"], 1_u64);
+        assert_eq!(rows[2]["pubkey"], event.unsigned().pubkey().as_str());
+        assert_eq!(
+            rows[2]["created_at"],
+            event.unsigned().created_at().as_u64()
+        );
     }
 }
