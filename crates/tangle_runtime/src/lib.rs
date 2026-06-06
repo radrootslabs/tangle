@@ -1,6 +1,13 @@
 #![forbid(unsafe_code)]
 
+use axum::{
+    Json, Router,
+    extract::State,
+    response::{IntoResponse, Response},
+    routing::get,
+};
 use core::fmt;
+use http::StatusCode;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +118,14 @@ impl fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let status =
+            StatusCode::from_u16(self.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        (status, Json(self.envelope())).into_response()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiErrorEnvelope {
     pub error: ApiErrorBody,
@@ -122,9 +137,122 @@ pub struct ApiErrorBody {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadinessCheckStatus {
+    Ready,
+    NotReady,
+}
+
+impl ReadinessCheckStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::NotReady => "not_ready",
+        }
+    }
+
+    pub fn is_ready(self) -> bool {
+        self == Self::Ready
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadinessState {
+    pub database: ReadinessCheckStatus,
+    pub migrations: ReadinessCheckStatus,
+    pub repository: ReadinessCheckStatus,
+}
+
+impl ReadinessState {
+    pub fn new(
+        database: ReadinessCheckStatus,
+        migrations: ReadinessCheckStatus,
+        repository: ReadinessCheckStatus,
+    ) -> Self {
+        Self {
+            database,
+            migrations,
+            repository,
+        }
+    }
+
+    pub fn ready() -> Self {
+        Self::new(
+            ReadinessCheckStatus::Ready,
+            ReadinessCheckStatus::Ready,
+            ReadinessCheckStatus::Ready,
+        )
+    }
+
+    pub fn is_ready(self) -> bool {
+        self.database.is_ready() && self.migrations.is_ready() && self.repository.is_ready()
+    }
+
+    pub fn response(self) -> ReadinessDocument {
+        ReadinessDocument {
+            status: if self.is_ready() {
+                "ready".to_owned()
+            } else {
+                "not_ready".to_owned()
+            },
+            checks: ReadinessChecksDocument {
+                database: self.database.as_str().to_owned(),
+                migrations: self.migrations.as_str().to_owned(),
+                repository: self.repository.as_str().to_owned(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthDocument {
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadinessDocument {
+    pub status: String,
+    pub checks: ReadinessChecksDocument,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadinessChecksDocument {
+    pub database: String,
+    pub migrations: String,
+    pub repository: String,
+}
+
+pub fn health_router(readiness: ReadinessState) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .with_state(readiness)
+}
+
+async fn healthz() -> Json<HealthDocument> {
+    Json(HealthDocument {
+        status: "ok".to_owned(),
+    })
+}
+
+async fn readyz(State(readiness): State<ReadinessState>) -> (StatusCode, Json<ReadinessDocument>) {
+    let status = if readiness.is_ready() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(readiness.response()))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ApiError, ApiErrorBody, ApiErrorCode, ApiErrorEnvelope};
+    use super::{
+        ApiError, ApiErrorBody, ApiErrorCode, ApiErrorEnvelope, ReadinessCheckStatus,
+        ReadinessState, health_router,
+    };
+    use axum::{body::Body, response::IntoResponse};
+    use http::{Request, StatusCode};
+    use tower::ServiceExt;
 
     #[test]
     fn api_error_codes_have_stable_labels_and_statuses() {
@@ -189,6 +317,105 @@ mod tests {
             }))
             .expect("envelope"),
             errors[0].envelope()
+        );
+    }
+
+    #[tokio::test]
+    async fn api_error_into_response_keeps_public_envelope_shape() {
+        let response = ApiError::not_found("listing not found").into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
+            serde_json::json!({
+                "error": {
+                    "code": "not_found",
+                    "message": "listing not found"
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_reports_liveness() {
+        let response = health_router(ReadinessState::ready())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
+            serde_json::json!({ "status": "ok" })
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_endpoint_reports_ready_checks() {
+        let response = health_router(ReadinessState::ready())
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
+            serde_json::json!({
+                "status": "ready",
+                "checks": {
+                    "database": "ready",
+                    "migrations": "ready",
+                    "repository": "ready"
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_endpoint_reports_unavailable_checks() {
+        let response = health_router(ReadinessState::new(
+            ReadinessCheckStatus::NotReady,
+            ReadinessCheckStatus::Ready,
+            ReadinessCheckStatus::NotReady,
+        ))
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
+            serde_json::json!({
+                "status": "not_ready",
+                "checks": {
+                    "database": "not_ready",
+                    "migrations": "ready",
+                    "repository": "not_ready"
+                }
+            })
         );
     }
 }

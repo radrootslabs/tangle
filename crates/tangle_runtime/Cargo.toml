@@ -8,10 +8,14 @@ license.workspace = true
 description = "Service runtime for the Tangle relay"
 
 [dependencies]
+axum = "0.8"
+http = "1"
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt"] }
+tower = { version = "0.5", features = ["util"] }
 
 [lints]
 workspace = true
