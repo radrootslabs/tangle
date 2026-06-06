@@ -3892,8 +3892,12 @@ dependencies = [
 name = "tangle_store_surreal"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "sha2",
  "surrealdb",
+ "tangle_protocol",
+ "tangle_store",
+ "tangle_test_support",
  "tokio",
 ]
 

@@ -8,10 +8,14 @@ license.workspace = true
 description = "SurrealDB storage backend for tangle"
 
 [dependencies]
+serde_json = "1"
 sha2 = "0.10"
 surrealdb = { version = "3.1.3", default-features = false, features = ["kv-mem"] }
+tangle_protocol = { path = "../tangle_protocol" }
+tangle_store = { path = "../tangle_store" }
 
 [dev-dependencies]
+tangle_test_support = { path = "../tangle_test_support" }
 tokio = { version = "1", features = ["macros", "rt"] }
 
 [lints]

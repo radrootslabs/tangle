@@ -4,6 +4,8 @@ use core::fmt;
 use sha2::{Digest, Sha256};
 use surrealdb::Surreal;
 use surrealdb::engine::local::{Db, Mem};
+use tangle_protocol::{AddressCoordinate, Event, EventId, event_to_value};
+use tangle_store::{StoreEventOutcome, StoredEvent};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SurrealConnectionMode {
@@ -304,7 +306,7 @@ DEFINE FIELD IF NOT EXISTS kind ON TABLE nostr_event TYPE int;
 DEFINE FIELD IF NOT EXISTS tags ON TABLE nostr_event TYPE array;
 DEFINE FIELD IF NOT EXISTS content ON TABLE nostr_event TYPE string;
 DEFINE FIELD IF NOT EXISTS sig ON TABLE nostr_event TYPE string;
-DEFINE FIELD IF NOT EXISTS raw_json ON TABLE nostr_event TYPE object;
+DEFINE FIELD IF NOT EXISTS raw_json ON TABLE nostr_event TYPE string;
 DEFINE FIELD IF NOT EXISTS received_at ON TABLE nostr_event TYPE int;
 DEFINE FIELD IF NOT EXISTS content_len ON TABLE nostr_event TYPE int;
 DEFINE FIELD IF NOT EXISTS tag_count ON TABLE nostr_event TYPE int;
@@ -758,6 +760,72 @@ impl SurrealStore {
             .unwrap_or_else(|| "None".to_owned()))
     }
 
+    pub async fn store_raw_event(
+        &self,
+        stored: &StoredEvent,
+    ) -> Result<StoreEventOutcome, SurrealStoreError> {
+        if self.raw_event_row(stored.event().id()).await?.is_some() {
+            return Ok(StoreEventOutcome::Duplicate);
+        }
+        let event = stored.event();
+        self.db
+            .query(
+                r#"
+CREATE type::record('nostr_event', $event_id) CONTENT {
+    event_id: $event_id,
+    pubkey: $pubkey,
+    created_at: $created_at,
+    kind: $kind,
+    tags: $tags,
+    content: $content,
+    sig: $sig,
+    raw_json: $raw_json,
+    received_at: $received_at,
+    content_len: $content_len,
+    tag_count: $tag_count,
+    d_tag: $d_tag,
+    address_key: $address_key,
+    deleted: false,
+    hidden: false,
+    rejection_reason: NONE
+};
+"#,
+            )
+            .bind(("event_id", event.id().as_str()))
+            .bind(("pubkey", event.unsigned().pubkey().as_str()))
+            .bind(("created_at", event.unsigned().created_at().as_u64()))
+            .bind(("kind", event.unsigned().kind().as_u32()))
+            .bind(("tags", event_tags_json(event)))
+            .bind(("content", event.unsigned().content()))
+            .bind(("sig", event.sig().as_str()))
+            .bind(("raw_json", event_to_value(event).to_string()))
+            .bind(("received_at", stored.received_at().as_u64()))
+            .bind(("content_len", stored.content_len() as u64))
+            .bind(("tag_count", stored.tag_count() as u64))
+            .bind(("d_tag", d_tag_value(event)))
+            .bind(("address_key", address_key_value(event)?))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        Ok(StoreEventOutcome::Inserted)
+    }
+
+    pub async fn raw_event_row(
+        &self,
+        event_id: &EventId,
+    ) -> Result<Option<serde_json::Value>, SurrealStoreError> {
+        let mut response = self
+            .db
+            .query("SELECT * FROM ONLY type::record('nostr_event', $event_id);")
+            .bind(("event_id", event_id.as_str()))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
     async fn applied_migration(
         &self,
         name: &str,
@@ -802,6 +870,37 @@ impl SurrealStore {
     }
 }
 
+fn event_tags_json(event: &Event) -> Vec<serde_json::Value> {
+    event
+        .unsigned()
+        .tags()
+        .iter()
+        .map(|tag| {
+            serde_json::Value::Array(
+                tag.values()
+                    .iter()
+                    .map(|value| serde_json::Value::String(value.clone()))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn d_tag_value(event: &Event) -> Option<String> {
+    event
+        .unsigned()
+        .tags()
+        .iter()
+        .find_map(|tag| tag.indexed_pair())
+        .and_then(|(name, value)| (name == "d").then(|| value.to_owned()))
+}
+
+fn address_key_value(event: &Event) -> Result<Option<String>, SurrealStoreError> {
+    AddressCoordinate::from_event(event)
+        .map(|address| address.map(|address| address.key().to_string()))
+        .map_err(|message| SurrealStoreError::new(&message))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SurrealStoreError {
     message: String,
@@ -840,6 +939,9 @@ mod tests {
         SurrealMigration, SurrealMigrationError, SurrealMigrationPlan, SurrealStore,
         base_migration_plan, migration_tracking_schema,
     };
+    use tangle_protocol::UnixTimestamp;
+    use tangle_store::{StoreEventOutcome, StoredEvent};
+    use tangle_test_support::{build_fixture_event, valid_public_listing_spec};
 
     #[test]
     fn memory_config_normalizes_namespace_and_database() {
@@ -1472,5 +1574,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn store_raw_event_persists_canonical_nostr_event_row() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let event = build_fixture_event(&valid_public_listing_spec()).expect("event");
+        let stored = StoredEvent::new(event.clone(), UnixTimestamp::new(1_714_124_500));
+
+        assert_eq!(
+            store.store_raw_event(&stored).await.expect("insert"),
+            StoreEventOutcome::Inserted
+        );
+        assert_eq!(
+            store.store_raw_event(&stored).await.expect("duplicate"),
+            StoreEventOutcome::Duplicate
+        );
+
+        let row = store
+            .raw_event_row(event.id())
+            .await
+            .expect("row query")
+            .expect("row exists");
+        assert_eq!(row["event_id"], event.id().as_str());
+        assert_eq!(row["pubkey"], event.unsigned().pubkey().as_str());
+        assert_eq!(row["created_at"], event.unsigned().created_at().as_u64());
+        assert_eq!(row["kind"], event.unsigned().kind().as_u32());
+        assert_eq!(row["content"], "Sweet storage carrots.");
+        assert_eq!(row["sig"], event.sig().as_str());
+        assert_eq!(row["received_at"], 1_714_124_500_u64);
+        assert_eq!(row["content_len"], 22_u64);
+        assert_eq!(row["tag_count"], 10_u64);
+        assert_eq!(row["d_tag"], "listing-a");
+        assert_eq!(
+            row["address_key"],
+            format!(
+                "{}:{}:{}",
+                event.unsigned().kind().as_u32(),
+                event.unsigned().pubkey().as_str(),
+                event.unsigned().tags()[0].values()[1]
+            )
+        );
+        assert_eq!(row["deleted"], false);
+        assert_eq!(row["hidden"], false);
+        assert_eq!(
+            row["raw_json"]
+                .as_str()
+                .expect("raw json string")
+                .parse::<serde_json::Value>()
+                .expect("raw json parses")["id"],
+            event.id().as_str()
+        );
+        assert_eq!(row["tags"].as_array().expect("tags").len(), 10);
     }
 }
