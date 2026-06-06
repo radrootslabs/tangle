@@ -2453,7 +2453,7 @@ mod tests {
             comment.parent().author().expect("parent author").as_str(),
             parent_pubkey
         );
-        assert_eq!(comment.cited_events(), &[comment_event.clone()]);
+        assert_eq!(comment.cited_events(), std::slice::from_ref(&comment_event));
         assert_eq!(comment.mentioned_pubkeys()[0].as_str(), parent_pubkey);
         assert_eq!(comment.mentioned_pubkeys()[1].as_str(), mentioned_pubkey);
         match comment.root().target() {
