@@ -1,0 +1,14 @@
+[package]
+name = "tangle_nips"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "MVP NIP parsers and projection contracts for tangle"
+
+[dependencies]
+tangle_protocol = { path = "../tangle_protocol" }
+
+[lints]
+workspace = true

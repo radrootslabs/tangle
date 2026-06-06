@@ -383,6 +383,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tangle_nips"
+version = "0.1.0"
+dependencies = [
+ "tangle_protocol",
+]
+
+[[package]]
 name = "tangle_protocol"
 version = "0.1.0"
 dependencies = [
