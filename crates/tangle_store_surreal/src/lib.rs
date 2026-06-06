@@ -311,6 +311,7 @@ pub fn base_migration_plan() -> SurrealMigrationPlan {
         reaction_projection_schema(),
         long_form_projection_schema(),
         forum_thread_schema(),
+        label_projection_schema(),
     ])
     .expect("base migration plan is strictly ordered")
 }
@@ -795,6 +796,34 @@ DEFINE INDEX IF NOT EXISTS forum_thread_topic_thread ON TABLE forum_thread_topic
 "#,
     )
     .expect("forum thread schema is valid")
+}
+
+pub fn label_projection_schema() -> SurrealMigration {
+    SurrealMigration::new(
+        "0015_label_projection",
+        r#"
+DEFINE TABLE IF NOT EXISTS label_projection SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS label_id ON TABLE label_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS event_id ON TABLE label_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS pubkey ON TABLE label_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON TABLE label_projection TYPE int;
+DEFINE FIELD IF NOT EXISTS content ON TABLE label_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS namespace ON TABLE label_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS label ON TABLE label_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS target_type ON TABLE label_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS target_ref ON TABLE label_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS hidden ON TABLE label_projection TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS deleted ON TABLE label_projection TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS projected_at ON TABLE label_projection TYPE int;
+DEFINE INDEX IF NOT EXISTS label_projection_label_uid ON TABLE label_projection COLUMNS label_id UNIQUE;
+DEFINE INDEX IF NOT EXISTS label_projection_event ON TABLE label_projection COLUMNS event_id;
+DEFINE INDEX IF NOT EXISTS label_projection_target_lookup ON TABLE label_projection COLUMNS target_type, target_ref, namespace, label, created_at, event_id;
+DEFINE INDEX IF NOT EXISTS label_projection_namespace_lookup ON TABLE label_projection COLUMNS namespace, label, created_at, event_id;
+DEFINE INDEX IF NOT EXISTS label_projection_author_created ON TABLE label_projection COLUMNS pubkey, created_at, event_id;
+DEFINE INDEX IF NOT EXISTS label_projection_visibility ON TABLE label_projection COLUMNS hidden, deleted, created_at, event_id;
+"#,
+    )
+    .expect("label projection schema is valid")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4839,6 +4868,42 @@ mod tests {
             "forum_thread_topic_thread",
         ] {
             assert!(topic.contains(expected), "missing {expected} in {topic}");
+        }
+    }
+
+    #[tokio::test]
+    async fn label_projection_schema_defines_reviewable_label_table() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let info = store
+            .table_info("label_projection")
+            .await
+            .expect("label info");
+
+        for expected in [
+            "label_id",
+            "event_id",
+            "pubkey",
+            "created_at",
+            "content",
+            "namespace",
+            "label",
+            "target_type",
+            "target_ref",
+            "hidden",
+            "deleted",
+            "projected_at",
+            "label_projection_label_uid",
+            "label_projection_event",
+            "label_projection_target_lookup",
+            "label_projection_namespace_lookup",
+            "label_projection_author_created",
+            "label_projection_visibility",
+        ] {
+            assert!(info.contains(expected), "missing {expected} in {info}");
         }
     }
 
