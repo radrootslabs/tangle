@@ -633,6 +633,61 @@ fn parse_fulfillment_method(value: &str) -> Option<FulfillmentMethod> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListingEffectiveStatus {
+    Active,
+    Sold,
+    Draft,
+}
+
+impl ListingEffectiveStatus {
+    pub fn canonical(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Sold => "sold",
+            Self::Draft => "draft",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListingStatus {
+    raw_status: Option<String>,
+    effective_status: ListingEffectiveStatus,
+}
+
+impl ListingStatus {
+    pub fn raw_status(&self) -> Option<&str> {
+        self.raw_status.as_deref()
+    }
+
+    pub fn effective_status(&self) -> ListingEffectiveStatus {
+        self.effective_status
+    }
+}
+
+pub fn parse_listing_status(event: &Event) -> Result<Option<ListingStatus>, String> {
+    let Some(listing_kind) = listing_kind_for_event(event) else {
+        return Ok(None);
+    };
+    let raw_status = optional_tag_value(event, "status")?;
+    let parsed_status = match raw_status.as_deref() {
+        Some("") => return Err("listing status tag must not be empty".to_owned()),
+        Some("active") => Some(ListingEffectiveStatus::Active),
+        Some("sold") => Some(ListingEffectiveStatus::Sold),
+        Some(value) => return Err(format!("listing status `{value}` is unsupported")),
+        None => None,
+    };
+    let effective_status = match listing_kind {
+        ListingKind::Draft => ListingEffectiveStatus::Draft,
+        ListingKind::Public => parsed_status.unwrap_or(ListingEffectiveStatus::Active),
+    };
+    Ok(Some(ListingStatus {
+        raw_status,
+        effective_status,
+    }))
+}
+
 fn listing_kind_for_event(event: &Event) -> Option<ListingKind> {
     match event.unsigned().kind().as_u32() {
         NIP99_PUBLIC_LISTING_KIND => Some(ListingKind::Public),
@@ -644,10 +699,11 @@ fn listing_kind_for_event(event: &Event) -> Option<ListingKind> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeletionTarget, FulfillmentMethod, ListingKind, ListingUnit, NIP99_PUBLIC_LISTING_KIND,
-        matching_tags, optional_tag_value, optional_tag_values, parse_deletion_request,
-        parse_listing_fulfillment, parse_listing_identity, parse_listing_price, parse_listing_text,
-        parse_listing_unit, parse_nip50_filter_search, parse_nip50_search, parse_relay_auth_event,
+        DeletionTarget, FulfillmentMethod, ListingEffectiveStatus, ListingKind, ListingUnit,
+        NIP99_PUBLIC_LISTING_KIND, matching_tags, optional_tag_value, optional_tag_values,
+        parse_deletion_request, parse_listing_fulfillment, parse_listing_identity,
+        parse_listing_price, parse_listing_status, parse_listing_text, parse_listing_unit,
+        parse_nip50_filter_search, parse_nip50_search, parse_relay_auth_event,
         parse_required_u64_tag, parse_u64_field, repeated_or_missing_policy_boundary,
         required_tag_value, required_tag_values, single_letter_tag_values,
         single_letter_values_for, tag_count,
@@ -1511,6 +1567,104 @@ mod tests {
         assert_eq!(
             parse_listing_fulfillment(&event).expect_err("unsupported"),
             "fulfillment method `drone` is unsupported"
+        );
+    }
+
+    #[test]
+    fn listing_status_parser_defaults_public_listings_to_active() {
+        let event = event_with_kind_and_tags(u64::from(NIP99_PUBLIC_LISTING_KIND), Vec::new());
+
+        let status = parse_listing_status(&event)
+            .expect("parse")
+            .expect("status");
+
+        assert_eq!(status.raw_status(), None);
+        assert_eq!(status.effective_status(), ListingEffectiveStatus::Active);
+        assert_eq!(ListingEffectiveStatus::Active.canonical(), "active");
+    }
+
+    #[test]
+    fn listing_status_parser_extracts_sold_and_active_status_tags() {
+        let sold = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("status", &["sold"]).expect("status")],
+        );
+        let active = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("status", &["active"]).expect("status")],
+        );
+
+        let sold_status = parse_listing_status(&sold).expect("sold").expect("status");
+        let active_status = parse_listing_status(&active)
+            .expect("active")
+            .expect("status");
+
+        assert_eq!(sold_status.raw_status(), Some("sold"));
+        assert_eq!(sold_status.effective_status(), ListingEffectiveStatus::Sold);
+        assert_eq!(ListingEffectiveStatus::Sold.canonical(), "sold");
+        assert_eq!(active_status.raw_status(), Some("active"));
+        assert_eq!(
+            active_status.effective_status(),
+            ListingEffectiveStatus::Active
+        );
+    }
+
+    #[test]
+    fn listing_status_parser_derives_draft_from_kind_and_ignores_non_listings() {
+        let draft = event_with_kind_and_tags(
+            30_403,
+            vec![Tag::from_parts("status", &["sold"]).expect("status")],
+        );
+        let note =
+            event_with_kind_and_tags(1, vec![Tag::from_parts("status", &["active"]).expect("s")]);
+
+        let status = parse_listing_status(&draft)
+            .expect("draft")
+            .expect("status");
+
+        assert_eq!(status.raw_status(), Some("sold"));
+        assert_eq!(status.effective_status(), ListingEffectiveStatus::Draft);
+        assert_eq!(ListingEffectiveStatus::Draft.canonical(), "draft");
+        assert_eq!(parse_listing_status(&note), Ok(None));
+    }
+
+    #[test]
+    fn listing_status_parser_rejects_repeated_missing_empty_and_unsupported_tags() {
+        let repeated = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![
+                Tag::from_parts("status", &["active"]).expect("status"),
+                Tag::from_parts("status", &["sold"]).expect("status"),
+            ],
+        );
+        let missing_value = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("status", &[]).expect("status")],
+        );
+        let empty = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("status", &[""]).expect("status")],
+        );
+        let unsupported = event_with_kind_and_tags(
+            u64::from(NIP99_PUBLIC_LISTING_KIND),
+            vec![Tag::from_parts("status", &["inactive"]).expect("status")],
+        );
+
+        assert_eq!(
+            parse_listing_status(&repeated).expect_err("repeated"),
+            "tag `status` must not be repeated"
+        );
+        assert_eq!(
+            parse_listing_status(&missing_value).expect_err("value"),
+            "tag `status` must include a value"
+        );
+        assert_eq!(
+            parse_listing_status(&empty).expect_err("empty"),
+            "listing status tag must not be empty"
+        );
+        assert_eq!(
+            parse_listing_status(&unsupported).expect_err("unsupported"),
+            "listing status `inactive` is unsupported"
         );
     }
 
