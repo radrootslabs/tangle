@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
-use tangle_protocol::{Event, TagName};
+use core::str::FromStr;
+use tangle_protocol::{AddressCoordinate, Event, EventId, TagName};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedTag {
@@ -133,12 +134,57 @@ pub fn first_single_letter_value(event: &Event, name: &str) -> Result<Option<Str
     Ok(single_letter_values_for(event, name)?.into_iter().next())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeletionTarget {
+    Event(EventId),
+    Address(AddressCoordinate),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionRequest {
+    event_id: EventId,
+    targets: Vec<DeletionTarget>,
+}
+
+impl DeletionRequest {
+    pub fn event_id(&self) -> &EventId {
+        &self.event_id
+    }
+
+    pub fn targets(&self) -> &[DeletionTarget] {
+        &self.targets
+    }
+}
+
+pub fn parse_deletion_request(event: &Event) -> Result<Option<DeletionRequest>, String> {
+    if event.unsigned().kind().as_u32() != 5 {
+        return Ok(None);
+    }
+    let mut targets = single_letter_values_for(event, "e")?
+        .into_iter()
+        .map(|value| EventId::new(&value).map(DeletionTarget::Event))
+        .collect::<Result<Vec<_>, _>>()?;
+    let address_targets = single_letter_values_for(event, "a")?
+        .into_iter()
+        .map(|value| AddressCoordinate::from_str(&value).map(DeletionTarget::Address))
+        .collect::<Result<Vec<_>, _>>()?;
+    targets.extend(address_targets);
+    if targets.is_empty() {
+        return Err("deletion event must target at least one e or a tag".to_owned());
+    }
+    Ok(Some(DeletionRequest {
+        event_id: event.id().clone(),
+        targets,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        matching_tags, optional_tag_value, optional_tag_values, parse_required_u64_tag,
-        parse_u64_field, repeated_or_missing_policy_boundary, required_tag_value,
-        required_tag_values, single_letter_tag_values, single_letter_values_for, tag_count,
+        DeletionTarget, matching_tags, optional_tag_value, optional_tag_values,
+        parse_deletion_request, parse_required_u64_tag, parse_u64_field,
+        repeated_or_missing_policy_boundary, required_tag_value, required_tag_values,
+        single_letter_tag_values, single_letter_values_for, tag_count,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -277,13 +323,101 @@ mod tests {
         );
     }
 
+    #[test]
+    fn deletion_request_parser_extracts_event_and_address_targets() {
+        let target_event_id = "2".repeat(EventId::HEX_LENGTH);
+        let target_pubkey = "3".repeat(PublicKeyHex::HEX_LENGTH);
+        let address = format!("30402:{target_pubkey}:listing-a");
+        let event = event_with_kind_and_tags(
+            5,
+            vec![
+                Tag::from_parts("e", &[&target_event_id]).expect("e"),
+                Tag::from_parts("a", &[&address]).expect("a"),
+            ],
+        );
+
+        let request = parse_deletion_request(&event)
+            .expect("parse")
+            .expect("request");
+
+        assert_eq!(request.event_id(), event.id());
+        assert_eq!(request.targets().len(), 2);
+        assert_eq!(
+            request.targets()[0],
+            DeletionTarget::Event(EventId::new(&target_event_id).expect("event id"))
+        );
+        assert!(matches!(
+            &request.targets()[1],
+            DeletionTarget::Address(address) if address.to_string() == format!("30402:{target_pubkey}:listing-a")
+        ));
+    }
+
+    #[test]
+    fn deletion_request_parser_ignores_non_deletion_kinds() {
+        let event = event_with_tags(vec![Tag::from_parts("e", &["ignored"]).expect("e")]);
+
+        assert_eq!(parse_deletion_request(&event), Ok(None));
+    }
+
+    #[test]
+    fn deletion_request_parser_rejects_missing_and_malformed_targets() {
+        let missing = event_with_kind_and_tags(5, Vec::new());
+        let malformed_event =
+            event_with_kind_and_tags(5, vec![Tag::from_parts("e", &["not-hex"]).expect("e")]);
+        let malformed_address = event_with_kind_and_tags(
+            5,
+            vec![Tag::from_parts("a", &["30402:not-a-pubkey:listing"]).expect("a")],
+        );
+
+        assert_eq!(
+            parse_deletion_request(&missing).expect_err("missing"),
+            "deletion event must target at least one e or a tag"
+        );
+        assert_eq!(
+            parse_deletion_request(&malformed_event).expect_err("event"),
+            "event id must be 64 characters, got 7"
+        );
+        assert_eq!(
+            parse_deletion_request(&malformed_address).expect_err("address"),
+            "public key must be 64 characters, got 12"
+        );
+    }
+
+    #[test]
+    fn deletion_request_parser_keeps_repeated_targets_in_order() {
+        let first = "4".repeat(EventId::HEX_LENGTH);
+        let second = "5".repeat(EventId::HEX_LENGTH);
+        let event = event_with_kind_and_tags(
+            5,
+            vec![
+                Tag::from_parts("e", &[&first]).expect("e"),
+                Tag::from_parts("e", &[&second]).expect("e"),
+            ],
+        );
+        let request = parse_deletion_request(&event)
+            .expect("parse")
+            .expect("request");
+
+        assert_eq!(
+            request.targets(),
+            &[
+                DeletionTarget::Event(EventId::new(&first).expect("first")),
+                DeletionTarget::Event(EventId::new(&second).expect("second")),
+            ]
+        );
+    }
+
     fn event_with_tags(tags: Vec<Tag>) -> Event {
+        event_with_kind_and_tags(30_402, tags)
+    }
+
+    fn event_with_kind_and_tags(kind: u64, tags: Vec<Tag>) -> Event {
         Event::new(
             EventId::new(&"a".repeat(EventId::HEX_LENGTH)).expect("id"),
             UnsignedEvent::new(
                 PublicKeyHex::new(&"1".repeat(PublicKeyHex::HEX_LENGTH)).expect("pubkey"),
                 UnixTimestamp::new(1_714_124_433),
-                Kind::new(30_402).expect("kind"),
+                Kind::new(kind).expect("kind"),
                 tags,
                 "",
             ),
