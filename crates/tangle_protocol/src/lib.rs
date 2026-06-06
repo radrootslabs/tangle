@@ -286,6 +286,139 @@ impl fmt::Display for TagValue {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsignedEvent {
+    pubkey: PublicKeyHex,
+    created_at: UnixTimestamp,
+    kind: Kind,
+    tags: Vec<Tag>,
+    content: String,
+}
+
+impl UnsignedEvent {
+    pub fn new(
+        pubkey: PublicKeyHex,
+        created_at: UnixTimestamp,
+        kind: Kind,
+        tags: Vec<Tag>,
+        content: &str,
+    ) -> Self {
+        Self {
+            pubkey,
+            created_at,
+            kind,
+            tags,
+            content: content.to_owned(),
+        }
+    }
+
+    pub fn pubkey(&self) -> &PublicKeyHex {
+        &self.pubkey
+    }
+
+    pub fn created_at(&self) -> UnixTimestamp {
+        self.created_at
+    }
+
+    pub fn kind(&self) -> Kind {
+        self.kind
+    }
+
+    pub fn tags(&self) -> &[Tag] {
+        &self.tags
+    }
+
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Event {
+    id: EventId,
+    unsigned: UnsignedEvent,
+    sig: SignatureHex,
+}
+
+impl Event {
+    pub fn new(id: EventId, unsigned: UnsignedEvent, sig: SignatureHex) -> Self {
+        Self { id, unsigned, sig }
+    }
+
+    pub fn id(&self) -> &EventId {
+        &self.id
+    }
+
+    pub fn unsigned(&self) -> &UnsignedEvent {
+        &self.unsigned
+    }
+
+    pub fn sig(&self) -> &SignatureHex {
+        &self.sig
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawEventJson(String);
+
+impl RawEventJson {
+    pub fn new(value: &str) -> Result<Self, EventShapeError> {
+        if value.is_empty() {
+            return Err(EventShapeError::empty_raw_json());
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+pub struct EventShapeError {
+    message: String,
+}
+
+impl EventShapeError {
+    pub fn missing_field(field: &'static str) -> Self {
+        Self {
+            message: format!("event field `{field}` is missing"),
+        }
+    }
+
+    pub fn invalid_field(field: &'static str, reason: &str) -> Self {
+        Self {
+            message: format!("event field `{field}` is invalid: {reason}"),
+        }
+    }
+
+    fn empty_raw_json() -> Self {
+        Self {
+            message: "raw event JSON must not be empty".to_owned(),
+        }
+    }
+}
+
+impl fmt::Display for EventShapeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl fmt::Debug for EventShapeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EventShapeError")
+            .field("message", &self.message)
+            .finish()
+    }
+}
+
+impl std::error::Error for EventShapeError {}
+
 fn require_lowercase_hex(scalar: &'static str, value: &str, expected: usize) -> Result<(), String> {
     let actual = value.chars().count();
     if actual != expected {
@@ -323,9 +456,9 @@ fn kind_out_of_range_error(value: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        EventId, Kind, PublicKeyHex, SignatureHex, SubscriptionId, Tag, TagName, TagValue,
-        UnixTimestamp, empty_error, invalid_length_error, kind_out_of_range_error,
-        non_lowercase_hex_error, too_long_error,
+        Event, EventId, EventShapeError, Kind, PublicKeyHex, RawEventJson, SignatureHex,
+        SubscriptionId, Tag, TagName, TagValue, UnixTimestamp, UnsignedEvent, empty_error,
+        invalid_length_error, kind_out_of_range_error, non_lowercase_hex_error, too_long_error,
     };
     use core::str::FromStr;
     use std::collections::hash_map::DefaultHasher;
@@ -501,5 +634,74 @@ mod tests {
         assert!(!TagName::is_indexable_name("aa"));
         assert!(!TagName::is_indexable_name("1"));
         assert_eq!(TagValue::new("").as_str(), "");
+    }
+
+    #[test]
+    fn unsigned_event_exposes_nostr_event_shape() {
+        let pubkey = PublicKeyHex::new(&"1".repeat(PublicKeyHex::HEX_LENGTH)).expect("pubkey");
+        let tag = Tag::from_parts("p", &["peer"]).expect("tag");
+        let event = UnsignedEvent::new(
+            pubkey.clone(),
+            UnixTimestamp::new(1_714_124_433),
+            Kind::new(1).expect("kind"),
+            vec![tag.clone()],
+            "hello",
+        );
+
+        assert_eq!(event.pubkey(), &pubkey);
+        assert_eq!(event.created_at().as_u64(), 1_714_124_433);
+        assert_eq!(event.kind().as_u32(), 1);
+        assert_eq!(event.tags(), &[tag]);
+        assert_eq!(event.content(), "hello");
+        assert!(format!("{event:?}").contains("UnsignedEvent"));
+    }
+
+    #[test]
+    fn signed_event_wraps_id_unsigned_shape_and_signature() {
+        let id = EventId::new(&"a".repeat(EventId::HEX_LENGTH)).expect("id");
+        let sig = SignatureHex::new(&"b".repeat(SignatureHex::HEX_LENGTH)).expect("sig");
+        let unsigned = UnsignedEvent::new(
+            PublicKeyHex::new(&"c".repeat(PublicKeyHex::HEX_LENGTH)).expect("pubkey"),
+            UnixTimestamp::new(1),
+            Kind::new(1).expect("kind"),
+            Vec::new(),
+            "",
+        );
+        let event = Event::new(id.clone(), unsigned.clone(), sig.clone());
+
+        assert_eq!(event.id(), &id);
+        assert_eq!(event.unsigned(), &unsigned);
+        assert_eq!(event.sig(), &sig);
+        assert_eq!(event.clone(), Event::new(id, unsigned, sig));
+        assert!(format!("{event:?}").contains("Event"));
+    }
+
+    #[test]
+    fn raw_event_json_rejects_empty_input_and_preserves_bytes() {
+        assert_eq!(
+            RawEventJson::new("").expect_err("empty").to_string(),
+            "raw event JSON must not be empty"
+        );
+        let raw = RawEventJson::new("{\"kind\":1}").expect("raw");
+
+        assert_eq!(raw.as_str(), "{\"kind\":1}");
+        assert_eq!(raw.clone().into_string(), "{\"kind\":1}");
+        assert_eq!(format!("{raw:?}"), "RawEventJson(\"{\\\"kind\\\":1}\")");
+    }
+
+    #[test]
+    fn event_shape_errors_have_stable_messages() {
+        let missing = EventShapeError::missing_field("pubkey");
+        let invalid = EventShapeError::invalid_field("kind", "must be unsigned integer");
+
+        assert_eq!(missing.to_string(), "event field `pubkey` is missing");
+        assert_eq!(
+            invalid.to_string(),
+            "event field `kind` is invalid: must be unsigned integer"
+        );
+        assert_eq!(
+            format!("{missing:?}"),
+            "EventShapeError { message: \"event field `pubkey` is missing\" }"
+        );
     }
 }
