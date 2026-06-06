@@ -307,6 +307,7 @@ pub fn base_migration_plan() -> SurrealMigrationPlan {
         search_document_schema(),
         policy_schemas(),
         comment_projection_schema(),
+        reaction_projection_schema(),
     ])
     .expect("base migration plan is strictly ordered")
 }
@@ -672,6 +673,46 @@ DEFINE INDEX IF NOT EXISTS comment_projection_author_created ON TABLE comment_pr
 "#,
     )
     .expect("comment projection schema is valid")
+}
+
+pub fn reaction_projection_schema() -> SurrealMigration {
+    SurrealMigration::new(
+        "0012_reaction_projection",
+        r#"
+DEFINE TABLE IF NOT EXISTS reaction_projection SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS reaction_id ON TABLE reaction_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS event_id ON TABLE reaction_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS pubkey ON TABLE reaction_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON TABLE reaction_projection TYPE int;
+DEFINE FIELD IF NOT EXISTS content ON TABLE reaction_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS value_type ON TABLE reaction_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS value ON TABLE reaction_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS target_event_id ON TABLE reaction_projection TYPE string;
+DEFINE FIELD IF NOT EXISTS target_pubkey ON TABLE reaction_projection TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS target_address ON TABLE reaction_projection TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS target_kind ON TABLE reaction_projection TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS hidden ON TABLE reaction_projection TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS deleted ON TABLE reaction_projection TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS projected_at ON TABLE reaction_projection TYPE int;
+DEFINE INDEX IF NOT EXISTS reaction_projection_event_uid ON TABLE reaction_projection COLUMNS event_id UNIQUE;
+DEFINE INDEX IF NOT EXISTS reaction_projection_target_created ON TABLE reaction_projection COLUMNS target_event_id, created_at, event_id;
+DEFINE INDEX IF NOT EXISTS reaction_projection_author_created ON TABLE reaction_projection COLUMNS pubkey, created_at, event_id;
+DEFINE INDEX IF NOT EXISTS reaction_projection_target_kind ON TABLE reaction_projection COLUMNS target_kind, target_event_id;
+
+DEFINE TABLE IF NOT EXISTS reaction_count SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS target_event_id ON TABLE reaction_count TYPE string;
+DEFINE FIELD IF NOT EXISTS target_kind ON TABLE reaction_count TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS like_count ON TABLE reaction_count TYPE int DEFAULT 0;
+DEFINE FIELD IF NOT EXISTS dislike_count ON TABLE reaction_count TYPE int DEFAULT 0;
+DEFINE FIELD IF NOT EXISTS emoji_count ON TABLE reaction_count TYPE int DEFAULT 0;
+DEFINE FIELD IF NOT EXISTS text_count ON TABLE reaction_count TYPE int DEFAULT 0;
+DEFINE FIELD IF NOT EXISTS total_count ON TABLE reaction_count TYPE int DEFAULT 0;
+DEFINE FIELD IF NOT EXISTS updated_at ON TABLE reaction_count TYPE int;
+DEFINE INDEX IF NOT EXISTS reaction_count_target_uid ON TABLE reaction_count COLUMNS target_event_id UNIQUE;
+DEFINE INDEX IF NOT EXISTS reaction_count_kind_target ON TABLE reaction_count COLUMNS target_kind, target_event_id;
+"#,
+    )
+    .expect("reaction projection schema is valid")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3650,6 +3691,63 @@ mod tests {
             "comment_projection_author_created",
         ] {
             assert!(info.contains(expected), "missing {expected} in {info}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reaction_projection_schema_defines_reaction_and_count_tables() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let projection = store
+            .table_info("reaction_projection")
+            .await
+            .expect("projection info");
+        let count = store
+            .table_info("reaction_count")
+            .await
+            .expect("count info");
+
+        for expected in [
+            "reaction_id",
+            "event_id",
+            "pubkey",
+            "created_at",
+            "content",
+            "value_type",
+            "value",
+            "target_event_id",
+            "target_pubkey",
+            "target_address",
+            "target_kind",
+            "hidden",
+            "deleted",
+            "projected_at",
+            "reaction_projection_event_uid",
+            "reaction_projection_target_created",
+            "reaction_projection_author_created",
+            "reaction_projection_target_kind",
+        ] {
+            assert!(
+                projection.contains(expected),
+                "missing {expected} in {projection}"
+            );
+        }
+        for expected in [
+            "target_event_id",
+            "target_kind",
+            "like_count",
+            "dislike_count",
+            "emoji_count",
+            "text_count",
+            "total_count",
+            "updated_at",
+            "reaction_count_target_uid",
+            "reaction_count_kind_target",
+        ] {
+            assert!(count.contains(expected), "missing {expected} in {count}");
         }
     }
 
