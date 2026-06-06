@@ -8,9 +8,10 @@ use surrealdb::engine::local::{Db, Mem, RocksDb};
 use tangle_nips::{
     CommentEvent, DeletionTarget, ForumThreadEvent, LabelEvent, ListingProjection,
     ListingProjectionEvaluation, LongFormEvent, LongFormKind, NIP99_DRAFT_LISTING_KIND,
-    NIP99_PUBLIC_LISTING_KIND, ReactionEvent, ReactionValue, evaluate_listing_projection,
-    parse_comment_event, parse_deletion_request, parse_forum_thread_event, parse_label_event,
-    parse_long_form_event, parse_reaction_event,
+    NIP99_PUBLIC_LISTING_KIND, ReactionEvent, ReactionValue, ReportEvent, ReportTarget,
+    evaluate_listing_projection, parse_comment_event, parse_deletion_request,
+    parse_forum_thread_event, parse_label_event, parse_long_form_event, parse_reaction_event,
+    parse_report_event,
 };
 use tangle_protocol::{AddressCoordinate, Event, EventId, Filter, UnixTimestamp, event_to_value};
 use tangle_store::{StoreEventOutcome, StoredEvent};
@@ -956,6 +957,13 @@ pub enum LabelProjectionOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportProjectionOutcome {
+    NotReport,
+    Ineligible,
+    Projected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HiddenEventOutcome {
     NotFound,
     Hidden,
@@ -1229,6 +1237,42 @@ impl LabelProjectionQuery {
 
     pub fn with_label(mut self, label: &str) -> Self {
         self.label = Some(label.to_owned());
+        self
+    }
+
+    pub fn with_pubkey(mut self, pubkey: &str) -> Self {
+        self.pubkey = Some(pubkey.to_owned());
+        self
+    }
+
+    pub fn with_limit(mut self, limit: u64) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReportProjectionQuery {
+    target_type: Option<String>,
+    target_ref: Option<String>,
+    report_type: Option<String>,
+    pubkey: Option<String>,
+    limit: Option<u64>,
+}
+
+impl ReportProjectionQuery {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_target(mut self, target_type: &str, target_ref: &str) -> Self {
+        self.target_type = Some(target_type.to_owned());
+        self.target_ref = Some(target_ref.to_owned());
+        self
+    }
+
+    pub fn with_report_type(mut self, report_type: &str) -> Self {
+        self.report_type = Some(report_type.to_owned());
         self
     }
 
@@ -2757,6 +2801,128 @@ UPSERT type::record('label_projection', $label_id) CONTENT {
         response.take(0).map_err(SurrealStoreError::from)
     }
 
+    pub async fn project_report(
+        &self,
+        event: &Event,
+        projected_at: UnixTimestamp,
+    ) -> Result<ReportProjectionOutcome, SurrealStoreError> {
+        let report = match parse_report_event(event) {
+            Ok(Some(report)) => report,
+            Ok(None) => return Ok(ReportProjectionOutcome::NotReport),
+            Err(_) => return Ok(ReportProjectionOutcome::Ineligible),
+        };
+        let fields = report_projection_fields(&report, projected_at);
+        self.db
+            .query("DELETE report_projection WHERE event_id = $event_id;")
+            .bind(("event_id", report.event_id().as_str()))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        for field in fields {
+            self.db
+                .query(
+                    r#"
+UPSERT type::record('report_projection', $report_id) CONTENT {
+    report_id: $report_id,
+    event_id: $event_id,
+    pubkey: $pubkey,
+    created_at: $created_at,
+    content: $content,
+    target_type: $target_type,
+    target_ref: $target_ref,
+    report_type: $report_type,
+    reported_pubkeys: $reported_pubkeys,
+    server_urls: $server_urls,
+    hidden: false,
+    deleted: false,
+    projected_at: $projected_at
+};
+"#,
+                )
+                .bind(("report_id", field.report_id.as_str()))
+                .bind(("event_id", field.event_id.as_str()))
+                .bind(("pubkey", field.pubkey.as_str()))
+                .bind(("created_at", field.created_at))
+                .bind(("content", field.content.as_str()))
+                .bind(("target_type", field.target_type.as_str()))
+                .bind(("target_ref", field.target_ref.as_str()))
+                .bind(("report_type", field.report_type.as_str()))
+                .bind(("reported_pubkeys", field.reported_pubkeys))
+                .bind(("server_urls", field.server_urls))
+                .bind(("projected_at", field.projected_at))
+                .await
+                .map_err(SurrealStoreError::from)?
+                .check()
+                .map_err(SurrealStoreError::from)?;
+        }
+        Ok(ReportProjectionOutcome::Projected)
+    }
+
+    pub async fn report_projection_rows(
+        &self,
+        event_id: &EventId,
+    ) -> Result<Vec<serde_json::Value>, SurrealStoreError> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT * FROM report_projection WHERE event_id = $event_id ORDER BY target_type ASC, target_ref ASC, report_type ASC, report_id ASC;",
+            )
+            .bind(("event_id", event_id.as_str()))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
+    pub async fn query_report_projections(
+        &self,
+        query: &ReportProjectionQuery,
+    ) -> Result<Vec<serde_json::Value>, SurrealStoreError> {
+        let mut statement =
+            "SELECT * FROM report_projection WHERE hidden = false AND deleted = false".to_owned();
+        if query.target_type.is_some() {
+            statement.push_str(" AND target_type = $target_type");
+        }
+        if query.target_ref.is_some() {
+            statement.push_str(" AND target_ref = $target_ref");
+        }
+        if query.report_type.is_some() {
+            statement.push_str(" AND report_type = $report_type");
+        }
+        if query.pubkey.is_some() {
+            statement.push_str(" AND pubkey = $pubkey");
+        }
+        statement.push_str(" ORDER BY created_at DESC, event_id ASC, report_id ASC");
+        if query.limit.is_some() {
+            statement.push_str(" LIMIT $limit");
+        }
+        statement.push(';');
+        let mut surreal_query = self.db.query(statement);
+        if let Some(value) = &query.target_type {
+            surreal_query = surreal_query.bind(("target_type", value.as_str()));
+        }
+        if let Some(value) = &query.target_ref {
+            surreal_query = surreal_query.bind(("target_ref", value.as_str()));
+        }
+        if let Some(value) = &query.report_type {
+            surreal_query = surreal_query.bind(("report_type", value.as_str()));
+        }
+        if let Some(value) = &query.pubkey {
+            surreal_query = surreal_query.bind(("pubkey", value.as_str()));
+        }
+        if let Some(value) = query.limit {
+            surreal_query = surreal_query.bind(("limit", value));
+        }
+        let mut response = surreal_query
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        response.take(0).map_err(SurrealStoreError::from)
+    }
+
     pub async fn project_listing_helpers(
         &self,
         event: &Event,
@@ -3059,6 +3225,7 @@ UPDATE long_form_topic SET hidden = true WHERE event_id = $event_id;
 UPDATE forum_thread_projection SET hidden = true WHERE event_id = $event_id;
 UPDATE forum_thread_topic SET hidden = true WHERE event_id = $event_id;
 UPDATE label_projection SET hidden = true WHERE event_id = $event_id;
+UPDATE report_projection SET hidden = true WHERE event_id = $event_id;
 UPDATE search_doc SET visible = false WHERE event_id = $event_id OR current_event_id = $event_id;
 "#,
             )
@@ -3115,6 +3282,7 @@ UPDATE long_form_topic SET hidden = false WHERE event_id = $event_id;
 UPDATE forum_thread_projection SET hidden = false WHERE event_id = $event_id;
 UPDATE forum_thread_topic SET hidden = false WHERE event_id = $event_id;
 UPDATE label_projection SET hidden = false WHERE event_id = $event_id;
+UPDATE report_projection SET hidden = false WHERE event_id = $event_id;
 UPDATE search_doc SET visible = true WHERE (event_id = $event_id OR current_event_id = $event_id) AND (status = "active" OR status = "published" OR status = "open");
 UPDATE search_doc SET visible = false WHERE (event_id = $event_id OR current_event_id = $event_id) AND status != "active" AND status != "published" AND status != "open";
 "#,
@@ -3716,6 +3884,7 @@ UPDATE long_form_topic SET deleted = true WHERE event_id = $event_id;
 UPDATE forum_thread_projection SET deleted = true WHERE event_id = $event_id AND pubkey = $author_pubkey;
 UPDATE forum_thread_topic SET deleted = true WHERE event_id = $event_id;
 UPDATE label_projection SET deleted = true WHERE event_id = $event_id AND pubkey = $author_pubkey;
+UPDATE report_projection SET deleted = true WHERE event_id = $event_id AND pubkey = $author_pubkey;
 UPDATE search_doc SET visible = false WHERE event_id = $event_id OR current_event_id = $event_id;
 "#,
             )
@@ -4049,6 +4218,20 @@ struct LabelProjectionFields {
     projected_at: u64,
 }
 
+struct ReportProjectionFields {
+    report_id: String,
+    event_id: String,
+    pubkey: String,
+    created_at: u64,
+    content: String,
+    target_type: String,
+    target_ref: String,
+    report_type: String,
+    reported_pubkeys: Vec<String>,
+    server_urls: Vec<String>,
+    projected_at: u64,
+}
+
 struct ListingCurrentFields {
     listing_key: String,
     listing_key_hash: String,
@@ -4293,6 +4476,62 @@ fn label_projection_id(
     )
 }
 
+fn report_projection_fields(
+    report: &ReportEvent,
+    projected_at: UnixTimestamp,
+) -> Vec<ReportProjectionFields> {
+    let reported_pubkeys = report
+        .reported_pubkeys()
+        .iter()
+        .map(|pubkey| pubkey.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let server_urls = report.server_urls().to_vec();
+    let mut pairs = BTreeSet::new();
+    for target in report.targets() {
+        pairs.insert(report_target_parts(target));
+    }
+    pairs
+        .into_iter()
+        .map(|(target_type, target_ref, report_type)| {
+            let event_id = report.event_id().as_str().to_owned();
+            let pubkey = report.pubkey().as_str().to_owned();
+            ReportProjectionFields {
+                report_id: report_projection_id(&event_id, &target_type, &target_ref, &report_type),
+                event_id,
+                pubkey,
+                created_at: report.created_at().as_u64(),
+                content: report.content().to_owned(),
+                target_type,
+                target_ref,
+                report_type,
+                reported_pubkeys: reported_pubkeys.clone(),
+                server_urls: server_urls.clone(),
+                projected_at: projected_at.as_u64(),
+            }
+        })
+        .collect()
+}
+
+fn report_target_parts(target: &ReportTarget) -> (String, String, String) {
+    (
+        target.target_type().to_owned(),
+        target.target_ref().to_owned(),
+        target.report_type().canonical().to_owned(),
+    )
+}
+
+fn report_projection_id(
+    event_id: &str,
+    target_type: &str,
+    target_ref: &str,
+    report_type: &str,
+) -> String {
+    checksum(
+        &serde_json::to_string(&[event_id, target_type, target_ref, report_type])
+            .expect("report projection identity serializes"),
+    )
+}
+
 struct SearchDocumentFields {
     doc_key: String,
     address_key: Option<String>,
@@ -4523,14 +4762,15 @@ mod tests {
         ForumThreadProjectionQuery, HiddenEventOutcome, LabelProjectionOutcome,
         LabelProjectionQuery, ListingCurrentOutcome, ListingHelperOutcome, ListingProjectionQuery,
         ListingRevisionOutcome, LongFormProjectionOutcome, LongFormProjectionQuery,
-        MigrationApplyOutcome, ReactionProjectionOutcome, SearchDocumentOutcome,
-        SearchDocumentQuery, SurrealConfigError, SurrealConnectionConfig, SurrealConnectionMode,
-        SurrealMigration, SurrealMigrationError, SurrealMigrationPlan, SurrealStore,
-        SurrealStoreError, base_migration_plan, migration_tracking_schema,
+        MigrationApplyOutcome, ReactionProjectionOutcome, ReportProjectionOutcome,
+        ReportProjectionQuery, SearchDocumentOutcome, SearchDocumentQuery, SurrealConfigError,
+        SurrealConnectionConfig, SurrealConnectionMode, SurrealMigration, SurrealMigrationError,
+        SurrealMigrationPlan, SurrealStore, SurrealStoreError, base_migration_plan,
+        migration_tracking_schema,
     };
     use tangle_nips::{
         ListingProjectionEvaluation, NIP7D_THREAD_KIND, NIP23_LONG_FORM_DRAFT_KIND,
-        NIP23_LONG_FORM_KIND, NIP32_LABEL_KIND,
+        NIP23_LONG_FORM_KIND, NIP32_LABEL_KIND, NIP56_REPORT_KIND,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -7866,6 +8106,246 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_reports_persists_deterministic_target_report_rows() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let report = listing_report(
+            &listing,
+            1_714_125_120,
+            Some("impersonation"),
+            "spam",
+            "moderator report",
+        );
+        let invalid_report = build_fixture_event_from_parts(
+            FixtureKey::Buyer,
+            1_714_125_119,
+            u64::from(NIP56_REPORT_KIND),
+            vec![vec![
+                "p".to_owned(),
+                listing.unsigned().pubkey().as_str().to_owned(),
+            ]],
+            "missing report type",
+        )
+        .expect("invalid report");
+
+        assert_eq!(
+            store
+                .project_report(&listing, UnixTimestamp::new(1_714_125_121))
+                .await
+                .expect("not report"),
+            ReportProjectionOutcome::NotReport
+        );
+        assert_eq!(
+            store
+                .project_report(&invalid_report, UnixTimestamp::new(1_714_125_121))
+                .await
+                .expect("invalid report"),
+            ReportProjectionOutcome::Ineligible
+        );
+        assert_eq!(
+            store
+                .project_report(&report, UnixTimestamp::new(1_714_125_122))
+                .await
+                .expect("project report"),
+            ReportProjectionOutcome::Projected
+        );
+        assert_eq!(
+            store
+                .project_report(&report, UnixTimestamp::new(1_714_125_123))
+                .await
+                .expect("reproject report"),
+            ReportProjectionOutcome::Projected
+        );
+
+        let rows = store
+            .report_projection_rows(report.id())
+            .await
+            .expect("report rows");
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .all(|row| row["report_id"].as_str().expect("report id").len() == 64)
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row["event_id"] == report.id().as_str())
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row["pubkey"] == FixtureKey::Buyer.public_key().as_str())
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row["created_at"] == 1_714_125_120_u64)
+        );
+        assert!(rows.iter().all(|row| row["content"] == "moderator report"));
+        assert!(
+            rows.iter()
+                .all(|row| row["reported_pubkeys"][0] == listing.unsigned().pubkey().as_str())
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row["server_urls"][0] == "https://media.radroots.test/report.jpg")
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row["projected_at"] == 1_714_125_123_u64)
+        );
+
+        let event_rows = store
+            .query_report_projections(
+                &ReportProjectionQuery::new()
+                    .with_target("event", listing.id().as_str())
+                    .with_report_type("spam")
+                    .with_pubkey(FixtureKey::Buyer.public_key().as_str())
+                    .with_limit(5),
+            )
+            .await
+            .expect("report query");
+        assert_eq!(event_rows.len(), 1);
+        assert_eq!(event_rows[0]["target_type"], "event");
+        assert_eq!(event_rows[0]["target_ref"], listing.id().as_str());
+        assert_eq!(event_rows[0]["report_type"], "spam");
+        assert_eq!(event_rows[0]["hidden"], false);
+        assert_eq!(event_rows[0]["deleted"], false);
+
+        let pubkey_rows = store
+            .query_report_projections(
+                &ReportProjectionQuery::new()
+                    .with_target("pubkey", listing.unsigned().pubkey().as_str())
+                    .with_report_type("impersonation")
+                    .with_limit(5),
+            )
+            .await
+            .expect("profile report query");
+        assert_eq!(pubkey_rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn report_projection_visibility_tracks_hidden_and_deleted_events() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let report = listing_report(
+            &listing,
+            1_714_125_130,
+            None,
+            "spam",
+            "listing should be reviewed",
+        );
+        let admin_pubkey = "a".repeat(PublicKeyHex::HEX_LENGTH);
+        store
+            .store_raw_event(&StoredEvent::new(
+                report.clone(),
+                UnixTimestamp::new(1_714_125_131),
+            ))
+            .await
+            .expect("raw report");
+        store
+            .project_report(&report, UnixTimestamp::new(1_714_125_132))
+            .await
+            .expect("project report");
+
+        let query = ReportProjectionQuery::new()
+            .with_target("event", listing.id().as_str())
+            .with_report_type("spam");
+        assert_eq!(
+            store
+                .query_report_projections(&query)
+                .await
+                .expect("visible reports")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .hide_event(
+                    report.id(),
+                    "report moderation",
+                    "admin_api",
+                    &admin_pubkey,
+                    UnixTimestamp::new(1_714_125_133),
+                )
+                .await
+                .expect("hide report"),
+            HiddenEventOutcome::Hidden
+        );
+        assert!(
+            store
+                .query_report_projections(&query)
+                .await
+                .expect("hidden reports")
+                .is_empty()
+        );
+        assert!(
+            store
+                .report_projection_rows(report.id())
+                .await
+                .expect("report rows")
+                .iter()
+                .all(|row| row["hidden"] == true)
+        );
+        assert_eq!(
+            store
+                .unhide_event(
+                    report.id(),
+                    "report restored",
+                    &admin_pubkey,
+                    UnixTimestamp::new(1_714_125_134),
+                )
+                .await
+                .expect("unhide report"),
+            HiddenEventOutcome::Unhidden
+        );
+        assert_eq!(
+            store
+                .query_report_projections(&query)
+                .await
+                .expect("restored reports")
+                .len(),
+            1
+        );
+
+        let deletion = build_fixture_event_from_parts(
+            FixtureKey::Buyer,
+            1_714_125_135,
+            5,
+            vec![vec!["e".to_owned(), report.id().as_str().to_owned()]],
+            "",
+        )
+        .expect("deletion event");
+        assert_eq!(
+            store
+                .apply_deletion_markers(&deletion)
+                .await
+                .expect("delete report"),
+            DeletionMarkerOutcome::Applied { targets: 1 }
+        );
+        assert!(
+            store
+                .query_report_projections(&query)
+                .await
+                .expect("deleted reports")
+                .is_empty()
+        );
+        assert!(
+            store
+                .report_projection_rows(report.id())
+                .await
+                .expect("report rows")
+                .iter()
+                .all(|row| row["deleted"] == true)
+        );
+    }
+
+    #[tokio::test]
     async fn hidden_event_overlay_excludes_events_from_public_read_models() {
         let store = memory_store().await;
         store
@@ -8474,6 +8954,41 @@ mod tests {
             content,
         )
         .expect("label event")
+    }
+
+    fn listing_report(
+        listing: &Event,
+        created_at: u64,
+        profile_report_type: Option<&str>,
+        event_report_type: &str,
+        content: &str,
+    ) -> Event {
+        let mut pubkey_tag = vec![
+            "p".to_owned(),
+            listing.unsigned().pubkey().as_str().to_owned(),
+        ];
+        if let Some(report_type) = profile_report_type {
+            pubkey_tag.push(report_type.to_owned());
+        }
+        build_fixture_event_from_parts(
+            FixtureKey::Buyer,
+            created_at,
+            u64::from(NIP56_REPORT_KIND),
+            vec![
+                pubkey_tag,
+                vec![
+                    "e".to_owned(),
+                    listing.id().as_str().to_owned(),
+                    event_report_type.to_owned(),
+                ],
+                vec![
+                    "server".to_owned(),
+                    "https://media.radroots.test/report.jpg".to_owned(),
+                ],
+            ],
+            content,
+        )
+        .expect("report event")
     }
 
     fn long_form_article(
