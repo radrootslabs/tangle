@@ -16,6 +16,12 @@
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
       mkPkgs = system: import nixpkgs { inherit system; };
+      coverageEnvironment = ''
+        LLVM_COV="$(command -v llvm-cov)"
+        LLVM_PROFDATA="$(command -v llvm-profdata)"
+        export LLVM_COV
+        export LLVM_PROFDATA
+      '';
       mkScript =
         pkgs: name: text:
         pkgs.writeShellApplication {
@@ -56,11 +62,12 @@
             cargo nextest run --workspace
           '';
           coverage = mkScript pkgs "tangle-coverage" ''
-            LLVM_COV="$(command -v llvm-cov)"
-            LLVM_PROFDATA="$(command -v llvm-profdata)"
-            export LLVM_COV
-            export LLVM_PROFDATA
+            ${coverageEnvironment}
             scripts/coverage.sh
+          '';
+          ci = mkScript pkgs "tangle-ci" ''
+            ${coverageEnvironment}
+            scripts/ci.sh
           '';
         in
         {
@@ -75,6 +82,10 @@
           coverage = {
             type = "app";
             program = "${coverage}/bin/tangle-coverage";
+          };
+          ci = {
+            type = "app";
+            program = "${ci}/bin/tangle-ci";
           };
         }
       );
