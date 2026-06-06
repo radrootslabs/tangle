@@ -173,6 +173,24 @@ pub fn http_get(port: u16, path: &str) -> String {
     try_http_get(port, path).expect("http get")
 }
 
+pub fn http_get_admin(port: u16, path: &str, admin_pubkey: &str) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("http connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .expect("write timeout");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: application/json\r\nx-tangle-admin-pubkey: {admin_pubkey}\r\nConnection: close\r\n\r\n"
+    )
+    .expect("http get");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("http read");
+    response
+}
+
 pub async fn reopen_store(config: &SurrealConnectionConfig) -> SurrealStore {
     let started = Instant::now();
     loop {
