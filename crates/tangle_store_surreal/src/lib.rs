@@ -277,8 +277,40 @@ DEFINE INDEX IF NOT EXISTS migration_name_uid ON TABLE migration COLUMNS name UN
 }
 
 pub fn base_migration_plan() -> SurrealMigrationPlan {
-    SurrealMigrationPlan::new(vec![migration_tracking_schema()])
+    SurrealMigrationPlan::new(vec![migration_tracking_schema(), raw_event_schema()])
         .expect("base migration plan is strictly ordered")
+}
+
+pub fn raw_event_schema() -> SurrealMigration {
+    SurrealMigration::new(
+        "0002_raw_event",
+        r#"
+DEFINE TABLE IF NOT EXISTS nostr_event SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS event_id ON TABLE nostr_event TYPE string;
+DEFINE FIELD IF NOT EXISTS pubkey ON TABLE nostr_event TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON TABLE nostr_event TYPE int;
+DEFINE FIELD IF NOT EXISTS kind ON TABLE nostr_event TYPE int;
+DEFINE FIELD IF NOT EXISTS tags ON TABLE nostr_event TYPE array;
+DEFINE FIELD IF NOT EXISTS content ON TABLE nostr_event TYPE string;
+DEFINE FIELD IF NOT EXISTS sig ON TABLE nostr_event TYPE string;
+DEFINE FIELD IF NOT EXISTS raw_json ON TABLE nostr_event TYPE object;
+DEFINE FIELD IF NOT EXISTS received_at ON TABLE nostr_event TYPE int;
+DEFINE FIELD IF NOT EXISTS content_len ON TABLE nostr_event TYPE int;
+DEFINE FIELD IF NOT EXISTS tag_count ON TABLE nostr_event TYPE int;
+DEFINE FIELD IF NOT EXISTS d_tag ON TABLE nostr_event TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS address_key ON TABLE nostr_event TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS deleted ON TABLE nostr_event TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS hidden ON TABLE nostr_event TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS rejection_reason ON TABLE nostr_event TYPE option<string>;
+DEFINE INDEX IF NOT EXISTS nostr_event_id_uid ON TABLE nostr_event COLUMNS event_id UNIQUE;
+DEFINE INDEX IF NOT EXISTS nostr_event_author_created ON TABLE nostr_event COLUMNS pubkey, created_at, event_id;
+DEFINE INDEX IF NOT EXISTS nostr_event_kind_created ON TABLE nostr_event COLUMNS kind, created_at, event_id;
+DEFINE INDEX IF NOT EXISTS nostr_event_kind_author_created ON TABLE nostr_event COLUMNS kind, pubkey, created_at, event_id;
+DEFINE INDEX IF NOT EXISTS nostr_event_address_created ON TABLE nostr_event COLUMNS address_key, created_at, event_id;
+DEFINE INDEX IF NOT EXISTS nostr_event_created ON TABLE nostr_event COLUMNS created_at, event_id;
+"#,
+    )
+    .expect("raw event schema is valid")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -396,6 +428,24 @@ impl SurrealStore {
             .collect())
     }
 
+    pub async fn table_info(&self, table: &str) -> Result<String, SurrealStoreError> {
+        let table = normalized_identifier(table, "table").map_err(|error| {
+            SurrealStoreError::new(&format!("surreal table info target is invalid: {error}"))
+        })?;
+        let mut response = self
+            .db
+            .query(format!("INFO FOR TABLE {table};"))
+            .await
+            .map_err(SurrealStoreError::from)?
+            .check()
+            .map_err(SurrealStoreError::from)?;
+        let info: Option<surrealdb::types::Value> =
+            response.take(0).map_err(SurrealStoreError::from)?;
+        Ok(info
+            .map(|value| format!("{value:?}"))
+            .unwrap_or_else(|| "None".to_owned()))
+    }
+
     async fn applied_migration(
         &self,
         name: &str,
@@ -476,7 +526,7 @@ mod tests {
     use super::{
         MigrationApplyOutcome, SurrealConfigError, SurrealConnectionConfig, SurrealConnectionMode,
         SurrealMigration, SurrealMigrationError, SurrealMigrationPlan, SurrealStore,
-        base_migration_plan, migration_tracking_schema,
+        base_migration_plan, migration_tracking_schema, raw_event_schema,
     };
 
     #[test]
@@ -657,20 +707,28 @@ mod tests {
         );
         assert_eq!(
             store.apply_plan(&plan).await.expect("apply"),
-            vec![MigrationApplyOutcome::Applied]
+            vec![
+                MigrationApplyOutcome::Applied,
+                MigrationApplyOutcome::Applied
+            ]
         );
         assert_eq!(
             store.apply_plan(&plan).await.expect("reapply"),
-            vec![MigrationApplyOutcome::AlreadyApplied]
+            vec![
+                MigrationApplyOutcome::AlreadyApplied,
+                MigrationApplyOutcome::AlreadyApplied
+            ]
         );
 
         let migrations = store.applied_migrations().await.expect("applied rows");
-        assert_eq!(migrations.len(), 1);
+        assert_eq!(migrations.len(), 2);
         assert_eq!(migrations[0].name(), "0001_migration_tracking");
         assert_eq!(
             migrations[0].checksum(),
             migration_tracking_schema().checksum()
         );
+        assert_eq!(migrations[1].name(), "0002_raw_event");
+        assert_eq!(migrations[1].checksum(), raw_event_schema().checksum());
         assert!(format!("{:?}", store.database()).contains("Surreal"));
     }
 
@@ -698,5 +756,46 @@ mod tests {
     async fn memory_store() -> SurrealStore {
         let config = SurrealConnectionConfig::memory("tangle_test", "relay").expect("config");
         SurrealStore::connect_memory(&config).await.expect("store")
+    }
+
+    #[tokio::test]
+    async fn raw_event_schema_defines_canonical_event_table() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let info = store.table_info("nostr_event").await.expect("table info");
+
+        for expected in [
+            "event_id",
+            "pubkey",
+            "created_at",
+            "kind",
+            "tags",
+            "content",
+            "sig",
+            "raw_json",
+            "received_at",
+            "content_len",
+            "tag_count",
+            "d_tag",
+            "address_key",
+            "deleted",
+            "hidden",
+            "rejection_reason",
+            "nostr_event_id_uid",
+            "nostr_event_kind_author_created",
+        ] {
+            assert!(info.contains(expected), "missing {expected} in {info}");
+        }
+        assert_eq!(
+            store
+                .table_info("nostr-event")
+                .await
+                .expect_err("invalid table")
+                .to_string(),
+            "surreal table info target is invalid: surreal table must use ASCII letters, digits, or underscore"
+        );
     }
 }
