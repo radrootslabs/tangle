@@ -138,11 +138,10 @@ fn run_ops_restore(invocation: &tangle::TangleInvocation) -> Result<String, Stri
 }
 
 fn tangle_runtime() -> tokio::runtime::Runtime {
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("failed to start tangle Tokio runtime");
-    runtime
+        .expect("failed to start tangle Tokio runtime")
 }
 
 #[cfg(test)]

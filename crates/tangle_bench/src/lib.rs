@@ -936,7 +936,7 @@ mod tests {
             .expect("store");
         let error = super::explain_query(&store, "SELECT * FROM").await;
 
-        assert!(error.expect_err("query error").len() > 0);
+        assert!(!error.expect_err("query error").is_empty());
     }
 
     #[tokio::test]
