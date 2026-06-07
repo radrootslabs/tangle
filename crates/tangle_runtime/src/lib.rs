@@ -6353,6 +6353,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_server_reports_listener_bind_failures() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind reserved listener");
+        let address = listener.local_addr().expect("reserved listener address");
+        let mut config = runtime_memory_config("runtime_listen_failure");
+        config.listen_addr = address;
+        let (shutdown, _) = GracefulShutdownSignal::new();
+        let error = super::RuntimeServer::new(config, shutdown)
+            .run()
+            .await
+            .expect_err("listen failure");
+
+        assert!(error.message().contains("listen failed:"));
+        drop(listener);
+    }
+
+    #[tokio::test]
     async fn runtime_websocket_route_handles_client_frame_edges() {
         let store = runtime_memory_store().await;
         let (shutdown, _) = GracefulShutdownSignal::new();
@@ -7605,6 +7623,16 @@ mod tests {
             super::require_admin_pubkey(&enabled, &headers).expect("admin"),
             admin
         );
+        headers.insert(
+            "x-tangle-admin-pubkey",
+            HeaderValue::from_static("not-a-pubkey"),
+        );
+        assert_eq!(
+            super::require_admin_pubkey(&enabled, &headers)
+                .expect_err("invalid admin")
+                .message(),
+            "admin pubkey header is invalid"
+        );
     }
 
     #[tokio::test]
@@ -7643,6 +7671,45 @@ mod tests {
             .expect_err("unhide missing")
             .message(),
             "event not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_policy_routes_reject_invalid_pubkey_paths() {
+        let store = runtime_memory_store().await;
+        let (shutdown, _) = GracefulShutdownSignal::new();
+        let state = super::RuntimeRelayState::new(
+            runtime_admin_config("admin_invalid_path"),
+            store,
+            shutdown,
+        );
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-tangle-admin-pubkey",
+            HeaderValue::from_str(FixtureKey::Relay.public_key().as_str()).expect("admin header"),
+        );
+
+        assert_eq!(
+            super::runtime_admin_approve_seller(
+                axum::extract::State(state.clone()),
+                headers.clone(),
+                axum::extract::Path("not-a-pubkey".to_owned()),
+            )
+            .await
+            .expect_err("approve invalid")
+            .message(),
+            "pubkey must be a 64-character hex public key"
+        );
+        assert_eq!(
+            super::runtime_admin_block_pubkey(
+                axum::extract::State(state),
+                headers,
+                axum::extract::Path("not-a-pubkey".to_owned()),
+            )
+            .await
+            .expect_err("block invalid")
+            .message(),
+            "pubkey must be a 64-character hex public key"
         );
     }
 
@@ -8024,10 +8091,24 @@ mod tests {
 
     #[test]
     fn marketplace_search_query_parser_rejects_invalid_parameters() {
+        let seller = "1".repeat(64);
         let long_query = format!("q={}", "a".repeat(300));
         let cases = [
             ("q=".to_owned(), "q must not be empty"),
             ("q=carrot&q=roots".to_owned(), "q must not be repeated"),
+            (
+                format!("seller={seller}&seller={seller}"),
+                "seller must not be repeated",
+            ),
+            (
+                "status=active&status=active".to_owned(),
+                "status must not be repeated",
+            ),
+            (
+                "sort=freshness&sort=freshness".to_owned(),
+                "sort must not be repeated",
+            ),
+            ("limit=1&limit=2".to_owned(), "limit must not be repeated"),
             (
                 long_query,
                 "runtime limit: search query bytes exceeded: 300 > 256",
@@ -8131,6 +8212,7 @@ mod tests {
         );
         assert!(super::label_projection_query("=1").is_ok());
         assert!(super::report_projection_query("=1").is_ok());
+        assert_eq!(super::parse_comment_query("=1").expect("empty key"), 50);
 
         for (error, expected) in cases {
             assert_eq!(error.code(), ApiErrorCode::InvalidRequest);
@@ -8239,6 +8321,80 @@ mod tests {
                 .expect_err("invalid price")
                 .message(),
             "price must fit two decimal minor units"
+        );
+        assert_eq!(
+            super::fulfillment_document(&serde_json::json!({
+                "pickup_available": true,
+                "delivery_available": false,
+                "shipping_available": false
+            }))
+            .expect("fulfillment"),
+            ["pickup".to_owned()]
+        );
+        assert_eq!(
+            listing_item_document(&serde_json::json!({
+                "listing_key": "30402:pubkey:listing-a",
+                "event_id": "event",
+                "seller_pubkey": "pubkey",
+                "d": "listing-a",
+                "title": "Carrot bunches",
+                "summary": null,
+                "geohash": null,
+                "price_decimal": "12.50",
+                "currency_norm": "USD",
+                "unit": "lb",
+                "effective_status": "active",
+                "updated_at": 1714124433_u64,
+                "pickup_available": false,
+                "delivery_available": false,
+                "shipping_available": false
+            }))
+            .expect("nullable listing")
+            .fulfillment,
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn read_model_document_helpers_reject_malformed_rows() {
+        let malformed = serde_json::json!({"event_id": "event"});
+
+        assert_eq!(
+            super::forum_thread_item_document(&malformed)
+                .expect_err("forum thread")
+                .code(),
+            ApiErrorCode::Internal
+        );
+        assert_eq!(
+            super::comment_item_document(&malformed)
+                .expect_err("comment")
+                .code(),
+            ApiErrorCode::Internal
+        );
+        assert_eq!(
+            super::moderation_label_document(&malformed)
+                .expect_err("label")
+                .code(),
+            ApiErrorCode::Internal
+        );
+        assert_eq!(
+            super::moderation_report_document(&malformed)
+                .expect_err("report")
+                .code(),
+            ApiErrorCode::Internal
+        );
+        assert_eq!(
+            super::reaction_counts_document(
+                Some(&serde_json::json!({
+                    "target_event_id": "event",
+                    "like_count": "bad"
+                })),
+                "event",
+                Some("30402"),
+            )
+            .expect_err("reaction count")
+            .code(),
+            ApiErrorCode::Internal
         );
     }
 
