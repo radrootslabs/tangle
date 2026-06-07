@@ -5593,6 +5593,20 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn remote_connection_converts_invalid_endpoint_errors() {
+        let config = SurrealConnectionConfig::http("definitely-not-a-surreal-engine", "ns", "db")
+            .expect("http config")
+            .with_root_credentials("root", "root")
+            .expect("credentials");
+
+        let error = SurrealStore::connect(&config)
+            .await
+            .expect_err("invalid endpoint");
+
+        assert!(!error.message().is_empty());
+    }
+
     #[test]
     fn row_helper_functions_accept_supported_shapes_and_reject_malformed_values() {
         assert_eq!(count_value(serde_json::json!(3)).expect("numeric count"), 3);
@@ -5708,6 +5722,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_rate_limit_rejects_malformed_persisted_state_rows() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let key = "event_write:".to_owned() + &"4".repeat(PublicKeyHex::HEX_LENGTH);
+        let cases = [
+            "not json".to_owned(),
+            serde_json::json!({"started_at": "100", "used": 1}).to_string(),
+            serde_json::json!({"started_at": 100, "used": "1"}).to_string(),
+        ];
+
+        for state in cases {
+            store
+                .database()
+                .query(
+                    r#"
+UPSERT type::record('rate_limit_state', $key) CONTENT {
+    key: $key,
+    state: $state,
+    expires_at: 160,
+    created_at: 100,
+    updated_at: 100
+};
+"#,
+                )
+                .bind(("key", key.as_str()))
+                .bind(("state", state))
+                .await
+                .expect("upsert malformed state")
+                .check()
+                .expect("upsert malformed state check");
+
+            assert_eq!(
+                store
+                    .check_durable_rate_limit(&key, 3, 60, 1, UnixTimestamp::new(110))
+                    .await
+                    .expect_err("malformed state")
+                    .message(),
+                "rate limit state is invalid"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn topic_projection_queries_short_circuit_when_topic_indexes_are_empty() {
         let store = memory_store().await;
         store
@@ -5746,6 +5806,100 @@ mod tests {
                 .await
                 .expect("unhide missing"),
             HiddenEventOutcome::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn hidden_event_policy_validation_rejects_blank_fields_after_event_lookup() {
+        let store = memory_store().await;
+        store
+            .apply_plan(&base_migration_plan())
+            .await
+            .expect("apply plan");
+        let listing = build_fixture_event(&valid_public_listing_spec()).expect("listing");
+        let admin_pubkey = "a".repeat(PublicKeyHex::HEX_LENGTH);
+        store
+            .store_raw_event(&StoredEvent::new(
+                listing.clone(),
+                UnixTimestamp::new(1_714_124_600),
+            ))
+            .await
+            .expect("raw listing");
+
+        assert_eq!(
+            store
+                .hide_event(
+                    listing.id(),
+                    " ",
+                    "admin_api",
+                    &admin_pubkey,
+                    UnixTimestamp::new(1_714_124_601),
+                )
+                .await
+                .expect_err("blank hide reason")
+                .message(),
+            "hidden event reason must not be empty"
+        );
+        assert_eq!(
+            store
+                .hide_event(
+                    listing.id(),
+                    "reason",
+                    "",
+                    &admin_pubkey,
+                    UnixTimestamp::new(1_714_124_602),
+                )
+                .await
+                .expect_err("blank hide source")
+                .message(),
+            "hidden event source must not be empty"
+        );
+        assert_eq!(
+            store
+                .hide_event(
+                    listing.id(),
+                    "reason",
+                    "admin_api",
+                    " ",
+                    UnixTimestamp::new(1_714_124_603),
+                )
+                .await
+                .expect_err("blank hide admin")
+                .message(),
+            "admin pubkey must not be empty"
+        );
+        assert_eq!(
+            store
+                .unhide_event(
+                    listing.id(),
+                    "",
+                    &admin_pubkey,
+                    UnixTimestamp::new(1_714_124_604),
+                )
+                .await
+                .expect_err("blank unhide reason")
+                .message(),
+            "hidden event reason must not be empty"
+        );
+        assert_eq!(
+            store
+                .unhide_event(
+                    listing.id(),
+                    "reason",
+                    "",
+                    UnixTimestamp::new(1_714_124_605),
+                )
+                .await
+                .expect_err("blank unhide admin")
+                .message(),
+            "admin pubkey must not be empty"
+        );
+        assert!(
+            store
+                .moderation_action_rows("event", listing.id().as_str())
+                .await
+                .expect("actions")
+                .is_empty()
         );
     }
 
@@ -8128,6 +8282,10 @@ mod tests {
             .project_reaction(&reaction, UnixTimestamp::new(1_714_125_042))
             .await
             .expect("project reaction");
+        store
+            .refresh_reaction_count_for_event(listing.id().as_str(), 1_714_125_042)
+            .await
+            .expect("refresh missing reaction row");
 
         assert_eq!(
             store
@@ -9878,6 +10036,7 @@ mod tests {
         );
         assert!(!rejected.allowed());
         assert_eq!(rejected.remaining(), 0);
+        assert_eq!(rejected.reset_at(), UnixTimestamp::new(160));
         assert_eq!(rejected.retry_after_seconds(), Some(40));
         let row = store
             .rate_limit_state_row(&key)
