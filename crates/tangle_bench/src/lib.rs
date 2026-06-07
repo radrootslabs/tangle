@@ -32,16 +32,16 @@ pub struct BenchDataset {
 }
 
 impl BenchDataset {
-    pub fn generate(config: BenchDatasetConfig) -> Result<Self, String> {
+    pub fn generate(config: BenchDatasetConfig) -> Self {
         let mut listings = Vec::with_capacity(config.listing_count);
         for index in 0..config.listing_count {
-            listings.push(bench_listing(index)?);
+            listings.push(bench_listing(index));
         }
         let mut notes = Vec::with_capacity(config.note_count);
         for index in 0..config.note_count {
-            notes.push(bench_note(index)?);
+            notes.push(bench_note(index));
         }
-        Ok(Self { listings, notes })
+        Self { listings, notes }
     }
 
     pub fn listings(&self) -> &[Event] {
@@ -257,7 +257,7 @@ pub struct IngestBenchmarkReport {
 pub async fn run_ingest_benchmark(
     config: BenchDatasetConfig,
 ) -> Result<IngestBenchmarkReport, String> {
-    let dataset = BenchDataset::generate(config)?;
+    let dataset = BenchDataset::generate(config);
     let started = Instant::now();
     let report = run_generic_relay_workload(&dataset).await?;
     Ok(IngestBenchmarkReport {
@@ -277,7 +277,7 @@ pub struct ListingQueryBenchmarkReport {
 pub async fn run_listing_query_benchmark(
     config: BenchDatasetConfig,
 ) -> Result<ListingQueryBenchmarkReport, String> {
-    let dataset = BenchDataset::generate(config)?;
+    let dataset = BenchDataset::generate(config);
     let materialized = materialize_listing_workload(&dataset).await?;
     let started = Instant::now();
     let listing_rows = materialized
@@ -314,7 +314,7 @@ pub struct SearchBenchmarkReport {
 pub async fn run_search_benchmark(
     config: BenchDatasetConfig,
 ) -> Result<SearchBenchmarkReport, String> {
-    let dataset = BenchDataset::generate(config)?;
+    let dataset = BenchDataset::generate(config);
     let materialized = materialize_listing_workload(&dataset).await?;
     let store = materialized.store();
     let mut indexed = 0;
@@ -368,7 +368,7 @@ pub struct QueryPlanCaptureReport {
 pub async fn capture_query_plans(
     config: BenchDatasetConfig,
 ) -> Result<QueryPlanCaptureReport, String> {
-    let dataset = BenchDataset::generate(config)?;
+    let dataset = BenchDataset::generate(config);
     let materialized = materialize_listing_workload(&dataset).await?;
     for event in dataset.listings() {
         materialized
@@ -402,7 +402,7 @@ pub struct RebuildBenchmarkReport {
 pub async fn run_rebuild_benchmark(
     config: BenchDatasetConfig,
 ) -> Result<RebuildBenchmarkReport, String> {
-    let dataset = BenchDataset::generate(config)?;
+    let dataset = BenchDataset::generate(config);
     let materialized = materialize_listing_workload(&dataset).await?;
     clear_projection_tables(materialized.store()).await?;
     let started = Instant::now();
@@ -475,7 +475,7 @@ pub struct RestoreDrillSmokeReport {
 pub async fn run_restore_drill_smoke(
     config: BenchDatasetConfig,
 ) -> Result<RestoreDrillSmokeReport, String> {
-    let dataset = BenchDataset::generate(config)?;
+    let dataset = BenchDataset::generate(config);
     let source = materialize_listing_workload(&dataset).await?;
     let source_rows = source
         .store()
@@ -623,7 +623,7 @@ async fn bench_memory_store(database: &str) -> Result<SurrealStore, String> {
     Ok(store)
 }
 
-fn bench_listing(index: usize) -> Result<Event, String> {
+fn bench_listing(index: usize) -> Event {
     let created_at = 1_714_200_000 + index as u64;
     let price_major = 10 + (index % 50);
     let price_minor = (index * 7) % 100;
@@ -652,9 +652,10 @@ fn bench_listing(index: usize) -> Result<Event, String> {
         ],
         &content,
     )
+    .expect("deterministic benchmark listing fixture builds")
 }
 
-fn bench_note(index: usize) -> Result<Event, String> {
+fn bench_note(index: usize) -> Event {
     build_fixture_event_from_parts(
         FixtureKey::Buyer,
         1_714_300_000 + index as u64,
@@ -662,6 +663,7 @@ fn bench_note(index: usize) -> Result<Event, String> {
         vec![vec!["t".to_owned(), "bench".to_owned()]],
         &format!("Deterministic generic relay note {index:04}"),
     )
+    .expect("deterministic benchmark note fixture builds")
 }
 
 fn bench_category(index: usize) -> &'static str {
@@ -686,11 +688,12 @@ mod tests {
     use super::{BenchDataset, BenchDatasetConfig};
     use std::collections::BTreeSet;
     use tangle_nips::{ListingProjectionEvaluation, evaluate_listing_projection};
+    use tangle_test_support::{build_fixture_event, projection_ineligible_listing_spec};
 
     #[test]
     fn deterministic_dataset_generator_produces_stable_signed_events() {
-        let first = BenchDataset::generate(BenchDatasetConfig::new(4, 2)).expect("first");
-        let second = BenchDataset::generate(BenchDatasetConfig::new(4, 2)).expect("second");
+        let first = BenchDataset::generate(BenchDatasetConfig::new(4, 2));
+        let second = BenchDataset::generate(BenchDatasetConfig::new(4, 2));
         let listing_ids = first
             .listings()
             .iter()
@@ -730,9 +733,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn deterministic_dataset_generator_handles_empty_edges() {
+        let empty = BenchDataset::generate(BenchDatasetConfig::new(0, 0));
+        let listings_only = BenchDataset::generate(BenchDatasetConfig::new(2, 0));
+        let notes_only = BenchDataset::generate(BenchDatasetConfig::new(0, 3));
+
+        assert!(empty.events().is_empty());
+        assert_eq!(listings_only.events().len(), 2);
+        assert_eq!(notes_only.events().len(), 3);
+        assert!(listings_only.notes().is_empty());
+        assert!(notes_only.listings().is_empty());
+    }
+
     #[tokio::test]
     async fn listing_workload_materializes_projected_listing_rows() {
-        let dataset = BenchDataset::generate(BenchDatasetConfig::new(8, 3)).expect("dataset");
+        let dataset = BenchDataset::generate(BenchDatasetConfig::new(8, 3));
         let materialized = super::materialize_listing_workload(&dataset)
             .await
             .expect("listing workload");
@@ -763,8 +779,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn listing_workload_counts_duplicates_and_ineligible_events() {
+        let listing = super::bench_listing(0);
+        let ineligible =
+            build_fixture_event(&projection_ineligible_listing_spec()).expect("ineligible listing");
+        let dataset = BenchDataset {
+            listings: vec![listing.clone(), listing, ineligible],
+            notes: Vec::new(),
+        };
+        let materialized = super::materialize_listing_workload(&dataset)
+            .await
+            .expect("listing workload");
+
+        assert_eq!(
+            materialized.report(),
+            super::ListingWorkloadReport {
+                attempted: 3,
+                inserted: 2,
+                projected: 2,
+                listing_rows: 1
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn search_workload_indexes_and_queries_listing_documents() {
-        let dataset = BenchDataset::generate(BenchDatasetConfig::new(12, 2)).expect("dataset");
+        let dataset = BenchDataset::generate(BenchDatasetConfig::new(12, 2));
         let report = super::run_search_workload(&dataset)
             .await
             .expect("search workload");
@@ -780,8 +820,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_workload_ignores_ineligible_listing_documents() {
+        let listing = super::bench_listing(0);
+        let ineligible =
+            build_fixture_event(&projection_ineligible_listing_spec()).expect("ineligible listing");
+        let dataset = BenchDataset {
+            listings: vec![listing, ineligible],
+            notes: Vec::new(),
+        };
+        let report = super::run_search_workload(&dataset)
+            .await
+            .expect("search workload");
+
+        assert_eq!(
+            report,
+            super::SearchWorkloadReport {
+                indexed: 1,
+                carrot_results: 1,
+                browse_results: 1
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn generic_relay_workload_stores_and_queries_non_marketplace_events() {
-        let dataset = BenchDataset::generate(BenchDatasetConfig::new(5, 7)).expect("dataset");
+        let dataset = BenchDataset::generate(BenchDatasetConfig::new(5, 7));
         let report = super::run_generic_relay_workload(&dataset)
             .await
             .expect("generic workload");
@@ -793,6 +856,29 @@ mod tests {
                 inserted: 12,
                 note_results: 7,
                 all_results: 12
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_relay_workload_counts_duplicate_raw_events() {
+        let listing = super::bench_listing(0);
+        let note = super::bench_note(0);
+        let dataset = BenchDataset {
+            listings: vec![listing.clone(), listing],
+            notes: vec![note.clone(), note],
+        };
+        let report = super::run_generic_relay_workload(&dataset)
+            .await
+            .expect("generic workload");
+
+        assert_eq!(
+            report,
+            super::GenericRelayWorkloadReport {
+                attempted: 4,
+                inserted: 2,
+                note_results: 1,
+                all_results: 2
             }
         );
     }
@@ -844,6 +930,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_plan_capture_reports_invalid_query_errors() {
+        let store = super::bench_memory_store("invalid_query_plan")
+            .await
+            .expect("store");
+        let error = super::explain_query(&store, "SELECT * FROM").await;
+
+        assert!(error.expect_err("query error").len() > 0);
+    }
+
+    #[tokio::test]
     async fn rebuild_benchmark_replays_raw_events_into_projection_rows() {
         let first = super::run_rebuild_benchmark(BenchDatasetConfig::new(7, 0))
             .await
@@ -870,5 +966,19 @@ mod tests {
         assert_eq!(report.restored, 6);
         assert_eq!(report.source_checksum, report.restored_checksum);
         assert!(report.checksum_matches);
+    }
+
+    #[test]
+    fn checksum_helpers_handle_empty_and_missing_fields() {
+        let empty = super::listing_rows_checksum(&[]);
+        let sparse = super::listing_rows_checksum(&[
+            serde_json::json!({"listing_key": "b"}),
+            serde_json::json!({"event_id": "a"}),
+        ]);
+
+        assert_eq!(empty.len(), 64);
+        assert_eq!(sparse.len(), 64);
+        assert_ne!(empty, sparse);
+        assert_eq!(super::lower_hex(&[0, 15, 16, 255]), "000f10ff");
     }
 }
