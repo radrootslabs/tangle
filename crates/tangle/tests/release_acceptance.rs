@@ -26,6 +26,7 @@ fn release_acceptance_script_covers_release_candidate_validation_ladder() {
         "cargo test -p tangle --test run_integration",
         "cargo test -p tangle_runtime runtime_restore_command_imports_backup_and_rebuilds_projection_state",
         "cargo test -p tangle_bench",
+        "scripts/benchmark_report.sh",
         "cargo test -p tangle --test source_comments",
         "cargo test -p tangle --test unsafe_code",
     ] {
