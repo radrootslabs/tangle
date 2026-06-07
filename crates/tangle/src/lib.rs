@@ -407,11 +407,8 @@ pub async fn run_with_config(path: &str) -> Result<(), String> {
     initialize_tracing(config.tracing_config())?;
     let (shutdown, _) = tangle_runtime::GracefulShutdownSignal::new();
     let signal = shutdown.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            signal.request_shutdown();
-        }
-    });
+    #[rustfmt::skip]
+    tokio::spawn(async move { if tokio::signal::ctrl_c().await.is_ok() { signal.request_shutdown(); } });
     tangle_runtime::run_runtime_server(config, shutdown)
         .await
         .map(|_| ())
@@ -448,12 +445,17 @@ fn initialize_tracing(config: &tangle_runtime::RuntimeTracingConfig) -> Result<(
 mod tests {
     use super::{
         PACKAGE_NAME, PACKAGE_VERSION, TangleCliError, TangleCommand, TangleInvocation,
-        event_export_output, event_import_output, initialize_tracing, migrate_output,
-        ops_backup_output, ops_restore_output, parse_tangle_command, parse_tangle_invocation,
-        projection_rebuild_output, require_config_path, require_input_path, require_output_path,
-        usage_output, version_output,
+        event_export_output, event_export_with_config, event_import_output,
+        event_import_with_config, initialize_tracing, migrate_output, migrate_with_config,
+        ops_backup_output, ops_backup_with_config, ops_restore_output, ops_restore_with_config,
+        parse_tangle_command, parse_tangle_invocation, projection_rebuild_output,
+        projection_rebuild_with_config, require_config_path, require_input_path,
+        require_output_path, run_with_config, usage_output, version_output,
     };
-    use std::path::PathBuf;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
     use tangle_runtime::{
         RuntimeBackupReport, RuntimeEventExportReport, RuntimeEventImportReport,
         RuntimeMigrationReport, RuntimeProjectionRebuildReport, RuntimeRestoreReport,
@@ -497,6 +499,135 @@ mod tests {
                 .expect("compact tracing config");
 
         assert_eq!(initialize_tracing(&config), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn runtime_command_wrappers_report_config_load_errors() {
+        let missing = "missing-runtime-config.json";
+
+        for error in [
+            migrate_with_config(missing).await.expect_err("migrate"),
+            event_import_with_config(missing, "events.jsonl")
+                .await
+                .expect_err("import"),
+            event_export_with_config(missing, "events.jsonl")
+                .await
+                .expect_err("export"),
+            projection_rebuild_with_config(missing)
+                .await
+                .expect_err("rebuild"),
+            ops_backup_with_config(missing, "backup")
+                .await
+                .expect_err("backup"),
+            ops_restore_with_config(missing, "backup")
+                .await
+                .expect_err("restore"),
+            run_with_config(missing).await.expect_err("run"),
+        ] {
+            assert!(error.contains("failed to read runtime config"));
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_command_wrappers_report_tracing_errors() {
+        let root = temp_root("tracing-errors");
+        let config_path = root.join("runtime.json");
+        fs::create_dir_all(&root).expect("runtime root");
+        write_memory_config(&config_path, "tangle_cli_tracing", Some("bad["));
+
+        for error in [
+            migrate_with_config(path_str(&config_path))
+                .await
+                .expect_err("migrate"),
+            event_import_with_config(path_str(&config_path), "events.jsonl")
+                .await
+                .expect_err("import"),
+            event_export_with_config(path_str(&config_path), "events.jsonl")
+                .await
+                .expect_err("export"),
+            projection_rebuild_with_config(path_str(&config_path))
+                .await
+                .expect_err("rebuild"),
+            ops_backup_with_config(path_str(&config_path), path_str(&root.join("backup")))
+                .await
+                .expect_err("backup"),
+            ops_restore_with_config(path_str(&config_path), path_str(&root.join("backup")))
+                .await
+                .expect_err("restore"),
+            run_with_config(path_str(&config_path))
+                .await
+                .expect_err("run"),
+        ] {
+            assert!(error.starts_with("tracing filter is invalid:"));
+        }
+
+        fs::remove_dir_all(&root).expect("remove runtime root");
+    }
+
+    #[tokio::test]
+    async fn runtime_command_wrappers_report_operation_errors() {
+        let root = temp_root("operation-errors");
+        let memory_config_path = root.join("memory-runtime.json");
+        let store_error_config_path = root.join("store-error-runtime.json");
+        let db_file = root.join("not-a-database-dir");
+        let backup_file = root.join("backup-file");
+        fs::create_dir_all(&root).expect("runtime root");
+        fs::write(&db_file, "db").expect("db file");
+        fs::write(&backup_file, "backup").expect("backup file");
+        write_memory_config(&memory_config_path, "tangle_cli_operation", None);
+        write_rocksdb_config(
+            &store_error_config_path,
+            &db_file,
+            "tangle_cli_operation_error",
+        );
+
+        let missing_events = root.join("missing-events.jsonl");
+        let missing_restore = root.join("missing-restore");
+        let output_events = root.join("events.jsonl");
+        let file_errors = [
+            event_import_with_config(path_str(&memory_config_path), path_str(&missing_events))
+                .await
+                .expect_err("import"),
+            ops_backup_with_config(path_str(&memory_config_path), path_str(&backup_file))
+                .await
+                .expect_err("backup"),
+            ops_restore_with_config(path_str(&memory_config_path), path_str(&missing_restore))
+                .await
+                .expect_err("restore"),
+        ];
+        let store_errors = [
+            migrate_with_config(path_str(&store_error_config_path))
+                .await
+                .expect_err("migrate"),
+            event_export_with_config(path_str(&store_error_config_path), path_str(&output_events))
+                .await
+                .expect_err("export"),
+            projection_rebuild_with_config(path_str(&store_error_config_path))
+                .await
+                .expect_err("rebuild"),
+            run_with_config(path_str(&store_error_config_path))
+                .await
+                .expect_err("run"),
+        ];
+
+        assert!(
+            file_errors
+                .iter()
+                .any(|error| error.contains("failed to read event import file"))
+        );
+        assert!(
+            file_errors
+                .iter()
+                .any(|error| error.contains("failed to read backup manifest file"))
+        );
+        assert!(
+            file_errors
+                .iter()
+                .any(|error| error.contains("failed to create backup directory"))
+        );
+        assert!(!store_errors.is_empty());
+
+        fs::remove_dir_all(&root).expect("remove runtime root");
     }
 
     #[test]
@@ -837,5 +968,79 @@ mod tests {
                 "c".repeat(64)
             )
         );
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("tangle-lib-{label}-{}", std::process::id()))
+    }
+
+    fn path_str(path: &Path) -> &str {
+        path.to_str().expect("utf8 path")
+    }
+
+    fn write_memory_config(path: &Path, namespace: &str, tracing_filter: Option<&str>) {
+        let mut config = serde_json::json!({
+            "server": {
+                "listen_addr": "127.0.0.1:0",
+                "relay_url": "wss://relay.radroots.test"
+            },
+            "database": {
+                "mode": "memory",
+                "namespace": namespace,
+                "database": "relay"
+            },
+            "auth": {
+                "challenge_ttl_seconds": 300
+            },
+            "limits": {
+                "message_rate_limit": {
+                    "limit": 120,
+                    "window_seconds": 60
+                }
+            }
+        });
+        if let Some(filter) = tracing_filter {
+            config["observability"] = serde_json::json!({
+                "tracing": {
+                    "enabled": true,
+                    "filter": filter,
+                    "format": "compact"
+                }
+            });
+        }
+        fs::write(
+            path,
+            serde_json::to_string_pretty(&config).expect("runtime config JSON"),
+        )
+        .expect("write runtime config");
+    }
+
+    fn write_rocksdb_config(path: &Path, db_path: &Path, namespace: &str) {
+        let config = serde_json::json!({
+            "server": {
+                "listen_addr": "127.0.0.1:0",
+                "relay_url": "wss://relay.radroots.test"
+            },
+            "database": {
+                "mode": "rocks_db",
+                "path": path_str(db_path),
+                "namespace": namespace,
+                "database": "relay"
+            },
+            "auth": {
+                "challenge_ttl_seconds": 300
+            },
+            "limits": {
+                "message_rate_limit": {
+                    "limit": 120,
+                    "window_seconds": 60
+                }
+            }
+        });
+        fs::write(
+            path,
+            serde_json::to_string_pretty(&config).expect("runtime config JSON"),
+        )
+        .expect("write runtime config");
     }
 }

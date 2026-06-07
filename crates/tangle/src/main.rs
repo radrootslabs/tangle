@@ -93,67 +93,138 @@ fn main() -> ExitCode {
 
 fn run_migrate(invocation: &tangle::TangleInvocation) -> Result<String, String> {
     let config_path = tangle::require_config_path(invocation).map_err(|error| error.to_string())?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("failed to start runtime: {error}"))?;
+    let runtime = tangle_runtime();
     runtime.block_on(tangle::migrate_with_config(config_path))
 }
 
 fn run_server(invocation: &tangle::TangleInvocation) -> Result<(), String> {
     let config_path = tangle::require_config_path(invocation).map_err(|error| error.to_string())?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("failed to start runtime: {error}"))?;
+    let runtime = tangle_runtime();
     runtime.block_on(tangle::run_with_config(config_path))
 }
 
 fn run_event_import(invocation: &tangle::TangleInvocation) -> Result<String, String> {
     let config_path = tangle::require_config_path(invocation).map_err(|error| error.to_string())?;
     let input_path = tangle::require_input_path(invocation).map_err(|error| error.to_string())?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("failed to start runtime: {error}"))?;
+    let runtime = tangle_runtime();
     runtime.block_on(tangle::event_import_with_config(config_path, input_path))
 }
 
 fn run_event_export(invocation: &tangle::TangleInvocation) -> Result<String, String> {
     let config_path = tangle::require_config_path(invocation).map_err(|error| error.to_string())?;
     let output_path = tangle::require_output_path(invocation).map_err(|error| error.to_string())?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("failed to start runtime: {error}"))?;
+    let runtime = tangle_runtime();
     runtime.block_on(tangle::event_export_with_config(config_path, output_path))
 }
 
 fn run_projection_rebuild(invocation: &tangle::TangleInvocation) -> Result<String, String> {
     let config_path = tangle::require_config_path(invocation).map_err(|error| error.to_string())?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("failed to start runtime: {error}"))?;
+    let runtime = tangle_runtime();
     runtime.block_on(tangle::projection_rebuild_with_config(config_path))
 }
 
 fn run_ops_backup(invocation: &tangle::TangleInvocation) -> Result<String, String> {
     let config_path = tangle::require_config_path(invocation).map_err(|error| error.to_string())?;
     let output_path = tangle::require_output_path(invocation).map_err(|error| error.to_string())?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("failed to start runtime: {error}"))?;
+    let runtime = tangle_runtime();
     runtime.block_on(tangle::ops_backup_with_config(config_path, output_path))
 }
 
 fn run_ops_restore(invocation: &tangle::TangleInvocation) -> Result<String, String> {
     let config_path = tangle::require_config_path(invocation).map_err(|error| error.to_string())?;
     let input_path = tangle::require_input_path(invocation).map_err(|error| error.to_string())?;
+    let runtime = tangle_runtime();
+    runtime.block_on(tangle::ops_restore_with_config(config_path, input_path))
+}
+
+fn tangle_runtime() -> tokio::runtime::Runtime {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|error| format!("failed to start runtime: {error}"))?;
-    runtime.block_on(tangle::ops_restore_with_config(config_path, input_path))
+        .expect("failed to start tangle Tokio runtime");
+    runtime
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        run_event_export, run_event_import, run_ops_backup, run_ops_restore, run_server,
+        tangle_runtime,
+    };
+
+    #[test]
+    fn command_runners_report_missing_options_in_process() {
+        let run = tangle::TangleInvocation::new(tangle::TangleCommand::Run, None);
+        assert_eq!(
+            run_server(&run).expect_err("run config"),
+            "--config requires a value"
+        );
+
+        let import_missing_config =
+            tangle::TangleInvocation::new(tangle::TangleCommand::EventImport, None);
+        assert_eq!(
+            run_event_import(&import_missing_config).expect_err("import config"),
+            "--config requires a value"
+        );
+        let import_missing_input = tangle::TangleInvocation::new(
+            tangle::TangleCommand::EventImport,
+            Some("runtime.json".to_owned()),
+        );
+        assert_eq!(
+            run_event_import(&import_missing_input).expect_err("import input"),
+            "--input requires a value"
+        );
+
+        let export_missing_config =
+            tangle::TangleInvocation::new(tangle::TangleCommand::EventExport, None);
+        assert_eq!(
+            run_event_export(&export_missing_config).expect_err("export config"),
+            "--config requires a value"
+        );
+        let export_missing_output = tangle::TangleInvocation::new(
+            tangle::TangleCommand::EventExport,
+            Some("runtime.json".to_owned()),
+        );
+        assert_eq!(
+            run_event_export(&export_missing_output).expect_err("export output"),
+            "--output requires a value"
+        );
+
+        let backup_missing_config =
+            tangle::TangleInvocation::new(tangle::TangleCommand::OpsBackup, None);
+        assert_eq!(
+            run_ops_backup(&backup_missing_config).expect_err("backup config"),
+            "--config requires a value"
+        );
+        let backup_missing_output = tangle::TangleInvocation::new(
+            tangle::TangleCommand::OpsBackup,
+            Some("runtime.json".to_owned()),
+        );
+        assert_eq!(
+            run_ops_backup(&backup_missing_output).expect_err("backup output"),
+            "--output requires a value"
+        );
+
+        let restore_missing_config =
+            tangle::TangleInvocation::new(tangle::TangleCommand::OpsRestore, None);
+        assert_eq!(
+            run_ops_restore(&restore_missing_config).expect_err("restore config"),
+            "--config requires a value"
+        );
+        let restore_missing_input = tangle::TangleInvocation::new(
+            tangle::TangleCommand::OpsRestore,
+            Some("runtime.json".to_owned()),
+        );
+        assert_eq!(
+            run_ops_restore(&restore_missing_input).expect_err("restore input"),
+            "--input requires a value"
+        );
+    }
+
+    #[test]
+    fn command_runner_runtime_builds_current_thread_executor() {
+        let runtime = tangle_runtime();
+
+        assert_eq!(runtime.block_on(async { 42 }), 42);
+    }
 }
