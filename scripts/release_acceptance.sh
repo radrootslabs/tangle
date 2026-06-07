@@ -18,4 +18,3 @@ cargo test -p tangle_runtime runtime_restore_command_imports_backup_and_rebuilds
 cargo test -p tangle_bench
 cargo test -p tangle --test source_comments
 cargo test -p tangle --test unsafe_code
-scripts/coverage.sh

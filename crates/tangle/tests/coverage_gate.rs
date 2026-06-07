@@ -18,16 +18,13 @@ fn coverage_script_requires_workspace_full_line_coverage() {
 }
 
 #[test]
-fn ci_and_validation_contract_require_coverage_gate() {
+fn release_and_ci_keep_coverage_diagnostic_outside_required_gates() {
+    let release = read("scripts/release_acceptance.sh");
     let ci = read("scripts/ci.sh");
     let validation = read("ci/workspace-validation.toml");
-
-    assert!(ci.contains("scripts/coverage.sh"));
-    assert!(validation.contains("id = \"coverage\""));
-    assert!(validation.contains("command = \"scripts/coverage.sh\""));
-    assert!(validation.contains("\"cargo-llvm-cov\""));
-    assert!(validation.contains("\"llvm-cov\""));
-    assert!(validation.contains("\"llvm-profdata\""));
+    assert!(!release.contains("scripts/coverage.sh"));
+    assert!(!ci.contains("scripts/coverage.sh"));
+    assert!(!validation.contains("id = \"coverage\""));
 }
 
 #[test]

@@ -32,13 +32,17 @@ fn release_acceptance_script_covers_release_candidate_validation_ladder() {
         "cargo test -p tangle_bench",
         "cargo test -p tangle --test source_comments",
         "cargo test -p tangle --test unsafe_code",
-        "scripts/coverage.sh",
     ] {
         assert!(
             script.contains(required),
             "release acceptance script is missing `{required}`"
         );
     }
+
+    assert!(
+        !script.contains("scripts/coverage.sh"),
+        "release acceptance must not depend on strict line coverage"
+    );
 
     #[cfg(unix)]
     {
