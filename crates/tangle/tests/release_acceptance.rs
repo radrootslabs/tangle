@@ -1,15 +1,11 @@
 #![forbid(unsafe_code)]
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[test]
 fn release_acceptance_script_covers_release_candidate_validation_ladder() {
-    let script_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root")
-        .join("scripts/release_acceptance.sh");
+    let script_path = workspace_root().join("scripts/release_acceptance.sh");
     let script = fs::read_to_string(&script_path).expect("release acceptance script");
 
     for required in [
@@ -58,4 +54,30 @@ fn release_acceptance_script_covers_release_candidate_validation_ladder() {
             "release acceptance script must be executable"
         );
     }
+}
+
+#[test]
+fn nix_exposes_release_acceptance_entrypoint() {
+    let flake = read("flake.nix");
+
+    for required in [
+        "releaseAcceptance = mkScript pkgs \"tangle-release-acceptance\"",
+        "scripts/release_acceptance.sh",
+        "\"release-acceptance\"",
+        "program = \"${releaseAcceptance}/bin/tangle-release-acceptance\"",
+    ] {
+        assert!(flake.contains(required), "flake is missing `{required}`");
+    }
+}
+
+fn read(path: &str) -> String {
+    fs::read_to_string(workspace_root().join(path)).expect(path)
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root")
+        .to_path_buf()
 }

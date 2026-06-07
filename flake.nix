@@ -69,6 +69,9 @@
             ${coverageEnvironment}
             scripts/ci.sh
           '';
+          releaseAcceptance = mkScript pkgs "tangle-release-acceptance" ''
+            scripts/release_acceptance.sh
+          '';
         in
         {
           check = {
@@ -86,6 +89,10 @@
           ci = {
             type = "app";
             program = "${ci}/bin/tangle-ci";
+          };
+          "release-acceptance" = {
+            type = "app";
+            program = "${releaseAcceptance}/bin/tangle-release-acceptance";
           };
         }
       );
