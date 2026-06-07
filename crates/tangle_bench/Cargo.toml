@@ -7,16 +7,19 @@ rust-version.workspace = true
 license.workspace = true
 description = "Benchmark suite for the Tangle relay"
 
+[[bin]]
+name = "tangle-benchmark-report"
+path = "src/bin/tangle_benchmark_report.rs"
+
 [dependencies]
 serde_json = "1"
 sha2 = "0.10"
 tangle_nips = { path = "../tangle_nips" }
 tangle_protocol = { path = "../tangle_protocol" }
+tangle_runtime = { path = "../tangle_runtime" }
 tangle_store = { path = "../tangle_store" }
 tangle_store_surreal = { path = "../tangle_store_surreal" }
 tangle_test_support = { path = "../tangle_test_support" }
-
-[dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }
 
 [lints]

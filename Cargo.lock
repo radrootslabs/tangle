@@ -4130,6 +4130,7 @@ dependencies = [
  "sha2",
  "tangle_nips",
  "tangle_protocol",
+ "tangle_runtime",
  "tangle_store",
  "tangle_store_surreal",
  "tangle_test_support",
