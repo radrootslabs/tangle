@@ -2923,7 +2923,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "pocket-db"
 version = "0.1.0"
-source = "git+https://github.com/mikedilger/pocket?rev=329334f20948c796c6016b673b92551ac4855ad7#329334f20948c796c6016b673b92551ac4855ad7"
+source = "git+https://github.com/triesap/pocket?rev=329334f20948c796c6016b673b92551ac4855ad7#329334f20948c796c6016b673b92551ac4855ad7"
 dependencies = [
  "heed",
  "libc",
@@ -2934,7 +2934,7 @@ dependencies = [
 [[package]]
 name = "pocket-types"
 version = "0.1.0"
-source = "git+https://github.com/mikedilger/pocket?rev=329334f20948c796c6016b673b92551ac4855ad7#329334f20948c796c6016b673b92551ac4855ad7"
+source = "git+https://github.com/triesap/pocket?rev=329334f20948c796c6016b673b92551ac4855ad7#329334f20948c796c6016b673b92551ac4855ad7"
 dependencies = [
  "derive_more",
  "rand 0.9.4",
@@ -4387,9 +4387,11 @@ dependencies = [
  "serde_json",
  "sha2",
  "tangle_core",
+ "tangle_groups",
  "tangle_nips",
  "tangle_protocol",
  "tangle_store",
+ "tangle_store_pocket",
  "tangle_store_surreal",
  "tangle_test_support",
  "tokio",

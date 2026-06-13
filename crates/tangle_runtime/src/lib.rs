@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod chorus_pocket;
+
 use axum::{
     Json, Router,
     extract::ws::{Message, WebSocket, WebSocketUpgrade},

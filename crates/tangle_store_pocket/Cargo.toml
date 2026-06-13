@@ -8,8 +8,8 @@ license.workspace = true
 description = "Pocket-backed storage adapter for Tangle"
 
 [dependencies]
-pocket-db = { git = "https://github.com/mikedilger/pocket", rev = "329334f20948c796c6016b673b92551ac4855ad7" }
-pocket-types = { git = "https://github.com/mikedilger/pocket", rev = "329334f20948c796c6016b673b92551ac4855ad7" }
+pocket-db = { git = "https://github.com/triesap/pocket", rev = "329334f20948c796c6016b673b92551ac4855ad7" }
+pocket-types = { git = "https://github.com/triesap/pocket", rev = "329334f20948c796c6016b673b92551ac4855ad7" }
 
 [lints]
 workspace = true
