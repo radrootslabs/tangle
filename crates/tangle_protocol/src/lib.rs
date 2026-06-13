@@ -624,6 +624,10 @@ pub enum ClientMessage {
         subscription_id: SubscriptionId,
         filters: Vec<Filter>,
     },
+    Count {
+        subscription_id: SubscriptionId,
+        filters: Vec<Filter>,
+    },
     Close(SubscriptionId),
     Auth(Event),
 }
@@ -747,6 +751,10 @@ pub enum RelayMessage {
         subscription_id: SubscriptionId,
         message: String,
     },
+    Count {
+        subscription_id: SubscriptionId,
+        count: u64,
+    },
     Notice(String),
     Auth(String),
 }
@@ -779,6 +787,10 @@ pub fn relay_message_to_value(message: &RelayMessage) -> serde_json::Value {
             subscription_id,
             message,
         } => serde_json::json!(["CLOSED", subscription_id.as_str(), message]),
+        RelayMessage::Count {
+            subscription_id,
+            count,
+        } => serde_json::json!(["COUNT", subscription_id.as_str(), {"count": count}]),
         RelayMessage::Notice(message) => serde_json::json!(["NOTICE", message]),
         RelayMessage::Auth(challenge) => serde_json::json!(["AUTH", challenge]),
     }
@@ -807,6 +819,79 @@ pub fn event_to_value(event: &Event) -> serde_json::Value {
         "content": event.unsigned().content(),
         "sig": event.sig().as_str()
     })
+}
+
+pub fn filter_to_value(filter: &Filter) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    if !filter.ids().is_empty() {
+        object.insert(
+            "ids".to_owned(),
+            serde_json::Value::Array(
+                filter
+                    .ids()
+                    .iter()
+                    .map(|id| serde_json::Value::String(id.as_str().to_owned()))
+                    .collect(),
+            ),
+        );
+    }
+    if !filter.authors().is_empty() {
+        object.insert(
+            "authors".to_owned(),
+            serde_json::Value::Array(
+                filter
+                    .authors()
+                    .iter()
+                    .map(|author| serde_json::Value::String(author.as_str().to_owned()))
+                    .collect(),
+            ),
+        );
+    }
+    if !filter.kinds().is_empty() {
+        object.insert(
+            "kinds".to_owned(),
+            serde_json::Value::Array(
+                filter
+                    .kinds()
+                    .iter()
+                    .map(|kind| serde_json::Value::Number(kind.as_u32().into()))
+                    .collect(),
+            ),
+        );
+    }
+    for (name, values) in filter.tag_filters() {
+        object.insert(
+            format!("#{}", name.as_str()),
+            serde_json::Value::Array(
+                values
+                    .iter()
+                    .map(|value| serde_json::Value::String(value.as_str().to_owned()))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(since) = filter.since() {
+        object.insert(
+            "since".to_owned(),
+            serde_json::Value::Number(since.as_u64().into()),
+        );
+    }
+    if let Some(until) = filter.until() {
+        object.insert(
+            "until".to_owned(),
+            serde_json::Value::Number(until.as_u64().into()),
+        );
+    }
+    if let Some(limit) = filter.limit() {
+        object.insert("limit".to_owned(), serde_json::Value::Number(limit.into()));
+    }
+    if let Some(search) = filter.search() {
+        object.insert(
+            "search".to_owned(),
+            serde_json::Value::String(search.to_owned()),
+        );
+    }
+    serde_json::Value::Object(object)
 }
 
 pub fn filter_from_value(value: &serde_json::Value) -> Result<Filter, String> {
@@ -848,6 +933,7 @@ pub fn parse_client_message(raw: &str) -> Result<ClientMessage, String> {
     match command {
         "EVENT" => parse_event_client_message(array),
         "REQ" => parse_req_client_message(array),
+        "COUNT" => parse_count_client_message(array),
         "CLOSE" => parse_close_client_message(array),
         "AUTH" => parse_auth_client_message(array),
         unsupported => Err(format!(
@@ -916,6 +1002,24 @@ fn parse_req_client_message(array: &[serde_json::Value]) -> Result<ClientMessage
         .map(filter_from_value)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ClientMessage::Req {
+        subscription_id,
+        filters,
+    })
+}
+
+fn parse_count_client_message(array: &[serde_json::Value]) -> Result<ClientMessage, String> {
+    if array.len() < 3 {
+        return Err("COUNT client message must contain a subscription id and filters".to_owned());
+    }
+    let subscription_id = array[1]
+        .as_str()
+        .ok_or_else(|| "COUNT subscription id must be a string".to_owned())
+        .and_then(SubscriptionId::new)?;
+    let filters = array[2..]
+        .iter()
+        .map(filter_from_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ClientMessage::Count {
         subscription_id,
         filters,
     })
@@ -1132,7 +1236,7 @@ mod tests {
         Filter, Kind, KindClass, PublicKeyHex, RawEventJson, RelayMessage, SignatureHex,
         SubscriptionId, Tag, TagName, TagValue, UnixTimestamp, UnsignedEvent, canonical_event_json,
         empty_error, encode_relay_message, event_from_value, event_to_value, filter_from_value,
-        invalid_length_error, kind_out_of_range_error, non_lowercase_hex_error,
+        filter_to_value, invalid_length_error, kind_out_of_range_error, non_lowercase_hex_error,
         parse_client_message, parse_event_json, relay_message_to_value, too_long_error,
     };
     use core::str::FromStr;
@@ -1520,12 +1624,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_client_message_accepts_event_auth_req_and_close() {
+    fn parse_client_message_accepts_event_auth_req_count_and_close() {
         let event_payload = event_json("a", "b", 1, tags_json());
         let auth_event_json = event_json("c", "d", 22242, "[]");
         let event_message = format!("[\"EVENT\",{event_payload}]");
         let auth_message = format!("[\"AUTH\",{auth_event_json}]");
         let req_message = "[\"REQ\",\"sub-a\",{\"ids\":[\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]},{\"kinds\":[1]}]";
+        let count_message = "[\"COUNT\",\"sub-a\",{\"kinds\":[1]}]";
         let close_message = "[\"CLOSE\",\"sub-a\"]";
         let event =
             parse_event_json(&RawEventJson::new(&event_payload).expect("raw")).expect("event");
@@ -1548,6 +1653,13 @@ mod tests {
                     filter_from_value(&serde_json::json!({"ids":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]})).expect("ids"),
                     filter_from_value(&serde_json::json!({"kinds":[1]})).expect("kinds")
                 ]
+            })
+        );
+        assert_eq!(
+            parse_client_message(count_message),
+            Ok(ClientMessage::Count {
+                subscription_id: SubscriptionId::new("sub-a").expect("sub"),
+                filters: vec![filter_from_value(&serde_json::json!({"kinds":[1]})).expect("kinds")]
             })
         );
         assert_eq!(
@@ -1576,8 +1688,8 @@ mod tests {
             "client message command must be a string"
         );
         assert_eq!(
-            parse_client_message("[\"COUNT\"]").expect_err("unsupported"),
-            "client message command `COUNT` is unsupported"
+            parse_client_message("[\"BOGUS\"]").expect_err("unsupported"),
+            "client message command `BOGUS` is unsupported"
         );
         assert_eq!(
             parse_client_message("[\"EVENT\"]").expect_err("event length"),
@@ -1609,6 +1721,22 @@ mod tests {
         );
         assert_eq!(
             parse_client_message("[\"REQ\",\"sub-a\",1]").expect_err("req filter"),
+            "filter must be a JSON object"
+        );
+        assert_eq!(
+            parse_client_message("[\"COUNT\"]").expect_err("count length"),
+            "COUNT client message must contain a subscription id and filters"
+        );
+        assert_eq!(
+            parse_client_message("[\"COUNT\",1,{}]").expect_err("count sub type"),
+            "COUNT subscription id must be a string"
+        );
+        assert_eq!(
+            parse_client_message("[\"COUNT\",\"\",{}]").expect_err("count sub empty"),
+            "subscription id must not be empty"
+        );
+        assert_eq!(
+            parse_client_message("[\"COUNT\",\"sub-a\",1]").expect_err("count filter"),
             "filter must be a JSON object"
         );
         assert_eq!(
@@ -1761,6 +1889,10 @@ mod tests {
         assert!(Filter::empty().matches(&event));
         assert_eq!(Filter::empty().limit(), None);
         assert_eq!(Filter::empty().search(), None);
+        assert_eq!(
+            filter_from_value(&filter_to_value(&filter)).expect("encoded"),
+            filter
+        );
     }
 
     #[test]
@@ -1968,7 +2100,7 @@ mod tests {
         );
         assert_eq!(
             relay_message_to_value(&RelayMessage::Closed {
-                subscription_id,
+                subscription_id: subscription_id.clone(),
                 message: "unsupported: filter contains unknown elements".to_owned()
             }),
             serde_json::json!([
@@ -1976,6 +2108,13 @@ mod tests {
                 "sub-a",
                 "unsupported: filter contains unknown elements"
             ])
+        );
+        assert_eq!(
+            relay_message_to_value(&RelayMessage::Count {
+                subscription_id,
+                count: 7
+            }),
+            serde_json::json!(["COUNT", "sub-a", {"count": 7}])
         );
         assert_eq!(
             relay_message_to_value(&RelayMessage::Notice("maintenance window".to_owned())),

@@ -1,11 +1,14 @@
 #![forbid(unsafe_code)]
 
+use core::fmt;
 use std::sync::Arc;
 
-use k256::schnorr::signature::Verifier;
-use k256::schnorr::{Signature, VerifyingKey};
+use k256::schnorr::signature::{Signer, Verifier};
+use k256::schnorr::{Signature, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
-use tangle_protocol::{Event, EventId, UnsignedEvent, canonical_event_json};
+use tangle_protocol::{
+    Event, EventId, PublicKeyHex, SignatureHex, UnsignedEvent, canonical_event_json,
+};
 use tokio::sync::Semaphore;
 
 pub fn compute_event_id(event: &UnsignedEvent) -> EventId {
@@ -55,6 +58,52 @@ pub fn verify_event_signature(event: &Event) -> Result<(), String> {
     verifying_key
         .verify(&event_id, &signature)
         .map_err(|_| "event signature verification failed".to_owned())
+}
+
+pub struct RelaySigner {
+    signing_key: SigningKey,
+    public_key: PublicKeyHex,
+}
+
+impl RelaySigner {
+    pub fn from_secret_hex(secret: &str) -> Result<Self, String> {
+        let bytes = fixed_hex_bytes(secret, 32, "relay secret")?;
+        let bytes: [u8; 32] = bytes
+            .try_into()
+            .expect("validated relay secret length is 32 bytes");
+        let signing_key = SigningKey::from_bytes(&bytes)
+            .map_err(|_| "relay secret is not a valid secp256k1 signing key".to_owned())?;
+        let public_key =
+            PublicKeyHex::new(&lower_hex(signing_key.verifying_key().to_bytes().as_ref()))
+                .expect("signing key emits a valid x-only public key");
+        Ok(Self {
+            signing_key,
+            public_key,
+        })
+    }
+
+    pub fn public_key(&self) -> &PublicKeyHex {
+        &self.public_key
+    }
+
+    pub fn sign_unsigned_event(&self, unsigned: UnsignedEvent) -> Event {
+        let event_id = compute_event_id(&unsigned);
+        let event_id_bytes =
+            fixed_hex_bytes(event_id.as_str(), 32, "event id").expect("event id is valid hex");
+        let signature: Signature = self.signing_key.sign(&event_id_bytes);
+        let signature = SignatureHex::new(&lower_hex(signature.to_bytes().as_ref()))
+            .expect("schnorr signature emits valid hex");
+        Event::new(event_id, unsigned, signature)
+    }
+}
+
+impl fmt::Debug for RelaySigner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RelaySigner")
+            .field("public_key", &self.public_key)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -153,7 +202,7 @@ fn hex_value(value: u8, scalar: &str) -> Result<u8, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        VerificationService, compute_event_id, compute_event_id_hex, event_id_matches,
+        RelaySigner, VerificationService, compute_event_id, compute_event_id_hex, event_id_matches,
         fixed_hex_bytes, lower_hex, verify_event_id, verify_event_signature,
     };
     use k256::schnorr::signature::Signer;
@@ -214,6 +263,32 @@ mod tests {
         let event = signed_event();
 
         assert_eq!(verify_event_signature(&event), Ok(()));
+    }
+
+    #[test]
+    fn relay_signer_derives_public_key_and_signs_canonical_events() {
+        let secret = lower_hex(&[7_u8; 32]);
+        let signer = RelaySigner::from_secret_hex(&secret).expect("signer");
+        let unsigned = UnsignedEvent::new(
+            signer.public_key().clone(),
+            UnixTimestamp::new(1_714_124_433),
+            Kind::new(1).expect("kind"),
+            vec![Tag::from_parts("t", &["radroots"]).expect("tag")],
+            "relay generated",
+        );
+
+        let event = signer.sign_unsigned_event(unsigned);
+
+        assert_eq!(event.unsigned().pubkey(), signer.public_key());
+        assert_eq!(verify_event_signature(&event), Ok(()));
+        assert_eq!(
+            format!("{signer:?}"),
+            format!(
+                "RelaySigner {{ public_key: {:?}, .. }}",
+                signer.public_key()
+            )
+        );
+        assert!(!format!("{signer:?}").contains(&secret));
     }
 
     #[test]

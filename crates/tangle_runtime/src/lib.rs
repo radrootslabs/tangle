@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod base_relay;
 pub mod chorus_pocket;
 
 use axum::{
@@ -1955,6 +1956,13 @@ async fn handle_client_message(
                 send_relay_message(socket, &response).await?;
             }
         }
+        ClientMessage::Count {
+            subscription_id,
+            filters,
+        } => {
+            let response = handlers.req.handle_count(subscription_id, filters).await;
+            send_relay_message(socket, &response).await?;
+        }
         ClientMessage::Close(subscription_id) => {
             handlers
                 .close
@@ -2729,6 +2737,32 @@ impl ReqMessageHandler {
             .collect::<Vec<_>>();
         messages.push(RelayMessage::Eose(subscription_id));
         messages
+    }
+
+    pub async fn handle_count(
+        &self,
+        subscription_id: SubscriptionId,
+        filters: Vec<Filter>,
+    ) -> RelayMessage {
+        if let Err(error) = self
+            .compiler
+            .compile(&filters, QueryExecutionMode::Historical)
+        {
+            return RelayMessage::Closed {
+                subscription_id,
+                message: format!("unsupported: {error}"),
+            };
+        }
+        match self.query_historical_events(&filters).await {
+            Ok(events) => RelayMessage::Count {
+                subscription_id,
+                count: events.len() as u64,
+            },
+            Err(error) => RelayMessage::Closed {
+                subscription_id,
+                message: error.message().to_owned(),
+            },
+        }
     }
 
     async fn query_historical_events(&self, filters: &[Filter]) -> Result<Vec<Event>, ApiError> {
