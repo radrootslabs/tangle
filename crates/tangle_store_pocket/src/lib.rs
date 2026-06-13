@@ -1,7 +1,41 @@
 #![forbid(unsafe_code)]
 
 use core::fmt;
+use pocket_db::Store;
+use pocket_types::{Event, Filter, Id, Pubkey};
 use std::path::{Path, PathBuf};
+
+pub const POCKET_SOURCE_REPOSITORY: &str = "https://github.com/mikedilger/pocket";
+pub const POCKET_SOURCE_REVISION: &str = "329334f20948c796c6016b673b92551ac4855ad7";
+
+pub type PocketEvent = Event;
+pub type PocketEventId = Id;
+pub type PocketFilter = Filter;
+pub type PocketPubkey = Pubkey;
+pub type PocketStore = Store;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PocketDependencyBoundary {
+    source_repository: &'static str,
+    source_revision: &'static str,
+}
+
+impl PocketDependencyBoundary {
+    pub fn current() -> Self {
+        Self {
+            source_repository: POCKET_SOURCE_REPOSITORY,
+            source_revision: POCKET_SOURCE_REVISION,
+        }
+    }
+
+    pub fn source_repository(&self) -> &'static str {
+        self.source_repository
+    }
+
+    pub fn source_revision(&self) -> &'static str {
+        self.source_revision
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PocketSyncPolicy {
@@ -97,7 +131,26 @@ impl std::error::Error for PocketConfigError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{PocketStoreConfig, PocketSyncPolicy};
+    use super::{
+        POCKET_SOURCE_REPOSITORY, POCKET_SOURCE_REVISION, PocketDependencyBoundary,
+        PocketStoreConfig, PocketSyncPolicy,
+    };
+
+    #[test]
+    fn pocket_dependency_boundary_pins_chorus_latest_manifest_revision() {
+        let boundary = PocketDependencyBoundary::current();
+
+        assert_eq!(
+            boundary.source_repository(),
+            "https://github.com/mikedilger/pocket"
+        );
+        assert_eq!(boundary.source_repository(), POCKET_SOURCE_REPOSITORY);
+        assert_eq!(
+            boundary.source_revision(),
+            "329334f20948c796c6016b673b92551ac4855ad7"
+        );
+        assert_eq!(boundary.source_revision(), POCKET_SOURCE_REVISION);
+    }
 
     #[test]
     fn pocket_store_config_preserves_explicit_storage_boundary() {
