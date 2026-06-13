@@ -1,0 +1,13 @@
+[package]
+name = "tangle_store_pocket"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pocket-backed storage adapter for Tangle"
+
+[dependencies]
+
+[lints]
+workspace = true

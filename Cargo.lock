@@ -4160,6 +4160,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tangle_groups"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tangle_protocol",
+]
+
+[[package]]
 name = "tangle_nips"
 version = "0.1.0"
 dependencies = [
@@ -4204,6 +4213,10 @@ dependencies = [
  "tangle_nips",
  "tangle_protocol",
 ]
+
+[[package]]
+name = "tangle_store_pocket"
+version = "0.1.0"
 
 [[package]]
 name = "tangle_store_surreal"
