@@ -5,8 +5,6 @@
   },
   "pocket": {
     "data_directory": "runtime/pocket",
-    "map_size_bytes": 1099511627776,
-    "reader_slots": 512,
     "sync_policy": "flush_on_shutdown"
   },
   "groups": {

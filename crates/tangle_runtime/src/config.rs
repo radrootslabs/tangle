@@ -305,8 +305,6 @@ struct BaseRelayServerConfigDocument {
 #[serde(deny_unknown_fields)]
 struct BaseRelayPocketConfigDocument {
     data_directory: String,
-    map_size_bytes: u64,
-    reader_slots: u32,
     sync_policy: BaseRelayPocketSyncPolicyDocument,
 }
 
@@ -437,8 +435,6 @@ pub fn parse_base_relay_runtime_config_json(
         })?;
     let pocket = PocketStoreConfig::new(
         PathBuf::from(document.pocket.data_directory),
-        document.pocket.map_size_bytes,
-        document.pocket.reader_slots,
         match document.pocket.sync_policy {
             BaseRelayPocketSyncPolicyDocument::FlushOnWrite => PocketSyncPolicy::FlushOnWrite,
             BaseRelayPocketSyncPolicyDocument::FlushOnShutdown => PocketSyncPolicy::FlushOnShutdown,
@@ -626,8 +622,6 @@ mod tests {
             config.pocket_config().data_directory(),
             Path::new("runtime/pocket")
         );
-        assert_eq!(config.pocket_config().map_size_bytes(), 1_099_511_627_776);
-        assert_eq!(config.pocket_config().reader_slots(), 512);
         assert_eq!(
             config.pocket_config().sync_policy(),
             PocketSyncPolicy::FlushOnShutdown
@@ -700,8 +694,6 @@ mod tests {
             },
             "pocket": {
                 "data_directory": "runtime/pocket",
-                "map_size_bytes": 1073741824,
-                "reader_slots": 128,
                 "sync_policy": "flush_on_shutdown"
             },
             "groups": {
@@ -781,8 +773,6 @@ mod tests {
             },
             "pocket": {
                 "data_directory": "runtime/pocket",
-                "map_size_bytes": 1073741824,
-                "reader_slots": 128,
                 "sync_policy": "flush_on_shutdown"
             },
             "groups": {
@@ -859,8 +849,6 @@ mod tests {
             },
             "pocket": {
                 "data_directory": "runtime/pocket",
-                "map_size_bytes": 1073741824,
-                "reader_slots": 128,
                 "sync_policy": "flush_on_shutdown"
             },
             "groups": {
@@ -928,6 +916,31 @@ mod tests {
                 .expect_err("unknown nested field")
                 .prefixed_message()
                 .contains("unknown field `max_unimplemented_limit`")
+        );
+    }
+
+    #[test]
+    fn base_relay_runtime_config_rejects_removed_pocket_options() {
+        let raw = include_str!("../../../config/tangle.example.json").replace(
+            "    \"data_directory\": \"runtime/pocket\",\n",
+            "    \"data_directory\": \"runtime/pocket\",\n    \"map_size_bytes\": 1073741824,\n",
+        );
+        assert!(
+            parse_base_relay_runtime_config_json(&raw)
+                .expect_err("removed map size")
+                .prefixed_message()
+                .contains("unknown field `map_size_bytes`")
+        );
+
+        let raw = include_str!("../../../config/tangle.example.json").replace(
+            "    \"data_directory\": \"runtime/pocket\",\n",
+            "    \"data_directory\": \"runtime/pocket\",\n    \"reader_slots\": 128,\n",
+        );
+        assert!(
+            parse_base_relay_runtime_config_json(&raw)
+                .expect_err("removed readers")
+                .prefixed_message()
+                .contains("unknown field `reader_slots`")
         );
     }
 

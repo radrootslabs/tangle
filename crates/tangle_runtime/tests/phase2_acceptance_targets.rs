@@ -1605,8 +1605,6 @@ fn runtime_config_value(root: &Path, listen_addr: SocketAddr) -> Value {
         },
         "pocket": {
             "data_directory": root.join("pocket"),
-            "map_size_bytes": 1073741824_u64,
-            "reader_slots": 128,
             "sync_policy": "flush_on_shutdown"
         },
         "groups": {

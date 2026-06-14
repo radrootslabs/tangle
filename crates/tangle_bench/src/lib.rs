@@ -1445,13 +1445,8 @@ fn authenticated(key: FixtureKey) -> Result<BaseAuthState, String> {
 fn bench_store_config(run_name: &str) -> Result<PocketStoreConfig, String> {
     let root = bench_temp_root(run_name);
     let _ = fs::remove_dir_all(&root);
-    PocketStoreConfig::new(
-        root.join("pocket"),
-        1024 * 1024 * 1024,
-        128,
-        PocketSyncPolicy::FlushOnShutdown,
-    )
-    .map_err(|error| error.to_string())
+    PocketStoreConfig::new(root.join("pocket"), PocketSyncPolicy::FlushOnShutdown)
+        .map_err(|error| error.to_string())
 }
 
 fn bench_temp_root(run_name: &str) -> PathBuf {

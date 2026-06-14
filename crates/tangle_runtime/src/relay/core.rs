@@ -2461,13 +2461,8 @@ mod tests {
     fn test_store_config(name: &str) -> PocketStoreConfig {
         let root = std::env::temp_dir().join(format!("tangle-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        PocketStoreConfig::new(
-            root.join("pocket"),
-            1024 * 1024 * 1024,
-            128,
-            PocketSyncPolicy::FlushOnShutdown,
-        )
-        .expect("config")
+        PocketStoreConfig::new(root.join("pocket"), PocketSyncPolicy::FlushOnShutdown)
+            .expect("config")
     }
 
     fn enabled_groups_for_owner(owner: &PublicKeyHex) -> tangle_groups::GroupRuntimeConfig {

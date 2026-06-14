@@ -1789,13 +1789,7 @@ fn final_group_name_for_order(name: &str, edits: [&Event; 2]) -> String {
 fn test_store_config(name: &str) -> PocketStoreConfig {
     let root = temp_root(name);
     let _ = fs::remove_dir_all(&root);
-    PocketStoreConfig::new(
-        root.join("pocket"),
-        1024 * 1024 * 1024,
-        128,
-        PocketSyncPolicy::FlushOnShutdown,
-    )
-    .expect("config")
+    PocketStoreConfig::new(root.join("pocket"), PocketSyncPolicy::FlushOnShutdown).expect("config")
 }
 
 fn relay_limits(max_pending_events: usize) -> BaseRelayLimits {
@@ -1987,8 +1981,6 @@ fn runtime_config(groups_enabled: bool) -> BaseRelayRuntimeConfig {
             },
             "pocket": {
                 "data_directory": "runtime/pocket",
-                "map_size_bytes": 1073741824_u64,
-                "reader_slots": 128,
                 "sync_policy": "flush_on_shutdown"
             },
             "groups": groups,

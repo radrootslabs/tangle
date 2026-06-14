@@ -344,22 +344,16 @@ pub enum PocketSyncPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PocketStoreConfig {
     data_directory: PathBuf,
-    map_size_bytes: u64,
-    reader_slots: u32,
     sync_policy: PocketSyncPolicy,
 }
 
 impl PocketStoreConfig {
     pub fn new(
         data_directory: impl Into<PathBuf>,
-        map_size_bytes: u64,
-        reader_slots: u32,
         sync_policy: PocketSyncPolicy,
     ) -> Result<Self, PocketConfigError> {
         let config = Self {
             data_directory: data_directory.into(),
-            map_size_bytes,
-            reader_slots,
             sync_policy,
         };
         config.validate()?;
@@ -372,29 +366,11 @@ impl PocketStoreConfig {
                 "pocket.data_directory must not be empty",
             ));
         }
-        if self.map_size_bytes == 0 {
-            return Err(PocketConfigError::invalid(
-                "pocket.map_size_bytes must be greater than zero",
-            ));
-        }
-        if self.reader_slots == 0 {
-            return Err(PocketConfigError::invalid(
-                "pocket.reader_slots must be greater than zero",
-            ));
-        }
         Ok(())
     }
 
     pub fn data_directory(&self) -> &Path {
         &self.data_directory
-    }
-
-    pub fn map_size_bytes(&self) -> u64 {
-        self.map_size_bytes
-    }
-
-    pub fn reader_slots(&self) -> u32 {
-        self.reader_slots
     }
 
     pub fn sync_policy(&self) -> PocketSyncPolicy {
@@ -547,13 +523,8 @@ mod tests {
     #[test]
     fn pocket_store_handle_opens_syncs_and_exposes_tangle_tables() {
         let root = std::env::temp_dir().join(format!("tangle-pocket-store-{}", std::process::id()));
-        let config = PocketStoreConfig::new(
-            root.join("pocket"),
-            1024 * 1024 * 1024,
-            128,
-            PocketSyncPolicy::FlushOnShutdown,
-        )
-        .expect("config");
+        let config = PocketStoreConfig::new(root.join("pocket"), PocketSyncPolicy::FlushOnShutdown)
+            .expect("config");
 
         let handle = PocketStoreHandle::open(&config).expect("open");
 
@@ -571,13 +542,8 @@ mod tests {
     fn pocket_store_handle_stores_queries_and_counts_events() {
         let root = std::env::temp_dir().join(format!("tangle-pocket-query-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let config = PocketStoreConfig::new(
-            root.join("pocket"),
-            1024 * 1024 * 1024,
-            128,
-            PocketSyncPolicy::FlushOnShutdown,
-        )
-        .expect("config");
+        let config = PocketStoreConfig::new(root.join("pocket"), PocketSyncPolicy::FlushOnShutdown)
+            .expect("config");
         let handle = PocketStoreHandle::open(&config).expect("open");
         let event = parse_pocket_event_json(event_json().as_bytes()).expect("event");
         let filter = parse_pocket_filter_json(filter_json().as_bytes()).expect("filter");
@@ -602,13 +568,8 @@ mod tests {
     #[test]
     fn pocket_store_handle_scans_canonical_events_with_offsets() {
         let root = temp_root("tangle-pocket-scan");
-        let config = PocketStoreConfig::new(
-            root.join("pocket"),
-            1024 * 1024 * 1024,
-            128,
-            PocketSyncPolicy::FlushOnShutdown,
-        )
-        .expect("config");
+        let config = PocketStoreConfig::new(root.join("pocket"), PocketSyncPolicy::FlushOnShutdown)
+            .expect("config");
         let handle = PocketStoreHandle::open(&config).expect("open");
         let first =
             parse_pocket_event_json(event_json_with("a", "1", "first").as_bytes()).expect("first");
@@ -637,13 +598,8 @@ mod tests {
     #[test]
     fn pocket_store_handle_screens_events_before_materialization() {
         let root = temp_root("tangle-pocket-screen");
-        let config = PocketStoreConfig::new(
-            root.join("pocket"),
-            1024 * 1024 * 1024,
-            128,
-            PocketSyncPolicy::FlushOnShutdown,
-        )
-        .expect("config");
+        let config = PocketStoreConfig::new(root.join("pocket"), PocketSyncPolicy::FlushOnShutdown)
+            .expect("config");
         let handle = PocketStoreHandle::open(&config).expect("open");
         let visible = parse_pocket_event_json(event_json_with("a", "1", "visible").as_bytes())
             .expect("visible");
@@ -674,13 +630,8 @@ mod tests {
     #[test]
     fn pocket_store_handle_persists_extra_table_records() {
         let root = temp_root("tangle-pocket-extra");
-        let config = PocketStoreConfig::new(
-            root.join("pocket"),
-            1024 * 1024 * 1024,
-            128,
-            PocketSyncPolicy::FlushOnShutdown,
-        )
-        .expect("config");
+        let config = PocketStoreConfig::new(root.join("pocket"), PocketSyncPolicy::FlushOnShutdown)
+            .expect("config");
         let handle = PocketStoreHandle::open(&config).expect("open");
 
         handle
@@ -744,13 +695,8 @@ mod tests {
     #[test]
     fn pocket_store_handle_syncs_written_events_and_extra_records() {
         let root = temp_root("tangle-pocket-sync");
-        let config = PocketStoreConfig::new(
-            root.join("pocket"),
-            1024 * 1024 * 1024,
-            128,
-            PocketSyncPolicy::FlushOnShutdown,
-        )
-        .expect("config");
+        let config = PocketStoreConfig::new(root.join("pocket"), PocketSyncPolicy::FlushOnShutdown)
+            .expect("config");
         let handle = PocketStoreHandle::open(&config).expect("open");
         let event =
             parse_pocket_event_json(event_json_with("d", "4", "synced").as_bytes()).expect("event");
@@ -790,8 +736,6 @@ mod tests {
     fn pocket_store_config_preserves_explicit_storage_boundary() {
         let config = PocketStoreConfig::new(
             "runtime/radroots/tangle/pocket",
-            1024 * 1024 * 1024,
-            128,
             PocketSyncPolicy::FlushOnShutdown,
         )
         .expect("config");
@@ -800,40 +744,16 @@ mod tests {
             config.data_directory().to_string_lossy(),
             "runtime/radroots/tangle/pocket"
         );
-        assert_eq!(config.map_size_bytes(), 1024 * 1024 * 1024);
-        assert_eq!(config.reader_slots(), 128);
         assert_eq!(config.sync_policy(), PocketSyncPolicy::FlushOnShutdown);
     }
 
     #[test]
     fn pocket_store_config_rejects_implicit_storage_values() {
         assert_eq!(
-            PocketStoreConfig::new("", 1, 1, PocketSyncPolicy::FlushOnWrite)
+            PocketStoreConfig::new("", PocketSyncPolicy::FlushOnWrite)
                 .expect_err("error")
                 .message(),
             "pocket.data_directory must not be empty"
-        );
-        assert_eq!(
-            PocketStoreConfig::new(
-                "runtime/radroots/tangle/pocket",
-                0,
-                1,
-                PocketSyncPolicy::FlushOnWrite
-            )
-            .expect_err("error")
-            .message(),
-            "pocket.map_size_bytes must be greater than zero"
-        );
-        assert_eq!(
-            PocketStoreConfig::new(
-                "runtime/radroots/tangle/pocket",
-                1,
-                0,
-                PocketSyncPolicy::FlushOnWrite
-            )
-            .expect_err("error")
-            .message(),
-            "pocket.reader_slots must be greater than zero"
         );
     }
 

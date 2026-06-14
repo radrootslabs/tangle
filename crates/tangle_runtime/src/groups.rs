@@ -1071,13 +1071,8 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let config = PocketStoreConfig::new(
-            root.join("pocket"),
-            1024 * 1024 * 1024,
-            128,
-            PocketSyncPolicy::FlushOnShutdown,
-        )
-        .expect("config");
+        let config = PocketStoreConfig::new(root.join("pocket"), PocketSyncPolicy::FlushOnShutdown)
+            .expect("config");
         let store = PocketStoreHandle::open(&config).expect("store");
 
         assert!(
@@ -1094,13 +1089,8 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let config = PocketStoreConfig::new(
-            root.join("pocket"),
-            1024 * 1024 * 1024,
-            128,
-            PocketSyncPolicy::FlushOnShutdown,
-        )
-        .expect("config");
+        let config = PocketStoreConfig::new(root.join("pocket"), PocketSyncPolicy::FlushOnShutdown)
+            .expect("config");
         let store = PocketStoreHandle::open(&config).expect("store");
         let public =
             tangle_v2_event(FixtureKey::Member, 1, 1, Vec::new(), "public").expect("public");
@@ -1254,13 +1244,8 @@ mod tests {
     fn test_store(name: &str) -> (std::path::PathBuf, PocketStoreHandle) {
         let root = std::env::temp_dir().join(format!("{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let config = PocketStoreConfig::new(
-            root.join("pocket"),
-            1024 * 1024 * 1024,
-            128,
-            PocketSyncPolicy::FlushOnShutdown,
-        )
-        .expect("config");
+        let config = PocketStoreConfig::new(root.join("pocket"), PocketSyncPolicy::FlushOnShutdown)
+            .expect("config");
         let store = PocketStoreHandle::open(&config).expect("store");
         (root, store)
     }

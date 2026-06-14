@@ -102,8 +102,6 @@ fn tangle_run_starts_server_and_stays_alive_until_shutdown() {
             },
             "pocket": {
                 "data_directory": data_dir,
-                "map_size_bytes": 10485760,
-                "reader_slots": 32,
                 "sync_policy": "flush_on_shutdown"
             },
             "groups": {
