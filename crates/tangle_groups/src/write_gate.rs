@@ -124,7 +124,7 @@ mod tests {
     };
     use crate::{
         GroupErrorKind, GroupEventClass, GroupLimitsConfig, KIND_GROUP_DELETE_EVENT,
-        KIND_GROUP_JOIN_REQUEST, KIND_GROUP_METADATA, KIND_GROUP_PUT_USER,
+        KIND_GROUP_JOIN_REQUEST, KIND_GROUP_PUT_USER, NIP29_RELAY_GENERATED_KIND_VALUES,
     };
     use pocket_types::Event as PocketEvent;
     use tangle_protocol::{
@@ -134,26 +134,25 @@ mod tests {
 
     #[test]
     fn client_submitted_relay_generated_events_are_rejected() {
-        let event = event(
-            KIND_GROUP_METADATA,
-            vec![Tag::from_parts("d", &["Farm"]).expect("d")],
-        );
-        let error = validate_client_group_event_structure(&event, GroupLimitsConfig::default())
-            .expect_err("relay generated");
+        for kind in NIP29_RELAY_GENERATED_KIND_VALUES {
+            let event = event(kind, vec![Tag::from_parts("d", &["Farm"]).expect("d")]);
+            let error = validate_client_group_event_structure(&event, GroupLimitsConfig::default())
+                .expect_err("relay generated");
 
-        assert_eq!(error.kind(), GroupErrorKind::DirectRelayGeneratedSubmission);
-        assert_eq!(
-            error.prefixed_message(),
-            "blocked: relay-generated group state events cannot be submitted by clients"
-        );
+            assert_eq!(error.kind(), GroupErrorKind::DirectRelayGeneratedSubmission);
+            assert_eq!(
+                error.prefixed_message(),
+                "blocked: relay-generated group state events cannot be submitted by clients"
+            );
 
-        let mut buffer = vec![0; 4096];
-        let error = validate_client_group_event_structure(
-            pocket_event(&event, &mut buffer),
-            GroupLimitsConfig::default(),
-        )
-        .expect_err("pocket relay generated");
-        assert_eq!(error.kind(), GroupErrorKind::DirectRelayGeneratedSubmission);
+            let mut buffer = vec![0; 4096];
+            let error = validate_client_group_event_structure(
+                pocket_event(&event, &mut buffer),
+                GroupLimitsConfig::default(),
+            )
+            .expect_err("pocket relay generated");
+            assert_eq!(error.kind(), GroupErrorKind::DirectRelayGeneratedSubmission);
+        }
     }
 
     #[test]

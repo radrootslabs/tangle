@@ -569,8 +569,8 @@ mod tests {
         GroupId, KIND_GROUP_ADMINS, KIND_GROUP_CREATE_GROUP, KIND_GROUP_CREATE_INVITE,
         KIND_GROUP_DELETE_EVENT, KIND_GROUP_DELETE_GROUP, KIND_GROUP_EDIT_METADATA,
         KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA,
-        KIND_GROUP_PUT_USER, KIND_GROUP_REMOVE_USER, MemberStatus, StoreOffset,
-        parse_group_runtime_config_json,
+        KIND_GROUP_PUT_USER, KIND_GROUP_REMOVE_USER, MemberStatus,
+        NIP29_RELAY_GENERATED_KIND_VALUES, StoreOffset, parse_group_runtime_config_json,
     };
     use tangle_protocol::{
         ClientMessage, Event, EventId, Filter, Kind, PublicKeyHex, RelayMessage, SubscriptionId,
@@ -821,23 +821,25 @@ mod tests {
     #[test]
     fn base_relay_rejects_client_submitted_relay_generated_group_state() {
         let mut relay = test_relay("base-relay-generated-group-reject", 4);
-        let event = signed_public_event(
-            7,
-            39_000,
-            vec![Tag::from_parts("d", &["public-group"]).expect("group")],
-            "",
-        );
+        for kind in NIP29_RELAY_GENERATED_KIND_VALUES {
+            let event = signed_public_event(
+                7,
+                kind.into(),
+                vec![Tag::from_parts("d", &["public-group"]).expect("group")],
+                "",
+            );
 
-        assert_eq!(
-            relay.handle_event(event.clone()).expect("event"),
-            RelayMessage::Ok {
-                event_id: event.id().clone(),
-                accepted: false,
-                message:
-                    "blocked: relay-generated group state events cannot be submitted by clients"
-                        .to_owned()
-            }
-        );
+            assert_eq!(
+                relay.handle_event(event.clone()).expect("event"),
+                RelayMessage::Ok {
+                    event_id: event.id().clone(),
+                    accepted: false,
+                    message:
+                        "blocked: relay-generated group state events cannot be submitted by clients"
+                            .to_owned()
+                }
+            );
+        }
     }
 
     #[test]
