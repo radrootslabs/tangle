@@ -1379,10 +1379,8 @@ fn rebuilt_projection_matches_live_projection_for_moderation_stream() {
         PocketQueryConfig::default(),
     )
     .expect("reopen");
-    assert_projection_without_checkpoint_eq(
-        &live_projection,
-        relay.group_projection().expect("projection"),
-    );
+    let recovered_projection = relay.group_projection().expect("projection");
+    assert_projection_without_checkpoint_eq(&live_projection, &recovered_projection);
     assert_eq!(
         stored_event_ids_for_kind(&config, KIND_GROUP_METADATA),
         metadata_before

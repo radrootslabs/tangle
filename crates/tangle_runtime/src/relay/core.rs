@@ -1,5 +1,5 @@
 use crate::errors::{BaseRelayError, ok_accepted, ok_rejected};
-use crate::groups::GroupService;
+use crate::groups::{GroupProjectionReadGuard, GroupServiceHandle};
 use crate::logging::{self, TangleModerationAuditResult};
 use crate::ops::BaseRelayReadinessState;
 use crate::pocket_conversion::{
@@ -12,8 +12,8 @@ use crate::relay::{
 use std::{cell::RefCell, collections::BTreeSet};
 use tangle_crypto::verify_event_signature;
 use tangle_groups::{
-    GroupAuthContext, GroupEventClass, GroupEventView, GroupProjection, GroupRuntimeConfig,
-    StoreOffset, classify_group_event, validate_client_group_event_structure,
+    GroupAuthContext, GroupEventClass, GroupEventView, GroupRuntimeConfig, StoreOffset,
+    classify_group_event, validate_client_group_event_structure,
 };
 use tangle_protocol::{ClientMessage, Event, Filter, RelayMessage, SubscriptionId, UnixTimestamp};
 use tangle_store_pocket::{
@@ -23,7 +23,7 @@ use tangle_store_pocket::{
 pub struct BaseRelay {
     store: PocketStoreHandle,
     subscriptions: LiveSubscriptionSet,
-    groups: Option<GroupService>,
+    groups: Option<GroupServiceHandle>,
     readiness: BaseRelayReadinessState,
     limits: BaseRelayLimits,
     query: PocketQueryConfig,
@@ -458,7 +458,7 @@ impl BaseRelay {
         groups: &GroupRuntimeConfig,
         query: PocketQueryConfig,
     ) -> Result<Self, BaseRelayError> {
-        let groups = GroupService::from_config(&store, groups)?;
+        let groups = GroupServiceHandle::from_config(&store, groups)?;
         let subscriptions =
             LiveSubscriptionSet::new(limits.max_pending_events(), limits.max_subscriptions())?;
         let readiness = BaseRelayReadinessState::runtime_ready_before_bind();
@@ -610,18 +610,18 @@ impl BaseRelay {
         self.store.clone()
     }
 
-    pub fn group_projection(&self) -> Option<&GroupProjection> {
-        self.groups.as_ref().map(|groups| groups.projection())
+    pub fn group_projection(&self) -> Option<GroupProjectionReadGuard<'_>> {
+        self.groups.as_ref().map(GroupServiceHandle::projection)
     }
 
-    pub(crate) fn group_service(&self) -> Option<&GroupService> {
+    pub(crate) fn group_service(&self) -> Option<&GroupServiceHandle> {
         self.groups.as_ref()
     }
 
     pub(crate) fn group_outbox_pending_events(&self) -> usize {
         self.groups
             .as_ref()
-            .map(GroupService::outbox_pending_events)
+            .map(GroupServiceHandle::outbox_pending_events)
             .unwrap_or(0)
     }
 
@@ -665,7 +665,7 @@ impl BaseRelay {
         let group_limits = self
             .groups
             .as_ref()
-            .map(GroupService::limits)
+            .map(GroupServiceHandle::limits)
             .unwrap_or_default();
         let audit_class = classify_group_event(&event, group_limits).ok();
         let class = match validate_client_group_event_structure(&event, group_limits) {
@@ -1028,7 +1028,7 @@ impl BaseRelay {
     }
 
     pub(crate) fn group_read_gate_visible_to_auth(
-        groups: Option<&GroupService>,
+        groups: Option<&GroupServiceHandle>,
         event: &(impl GroupEventView + ?Sized),
         auth: &GroupAuthContext,
     ) -> Result<bool, BaseRelayError> {
@@ -1828,12 +1828,11 @@ mod tests {
         );
 
         let group_id = GroupId::new("Farm").expect("group");
-        let group = relay
-            .group_projection()
-            .expect("projection")
-            .group(&group_id)
-            .expect("group");
-        assert_eq!(group.metadata().name(), Some("Market"));
+        {
+            let projection = relay.group_projection().expect("projection");
+            let group = projection.group(&group_id).expect("group");
+            assert_eq!(group.metadata().name(), Some("Market"));
+        }
         let metadata = query_filter(
             &mut relay,
             "metadata-edit",

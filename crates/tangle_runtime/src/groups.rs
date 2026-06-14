@@ -5,7 +5,9 @@ use crate::{
     pocket_conversion::{pocket_event_id, pocket_event_to_tangle, tangle_event_to_pocket},
 };
 use std::{
+    ops::Deref,
     str,
+    sync::{Arc, RwLock, RwLockReadGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tangle_crypto::RelaySigner;
@@ -27,7 +29,24 @@ use tangle_store_pocket::{
     TANGLE_GROUP_PROJECTION_TABLE,
 };
 
-pub(crate) struct GroupService {
+#[derive(Clone)]
+pub(crate) struct GroupServiceHandle {
+    state: Arc<RwLock<GroupServiceState>>,
+}
+
+pub struct GroupProjectionReadGuard<'a> {
+    state: RwLockReadGuard<'a, GroupServiceState>,
+}
+
+impl Deref for GroupProjectionReadGuard<'_> {
+    type Target = GroupProjection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state.projection
+    }
+}
+
+pub(crate) struct GroupServiceState {
     builder: GroupGeneratedEventBuilder,
     authority: GroupAuthority,
     projection: GroupProjection,
@@ -38,8 +57,81 @@ pub(crate) struct GroupService {
     outbox_replay_batch_cap: u32,
 }
 
-impl GroupService {
+impl GroupServiceHandle {
     pub(crate) fn from_config(
+        store: &PocketStoreHandle,
+        config: &GroupRuntimeConfig,
+    ) -> Result<Option<Self>, BaseRelayError> {
+        GroupServiceState::from_config(store, config).map(|state| {
+            state.map(|state| Self {
+                state: Arc::new(RwLock::new(state)),
+            })
+        })
+    }
+
+    pub(crate) fn projection(&self) -> GroupProjectionReadGuard<'_> {
+        GroupProjectionReadGuard {
+            state: self
+                .state
+                .read()
+                .expect("group service state lock is not poisoned"),
+        }
+    }
+
+    pub(crate) fn limits(&self) -> GroupLimitsConfig {
+        self.state
+            .read()
+            .expect("group service state lock is not poisoned")
+            .limits()
+    }
+
+    pub(crate) fn outbox_pending_events(&self) -> usize {
+        self.state
+            .read()
+            .expect("group service state lock is not poisoned")
+            .outbox_pending_events()
+    }
+
+    pub(crate) fn check_event(
+        &self,
+        store: &PocketStoreHandle,
+        event: &Event,
+        class: &GroupEventClass,
+        auth: &GroupAuthContext,
+    ) -> Result<(), GroupError> {
+        self.state
+            .read()
+            .map_err(|_| GroupError::internal("group service state lock is poisoned"))?
+            .check_event(store, event, class, auth)
+    }
+
+    pub(crate) fn event_visible_to_auth(
+        &self,
+        event: &(impl GroupEventView + ?Sized),
+        auth: &GroupAuthContext,
+    ) -> Result<bool, GroupError> {
+        self.state
+            .read()
+            .map_err(|_| GroupError::internal("group service state lock is poisoned"))?
+            .event_visible_to_auth(event, auth)
+    }
+
+    pub(crate) fn after_source_event_stored(
+        &self,
+        store: &PocketStoreHandle,
+        event: &Event,
+        class: &GroupEventClass,
+        store_offset: StoreOffset,
+    ) -> Result<Vec<StoreOffset>, BaseRelayError> {
+        self.state
+            .write()
+            .map_err(|_| BaseRelayError::error("group service state lock is poisoned"))?
+            .after_source_event_stored(store, event, class, store_offset)
+    }
+}
+
+impl GroupServiceState {
+    fn from_config(
         store: &PocketStoreHandle,
         config: &GroupRuntimeConfig,
     ) -> Result<Option<Self>, BaseRelayError> {
@@ -52,7 +144,7 @@ impl GroupService {
         let signer = RelaySigner::from_secret_hex(relay_secret.expose_for_signing())
             .map_err(BaseRelayError::invalid)?;
         let storage = load_group_storage(store, config.limits())?;
-        let mut service = Self {
+        let mut state = Self {
             builder: GroupGeneratedEventBuilder::new(signer),
             authority: GroupAuthority::new(
                 config.owner_pubkeys().iter().cloned(),
@@ -65,24 +157,20 @@ impl GroupService {
             member_snapshot_cap: config.limits().max_member_list_pubkeys(),
             outbox_replay_batch_cap: config.limits().max_outbox_replay_batch(),
         };
-        service.derive_missing_outbox_records(store)?;
-        service.materialize_outbox(store)?;
-        Ok(Some(service))
+        state.derive_missing_outbox_records(store)?;
+        state.materialize_outbox(store)?;
+        Ok(Some(state))
     }
 
-    pub(crate) fn projection(&self) -> &GroupProjection {
-        &self.projection
-    }
-
-    pub(crate) fn limits(&self) -> GroupLimitsConfig {
+    fn limits(&self) -> GroupLimitsConfig {
         self.limits
     }
 
-    pub(crate) fn outbox_pending_events(&self) -> usize {
+    fn outbox_pending_events(&self) -> usize {
         self.outbox.replay_plan().records().len()
     }
 
-    pub(crate) fn check_event(
+    fn check_event(
         &self,
         store: &PocketStoreHandle,
         event: &Event,
@@ -138,7 +226,7 @@ impl GroupService {
         Ok(())
     }
 
-    pub(crate) fn event_visible_to_auth(
+    fn event_visible_to_auth(
         &self,
         event: &(impl GroupEventView + ?Sized),
         auth: &GroupAuthContext,
@@ -157,7 +245,7 @@ impl GroupService {
         Ok(false)
     }
 
-    pub(crate) fn after_source_event_stored(
+    fn after_source_event_stored(
         &mut self,
         store: &PocketStoreHandle,
         event: &Event,
@@ -1046,7 +1134,7 @@ fn delete_target_event_id(event: &Event) -> Result<EventId, GroupError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GroupCheckpointStatus, GroupService, scan_canonical_group_events,
+        GroupCheckpointStatus, GroupServiceHandle, scan_canonical_group_events,
         scan_canonical_group_events_after, validate_group_extra_tables,
     };
     use crate::pocket_conversion::tangle_event_to_pocket;
@@ -1075,7 +1163,7 @@ mod tests {
         let store = PocketStoreHandle::open(&config).expect("store");
 
         assert!(
-            GroupService::from_config(&store, &GroupRuntimeConfig::disabled())
+            GroupServiceHandle::from_config(&store, &GroupRuntimeConfig::disabled())
                 .expect("service")
                 .is_none()
         );
