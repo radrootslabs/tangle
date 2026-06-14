@@ -9,7 +9,7 @@ use crate::{
         live::{CloseResult, LiveSubscriptionSet},
     },
     runtime::{
-        TangleClientMessageMetricKind, TangleQueryRateLimitContext, TangleRuntimeHandle,
+        TangleClientMessageMetricKind, TangleClientRateLimitContext, TangleRuntimeHandle,
         TangleRuntimeLimits,
     },
 };
@@ -271,9 +271,9 @@ impl TangleWebSocketSession {
                 subscription_id,
                 filters,
             } => {
-                let context = self.query_rate_limit_context();
+                let context = self.client_rate_limit_context();
                 self.runtime
-                    .handle_client_message_with_query_context(
+                    .handle_client_message_with_rate_limit_context(
                         ClientMessage::Count {
                             subscription_id,
                             filters,
@@ -296,8 +296,14 @@ impl TangleWebSocketSession {
                 Ok(Vec::new())
             }
             message => {
+                let context = self.client_rate_limit_context();
                 self.runtime
-                    .handle_client_message(message, &mut self.auth, current_unix_timestamp())
+                    .handle_client_message_with_rate_limit_context(
+                        message,
+                        &mut self.auth,
+                        context,
+                        current_unix_timestamp(),
+                    )
                     .await
             }
         }
@@ -320,7 +326,7 @@ impl TangleWebSocketSession {
                 &subscription_id,
                 &filters,
                 &self.auth,
-                self.query_rate_limit_context(),
+                self.client_rate_limit_context(),
                 current_unix_timestamp(),
             )
             .await
@@ -347,8 +353,8 @@ impl TangleWebSocketSession {
         }
     }
 
-    fn query_rate_limit_context(&self) -> TangleQueryRateLimitContext {
-        TangleQueryRateLimitContext::new(self.peer_ip, Some(self.connection_id))
+    fn client_rate_limit_context(&self) -> TangleClientRateLimitContext {
+        TangleClientRateLimitContext::new(self.peer_ip, Some(self.connection_id))
     }
 
     fn send_relay_message(&self, message: RelayMessage) -> Result<(), TangleOutboundQueueError> {
@@ -759,18 +765,23 @@ mod tests {
             },
             "rate_limits": {
                 "auth": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 120},
                     "per_pubkey": {"window_seconds": 60, "max_hits": 30},
-                    "failures": {"window_seconds": 300, "max_hits": 5}
+                    "failures": {"window_seconds": 300, "max_hits": 5},
+                    "failures_per_ip": {"window_seconds": 300, "max_hits": 20}
                 },
                 "event": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 600},
                     "per_pubkey": {"window_seconds": 60, "max_hits": 120},
                     "per_kind": {"window_seconds": 60, "max_hits": 1000}
                 },
                 "group": {
+                    "write_per_ip": {"window_seconds": 60, "max_hits": 300},
                     "write_per_pubkey": {"window_seconds": 60, "max_hits": 60},
                     "write_per_group": {"window_seconds": 60, "max_hits": 90},
                     "write_per_kind": {"window_seconds": 60, "max_hits": 300},
-                    "join_flow": {"window_seconds": 300, "max_hits": 10}
+                    "join_flow": {"window_seconds": 300, "max_hits": 10},
+                    "join_flow_per_ip": {"window_seconds": 300, "max_hits": 30}
                 },
                 "req": {
                     "per_ip": {"window_seconds": 60, "max_hits": 600},

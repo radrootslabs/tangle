@@ -1635,18 +1635,23 @@ fn runtime_config_value(root: &Path, listen_addr: SocketAddr) -> Value {
         },
         "rate_limits": {
             "auth": {
+                "per_ip": {"window_seconds": 60, "max_hits": 120},
                 "per_pubkey": {"window_seconds": 60, "max_hits": 30},
-                "failures": {"window_seconds": 300, "max_hits": 5}
+                "failures": {"window_seconds": 300, "max_hits": 5},
+                    "failures_per_ip": {"window_seconds": 300, "max_hits": 20}
             },
             "event": {
+                "per_ip": {"window_seconds": 60, "max_hits": 600},
                 "per_pubkey": {"window_seconds": 60, "max_hits": 120},
                 "per_kind": {"window_seconds": 60, "max_hits": 1000}
             },
             "group": {
+                "write_per_ip": {"window_seconds": 60, "max_hits": 300},
                 "write_per_pubkey": {"window_seconds": 60, "max_hits": 60},
                 "write_per_group": {"window_seconds": 60, "max_hits": 90},
                 "write_per_kind": {"window_seconds": 60, "max_hits": 300},
-                "join_flow": {"window_seconds": 300, "max_hits": 10}
+                "join_flow": {"window_seconds": 300, "max_hits": 10},
+                    "join_flow_per_ip": {"window_seconds": 300, "max_hits": 30}
             },
             "req": {
                 "per_ip": {"window_seconds": 60, "max_hits": 600},

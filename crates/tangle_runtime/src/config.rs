@@ -354,13 +354,16 @@ struct BaseRelayRateLimitsDocument {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BaseRelayAuthRateLimitsDocument {
+    per_ip: BaseRelayRateLimitRuleDocument,
     per_pubkey: BaseRelayRateLimitRuleDocument,
     failures: BaseRelayRateLimitRuleDocument,
+    failures_per_ip: BaseRelayRateLimitRuleDocument,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BaseRelayEventRateLimitsDocument {
+    per_ip: BaseRelayRateLimitRuleDocument,
     per_pubkey: BaseRelayRateLimitRuleDocument,
     per_kind: BaseRelayRateLimitRuleDocument,
 }
@@ -368,10 +371,12 @@ struct BaseRelayEventRateLimitsDocument {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BaseRelayGroupRateLimitsDocument {
+    write_per_ip: BaseRelayRateLimitRuleDocument,
     write_per_pubkey: BaseRelayRateLimitRuleDocument,
     write_per_group: BaseRelayRateLimitRuleDocument,
     write_per_kind: BaseRelayRateLimitRuleDocument,
     join_flow: BaseRelayRateLimitRuleDocument,
+    join_flow_per_ip: BaseRelayRateLimitRuleDocument,
 }
 
 #[derive(Debug, Deserialize)]
@@ -490,6 +495,10 @@ fn base_relay_rate_limits_from_document(
     Ok(TangleRateLimitConfig::new(
         TangleAuthRateLimitConfig::new(
             base_relay_rate_limit_rule_from_document(
+                "rate_limits.auth.per_ip",
+                document.auth.per_ip,
+            )?,
+            base_relay_rate_limit_rule_from_document(
                 "rate_limits.auth.per_pubkey",
                 document.auth.per_pubkey,
             )?,
@@ -497,8 +506,16 @@ fn base_relay_rate_limits_from_document(
                 "rate_limits.auth.failures",
                 document.auth.failures,
             )?,
+            base_relay_rate_limit_rule_from_document(
+                "rate_limits.auth.failures_per_ip",
+                document.auth.failures_per_ip,
+            )?,
         ),
         TangleEventRateLimitConfig::new(
+            base_relay_rate_limit_rule_from_document(
+                "rate_limits.event.per_ip",
+                document.event.per_ip,
+            )?,
             base_relay_rate_limit_rule_from_document(
                 "rate_limits.event.per_pubkey",
                 document.event.per_pubkey,
@@ -509,6 +526,10 @@ fn base_relay_rate_limits_from_document(
             )?,
         ),
         TangleGroupRateLimitConfig::new(
+            base_relay_rate_limit_rule_from_document(
+                "rate_limits.group.write_per_ip",
+                document.group.write_per_ip,
+            )?,
             base_relay_rate_limit_rule_from_document(
                 "rate_limits.group.write_per_pubkey",
                 document.group.write_per_pubkey,
@@ -524,6 +545,10 @@ fn base_relay_rate_limits_from_document(
             base_relay_rate_limit_rule_from_document(
                 "rate_limits.group.join_flow",
                 document.group.join_flow,
+            )?,
+            base_relay_rate_limit_rule_from_document(
+                "rate_limits.group.join_flow_per_ip",
+                document.group.join_flow_per_ip,
             )?,
         ),
         base_relay_query_rate_limits_from_document("rate_limits.req", document.req)?,
@@ -624,10 +649,14 @@ mod tests {
         assert_eq!(config.limits().max_content_length(), 65_536);
         assert_eq!(config.limits().broadcast_channel_capacity(), 4_096);
         assert_eq!(config.limits().per_connection_outbound_queue(), 256);
+        assert_eq!(config.rate_limits().auth().per_ip().max_hits(), 120);
         assert_eq!(config.rate_limits().auth().per_pubkey().max_hits(), 30);
         assert_eq!(config.rate_limits().auth().failures().max_hits(), 5);
+        assert_eq!(config.rate_limits().auth().failures_per_ip().max_hits(), 20);
+        assert_eq!(config.rate_limits().event().per_ip().max_hits(), 600);
         assert_eq!(config.rate_limits().event().per_pubkey().max_hits(), 120);
         assert_eq!(config.rate_limits().event().per_kind().max_hits(), 1_000);
+        assert_eq!(config.rate_limits().group().write_per_ip().max_hits(), 300);
         assert_eq!(
             config.rate_limits().group().write_per_pubkey().max_hits(),
             60
@@ -641,6 +670,10 @@ mod tests {
             300
         );
         assert_eq!(config.rate_limits().group().join_flow().max_hits(), 10);
+        assert_eq!(
+            config.rate_limits().group().join_flow_per_ip().max_hits(),
+            30
+        );
         assert_eq!(config.rate_limits().req().per_ip().max_hits(), 600);
         assert_eq!(config.rate_limits().req().per_connection().max_hits(), 120);
         assert_eq!(config.rate_limits().req().per_pubkey().max_hits(), 240);
@@ -694,18 +727,23 @@ mod tests {
             },
             "rate_limits": {
                 "auth": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 120},
                     "per_pubkey": {"window_seconds": 60, "max_hits": 30},
-                    "failures": {"window_seconds": 300, "max_hits": 5}
+                    "failures": {"window_seconds": 300, "max_hits": 5},
+                    "failures_per_ip": {"window_seconds": 300, "max_hits": 20}
                 },
                 "event": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 600},
                     "per_pubkey": {"window_seconds": 60, "max_hits": 120},
                     "per_kind": {"window_seconds": 60, "max_hits": 1000}
                 },
                 "group": {
+                    "write_per_ip": {"window_seconds": 60, "max_hits": 300},
                     "write_per_pubkey": {"window_seconds": 60, "max_hits": 60},
                     "write_per_group": {"window_seconds": 60, "max_hits": 90},
                     "write_per_kind": {"window_seconds": 60, "max_hits": 300},
-                    "join_flow": {"window_seconds": 300, "max_hits": 10}
+                    "join_flow": {"window_seconds": 300, "max_hits": 10},
+                    "join_flow_per_ip": {"window_seconds": 300, "max_hits": 30}
                 },
                 "req": {
                     "per_ip": {"window_seconds": 60, "max_hits": 600},
@@ -770,18 +808,23 @@ mod tests {
             },
             "rate_limits": {
                 "auth": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 120},
                     "per_pubkey": {"window_seconds": 60, "max_hits": 30},
-                    "failures": {"window_seconds": 300, "max_hits": 5}
+                    "failures": {"window_seconds": 300, "max_hits": 5},
+                    "failures_per_ip": {"window_seconds": 300, "max_hits": 20}
                 },
                 "event": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 600},
                     "per_pubkey": {"window_seconds": 60, "max_hits": 120},
                     "per_kind": {"window_seconds": 60, "max_hits": 1000}
                 },
                 "group": {
+                    "write_per_ip": {"window_seconds": 60, "max_hits": 300},
                     "write_per_pubkey": {"window_seconds": 60, "max_hits": 60},
                     "write_per_group": {"window_seconds": 60, "max_hits": 90},
                     "write_per_kind": {"window_seconds": 60, "max_hits": 300},
-                    "join_flow": {"window_seconds": 300, "max_hits": 10}
+                    "join_flow": {"window_seconds": 300, "max_hits": 10},
+                    "join_flow_per_ip": {"window_seconds": 300, "max_hits": 30}
                 },
                 "req": {
                     "per_ip": {"window_seconds": 60, "max_hits": 600},
@@ -844,18 +887,23 @@ mod tests {
             },
             "rate_limits": {
                 "auth": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 120},
                     "per_pubkey": {"window_seconds": 60, "max_hits": 30},
-                    "failures": {"window_seconds": 300, "max_hits": 5}
+                    "failures": {"window_seconds": 300, "max_hits": 5},
+                    "failures_per_ip": {"window_seconds": 300, "max_hits": 20}
                 },
                 "event": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 600},
                     "per_pubkey": {"window_seconds": 60, "max_hits": 120},
                     "per_kind": {"window_seconds": 60, "max_hits": 1000}
                 },
                 "group": {
+                    "write_per_ip": {"window_seconds": 60, "max_hits": 300},
                     "write_per_pubkey": {"window_seconds": 60, "max_hits": 60},
                     "write_per_group": {"window_seconds": 60, "max_hits": 90},
                     "write_per_kind": {"window_seconds": 60, "max_hits": 300},
-                    "join_flow": {"window_seconds": 300, "max_hits": 10}
+                    "join_flow": {"window_seconds": 300, "max_hits": 10},
+                    "join_flow_per_ip": {"window_seconds": 300, "max_hits": 30}
                 },
                 "req": {
                     "per_ip": {"window_seconds": 60, "max_hits": 600},
@@ -892,6 +940,64 @@ mod tests {
                 .expect_err("missing query complexity")
                 .prefixed_message()
                 .contains("missing field `max_query_complexity`")
+        );
+    }
+
+    #[test]
+    fn base_relay_runtime_config_requires_ip_scoped_rate_limits() {
+        let raw = include_str!("../../../ops/production/tangle-v2.example.json").replace(
+            "      \"per_ip\": {\n        \"window_seconds\": 60,\n        \"max_hits\": 120\n      },\n",
+            "",
+        );
+        assert!(
+            parse_base_relay_runtime_config_json(&raw)
+                .expect_err("missing auth ip")
+                .prefixed_message()
+                .contains("missing field `per_ip`")
+        );
+
+        let raw = include_str!("../../../ops/production/tangle-v2.example.json").replace(
+            "      \"failures\": {\n        \"window_seconds\": 300,\n        \"max_hits\": 5\n      },\n      \"failures_per_ip\": {\n        \"window_seconds\": 300,\n        \"max_hits\": 20\n      }\n",
+            "      \"failures\": {\n        \"window_seconds\": 300,\n        \"max_hits\": 5\n      }\n",
+        );
+        assert!(
+            parse_base_relay_runtime_config_json(&raw)
+                .expect_err("missing auth failure ip")
+                .prefixed_message()
+                .contains("missing field `failures_per_ip`")
+        );
+
+        let raw = include_str!("../../../ops/production/tangle-v2.example.json").replace(
+            "      \"per_ip\": {\n        \"window_seconds\": 60,\n        \"max_hits\": 600\n      },\n",
+            "",
+        );
+        assert!(
+            parse_base_relay_runtime_config_json(&raw)
+                .expect_err("missing event ip")
+                .prefixed_message()
+                .contains("missing field `per_ip`")
+        );
+
+        let raw = include_str!("../../../ops/production/tangle-v2.example.json").replace(
+            "      \"write_per_ip\": {\n        \"window_seconds\": 60,\n        \"max_hits\": 300\n      },\n",
+            "",
+        );
+        assert!(
+            parse_base_relay_runtime_config_json(&raw)
+                .expect_err("missing group write ip")
+                .prefixed_message()
+                .contains("missing field `write_per_ip`")
+        );
+
+        let raw = include_str!("../../../ops/production/tangle-v2.example.json").replace(
+            "      \"join_flow\": {\n        \"window_seconds\": 300,\n        \"max_hits\": 10\n      },\n      \"join_flow_per_ip\": {\n        \"window_seconds\": 300,\n        \"max_hits\": 30\n      }\n",
+            "      \"join_flow\": {\n        \"window_seconds\": 300,\n        \"max_hits\": 10\n      }\n",
+        );
+        assert!(
+            parse_base_relay_runtime_config_json(&raw)
+                .expect_err("missing group join ip")
+                .prefixed_message()
+                .contains("missing field `join_flow_per_ip`")
         );
     }
 }

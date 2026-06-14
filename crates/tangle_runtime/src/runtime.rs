@@ -49,12 +49,12 @@ pub struct TangleRuntime {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TangleQueryRateLimitContext {
+pub struct TangleClientRateLimitContext {
     peer_ip: Option<IpAddr>,
     connection_id: Option<u64>,
 }
 
-impl TangleQueryRateLimitContext {
+impl TangleClientRateLimitContext {
     pub fn new(peer_ip: Option<IpAddr>, connection_id: Option<u64>) -> Self {
         Self {
             peer_ip,
@@ -70,7 +70,7 @@ struct TangleQueryRateLimitRequest<'a> {
     subscription_id: &'a SubscriptionId,
     filters: &'a [Filter],
     auth: &'a BaseAuthState,
-    context: TangleQueryRateLimitContext,
+    context: TangleClientRateLimitContext,
     now: UnixTimestamp,
 }
 
@@ -149,8 +149,24 @@ impl TangleRuntime {
         self.relay.shutdown()
     }
 
-    fn rate_limit_event(&self, event: &Event, now: UnixTimestamp) -> Option<RelayMessage> {
+    fn rate_limit_event(
+        &self,
+        event: &Event,
+        context: TangleClientRateLimitContext,
+        now: UnixTimestamp,
+    ) -> Option<RelayMessage> {
         let rules = self.config.rate_limits().event();
+        if let Some(peer_ip) = context.peer_ip
+            && let Some(message) = self.rate_limit_ok(
+                event,
+                TangleRateLimitKey::ip(TangleRateLimitScope::Event, peer_ip),
+                rules.per_ip(),
+                "event ip",
+                now,
+            )
+        {
+            return Some(message);
+        }
         self.rate_limit_ok(
             event,
             TangleRateLimitKey::pubkey(
@@ -172,8 +188,24 @@ impl TangleRuntime {
         })
     }
 
-    fn rate_limit_auth_attempt(&self, event: &Event, now: UnixTimestamp) -> Option<RelayMessage> {
+    fn rate_limit_auth_attempt(
+        &self,
+        event: &Event,
+        context: TangleClientRateLimitContext,
+        now: UnixTimestamp,
+    ) -> Option<RelayMessage> {
         let rules = self.config.rate_limits().auth();
+        if let Some(peer_ip) = context.peer_ip
+            && let Some(message) = self.rate_limit_ok(
+                event,
+                TangleRateLimitKey::ip(TangleRateLimitScope::Auth, peer_ip),
+                rules.per_ip(),
+                "auth ip",
+                now,
+            )
+        {
+            return Some(message);
+        }
         self.rate_limit_ok(
             event,
             TangleRateLimitKey::pubkey(
@@ -186,8 +218,24 @@ impl TangleRuntime {
         )
     }
 
-    fn rate_limit_auth_failure(&self, event: &Event, now: UnixTimestamp) -> Option<RelayMessage> {
+    fn rate_limit_auth_failure(
+        &self,
+        event: &Event,
+        context: TangleClientRateLimitContext,
+        now: UnixTimestamp,
+    ) -> Option<RelayMessage> {
         let rules = self.config.rate_limits().auth();
+        if let Some(peer_ip) = context.peer_ip
+            && let Some(message) = self.rate_limit_ok(
+                event,
+                TangleRateLimitKey::auth_failure(Some(peer_ip), None),
+                rules.failures_per_ip(),
+                "auth failure ip",
+                now,
+            )
+        {
+            return Some(message);
+        }
         self.rate_limit_ok(
             event,
             TangleRateLimitKey::auth_failure(None, Some(event.unsigned().pubkey().clone())),
@@ -197,7 +245,12 @@ impl TangleRuntime {
         )
     }
 
-    fn rate_limit_group_write(&self, event: &Event, now: UnixTimestamp) -> Option<RelayMessage> {
+    fn rate_limit_group_write(
+        &self,
+        event: &Event,
+        context: TangleClientRateLimitContext,
+        now: UnixTimestamp,
+    ) -> Option<RelayMessage> {
         if !self.config.groups().enabled() {
             return None;
         }
@@ -205,12 +258,34 @@ impl TangleRuntime {
             validate_client_group_event_structure(event, self.config.groups().limits()).ok()?;
         let group_id = class.group_id()?.clone();
         let rules = self.config.rate_limits().group();
-        if event.unsigned().kind().as_u32() == KIND_GROUP_JOIN_REQUEST
-            && let Some(message) = self.rate_limit_ok(
+        if event.unsigned().kind().as_u32() == KIND_GROUP_JOIN_REQUEST {
+            if let Some(peer_ip) = context.peer_ip
+                && let Some(message) = self.rate_limit_ok(
+                    event,
+                    TangleRateLimitKey::join_flow_ip(group_id.clone(), peer_ip),
+                    rules.join_flow_per_ip(),
+                    "group join ip",
+                    now,
+                )
+            {
+                return Some(message);
+            }
+            if let Some(message) = self.rate_limit_ok(
                 event,
                 TangleRateLimitKey::join_flow(group_id.clone(), event.unsigned().pubkey().clone()),
                 rules.join_flow(),
                 "group join",
+                now,
+            ) {
+                return Some(message);
+            }
+        }
+        if let Some(peer_ip) = context.peer_ip
+            && let Some(message) = self.rate_limit_ok(
+                event,
+                TangleRateLimitKey::ip(TangleRateLimitScope::GroupWrite, peer_ip),
+                rules.write_per_ip(),
+                "group ip",
                 now,
             )
         {
@@ -257,7 +332,7 @@ impl TangleRuntime {
         subscription_id: &SubscriptionId,
         filters: &[Filter],
         auth: &BaseAuthState,
-        context: TangleQueryRateLimitContext,
+        context: TangleClientRateLimitContext,
         now: UnixTimestamp,
     ) -> Option<RelayMessage> {
         self.rate_limit_query(TangleQueryRateLimitRequest {
@@ -277,7 +352,7 @@ impl TangleRuntime {
         subscription_id: &SubscriptionId,
         filters: &[Filter],
         auth: &BaseAuthState,
-        context: TangleQueryRateLimitContext,
+        context: TangleClientRateLimitContext,
         now: UnixTimestamp,
     ) -> Option<RelayMessage> {
         self.rate_limit_query(TangleQueryRateLimitRequest {
@@ -448,20 +523,20 @@ impl TangleRuntimeHandle {
         auth: &mut BaseAuthState,
         now: UnixTimestamp,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
-        self.handle_client_message_with_query_context(
+        self.handle_client_message_with_rate_limit_context(
             message,
             auth,
-            TangleQueryRateLimitContext::default(),
+            TangleClientRateLimitContext::default(),
             now,
         )
         .await
     }
 
-    pub async fn handle_client_message_with_query_context(
+    pub async fn handle_client_message_with_rate_limit_context(
         &self,
         message: ClientMessage,
         auth: &mut BaseAuthState,
-        query_context: TangleQueryRateLimitContext,
+        rate_limit_context: TangleClientRateLimitContext,
         now: UnixTimestamp,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
         self.metrics
@@ -472,11 +547,13 @@ impl TangleRuntimeHandle {
                 let started_at = Instant::now();
                 let event_id = event.id().clone();
                 let is_group_event = runtime.is_group_event(&event);
-                if let Some(message) = runtime.rate_limit_event(&event, now) {
+                if let Some(message) = runtime.rate_limit_event(&event, rate_limit_context, now) {
                     record_event_metrics(runtime.metrics(), &message, is_group_event, started_at);
                     return Ok(vec![message]);
                 }
-                if let Some(message) = runtime.rate_limit_group_write(&event, now) {
+                if let Some(message) =
+                    runtime.rate_limit_group_write(&event, rate_limit_context, now)
+                {
                     record_event_metrics(runtime.metrics(), &message, is_group_event, started_at);
                     return Ok(vec![message]);
                 }
@@ -520,9 +597,13 @@ impl TangleRuntimeHandle {
                     .limits()
                     .base_relay_limits()
                     .validate_filters(&filters)?;
-                if let Some(message) =
-                    runtime.rate_limit_req(&subscription_id, &filters, auth, query_context, now)
-                {
+                if let Some(message) = runtime.rate_limit_req(
+                    &subscription_id,
+                    &filters,
+                    auth,
+                    rate_limit_context,
+                    now,
+                ) {
                     runtime
                         .metrics()
                         .record_query_latency(elapsed_micros(started_at));
@@ -554,9 +635,13 @@ impl TangleRuntimeHandle {
                     .limits()
                     .base_relay_limits()
                     .validate_filters(&filters)?;
-                if let Some(message) =
-                    runtime.rate_limit_count(&subscription_id, &filters, auth, query_context, now)
-                {
+                if let Some(message) = runtime.rate_limit_count(
+                    &subscription_id,
+                    &filters,
+                    auth,
+                    rate_limit_context,
+                    now,
+                ) {
                     runtime
                         .metrics()
                         .record_query_latency(elapsed_micros(started_at));
@@ -584,7 +669,9 @@ impl TangleRuntimeHandle {
                         message: error.prefixed_message(),
                     }]);
                 }
-                if let Some(message) = runtime.rate_limit_auth_attempt(&event, now) {
+                if let Some(message) =
+                    runtime.rate_limit_auth_attempt(&event, rate_limit_context, now)
+                {
                     runtime.metrics().record_auth_failure();
                     return Ok(vec![message]);
                 }
@@ -596,7 +683,8 @@ impl TangleRuntimeHandle {
                 )?;
                 if auth_response_failed(&replies) {
                     runtime.metrics().record_auth_failure();
-                    if let Some(message) = runtime.rate_limit_auth_failure(&event_for_failure, now)
+                    if let Some(message) =
+                        runtime.rate_limit_auth_failure(&event_for_failure, rate_limit_context, now)
                     {
                         return Ok(vec![message]);
                     }
@@ -629,13 +717,16 @@ impl TangleRuntimeHandle {
         subscription_id: &SubscriptionId,
         filters: &[Filter],
         auth: &BaseAuthState,
-        query_context: TangleQueryRateLimitContext,
+        rate_limit_context: TangleClientRateLimitContext,
         now: UnixTimestamp,
     ) -> Option<RelayMessage> {
-        self.inner
-            .lock()
-            .await
-            .rate_limit_req(subscription_id, filters, auth, query_context, now)
+        self.inner.lock().await.rate_limit_req(
+            subscription_id,
+            filters,
+            auth,
+            rate_limit_context,
+            now,
+        )
     }
 
     pub(crate) async fn query_req_with_auth(
@@ -1405,7 +1496,7 @@ impl Default for TangleShutdownSignal {
 #[cfg(test)]
 mod tests {
     use super::{
-        TangleQueryRateLimitContext, TangleRuntime, TangleRuntimeHandle, TangleRuntimeLimits,
+        TangleClientRateLimitContext, TangleRuntime, TangleRuntimeHandle, TangleRuntimeLimits,
     };
     use crate::config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json};
     use crate::event_bus::{TangleEventBus, TangleEventReceiveError};
@@ -1750,6 +1841,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_rate_limits_event_peer_ips_partition_peers_and_precede_identity_keys() {
+        let root = temp_root("runtime-event-ip-rate-limit");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let rule = runtime.config().rate_limits().event().per_ip();
+        let saturated_peer_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 20));
+        let other_peer_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 21));
+        let key = TangleRateLimitKey::ip(TangleRateLimitScope::Event, saturated_peer_ip);
+        for _ in 0..rule.max_hits() {
+            runtime
+                .rate_limiter()
+                .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
+        }
+        let limited_event =
+            tangle_v2_event(FixtureKey::Member, 1_714_124_433, 1, Vec::new(), "limited")
+                .expect("limited event");
+        let rotated_event =
+            tangle_v2_event(FixtureKey::Admin, 1_714_124_434, 2, Vec::new(), "rotated")
+                .expect("rotated event");
+        let allowed_event =
+            tangle_v2_event(FixtureKey::Owner, 1_714_124_435, 2, Vec::new(), "allowed")
+                .expect("allowed event");
+        let handle = TangleRuntimeHandle::new(runtime);
+        let mut auth = handle.auth_state().await.expect("auth");
+
+        assert_eq!(
+            handle
+                .handle_client_message_with_rate_limit_context(
+                    ClientMessage::Event(limited_event.clone()),
+                    &mut auth,
+                    TangleClientRateLimitContext::new(Some(saturated_peer_ip), None),
+                    UnixTimestamp::new(1_714_124_433)
+                )
+                .await
+                .expect("event"),
+            vec![RelayMessage::Ok {
+                event_id: limited_event.id().clone(),
+                accepted: false,
+                message: "rate-limited: event ip rate limit exceeded until 1714124493".to_owned()
+            }]
+        );
+        assert_eq!(
+            handle
+                .handle_client_message_with_rate_limit_context(
+                    ClientMessage::Event(rotated_event.clone()),
+                    &mut auth,
+                    TangleClientRateLimitContext::new(Some(saturated_peer_ip), None),
+                    UnixTimestamp::new(1_714_124_433)
+                )
+                .await
+                .expect("event"),
+            vec![RelayMessage::Ok {
+                event_id: rotated_event.id().clone(),
+                accepted: false,
+                message: "rate-limited: event ip rate limit exceeded until 1714124493".to_owned()
+            }]
+        );
+        assert_eq!(
+            handle
+                .handle_client_message_with_rate_limit_context(
+                    ClientMessage::Event(allowed_event.clone()),
+                    &mut auth,
+                    TangleClientRateLimitContext::new(Some(other_peer_ip), None),
+                    UnixTimestamp::new(1_714_124_433)
+                )
+                .await
+                .expect("event"),
+            vec![RelayMessage::Ok {
+                event_id: allowed_event.id().clone(),
+                accepted: true,
+                message: String::new()
+            }]
+        );
+        assert_eq!(handle.metrics().rate_limit_rejections(), 2);
+        assert_eq!(handle.metrics().event_rejections(), 2);
+        assert_eq!(handle.metrics().event_admissions(), 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn runtime_rate_limits_auth_pubkeys_before_authentication() {
         let root = temp_root("runtime-auth-pubkey-rate-limit");
         let _ = std::fs::remove_dir_all(&root);
@@ -1792,6 +1964,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_rate_limits_auth_peer_ips_before_authentication() {
+        let root = temp_root("runtime-auth-ip-rate-limit");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let auth_event =
+            tangle_v2_auth_event(FixtureKey::Member, "challenge-a", 120).expect("auth event");
+        let rule = runtime.config().rate_limits().auth().per_ip();
+        let peer_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 30));
+        let key = TangleRateLimitKey::ip(TangleRateLimitScope::Auth, peer_ip);
+        for _ in 0..rule.max_hits() {
+            runtime
+                .rate_limiter()
+                .record(key.clone(), rule, UnixTimestamp::new(120));
+        }
+        let handle = TangleRuntimeHandle::new(runtime);
+        let mut auth = handle.auth_state().await.expect("auth");
+        auth.issue_challenge("challenge-a", UnixTimestamp::new(100))
+            .expect("challenge");
+
+        assert_eq!(
+            handle
+                .handle_client_message_with_rate_limit_context(
+                    ClientMessage::Auth(auth_event.clone()),
+                    &mut auth,
+                    TangleClientRateLimitContext::new(Some(peer_ip), None),
+                    UnixTimestamp::new(120)
+                )
+                .await
+                .expect("auth"),
+            vec![RelayMessage::Ok {
+                event_id: auth_event.id().clone(),
+                accepted: false,
+                message: "rate-limited: auth ip rate limit exceeded until 180".to_owned()
+            }]
+        );
+        assert!(auth.authenticated_pubkeys().is_empty());
+        assert_eq!(handle.metrics().rate_limit_rejections(), 1);
+        assert_eq!(handle.metrics().auth_failures(), 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn runtime_rate_limits_auth_failures() {
         let root = temp_root("runtime-auth-failure-rate-limit");
         let _ = std::fs::remove_dir_all(&root);
@@ -1825,6 +2040,47 @@ mod tests {
                     .to_owned()
             }]
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_rate_limits_auth_failures_by_peer_ip() {
+        let root = temp_root("runtime-auth-failure-ip-rate-limit");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let auth_event = tangle_v2_event(FixtureKey::Admin, 1_714_124_433, 22_242, Vec::new(), "")
+            .expect("auth event");
+        let peer_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 31));
+        let key = TangleRateLimitKey::auth_failure(Some(peer_ip), None);
+        let rule = runtime.config().rate_limits().auth().failures_per_ip();
+        for _ in 0..rule.max_hits() {
+            runtime
+                .rate_limiter()
+                .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
+        }
+        let handle = TangleRuntimeHandle::new(runtime);
+        let mut auth = handle.auth_state().await.expect("auth");
+
+        assert_eq!(
+            handle
+                .handle_client_message_with_rate_limit_context(
+                    ClientMessage::Auth(auth_event.clone()),
+                    &mut auth,
+                    TangleClientRateLimitContext::new(Some(peer_ip), None),
+                    UnixTimestamp::new(1_714_124_433)
+                )
+                .await
+                .expect("auth"),
+            vec![RelayMessage::Ok {
+                event_id: auth_event.id().clone(),
+                accepted: false,
+                message: "rate-limited: auth failure ip rate limit exceeded until 1714124733"
+                    .to_owned()
+            }]
+        );
+        assert_eq!(handle.metrics().rate_limit_rejections(), 1);
+        assert_eq!(handle.metrics().auth_failures(), 1);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1871,6 +2127,53 @@ mod tests {
                     .to_owned()
             }]
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_rate_limits_group_writes_by_peer_ip() {
+        let root = temp_root("runtime-group-ip-rate-limit");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let event = tangle_v2_event(
+            FixtureKey::Member,
+            1_714_124_433,
+            1,
+            vec![Tag::from_parts("h", &["Farm"]).expect("h")],
+            "limited",
+        )
+        .expect("event");
+        let rule = runtime.config().rate_limits().group().write_per_ip();
+        let peer_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 40));
+        let key = TangleRateLimitKey::ip(TangleRateLimitScope::GroupWrite, peer_ip);
+        for _ in 0..rule.max_hits() {
+            runtime
+                .rate_limiter()
+                .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
+        }
+        let handle = TangleRuntimeHandle::new(runtime);
+        let mut auth = handle.auth_state().await.expect("auth");
+
+        assert_eq!(
+            handle
+                .handle_client_message_with_rate_limit_context(
+                    ClientMessage::Event(event.clone()),
+                    &mut auth,
+                    TangleClientRateLimitContext::new(Some(peer_ip), None),
+                    UnixTimestamp::new(1_714_124_433)
+                )
+                .await
+                .expect("event"),
+            vec![RelayMessage::Ok {
+                event_id: event.id().clone(),
+                accepted: false,
+                message: "rate-limited: group ip rate limit exceeded until 1714124493".to_owned()
+            }]
+        );
+        assert_eq!(handle.metrics().rate_limit_rejections(), 1);
+        assert_eq!(handle.metrics().event_rejections(), 1);
+        assert_eq!(handle.metrics().group_write_denials(), 1);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2006,6 +2309,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_rate_limits_group_join_flows_by_peer_ip() {
+        let root = temp_root("runtime-group-join-ip-rate-limit");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let group_id = GroupId::new("Farm").expect("group");
+        let event = tangle_v2_event(
+            FixtureKey::Member,
+            1_714_124_433,
+            KIND_GROUP_JOIN_REQUEST.into(),
+            vec![Tag::from_parts("h", &[group_id.as_str()]).expect("h")],
+            "",
+        )
+        .expect("event");
+        let rule = runtime.config().rate_limits().group().join_flow_per_ip();
+        let peer_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 41));
+        let key = TangleRateLimitKey::join_flow_ip(group_id, peer_ip);
+        for _ in 0..rule.max_hits() {
+            runtime
+                .rate_limiter()
+                .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
+        }
+        let handle = TangleRuntimeHandle::new(runtime);
+        let mut auth = handle.auth_state().await.expect("auth");
+
+        assert_eq!(
+            handle
+                .handle_client_message_with_rate_limit_context(
+                    ClientMessage::Event(event.clone()),
+                    &mut auth,
+                    TangleClientRateLimitContext::new(Some(peer_ip), None),
+                    UnixTimestamp::new(1_714_124_433)
+                )
+                .await
+                .expect("event"),
+            vec![RelayMessage::Ok {
+                event_id: event.id().clone(),
+                accepted: false,
+                message: "rate-limited: group join ip rate limit exceeded until 1714124733"
+                    .to_owned()
+            }]
+        );
+        assert_eq!(handle.metrics().rate_limit_rejections(), 1);
+        assert_eq!(handle.metrics().event_rejections(), 1);
+        assert_eq!(handle.metrics().group_write_denials(), 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn runtime_rate_limits_req_authenticated_pubkeys() {
         let root = temp_root("runtime-req-pubkey-rate-limit");
         let _ = std::fs::remove_dir_all(&root);
@@ -2082,13 +2434,13 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message_with_query_context(
+                .handle_client_message_with_rate_limit_context(
                     ClientMessage::Req {
                         subscription_id: subscription_id.clone(),
                         filters
                     },
                     &mut auth,
-                    TangleQueryRateLimitContext::new(None, Some(77)),
+                    TangleClientRateLimitContext::new(None, Some(77)),
                     UnixTimestamp::new(1_714_124_433)
                 )
                 .await
@@ -2163,13 +2515,13 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message_with_query_context(
+                .handle_client_message_with_rate_limit_context(
                     ClientMessage::Count {
                         subscription_id: subscription_id.clone(),
                         filters
                     },
                     &mut auth,
-                    TangleQueryRateLimitContext::new(Some(peer_ip), None),
+                    TangleClientRateLimitContext::new(Some(peer_ip), None),
                     UnixTimestamp::new(1_714_124_433)
                 )
                 .await
@@ -2393,18 +2745,23 @@ mod tests {
             },
             "rate_limits": {
                 "auth": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 120},
                     "per_pubkey": {"window_seconds": 60, "max_hits": 30},
-                    "failures": {"window_seconds": 300, "max_hits": 5}
+                    "failures": {"window_seconds": 300, "max_hits": 5},
+                    "failures_per_ip": {"window_seconds": 300, "max_hits": 20}
                 },
                 "event": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 600},
                     "per_pubkey": {"window_seconds": 60, "max_hits": 120},
                     "per_kind": {"window_seconds": 60, "max_hits": 1000}
                 },
                 "group": {
+                    "write_per_ip": {"window_seconds": 60, "max_hits": 300},
                     "write_per_pubkey": {"window_seconds": 60, "max_hits": 60},
                     "write_per_group": {"window_seconds": 60, "max_hits": 90},
                     "write_per_kind": {"window_seconds": 60, "max_hits": 300},
-                    "join_flow": {"window_seconds": 300, "max_hits": 10}
+                    "join_flow": {"window_seconds": 300, "max_hits": 10},
+                    "join_flow_per_ip": {"window_seconds": 300, "max_hits": 30}
                 },
                 "req": {
                     "per_ip": {"window_seconds": 60, "max_hits": 600},
