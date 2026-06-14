@@ -347,7 +347,7 @@ impl BaseRelay {
     ) -> Result<RelayMessage, BaseRelayError> {
         Ok(RelayMessage::Count {
             subscription_id,
-            count: self.query_events(&filters, auth)?.len() as u64,
+            count: self.count_events(&filters, auth)?,
         })
     }
 
@@ -387,6 +387,21 @@ impl BaseRelay {
             output.extend(events);
         }
         Ok(Self::sort_and_dedupe_query_events(output))
+    }
+
+    fn count_events(
+        &self,
+        filters: &[Filter],
+        auth: &GroupAuthContext,
+    ) -> Result<u64, BaseRelayError> {
+        let mut seen = BTreeSet::new();
+        for filter in filters {
+            let filter = filter.without_limit();
+            for event in self.query_filter_events(&filter, auth)? {
+                seen.insert(event.id().clone());
+            }
+        }
+        u64::try_from(seen.len()).map_err(|_| BaseRelayError::error("visible event count overflow"))
     }
 
     fn query_filter_events(
@@ -604,6 +619,58 @@ mod tests {
             RelayMessage::Event { event, .. }
                 if event.id() == old_market.id() || event.id() == wrong_tag.id()
         )));
+    }
+
+    #[test]
+    fn base_relay_count_dedupes_overlapping_visible_filters() {
+        let mut relay = test_relay("base-relay-count-dedupe", 8);
+        let market_tag = Tag::from_parts("t", &["market"]).expect("tag");
+        let first = signed_event_at(7, 1, vec![market_tag.clone()], "first", 1_714_124_433);
+        let second = signed_event_at(8, 1, vec![market_tag], "second", 1_714_124_434);
+        let third = signed_event_at(7, 2, Vec::new(), "third", 1_714_124_435);
+
+        for event in [&first, &second, &third] {
+            assert_accepted(relay.handle_event(event.clone()).expect("event"), event);
+        }
+
+        let market_notes =
+            filter_from_value(&serde_json::json!({"kinds":[1],"#t":["market"],"limit":2}))
+                .expect("market filter");
+        let author_events = filter_from_value(&serde_json::json!({
+            "authors":[first.unsigned().pubkey().as_str()],
+            "kinds":[1,2],
+            "limit":10
+        }))
+        .expect("author filter");
+        let limited_market =
+            filter_from_value(&serde_json::json!({"kinds":[1],"#t":["market"],"limit":1}))
+                .expect("limited filter");
+
+        assert_eq!(
+            relay
+                .handle_count(
+                    SubscriptionId::new("count-limit").expect("sub"),
+                    vec![limited_market]
+                )
+                .expect("count"),
+            RelayMessage::Count {
+                subscription_id: SubscriptionId::new("count-limit").expect("sub"),
+                count: 2
+            }
+        );
+
+        assert_eq!(
+            relay
+                .handle_count(
+                    SubscriptionId::new("count-dedupe").expect("sub"),
+                    vec![market_notes, author_events]
+                )
+                .expect("count"),
+            RelayMessage::Count {
+                subscription_id: SubscriptionId::new("count-dedupe").expect("sub"),
+                count: 3
+            }
+        );
     }
 
     #[test]
