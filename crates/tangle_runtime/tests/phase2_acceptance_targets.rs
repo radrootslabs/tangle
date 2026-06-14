@@ -246,6 +246,206 @@ async fn websocket_clients_use_nip01_nip42_and_nip45_flows() {
 }
 
 #[tokio::test]
+async fn websocket_public_relay_covers_query_count_ephemeral_and_rejection_flows() {
+    let root = temp_root("acceptance-public-websocket");
+    let _ = std::fs::remove_dir_all(&root);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let runtime = TangleRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let shutdown = runtime.shutdown_signal().clone();
+    let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
+    let mut publisher = connect_nostr_socket(address).await;
+    let mut subscriber = connect_nostr_socket(address).await;
+    let _ = read_auth_challenge(&mut publisher).await;
+    let _ = read_auth_challenge(&mut subscriber).await;
+    let first = tangle_v2_event(
+        FixtureKey::Member,
+        1_714_124_433,
+        1,
+        Vec::new(),
+        "public one",
+    )
+    .expect("first event");
+    let second = tangle_v2_event(
+        FixtureKey::Admin,
+        1_714_124_435,
+        1,
+        Vec::new(),
+        "public two",
+    )
+    .expect("second event");
+    let other_kind = tangle_v2_event(
+        FixtureKey::Owner,
+        1_714_124_436,
+        2,
+        Vec::new(),
+        "public other",
+    )
+    .expect("other event");
+    let ephemeral = tangle_v2_event(
+        FixtureKey::Member,
+        1_714_124_437,
+        20_001,
+        Vec::new(),
+        "public transient",
+    )
+    .expect("ephemeral event");
+    let signature_source = tangle_v2_event(
+        FixtureKey::Owner,
+        1_714_124_438,
+        1,
+        Vec::new(),
+        "signature source",
+    )
+    .expect("signature source");
+    let invalid = Event::new(
+        first.id().clone(),
+        first.unsigned().clone(),
+        signature_source.sig().clone(),
+    );
+
+    send_client_value(
+        &mut subscriber,
+        json!(["REQ", "live-public", {"kinds":[1, 20001]}]),
+    )
+    .await;
+    assert_eq!(
+        read_relay_value(&mut subscriber).await,
+        json!(["EOSE", "live-public"])
+    );
+
+    send_client_value(&mut publisher, json!(["EVENT", event_to_value(&invalid)])).await;
+    assert_ok(
+        read_relay_value(&mut publisher).await,
+        &invalid,
+        false,
+        "invalid: event signature verification failed",
+    );
+    expect_no_relay_message(&mut subscriber).await;
+
+    send_client_value(&mut publisher, json!(["EVENT", event_to_value(&first)])).await;
+    assert_ok(read_relay_value(&mut publisher).await, &first, true, "");
+    assert_live_event(
+        read_relay_value(&mut subscriber).await,
+        "live-public",
+        &first,
+    );
+
+    send_client_value(&mut publisher, json!(["EVENT", event_to_value(&second)])).await;
+    assert_ok(read_relay_value(&mut publisher).await, &second, true, "");
+    assert_live_event(
+        read_relay_value(&mut subscriber).await,
+        "live-public",
+        &second,
+    );
+
+    send_client_value(
+        &mut publisher,
+        json!(["EVENT", event_to_value(&other_kind)]),
+    )
+    .await;
+    assert_ok(
+        read_relay_value(&mut publisher).await,
+        &other_kind,
+        true,
+        "",
+    );
+    expect_no_relay_message(&mut subscriber).await;
+
+    send_client_value(&mut publisher, json!(["EVENT", event_to_value(&ephemeral)])).await;
+    assert_ok(read_relay_value(&mut publisher).await, &ephemeral, true, "");
+    expect_no_relay_message(&mut subscriber).await;
+
+    send_client_value(
+        &mut publisher,
+        json!(["COUNT", "count-kind-one", {"kinds":[1]}]),
+    )
+    .await;
+    assert_eq!(
+        read_relay_value(&mut publisher).await,
+        json!(["COUNT", "count-kind-one", {"count": 2}])
+    );
+
+    send_client_value(
+        &mut publisher,
+        json!(["COUNT", "count-ephemeral", {"kinds":[20001]}]),
+    )
+    .await;
+    assert_eq!(
+        read_relay_value(&mut publisher).await,
+        json!(["COUNT", "count-ephemeral", {"count": 0}])
+    );
+
+    send_client_value(
+        &mut publisher,
+        json!([
+            "REQ",
+            "query-public",
+            {"kinds":[1], "limit":1},
+            {"ids":[first.id().as_str(), other_kind.id().as_str()]}
+        ]),
+    )
+    .await;
+    assert_live_event(
+        read_relay_value(&mut publisher).await,
+        "query-public",
+        &other_kind,
+    );
+    assert_live_event(
+        read_relay_value(&mut publisher).await,
+        "query-public",
+        &second,
+    );
+    assert_live_event(
+        read_relay_value(&mut publisher).await,
+        "query-public",
+        &first,
+    );
+    assert_eq!(
+        read_relay_value(&mut publisher).await,
+        json!(["EOSE", "query-public"])
+    );
+
+    send_client_value(&mut subscriber, json!(["CLOSE", "live-public"])).await;
+    expect_no_relay_message(&mut subscriber).await;
+    send_client_value(&mut publisher, json!(["CLOSE", "query-public"])).await;
+    expect_no_relay_message(&mut publisher).await;
+
+    let after_close = tangle_v2_event(
+        FixtureKey::Admin,
+        1_714_124_439,
+        1,
+        Vec::new(),
+        "after close",
+    )
+    .expect("after close event");
+    send_client_value(
+        &mut publisher,
+        json!(["EVENT", event_to_value(&after_close)]),
+    )
+    .await;
+    assert_ok(
+        read_relay_value(&mut publisher).await,
+        &after_close,
+        true,
+        "",
+    );
+    expect_no_relay_message(&mut subscriber).await;
+
+    shutdown.request_shutdown();
+    read_websocket_close(&mut publisher).await;
+    read_websocket_close(&mut subscriber).await;
+    let report = timeout(Duration::from_secs(2), task)
+        .await
+        .expect("shutdown timeout")
+        .expect("task")
+        .expect("serve");
+    assert_eq!(report.listen_addr(), address);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn nip11_includes_cors_headers_and_truthful_supported_nips() {
     let root = temp_root("acceptance-nip11");
     let _ = std::fs::remove_dir_all(&root);
