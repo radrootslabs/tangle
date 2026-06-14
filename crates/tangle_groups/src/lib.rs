@@ -122,37 +122,6 @@ impl fmt::Display for CanonicalRelayUrl {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-pub struct GroupRedactionConfig {
-    #[serde(default = "default_true")]
-    redact_private_tags: bool,
-    #[serde(default = "default_true")]
-    redact_invite_codes: bool,
-}
-
-impl GroupRedactionConfig {
-    pub fn strict() -> Self {
-        Self {
-            redact_private_tags: true,
-            redact_invite_codes: true,
-        }
-    }
-
-    pub fn redact_private_tags(&self) -> bool {
-        self.redact_private_tags
-    }
-
-    pub fn redact_invite_codes(&self) -> bool {
-        self.redact_invite_codes
-    }
-}
-
-impl Default for GroupRedactionConfig {
-    fn default() -> Self {
-        Self::strict()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GroupPolicyConfig {
     #[serde(default)]
@@ -205,7 +174,6 @@ impl Default for GroupPolicyConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GroupRuntimeSettingsConfig {
     policy: GroupPolicyConfig,
-    redaction: GroupRedactionConfig,
     limits: GroupLimitsConfig,
 }
 
@@ -213,21 +181,15 @@ impl GroupRuntimeSettingsConfig {
     pub fn strict() -> Self {
         Self {
             policy: GroupPolicyConfig::strict(),
-            redaction: GroupRedactionConfig::strict(),
             limits: GroupLimitsConfig::default(),
         }
     }
 
     pub fn new(
         policy: GroupPolicyConfig,
-        redaction: GroupRedactionConfig,
         limits: GroupLimitsConfig,
     ) -> Result<Self, GroupConfigError> {
-        let value = Self {
-            policy,
-            redaction,
-            limits,
-        };
+        let value = Self { policy, limits };
         value.validate()?;
         Ok(value)
     }
@@ -239,10 +201,6 @@ impl GroupRuntimeSettingsConfig {
 
     pub fn policy(&self) -> GroupPolicyConfig {
         self.policy
-    }
-
-    pub fn redaction(&self) -> GroupRedactionConfig {
-        self.redaction
     }
 
     pub fn limits(&self) -> GroupLimitsConfig {
@@ -257,6 +215,7 @@ impl Default for GroupRuntimeSettingsConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GroupLimitsConfig {
     #[serde(default = "default_max_group_id_bytes")]
     max_group_id_bytes: u16,
@@ -418,10 +377,6 @@ impl GroupRuntimeConfig {
         self.settings.policy()
     }
 
-    pub fn redaction(&self) -> GroupRedactionConfig {
-        self.settings.redaction()
-    }
-
     pub fn limits(&self) -> GroupLimitsConfig {
         self.settings.limits()
     }
@@ -453,6 +408,7 @@ impl fmt::Display for GroupConfigError {
 impl std::error::Error for GroupConfigError {}
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GroupRuntimeConfigDocument {
     enabled: bool,
     canonical_relay_url: Option<String>,
@@ -463,8 +419,6 @@ struct GroupRuntimeConfigDocument {
     admin_pubkeys: Vec<String>,
     #[serde(default)]
     policy: GroupPolicyConfig,
-    #[serde(default)]
-    redaction: GroupRedactionConfig,
     #[serde(default)]
     limits: GroupLimitsConfig,
 }
@@ -489,7 +443,7 @@ pub fn parse_group_runtime_config_json(raw: &str) -> Result<GroupRuntimeConfig, 
         relay_secret,
         parse_pubkeys("groups.owner_pubkeys", document.owner_pubkeys)?,
         parse_pubkeys("groups.admin_pubkeys", document.admin_pubkeys)?,
-        GroupRuntimeSettingsConfig::new(document.policy, document.redaction, document.limits)?,
+        GroupRuntimeSettingsConfig::new(document.policy, document.limits)?,
     )
 }
 
@@ -532,10 +486,6 @@ where
         )));
     }
     Ok(())
-}
-
-fn default_true() -> bool {
-    true
 }
 
 fn default_max_group_id_bytes() -> u16 {
@@ -588,7 +538,6 @@ mod tests {
                 "owner_pubkeys": ["{owner}"],
                 "admin_pubkeys": ["{admin}"],
                 "policy": {{"public_join": false, "invites_enabled": false}},
-                "redaction": {{"redact_private_tags": true, "redact_invite_codes": true}},
                 "limits": {{
                     "max_group_id_bytes": 64,
                     "max_group_tags_per_event": 4,
@@ -611,8 +560,6 @@ mod tests {
         assert_eq!(config.policy(), GroupPolicyConfig::strict());
         assert!(!config.policy().public_join());
         assert!(!config.policy().invites_enabled());
-        assert!(config.redaction().redact_private_tags());
-        assert!(config.redaction().redact_invite_codes());
         assert_eq!(config.limits().max_group_id_bytes(), 64);
         assert_eq!(config.limits().max_group_tags_per_event(), 4);
         assert_eq!(config.limits().max_supported_kinds(), 32);
@@ -654,6 +601,29 @@ mod tests {
             error
                 .message()
                 .contains("unknown field `compat_zooid_closed_means_restricted`")
+        );
+    }
+
+    #[test]
+    fn group_config_rejects_removed_and_unknown_fields() {
+        let removed_redaction = parse_group_runtime_config_json(
+            r#"{"enabled": false, "redaction": {"redact_private_tags": true}}"#,
+        )
+        .expect_err("redaction");
+        assert!(
+            removed_redaction
+                .message()
+                .contains("unknown field `redaction`")
+        );
+
+        let unknown_limit = parse_group_runtime_config_json(
+            r#"{"enabled": false, "limits": {"max_unimplemented_outbox_batch": 10}}"#,
+        )
+        .expect_err("unknown limit");
+        assert!(
+            unknown_limit
+                .message()
+                .contains("unknown field `max_unimplemented_outbox_batch`")
         );
     }
 

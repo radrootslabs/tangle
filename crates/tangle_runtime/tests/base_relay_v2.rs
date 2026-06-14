@@ -1321,6 +1321,23 @@ fn pending_and_retryable_group_outbox_records_materialize_on_restart() {
 }
 
 #[test]
+fn max_outbox_replay_batch_one_drains_all_pending_generated_records() {
+    let config = test_store_config("outbox-batch-one");
+    let owner_auth = authenticated(FixtureKey::Owner);
+    let mut relay =
+        BaseRelay::open_with_groups(&config, 8, &group_config_with_outbox_batch(1)).expect("relay");
+
+    accept_group_create(&mut relay, "BatchFarm", &[], 1, &owner_auth);
+
+    assert_eq!(count_kind(&relay, KIND_GROUP_METADATA), 1);
+    assert_eq!(count_kind(&relay, KIND_GROUP_ADMINS), 1);
+    let counts = outbox_status_counts(&config);
+    assert_eq!(counts.pending, 0);
+    assert_eq!(counts.retryable, 0);
+    assert_eq!(counts.stored, 2);
+}
+
+#[test]
 fn already_stored_generated_events_mark_outbox_stored_without_duplication_on_restart() {
     let config = test_store_config("outbox-generated-already-stored");
     let owner_auth = authenticated(FixtureKey::Owner);
@@ -1902,6 +1919,22 @@ fn group_config_with_public_join() -> GroupRuntimeConfig {
             "owner_pubkeys": ["{}"],
             "admin_pubkeys": ["{}"],
             "policy": {{"public_join": true, "invites_enabled": false}}
+        }}"#,
+        FixtureKey::Owner.public_key().as_str(),
+        FixtureKey::Admin.public_key().as_str()
+    ))
+    .expect("groups")
+}
+
+fn group_config_with_outbox_batch(batch: u32) -> GroupRuntimeConfig {
+    parse_group_runtime_config_json(&format!(
+        r#"{{
+            "enabled": true,
+            "canonical_relay_url": "{TANGLE_V2_RELAY_URL}",
+            "relay_secret": "{TANGLE_V2_RELAY_SECRET_HEX}",
+            "owner_pubkeys": ["{}"],
+            "admin_pubkeys": ["{}"],
+            "limits": {{"max_outbox_replay_batch": {batch}}}
         }}"#,
         FixtureKey::Owner.public_key().as_str(),
         FixtureKey::Admin.public_key().as_str()

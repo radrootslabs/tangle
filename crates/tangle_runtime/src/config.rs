@@ -133,6 +133,7 @@ impl Default for BaseRelayTracingConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BaseRelayRuntimeConfigDocument {
     server: BaseRelayServerConfigDocument,
     pocket: BaseRelayPocketConfigDocument,
@@ -144,12 +145,14 @@ struct BaseRelayRuntimeConfigDocument {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BaseRelayServerConfigDocument {
     listen_addr: String,
     relay_url: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BaseRelayPocketConfigDocument {
     data_directory: String,
     map_size_bytes: u64,
@@ -165,23 +168,27 @@ enum BaseRelayPocketSyncPolicyDocument {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BaseRelayAuthConfigDocument {
     challenge_ttl_seconds: u64,
     created_at_skew_seconds: u64,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BaseRelayRuntimeLimitsDocument {
     max_pending_events: usize,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BaseRelayObservabilityConfigDocument {
     #[serde(default)]
     tracing: BaseRelayTracingConfigDocument,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BaseRelayTracingConfigDocument {
     enabled: Option<bool>,
     filter: Option<String>,
@@ -332,6 +339,69 @@ mod tests {
                 .expect_err("zero skew")
                 .prefixed_message(),
             "invalid: auth.created_at_skew_seconds must be greater than zero"
+        );
+    }
+
+    #[test]
+    fn base_relay_runtime_config_rejects_unknown_fields() {
+        let unknown_top_level = r#"{
+            "server": {
+                "listen_addr": "127.0.0.1:0",
+                "relay_url": "wss://relay.radroots.test"
+            },
+            "pocket": {
+                "data_directory": "runtime/pocket",
+                "map_size_bytes": 1073741824,
+                "reader_slots": 128,
+                "sync_policy": "flush_on_shutdown"
+            },
+            "groups": {
+                "enabled": false
+            },
+            "auth": {
+                "challenge_ttl_seconds": 300,
+                "created_at_skew_seconds": 600
+            },
+            "limits": {
+                "max_pending_events": 8
+            },
+            "ignored": true
+        }"#;
+        assert!(
+            parse_base_relay_runtime_config_json(unknown_top_level)
+                .expect_err("unknown top-level field")
+                .prefixed_message()
+                .contains("unknown field `ignored`")
+        );
+
+        let unknown_nested = r#"{
+            "server": {
+                "listen_addr": "127.0.0.1:0",
+                "relay_url": "wss://relay.radroots.test"
+            },
+            "pocket": {
+                "data_directory": "runtime/pocket",
+                "map_size_bytes": 1073741824,
+                "reader_slots": 128,
+                "sync_policy": "flush_on_shutdown"
+            },
+            "groups": {
+                "enabled": false
+            },
+            "auth": {
+                "challenge_ttl_seconds": 300,
+                "created_at_skew_seconds": 600
+            },
+            "limits": {
+                "max_pending_events": 8,
+                "max_unimplemented_limit": 99
+            }
+        }"#;
+        assert!(
+            parse_base_relay_runtime_config_json(unknown_nested)
+                .expect_err("unknown nested field")
+                .prefixed_message()
+                .contains("unknown field `max_unimplemented_limit`")
         );
     }
 }

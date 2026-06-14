@@ -35,6 +35,7 @@ pub(crate) struct GroupService {
     policy: GroupPolicyConfig,
     limits: GroupLimitsConfig,
     member_snapshot_cap: u32,
+    outbox_replay_batch_cap: u32,
 }
 
 impl GroupService {
@@ -62,6 +63,7 @@ impl GroupService {
             policy: config.policy(),
             limits: config.limits(),
             member_snapshot_cap: config.limits().max_member_list_pubkeys(),
+            outbox_replay_batch_cap: config.limits().max_outbox_replay_batch(),
         };
         service.derive_missing_outbox_records(store)?;
         service.materialize_outbox(store)?;
@@ -232,8 +234,22 @@ impl GroupService {
         &mut self,
         store: &PocketStoreHandle,
     ) -> Result<Vec<StoreOffset>, BaseRelayError> {
-        let records = self.outbox.replay_plan().records().to_vec();
-        self.materialize_records(store, records)
+        let mut stored_offsets = Vec::new();
+        loop {
+            let records = self
+                .outbox
+                .replay_plan()
+                .records()
+                .iter()
+                .take(self.outbox_replay_batch_cap())
+                .cloned()
+                .collect::<Vec<_>>();
+            if records.is_empty() {
+                break;
+            }
+            stored_offsets.extend(self.materialize_records(store, records)?);
+        }
+        Ok(stored_offsets)
     }
 
     fn materialize_outbox_for_group(
@@ -241,12 +257,27 @@ impl GroupService {
         store: &PocketStoreHandle,
         group_id: &GroupId,
     ) -> Result<Vec<StoreOffset>, BaseRelayError> {
-        let records = self
-            .outbox
-            .replay_plan_for_group(group_id)
-            .records()
-            .to_vec();
-        self.materialize_records(store, records)
+        let mut stored_offsets = Vec::new();
+        loop {
+            let records = self
+                .outbox
+                .replay_plan_for_group(group_id)
+                .records()
+                .iter()
+                .take(self.outbox_replay_batch_cap())
+                .cloned()
+                .collect::<Vec<_>>();
+            if records.is_empty() {
+                break;
+            }
+            stored_offsets.extend(self.materialize_records(store, records)?);
+        }
+        Ok(stored_offsets)
+    }
+
+    fn outbox_replay_batch_cap(&self) -> usize {
+        usize::try_from(self.outbox_replay_batch_cap)
+            .expect("u32 outbox replay batch cap fits usize")
     }
 
     fn materialize_records(

@@ -112,10 +112,6 @@ fn tangle_run_starts_server_and_stays_alive_until_shutdown() {
                 "relay_secret": TANGLE_V2_RELAY_SECRET_HEX,
                 "owner_pubkeys": [FixtureKey::Owner.public_key().as_str()],
                 "admin_pubkeys": [FixtureKey::Admin.public_key().as_str()],
-                "redaction": {
-                    "redact_private_tags": true,
-                    "redact_invite_codes": true
-                },
                 "limits": {
                     "max_group_id_bytes": 128,
                     "max_group_tags_per_event": 8,
