@@ -179,7 +179,7 @@ fn auth_integration_covers_challenge_edges() {
 fn group_auth_lifecycle_membership_and_flag_flows_pass_in_process() {
     let config = test_store_config("group-flows");
     let groups = group_config_with_public_join();
-    let mut relay = BaseRelay::open_with_groups(
+    let relay = BaseRelay::open_with_groups(
         &config,
         relay_limits(8),
         &groups,
@@ -387,7 +387,7 @@ fn relay_override_role_changes_generate_admin_snapshots() {
 #[test]
 fn group_join_requests_are_denied_by_default() {
     let config = test_store_config("group-public-join-default");
-    let mut relay = BaseRelay::open_with_groups(
+    let relay = BaseRelay::open_with_groups(
         &config,
         relay_limits(8),
         &group_config(),

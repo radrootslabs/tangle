@@ -577,13 +577,13 @@ impl BaseRelay {
             })
     }
 
-    pub fn handle_event(&mut self, event: Event) -> Result<RelayMessage, BaseRelayError> {
+    pub fn handle_event(&self, event: Event) -> Result<RelayMessage, BaseRelayError> {
         self.handle_event_with_group_auth(event, &GroupAuthContext::unauthenticated())
             .map(BaseRelayEventWrite::into_message)
     }
 
     pub fn handle_event_with_auth(
-        &mut self,
+        &self,
         event: Event,
         auth: &BaseAuthState,
     ) -> Result<RelayMessage, BaseRelayError> {
@@ -592,7 +592,7 @@ impl BaseRelay {
     }
 
     pub(crate) fn handle_event_with_auth_report(
-        &mut self,
+        &self,
         event: Event,
         auth: &BaseAuthState,
     ) -> Result<BaseRelayEventWrite, BaseRelayError> {
@@ -636,7 +636,7 @@ impl BaseRelay {
     }
 
     fn handle_event_with_group_auth(
-        &mut self,
+        &self,
         event: Event,
         auth: &GroupAuthContext,
     ) -> Result<BaseRelayEventWrite, BaseRelayError> {
@@ -733,7 +733,7 @@ impl BaseRelay {
         let store_offset = StoreOffset::new(self.store.store_event(&pocket_event)?);
         let mut stored_offsets = vec![store_offset];
         if !matches!(class, GroupEventClass::NonGroup)
-            && let Some(groups) = self.groups.as_mut()
+            && let Some(groups) = self.groups.as_ref()
         {
             stored_offsets.extend(groups.after_source_event_stored(
                 &self.store,
@@ -1434,7 +1434,7 @@ mod tests {
 
     #[test]
     fn base_relay_count_dedupes_overlapping_visible_filters() {
-        let mut relay = test_relay("base-relay-count-dedupe", 8);
+        let relay = test_relay("base-relay-count-dedupe", 8);
         let market_tag = Tag::from_parts("t", &["market"]).expect("tag");
         let first = signed_event_at(7, 1, vec![market_tag.clone()], "first", 1_714_124_433);
         let second = signed_event_at(8, 1, vec![market_tag], "second", 1_714_124_434);
@@ -1486,7 +1486,7 @@ mod tests {
 
     #[test]
     fn base_relay_event_path_rejects_invalid_signatures_and_skips_ephemeral_storage() {
-        let mut relay = test_relay("base-relay-event-store-path", 8);
+        let relay = test_relay("base-relay-event-store-path", 8);
         let valid = signed_public_event(7, 1, Vec::new(), "valid");
         let signature_source = signed_public_event(8, 1, Vec::new(), "signature source");
         let invalid = Event::new(
@@ -1527,7 +1527,7 @@ mod tests {
 
     #[test]
     fn base_relay_enforces_nip70_protected_event_author_auth() {
-        let mut relay = test_relay("base-relay-nip70-protected", 8);
+        let relay = test_relay("base-relay-nip70-protected", 8);
         let protected = signed_public_event(
             7,
             1,
@@ -1560,7 +1560,7 @@ mod tests {
 
     #[test]
     fn base_relay_rejects_group_marked_events_before_group_service() {
-        let mut relay = test_relay("base-relay-group-reject", 4);
+        let relay = test_relay("base-relay-group-reject", 4);
         let event = signed_public_event(
             7,
             1,
@@ -1581,7 +1581,7 @@ mod tests {
 
     #[test]
     fn base_relay_rejects_client_submitted_relay_generated_group_state() {
-        let mut relay = test_relay("base-relay-generated-group-reject", 4);
+        let relay = test_relay("base-relay-generated-group-reject", 4);
         for kind in NIP29_RELAY_GENERATED_KIND_VALUES {
             let event = signed_public_event(
                 7,
@@ -1644,7 +1644,7 @@ mod tests {
     #[test]
     fn group_event_write_requires_auth_before_storage() {
         let owner = signer(7).public_key().clone();
-        let mut relay = test_relay_with_groups(
+        let relay = test_relay_with_groups(
             "base-relay-group-auth-required",
             4,
             &enabled_groups_for_owner(&owner),
@@ -1675,7 +1675,7 @@ mod tests {
     #[test]
     fn group_create_updates_projection_and_stores_generated_snapshots() {
         let owner = signer(7).public_key().clone();
-        let mut relay = test_relay_with_groups(
+        let relay = test_relay_with_groups(
             "base-relay-group-create",
             4,
             &enabled_groups_for_owner(&owner),
@@ -1711,7 +1711,7 @@ mod tests {
     fn group_join_materializes_relay_membership_event() {
         let owner = signer(7).public_key().clone();
         let joiner = signer(8).public_key().clone();
-        let mut relay = test_relay_with_groups(
+        let relay = test_relay_with_groups(
             "base-relay-group-join",
             4,
             &enabled_groups_for_owner_with_public_join(&owner),
@@ -1757,7 +1757,7 @@ mod tests {
     #[test]
     fn group_join_requires_public_join_policy() {
         let owner = signer(7).public_key().clone();
-        let mut relay = test_relay_with_groups(
+        let relay = test_relay_with_groups(
             "base-relay-group-join-default-deny",
             4,
             &enabled_groups_for_owner(&owner),
@@ -1837,7 +1837,7 @@ mod tests {
         let owner = signer(7).public_key().clone();
         let member = signer(8).public_key().clone();
         let target = signer(9).public_key().clone();
-        let mut relay = test_relay_with_groups(
+        let relay = test_relay_with_groups(
             "base-relay-group-member-flow",
             4,
             &enabled_groups_for_owner_with_public_join(&owner),
@@ -1962,7 +1962,7 @@ mod tests {
         let owner = signer(7).public_key().clone();
         let outsider_auth = authenticated_state(8);
         let owner_auth = authenticated_state(7);
-        let mut relay = test_relay_with_groups(
+        let relay = test_relay_with_groups(
             "base-relay-group-delete-event",
             4,
             &enabled_groups_for_owner(&owner),
@@ -2057,7 +2057,7 @@ mod tests {
     fn group_delete_tombstone_hides_events_and_rejects_future_writes() {
         let owner = signer(7).public_key().clone();
         let auth = authenticated_state(7);
-        let mut relay = test_relay_with_groups(
+        let relay = test_relay_with_groups(
             "base-relay-group-delete-tombstone",
             4,
             &enabled_groups_for_owner(&owner),
@@ -2109,7 +2109,7 @@ mod tests {
         let owner = signer(7).public_key().clone();
         let outsider_auth = authenticated_state(8);
         let owner_auth = authenticated_state(7);
-        let mut relay = test_relay_with_groups(
+        let relay = test_relay_with_groups(
             "base-relay-group-strict-policy-flow",
             4,
             &enabled_groups_for_owner(&owner),
@@ -2254,7 +2254,7 @@ mod tests {
         let owner = signer(7).public_key().clone();
         let owner_auth = authenticated_state(7);
         let unauth = BaseAuthState::new("wss://relay.radroots.test", 60, 600).expect("auth state");
-        let mut relay = test_relay_with_groups(
+        let relay = test_relay_with_groups(
             "base-relay-private-offset-read",
             4,
             &enabled_groups_for_owner(&owner),

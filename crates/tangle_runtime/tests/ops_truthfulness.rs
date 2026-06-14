@@ -86,7 +86,7 @@ fn operations_surfaces_match_enforced_runtime_contracts() {
     assert_eq!(bound.status, "ready");
     assert_eq!(bound.checks.server_bind, "ready");
 
-    let mut relay = config.open_relay().expect("relay");
+    let relay = config.open_relay().expect("relay");
     let protected = tangle_v2_event(
         FixtureKey::Member,
         1_714_124_433,

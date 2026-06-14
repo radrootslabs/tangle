@@ -1036,7 +1036,7 @@ fn protected_events_require_author_auth_before_nip70_is_advertised() {
         .expect("info config")
         .build_document()
         .expect("document");
-    let mut relay = config.open_relay().expect("relay");
+    let relay = config.open_relay().expect("relay");
     let protected = tangle_v2_event(
         FixtureKey::Member,
         1_714_124_433,

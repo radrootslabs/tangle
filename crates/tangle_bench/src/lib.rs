@@ -1108,7 +1108,7 @@ fn materialize_dataset(
     max_pending_events: usize,
 ) -> Result<MaterializedBenchRelay, String> {
     let store_config = bench_store_config(run_name)?;
-    let mut relay = BaseRelay::open_with_groups(
+    let relay = BaseRelay::open_with_groups(
         &store_config,
         relay_limits(max_pending_events),
         &group_config()?,

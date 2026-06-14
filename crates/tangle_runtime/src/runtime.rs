@@ -606,7 +606,7 @@ impl TangleRuntimeHandle {
                     return Ok(vec![message]);
                 }
                 let (result, group_outbox_pending_events) = {
-                    let mut relay = self.inner.relay.lock().await;
+                    let relay = self.inner.relay.lock().await;
                     let result = relay.handle_event_with_auth_report(event, auth)?;
                     let pending_events =
                         is_group_event.then(|| relay.group_outbox_pending_events());
