@@ -16,8 +16,8 @@ use tangle_groups::{
     GroupPolicyConfig, GroupProjection, GroupReadDecision, GroupReadGate, GroupRuntimeConfig,
     GroupState, GroupTombstone, KIND_GROUP_CREATE_GROUP, KIND_GROUP_DELETE_EVENT,
     KIND_GROUP_EDIT_METADATA, KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST,
-    KIND_GROUP_MEMBERS, KIND_GROUP_PUT_USER, KIND_GROUP_REMOVE_USER, MemberState,
-    ProjectedRoleDefinition, ProjectionCheckpoint, StoreOffset, event_deletion_key,
+    KIND_GROUP_MEMBERS, KIND_GROUP_PUT_USER, KIND_GROUP_REMOVE_USER, MemberState, MemberStatus,
+    ProjectedRoleDefinition, ProjectionCheckpoint, RoleName, StoreOffset, event_deletion_key,
     event_view::GroupEventView, group_current_key, member_current_key, projection_checkpoint_key,
     rebuild_group_projection, role_current_key, tombstone_key,
 };
@@ -159,12 +159,14 @@ impl GroupService {
         class: &GroupEventClass,
         store_offset: StoreOffset,
     ) -> Result<Vec<StoreOffset>, BaseRelayError> {
+        let before_membership_admin =
+            membership_admin_snapshot_state(&self.projection, event, class)?;
         self.projection
             .apply_canonical_event(event, store_offset, self.limits)?;
         if let Some(group_id) = class_group_id(class) {
             self.persist_group_projection(store, group_id)?;
         }
-        for record in self.plan_outbox_records(event, class)? {
+        for record in self.plan_outbox_records(event, class, before_membership_admin)? {
             let inserted = self.outbox.merge_idempotent(record.clone())?;
             if inserted {
                 persist_outbox_record(store, &record)?;
@@ -180,6 +182,7 @@ impl GroupService {
         &self,
         event: &Event,
         class: &GroupEventClass,
+        before_membership_admin: Option<bool>,
     ) -> Result<Vec<GroupOutboxRecord>, GroupError> {
         plan_group_outbox_records(
             event,
@@ -187,6 +190,7 @@ impl GroupService {
             &self.projection,
             &self.authority,
             self.member_snapshot_cap,
+            before_membership_admin,
         )
     }
 
@@ -201,6 +205,8 @@ impl GroupService {
         events.sort_by_key(CanonicalGroupEvent::tuple);
         for item in events {
             let class = tangle_groups::classify_group_event(item.event(), self.limits)?;
+            let before_membership_admin =
+                membership_admin_snapshot_state(&projection, item.event(), &class)?;
             projection.apply_canonical_event(item.event(), item.store_offset(), self.limits)?;
             if item.event().unsigned().pubkey() == &relay_pubkey {
                 continue;
@@ -211,6 +217,7 @@ impl GroupService {
                 &projection,
                 &self.authority,
                 self.member_snapshot_cap,
+                before_membership_admin,
             )? {
                 let inserted = self.outbox.merge_idempotent(record.clone())?;
                 if inserted {
@@ -359,6 +366,7 @@ fn plan_group_outbox_records(
     projection: &GroupProjection,
     authority: &GroupAuthority,
     member_snapshot_cap: u32,
+    before_membership_admin: Option<bool>,
 ) -> Result<Vec<GroupOutboxRecord>, GroupError> {
     let created_at = event.unsigned().created_at();
     match class {
@@ -394,9 +402,15 @@ fn plan_group_outbox_records(
                     GroupGeneratedEventBuilder::metadata_snapshot_payload(group, created_at)?,
                 )])
             }
-            KIND_GROUP_PUT_USER | KIND_GROUP_REMOVE_USER => {
-                member_snapshot_record(event, group_id, projection, created_at, member_snapshot_cap)
-            }
+            KIND_GROUP_PUT_USER | KIND_GROUP_REMOVE_USER => member_snapshot_records(
+                event,
+                group_id,
+                projection,
+                authority,
+                created_at,
+                member_snapshot_cap,
+                before_membership_admin,
+            ),
             _ => Ok(Vec::new()),
         },
         GroupEventClass::Normal { group_id } => match event.unsigned().kind().as_u32() {
@@ -428,6 +442,35 @@ fn plan_group_outbox_records(
             Ok(Vec::new())
         }
     }
+}
+
+fn member_snapshot_records(
+    event: &Event,
+    group_id: &GroupId,
+    projection: &GroupProjection,
+    authority: &GroupAuthority,
+    created_at: UnixTimestamp,
+    member_snapshot_cap: u32,
+    before_membership_admin: Option<bool>,
+) -> Result<Vec<GroupOutboxRecord>, GroupError> {
+    let mut records =
+        member_snapshot_record(event, group_id, projection, created_at, member_snapshot_cap)?;
+    if let Some(before) = before_membership_admin {
+        let target = membership_target_pubkey(event)?;
+        let after = member_is_relay_override_admin(projection, group_id, &target);
+        if before != after {
+            records.push(pending_record(
+                event,
+                GroupOutboxEffect::AdminListSnapshot,
+                group_id,
+                None,
+                GroupGeneratedEventBuilder::admin_list_snapshot_payload(
+                    group_id, projection, authority, created_at,
+                )?,
+            ));
+        }
+    }
+    Ok(records)
 }
 
 fn member_snapshot_record(
@@ -465,6 +508,63 @@ fn member_snapshot_record(
             record
         }
     }])
+}
+
+fn membership_admin_snapshot_state(
+    projection: &GroupProjection,
+    event: &Event,
+    class: &GroupEventClass,
+) -> Result<Option<bool>, GroupError> {
+    match class {
+        GroupEventClass::Moderation { kind, group_id }
+            if matches!(kind.as_u32(), KIND_GROUP_PUT_USER | KIND_GROUP_REMOVE_USER) =>
+        {
+            let target = membership_target_pubkey(event)?;
+            Ok(Some(member_is_relay_override_admin(
+                projection, group_id, &target,
+            )))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn member_is_relay_override_admin(
+    projection: &GroupProjection,
+    group_id: &GroupId,
+    pubkey: &PublicKeyHex,
+) -> bool {
+    projection
+        .member(group_id, pubkey)
+        .filter(|member| member.status() == MemberStatus::Member)
+        .is_some_and(|member| {
+            member
+                .roles()
+                .contains(&RoleName::permanent_relay_override())
+        })
+}
+
+fn membership_target_pubkey(event: &Event) -> Result<PublicKeyHex, GroupError> {
+    for tag in event.unsigned().tags() {
+        if tag.values().first().is_none_or(|name| name != "p") {
+            continue;
+        }
+        let Some((_, value)) = tag.indexed_pair() else {
+            return Err(GroupError::invalid(
+                GroupErrorKind::MalformedTargetTag,
+                "malformed p target tag",
+            ));
+        };
+        return PublicKeyHex::new(value).map_err(|reason| {
+            GroupError::invalid(
+                GroupErrorKind::MalformedTargetTag,
+                format!("malformed p target tag: {reason}"),
+            )
+        });
+    }
+    Err(GroupError::invalid(
+        GroupErrorKind::MissingTargetTag,
+        "missing p target tag",
+    ))
 }
 
 fn pending_record(

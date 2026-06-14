@@ -6,8 +6,8 @@ use tangle_groups::{
     GroupId, GroupOutboxRecord, GroupOutboxStatus, GroupRuntimeConfig, KIND_GROUP_ADMINS,
     KIND_GROUP_DELETE_GROUP, KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS,
     KIND_GROUP_METADATA, KIND_GROUP_PUT_USER, MemberStatus, NIP29_RELAY_GENERATED_KIND_VALUES,
-    ProjectionCheckpoint, StoreOffset, member_current_key, parse_group_runtime_config_json,
-    projection_checkpoint_key,
+    PERMANENT_RELAY_OVERRIDE_ROLE, ProjectionCheckpoint, StoreOffset, member_current_key,
+    parse_group_runtime_config_json, projection_checkpoint_key,
 };
 use tangle_protocol::{
     Event, Filter, RawEventJson, RelayMessage, SubscriptionId, Tag, UnixTimestamp,
@@ -26,8 +26,8 @@ use tangle_test_support::{
     FixtureKey, TANGLE_V2_RELAY_SECRET_HEX, TANGLE_V2_RELAY_URL, tangle_v2_auth_event,
     tangle_v2_delete_group_event, tangle_v2_event, tangle_v2_group_config,
     tangle_v2_group_create_event, tangle_v2_group_event, tangle_v2_group_metadata_event,
-    tangle_v2_join_event, tangle_v2_leave_event, tangle_v2_put_user_event,
-    tangle_v2_remove_user_event,
+    tangle_v2_group_tag, tangle_v2_join_event, tangle_v2_leave_event, tangle_v2_pubkey_tag,
+    tangle_v2_put_user_event, tangle_v2_remove_user_event, tangle_v2_tag,
 };
 
 #[test]
@@ -274,6 +274,78 @@ fn group_auth_lifecycle_membership_and_flag_flows_pass_in_process() {
         1,
     );
     assert_eq!(member_auth.authenticated_pubkeys().len(), 1);
+}
+
+#[test]
+fn relay_override_role_changes_generate_admin_snapshots() {
+    let config = test_store_config("role-admin-snapshots");
+    let mut relay = BaseRelay::open_with_groups(&config, 8, &group_config()).expect("relay");
+    let owner_auth = authenticated(FixtureKey::Owner);
+    let admin_auth = authenticated(FixtureKey::Admin);
+    let member = FixtureKey::Member.public_key().as_str().to_owned();
+    let owner = FixtureKey::Owner.public_key().as_str().to_owned();
+    let admin = FixtureKey::Admin.public_key().as_str().to_owned();
+
+    accept_group_create(&mut relay, "RoleFarm", &[], 1, &owner_auth);
+    assert_eq!(
+        stored_event_ids_for_kind(&config, KIND_GROUP_ADMINS).len(),
+        1
+    );
+
+    let promote = tangle_v2_put_user_event_with_roles(
+        FixtureKey::Admin,
+        "RoleFarm",
+        FixtureKey::Member,
+        2,
+        &[PERMANENT_RELAY_OVERRIDE_ROLE],
+    );
+    assert_accepted(
+        relay
+            .handle_event_with_auth(promote.clone(), &admin_auth)
+            .expect("promote"),
+        &promote,
+    );
+    assert!(
+        relay
+            .group_projection()
+            .expect("projection")
+            .member(&group("RoleFarm"), &FixtureKey::Member.public_key())
+            .expect("member")
+            .roles()
+            .iter()
+            .any(|role| role.as_str() == PERMANENT_RELAY_OVERRIDE_ROLE)
+    );
+    assert_eq!(outbox_status_counts(&config).stored, 4);
+    assert_eq!(
+        stored_event_ids_for_kind(&config, KIND_GROUP_ADMINS).len(),
+        2
+    );
+    assert_eq!(
+        latest_admin_snapshot_pubkeys(&mut relay, "RoleFarm"),
+        sorted_strings([owner.clone(), admin.clone(), member.clone()])
+    );
+
+    let demote = tangle_v2_put_user_event_with_roles(
+        FixtureKey::Admin,
+        "RoleFarm",
+        FixtureKey::Member,
+        3,
+        &[],
+    );
+    assert_accepted(
+        relay
+            .handle_event_with_auth(demote.clone(), &admin_auth)
+            .expect("demote"),
+        &demote,
+    );
+    assert_eq!(
+        stored_event_ids_for_kind(&config, KIND_GROUP_ADMINS).len(),
+        3
+    );
+    assert_eq!(
+        latest_admin_snapshot_pubkeys(&mut relay, "RoleFarm"),
+        sorted_strings([owner, admin])
+    );
 }
 
 #[test]
@@ -1202,6 +1274,72 @@ fn accept_group_create(
             .expect("create"),
         &event,
     );
+}
+
+fn tangle_v2_put_user_event_with_roles(
+    actor: FixtureKey,
+    group_id: &str,
+    target: FixtureKey,
+    created_at: u64,
+    roles: &[&str],
+) -> Event {
+    let mut tags = vec![
+        tangle_v2_group_tag(group_id).expect("group tag"),
+        tangle_v2_pubkey_tag(target).expect("pubkey tag"),
+    ];
+    for role in roles {
+        tags.push(tangle_v2_tag("role", &[*role]).expect("role tag"));
+    }
+    tangle_v2_event(actor, created_at, KIND_GROUP_PUT_USER.into(), tags, "").expect("put user")
+}
+
+fn latest_admin_snapshot_pubkeys(relay: &mut BaseRelay, group_id: &str) -> Vec<String> {
+    let mut events = query_events(
+        relay,
+        "admin-snapshots",
+        vec![filter_group_tag(KIND_GROUP_ADMINS, "d", group_id)],
+    );
+    events.sort_by_key(|event| (event.unsigned().created_at(), event.id().clone()));
+    let latest = events.last().expect("admin snapshot");
+    let mut pubkeys = latest
+        .unsigned()
+        .tags()
+        .iter()
+        .filter_map(|tag| match tag.values() {
+            [name, pubkey, ..] if name == "p" => Some(pubkey.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    pubkeys.sort();
+    pubkeys
+}
+
+fn query_events(relay: &mut BaseRelay, subscription_id: &str, filters: Vec<Filter>) -> Vec<Event> {
+    let subscription_id = subscription(subscription_id);
+    let messages = relay
+        .handle_req(subscription_id.clone(), filters)
+        .expect("query");
+    let mut events = Vec::new();
+    for message in messages {
+        match message {
+            RelayMessage::Event {
+                subscription_id: actual,
+                event,
+            } => {
+                assert_eq!(actual, subscription_id);
+                events.push(event);
+            }
+            RelayMessage::Eose(actual) => assert_eq!(actual, subscription_id),
+            value => panic!("expected event or EOSE, got {value:?}"),
+        }
+    }
+    events
+}
+
+fn sorted_strings(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut values = values.into_iter().collect::<Vec<_>>();
+    values.sort();
+    values
 }
 
 fn final_group_name_for_order(name: &str, edits: [&Event; 2]) -> String {
