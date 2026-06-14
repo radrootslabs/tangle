@@ -5,7 +5,13 @@ use crate::{
     errors::BaseRelayError,
 };
 use std::{fmt, net::IpAddr, net::SocketAddr};
-use tangle_protocol::{EventId, SubscriptionId, UnixTimestamp};
+use tangle_groups::{
+    GroupEventClass, KIND_GROUP_ADMINS, KIND_GROUP_CREATE_GROUP, KIND_GROUP_DELETE_EVENT,
+    KIND_GROUP_DELETE_GROUP, KIND_GROUP_EDIT_METADATA, KIND_GROUP_JOIN_REQUEST,
+    KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA, KIND_GROUP_PUT_USER,
+    KIND_GROUP_REMOVE_USER,
+};
+use tangle_protocol::{Event, EventId, SubscriptionId, UnixTimestamp};
 use tracing_subscriber::EnvFilter;
 
 pub const TANGLE_LOG_REDACTED: &str = "<redacted>";
@@ -235,8 +241,129 @@ pub fn log_event_stored(event_id: &EventId, stored_offsets: usize, total_stored_
     );
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TangleModerationAuditResult {
+    Accepted,
+    Rejected,
+}
+
+impl TangleModerationAuditResult {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TangleModerationAuditEntry {
+    action_family: &'static str,
+    result: &'static str,
+    event_id: String,
+    actor_pubkey: String,
+    event_kind: u32,
+    target_count: usize,
+    generated_state_rejection: bool,
+}
+
+impl TangleModerationAuditEntry {
+    pub(crate) fn new(
+        event: &Event,
+        class: &GroupEventClass,
+        result: TangleModerationAuditResult,
+    ) -> Option<Self> {
+        let action_family = moderation_audit_action_family(event, class)?;
+        let generated_state_rejection = matches!(
+            (class, result),
+            (
+                GroupEventClass::RelayGeneratedSnapshot { .. },
+                TangleModerationAuditResult::Rejected
+            )
+        );
+        Some(Self {
+            action_family,
+            result: result.as_str(),
+            event_id: event.id().as_str().to_owned(),
+            actor_pubkey: event.unsigned().pubkey().as_str().to_owned(),
+            event_kind: event.unsigned().kind().as_u32(),
+            target_count: moderation_target_count(event, action_family),
+            generated_state_rejection,
+        })
+    }
+}
+
+pub(crate) fn log_group_moderation_audit(
+    event: &Event,
+    class: &GroupEventClass,
+    result: TangleModerationAuditResult,
+) {
+    let Some(entry) = TangleModerationAuditEntry::new(event, class, result) else {
+        return;
+    };
+    tracing::info!(
+        event = "group_moderation_audit",
+        action_family = entry.action_family,
+        result = entry.result,
+        event_id = entry.event_id,
+        actor_pubkey = entry.actor_pubkey,
+        event_kind = entry.event_kind,
+        target_count = entry.target_count,
+        group_id = TANGLE_LOG_REDACTED,
+        group_id_redacted = true,
+        generated_state_rejection = entry.generated_state_rejection,
+        "tangle group moderation audit"
+    );
+}
+
 pub fn sanitize_error_message(config: &BaseRelayRuntimeConfig, message: impl AsRef<str>) -> String {
     TangleLogRedactor::from_runtime_config(config).redact(message)
+}
+
+fn moderation_audit_action_family(event: &Event, class: &GroupEventClass) -> Option<&'static str> {
+    match class {
+        GroupEventClass::Moderation { kind, .. } => match kind.as_u32() {
+            KIND_GROUP_CREATE_GROUP => Some("group_create"),
+            KIND_GROUP_EDIT_METADATA => Some("metadata"),
+            KIND_GROUP_DELETE_GROUP => Some("delete_group"),
+            KIND_GROUP_DELETE_EVENT => Some("delete_event"),
+            KIND_GROUP_PUT_USER => Some("put_user"),
+            KIND_GROUP_REMOVE_USER => Some("remove_user"),
+            _ => None,
+        },
+        GroupEventClass::Normal { .. } => match event.unsigned().kind().as_u32() {
+            KIND_GROUP_JOIN_REQUEST => Some("join"),
+            KIND_GROUP_LEAVE_REQUEST => Some("leave"),
+            _ => None,
+        },
+        GroupEventClass::RelayGeneratedSnapshot { kind, .. } => match kind.as_u32() {
+            KIND_GROUP_METADATA => Some("metadata"),
+            KIND_GROUP_ADMINS => Some("admins"),
+            KIND_GROUP_MEMBERS => Some("members"),
+            _ => None,
+        },
+        GroupEventClass::NonGroup => None,
+    }
+}
+
+fn moderation_target_count(event: &Event, action_family: &str) -> usize {
+    let target_tag = match action_family {
+        "put_user" | "remove_user" | "members" => Some("p"),
+        "delete_event" => Some("e"),
+        _ => None,
+    };
+    let Some(target_tag) = target_tag else {
+        return 0;
+    };
+    event
+        .unsigned()
+        .tags()
+        .iter()
+        .filter(|tag| {
+            tag.indexed_pair()
+                .is_some_and(|(name, _)| name == target_tag)
+        })
+        .count()
 }
 
 fn relay_secret_log_value(config: &BaseRelayRuntimeConfig) -> &'static str {
@@ -256,13 +383,25 @@ fn optional_ip(peer_ip: Option<IpAddr>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        TANGLE_LOG_REDACTED, TangleLogRedactor, TangleRuntimeLogSummary, log_runtime_config_loaded,
-        sanitize_error_message,
+        TANGLE_LOG_REDACTED, TangleLogRedactor, TangleModerationAuditEntry,
+        TangleModerationAuditResult, TangleRuntimeLogSummary, log_group_moderation_audit,
+        log_runtime_config_loaded, sanitize_error_message,
     };
     use crate::config::parse_base_relay_runtime_config_json;
     use std::{
         io,
         sync::{Arc, Mutex},
+    };
+    use tangle_groups::{
+        GroupEventClass, GroupLimitsConfig, KIND_GROUP_ADMINS, KIND_GROUP_JOIN_REQUEST,
+        KIND_GROUP_MEMBERS, KIND_GROUP_METADATA, classify_group_event,
+    };
+    use tangle_test_support::{
+        FixtureKey, tangle_v2_address_group_tag, tangle_v2_delete_event_event,
+        tangle_v2_delete_group_event, tangle_v2_event, tangle_v2_group_create_event,
+        tangle_v2_group_event, tangle_v2_group_metadata_event, tangle_v2_group_tag,
+        tangle_v2_join_event, tangle_v2_leave_event, tangle_v2_put_user_event,
+        tangle_v2_remove_user_event, tangle_v2_tag,
     };
 
     #[test]
@@ -313,6 +452,189 @@ mod tests {
         assert!(output.contains(r#""event":"runtime_config_loaded""#));
         assert!(output.contains(r#""relay_secret":"<redacted>""#));
         assert!(!output.contains(&secret));
+    }
+
+    #[test]
+    fn group_moderation_audit_entries_cover_required_action_families_and_target_counts() {
+        let target = tangle_v2_group_event(FixtureKey::Member, "AuditFarm", 10, 1, "target")
+            .expect("target");
+        let cases = [
+            (
+                tangle_v2_group_create_event(FixtureKey::Owner, "AuditFarm", 11, &[])
+                    .expect("create"),
+                "group_create",
+                0,
+                false,
+            ),
+            (
+                tangle_v2_group_metadata_event(
+                    FixtureKey::Owner,
+                    "AuditFarm",
+                    "Audit Farm",
+                    12,
+                    &[],
+                )
+                .expect("metadata"),
+                "metadata",
+                0,
+                false,
+            ),
+            (
+                tangle_v2_put_user_event(FixtureKey::Owner, "AuditFarm", FixtureKey::Member, 13)
+                    .expect("put"),
+                "put_user",
+                1,
+                false,
+            ),
+            (
+                tangle_v2_remove_user_event(FixtureKey::Owner, "AuditFarm", FixtureKey::Member, 14)
+                    .expect("remove"),
+                "remove_user",
+                1,
+                false,
+            ),
+            (
+                tangle_v2_delete_event_event(FixtureKey::Owner, "AuditFarm", &target, 15)
+                    .expect("delete event"),
+                "delete_event",
+                1,
+                false,
+            ),
+            (
+                tangle_v2_delete_group_event(FixtureKey::Owner, "AuditFarm", 16)
+                    .expect("delete group"),
+                "delete_group",
+                0,
+                false,
+            ),
+            (
+                tangle_v2_join_event(FixtureKey::Member, "AuditFarm", 17).expect("join"),
+                "join",
+                0,
+                false,
+            ),
+            (
+                tangle_v2_leave_event(FixtureKey::Member, "AuditFarm", 18).expect("leave"),
+                "leave",
+                0,
+                false,
+            ),
+            (
+                tangle_v2_event(
+                    FixtureKey::Owner,
+                    19,
+                    KIND_GROUP_METADATA.into(),
+                    vec![tangle_v2_address_group_tag("AuditFarm").expect("d")],
+                    "",
+                )
+                .expect("generated metadata"),
+                "metadata",
+                0,
+                true,
+            ),
+            (
+                tangle_v2_event(
+                    FixtureKey::Owner,
+                    20,
+                    KIND_GROUP_ADMINS.into(),
+                    vec![tangle_v2_address_group_tag("AuditFarm").expect("d")],
+                    "",
+                )
+                .expect("generated admins"),
+                "admins",
+                0,
+                true,
+            ),
+            (
+                tangle_v2_event(
+                    FixtureKey::Owner,
+                    21,
+                    KIND_GROUP_MEMBERS.into(),
+                    vec![
+                        tangle_v2_address_group_tag("AuditFarm").expect("d"),
+                        tangle_v2_tag("p", &[FixtureKey::Member.public_key().as_str()]).expect("p"),
+                    ],
+                    "",
+                )
+                .expect("generated members"),
+                "members",
+                1,
+                true,
+            ),
+        ];
+
+        for (event, action_family, target_count, generated_state_rejection) in cases {
+            let class = classify_group_event(&event, GroupLimitsConfig::default()).expect("class");
+            let result = if matches!(class, GroupEventClass::RelayGeneratedSnapshot { .. }) {
+                TangleModerationAuditResult::Rejected
+            } else {
+                TangleModerationAuditResult::Accepted
+            };
+            let entry =
+                TangleModerationAuditEntry::new(&event, &class, result).expect("audit entry");
+
+            assert_eq!(entry.action_family, action_family);
+            assert_eq!(entry.target_count, target_count);
+            assert_eq!(entry.generated_state_rejection, generated_state_rejection);
+            assert_eq!(entry.result, result.as_str());
+        }
+    }
+
+    #[test]
+    fn group_moderation_audit_log_redacts_group_content_invite_and_secret_values() {
+        let secret = "7".repeat(64);
+        let event = tangle_v2_event(
+            FixtureKey::Member,
+            31,
+            KIND_GROUP_JOIN_REQUEST.into(),
+            vec![
+                tangle_v2_group_tag("SecretFarm").expect("h"),
+                tangle_v2_tag("code", &["invite-super-secret"]).expect("code"),
+            ],
+            "secret-content",
+        )
+        .expect("join");
+        let class = classify_group_event(&event, GroupLimitsConfig::default()).expect("class");
+        let writer = CapturedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(writer.clone())
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_group_moderation_audit(&event, &class, TangleModerationAuditResult::Rejected);
+        });
+
+        let output = writer.output();
+        assert!(output.contains(r#""event":"group_moderation_audit""#));
+        assert!(output.contains(r#""action_family":"join""#));
+        assert!(output.contains(r#""result":"rejected""#));
+        assert!(output.contains(r#""event_id":"#));
+        assert!(output.contains(event.id().as_str()));
+        assert!(output.contains(r#""actor_pubkey":"#));
+        assert!(output.contains(event.unsigned().pubkey().as_str()));
+        assert!(output.contains(r#""event_kind":9021"#));
+        assert!(output.contains(r#""target_count":0"#));
+        assert!(output.contains(r#""group_id":"<redacted>""#));
+        assert!(output.contains(r#""group_id_redacted":true"#));
+        assert!(output.contains(r#""generated_state_rejection":false"#));
+        assert!(!output.contains("SecretFarm"));
+        assert!(!output.contains("secret-content"));
+        assert!(!output.contains("invite-super-secret"));
+        assert!(!output.contains(&secret));
+    }
+
+    #[test]
+    fn group_moderation_audit_ignores_non_requested_group_event_kinds() {
+        let event =
+            tangle_v2_group_event(FixtureKey::Member, "AuditFarm", 41, 1, "normal").expect("event");
+        let class = classify_group_event(&event, GroupLimitsConfig::default()).expect("class");
+
+        assert!(
+            TangleModerationAuditEntry::new(&event, &class, TangleModerationAuditResult::Accepted)
+                .is_none()
+        );
     }
 
     #[derive(Clone, Default)]

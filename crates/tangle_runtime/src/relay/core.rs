@@ -1,5 +1,6 @@
 use crate::errors::{BaseRelayError, ok_accepted, ok_rejected};
 use crate::groups::GroupService;
+use crate::logging::{self, TangleModerationAuditResult};
 use crate::ops::BaseRelayReadinessState;
 use crate::pocket_conversion::{
     pocket_event_id, pocket_event_to_tangle, tangle_event_to_pocket, tangle_filter_to_pocket,
@@ -12,7 +13,7 @@ use std::{cell::RefCell, collections::BTreeSet};
 use tangle_crypto::verify_event_signature;
 use tangle_groups::{
     GroupAuthContext, GroupEventClass, GroupEventView, GroupProjection, GroupRuntimeConfig,
-    StoreOffset, validate_client_group_event_structure,
+    StoreOffset, classify_group_event, validate_client_group_event_structure,
 };
 use tangle_protocol::{ClientMessage, Event, Filter, RelayMessage, SubscriptionId, UnixTimestamp};
 use tangle_store_pocket::{PocketScreenResult, PocketStoreConfig, PocketStoreHandle};
@@ -634,9 +635,17 @@ impl BaseRelay {
             .as_ref()
             .map(GroupService::limits)
             .unwrap_or_default();
+        let audit_class = classify_group_event(&event, group_limits).ok();
         let class = match validate_client_group_event_structure(&event, group_limits) {
             Ok(class) => class,
             Err(error) => {
+                if let Some(class) = audit_class.as_ref() {
+                    logging::log_group_moderation_audit(
+                        &event,
+                        class,
+                        TangleModerationAuditResult::Rejected,
+                    );
+                }
                 return Ok(BaseRelayEventWrite::unstored(ok_rejected(
                     event_id,
                     error.prefixed_message(),
@@ -645,17 +654,32 @@ impl BaseRelay {
         };
         if !matches!(class, GroupEventClass::NonGroup) {
             let Some(groups) = self.groups.as_ref() else {
+                logging::log_group_moderation_audit(
+                    &event,
+                    &class,
+                    TangleModerationAuditResult::Rejected,
+                );
                 return Ok(BaseRelayEventWrite::unstored(ok_rejected(
                     event_id,
                     "blocked: NIP-29 group events are not accepted before group service".to_owned(),
                 )));
             };
             if let Err(error) = groups.check_event(&self.store, &event, &class, auth) {
+                logging::log_group_moderation_audit(
+                    &event,
+                    &class,
+                    TangleModerationAuditResult::Rejected,
+                );
                 return Ok(BaseRelayEventWrite::unstored(ok_rejected(
                     event_id,
                     error.prefixed_message(),
                 )));
             }
+            logging::log_group_moderation_audit(
+                &event,
+                &class,
+                TangleModerationAuditResult::Accepted,
+            );
         }
         if event.unsigned().kind().is_ephemeral() {
             return Ok(BaseRelayEventWrite::unstored(ok_accepted(
