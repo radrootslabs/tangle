@@ -4,6 +4,7 @@ use crate::{
     config::BaseRelayRuntimeConfig,
     errors::BaseRelayError,
     event_bus::{TangleEventBus, TangleEventReceiver},
+    groups::GroupServiceHandle,
     logging,
     ops::{BaseRelayReadinessHandle, BaseRelayReadinessState},
     pocket_conversion::pocket_event_to_tangle,
@@ -155,6 +156,7 @@ impl TangleRuntime {
 struct TangleRuntimeShared {
     config: Arc<BaseRelayRuntimeConfig>,
     store: PocketStoreHandle,
+    groups: Option<GroupServiceHandle>,
     relay: Mutex<BaseRelay>,
     readiness: BaseRelayReadinessHandle,
     limits: TangleRuntimeLimits,
@@ -177,9 +179,11 @@ impl TangleRuntimeShared {
             shutdown,
         } = runtime;
         let store = relay.store_handle();
+        let groups = relay.group_service_handle();
         Self {
             config: Arc::new(config),
             store,
+            groups,
             relay: Mutex::new(relay),
             readiness,
             limits,
@@ -823,10 +827,11 @@ impl TangleRuntimeHandle {
         let pocket_event = self.inner.store.event_by_offset(offset.as_u64())?;
         let event = pocket_event_to_tangle(&pocket_event)?;
         let group_auth = GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned());
-        let visible = {
-            let relay = self.inner.relay.lock().await;
-            BaseRelay::group_read_gate_visible_to_auth(relay.group_service(), &event, &group_auth)?
-        };
+        let visible = BaseRelay::group_read_gate_visible_to_auth(
+            self.inner.groups.as_ref(),
+            &event,
+            &group_auth,
+        )?;
         if !visible {
             self.inner.metrics.record_group_read_denial();
             return Ok(None);
@@ -839,11 +844,12 @@ impl TangleRuntimeHandle {
         offset: StoreOffset,
         subscriptions: &mut LiveSubscriptionSet,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
-        self.inner
-            .relay
-            .lock()
-            .await
-            .fanout_offset(offset, subscriptions)
+        let pocket_event = self.inner.store.event_by_offset(offset.as_u64())?;
+        let event = pocket_event_to_tangle(&pocket_event)?;
+        Ok(subscriptions.fanout(&event, |event, auth| {
+            BaseRelay::group_read_gate_visible_to_auth(self.inner.groups.as_ref(), event, auth)
+                .unwrap_or(false)
+        }))
     }
 
     pub async fn shutdown(&self) -> Result<BaseRelayShutdownReport, BaseRelayError> {

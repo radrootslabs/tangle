@@ -614,8 +614,8 @@ impl BaseRelay {
         self.groups.as_ref().map(GroupServiceHandle::projection)
     }
 
-    pub(crate) fn group_service(&self) -> Option<&GroupServiceHandle> {
-        self.groups.as_ref()
+    pub(crate) fn group_service_handle(&self) -> Option<GroupServiceHandle> {
+        self.groups.clone()
     }
 
     pub(crate) fn group_outbox_pending_events(&self) -> usize {
@@ -1036,18 +1036,6 @@ impl BaseRelay {
             .map(|groups| groups.event_visible_to_auth(event, auth))
             .unwrap_or(Ok(true))
             .map_err(BaseRelayError::from)
-    }
-
-    pub(crate) fn fanout_offset(
-        &self,
-        offset: StoreOffset,
-        subscriptions: &mut LiveSubscriptionSet,
-    ) -> Result<Vec<RelayMessage>, BaseRelayError> {
-        let event = self.event_by_offset(offset)?;
-        let groups = self.groups.as_ref();
-        Ok(subscriptions.fanout(&event, |event, auth| {
-            Self::group_read_gate_visible_to_auth(groups, event, auth).unwrap_or(false)
-        }))
     }
 }
 

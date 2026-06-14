@@ -1298,6 +1298,7 @@ fn closed_groups_use_strict_nip29_semantics_without_compatibility_flag() {
 #[test]
 fn req_count_and_live_fanout_share_one_group_read_gate() {
     let relay_core = include_str!("../src/relay/core.rs");
+    let runtime = include_str!("../src/runtime.rs");
 
     assert_eq!(
         relay_core
@@ -1309,7 +1310,13 @@ fn req_count_and_live_fanout_share_one_group_read_gate() {
         relay_core
             .matches("Self::group_read_gate_visible_to_auth")
             .count(),
-        4
+        3
+    );
+    assert_eq!(
+        runtime
+            .matches("BaseRelay::group_read_gate_visible_to_auth")
+            .count(),
+        2
     );
     assert!(!relay_core.contains("fn event_visible_to_auth("));
     assert!(!relay_core.contains("fn pocket_event_visible_to_auth("));
