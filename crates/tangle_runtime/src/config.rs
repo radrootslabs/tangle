@@ -607,6 +607,8 @@ mod tests {
             PocketSyncPolicy::FlushOnShutdown
         );
         assert!(config.groups().enabled());
+        assert!(!config.groups().policy().public_join());
+        assert!(!config.groups().policy().invites_enabled());
         assert_eq!(config.auth_ttl_seconds(), 300);
         assert_eq!(config.auth_created_at_skew_seconds(), 600);
         assert_eq!(config.limits().max_message_length(), 1_048_576);
