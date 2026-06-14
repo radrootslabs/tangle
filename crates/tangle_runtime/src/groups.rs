@@ -299,7 +299,7 @@ impl GroupService {
         record: &GroupOutboxRecord,
     ) -> Result<(EventId, Option<StoreOffset>), BaseRelayError> {
         let event = self.builder.sign_payload(record.payload())?;
-        if store.event_by_id(pocket_event_id(event.id())?)?.is_some() {
+        if generated_event_already_stored(store, event.id())? {
             return Ok((event.id().clone(), None));
         }
         let pocket_event = tangle_event_to_pocket(&event)?;
@@ -959,6 +959,21 @@ fn persist_outbox_record(
         &record.to_json_bytes()?,
     )?;
     Ok(())
+}
+
+fn generated_event_already_stored(
+    store: &PocketStoreHandle,
+    event_id: &EventId,
+) -> Result<bool, BaseRelayError> {
+    if store.event_by_id(pocket_event_id(event_id)?)?.is_some() {
+        return Ok(true);
+    }
+    for stored in store.scan_events()? {
+        if stored.event().id().as_hex_string() == event_id.as_str() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn class_group_id(class: &GroupEventClass) -> Option<&GroupId> {
