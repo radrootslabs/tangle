@@ -635,6 +635,309 @@ async fn websocket_nip29_group_lifecycle_state_and_live_paths_are_integrated() {
 }
 
 #[tokio::test]
+async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_live() {
+    let root = temp_root("acceptance-privacy-websocket");
+    let _ = std::fs::remove_dir_all(&root);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let runtime = TangleRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let shutdown = runtime.shutdown_signal().clone();
+    let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
+    let mut owner_writer = connect_nostr_socket(address).await;
+    let mut owner_reader = connect_nostr_socket(address).await;
+    let mut member_writer = connect_nostr_socket(address).await;
+    let mut member_reader = connect_nostr_socket(address).await;
+    let mut observer = connect_nostr_socket(address).await;
+    let owner_writer_challenge = read_auth_challenge(&mut owner_writer).await;
+    let owner_reader_challenge = read_auth_challenge(&mut owner_reader).await;
+    let member_writer_challenge = read_auth_challenge(&mut member_writer).await;
+    let member_reader_challenge = read_auth_challenge(&mut member_reader).await;
+    let _ = read_auth_challenge(&mut observer).await;
+    let auth_created_at = current_unix_timestamp();
+
+    authenticate_client(
+        &mut owner_writer,
+        FixtureKey::Owner,
+        &owner_writer_challenge,
+        auth_created_at,
+    )
+    .await;
+    authenticate_client(
+        &mut owner_reader,
+        FixtureKey::Owner,
+        &owner_reader_challenge,
+        auth_created_at.saturating_add(1),
+    )
+    .await;
+    authenticate_client(
+        &mut member_writer,
+        FixtureKey::Member,
+        &member_writer_challenge,
+        auth_created_at.saturating_add(2),
+    )
+    .await;
+    authenticate_client(
+        &mut member_reader,
+        FixtureKey::Member,
+        &member_reader_challenge,
+        auth_created_at.saturating_add(3),
+    )
+    .await;
+
+    let private_create = tangle_v2_group_create_event(
+        FixtureKey::Owner,
+        "PrivateSocket",
+        1_714_124_450,
+        &["private"],
+    )
+    .expect("private create");
+    send_client_value(
+        &mut owner_writer,
+        json!(["EVENT", event_to_value(&private_create)]),
+    )
+    .await;
+    assert_ok(
+        read_relay_value(&mut owner_writer).await,
+        &private_create,
+        true,
+        "",
+    );
+
+    let private_put = tangle_v2_put_user_event(
+        FixtureKey::Owner,
+        "PrivateSocket",
+        FixtureKey::Member,
+        1_714_124_451,
+    )
+    .expect("private put");
+    send_client_value(
+        &mut owner_writer,
+        json!(["EVENT", event_to_value(&private_put)]),
+    )
+    .await;
+    assert_ok(
+        read_relay_value(&mut owner_writer).await,
+        &private_put,
+        true,
+        "",
+    );
+
+    assert_count_message(
+        &mut observer,
+        "private-metadata-public-count",
+        json!({"kinds":[KIND_GROUP_METADATA], "#d":["PrivateSocket"]}),
+        1,
+    )
+    .await;
+    assert_count_message(
+        &mut observer,
+        "private-members-public-count",
+        json!({"kinds":[KIND_GROUP_MEMBERS], "#d":["PrivateSocket"]}),
+        0,
+    )
+    .await;
+
+    send_client_value(
+        &mut observer,
+        json!(["REQ", "private-public-live", {"kinds":[1], "#h":["PrivateSocket"]}]),
+    )
+    .await;
+    assert_eq!(
+        read_relay_value(&mut observer).await,
+        json!(["EOSE", "private-public-live"])
+    );
+    send_client_value(
+        &mut member_reader,
+        json!(["REQ", "private-member-live", {"kinds":[1], "#h":["PrivateSocket"]}]),
+    )
+    .await;
+    assert_eq!(
+        read_relay_value(&mut member_reader).await,
+        json!(["EOSE", "private-member-live"])
+    );
+
+    let private_note = tangle_v2_group_event(
+        FixtureKey::Member,
+        "PrivateSocket",
+        1_714_124_452,
+        1,
+        "private harvest",
+    )
+    .expect("private note");
+    send_client_value(
+        &mut member_writer,
+        json!(["EVENT", event_to_value(&private_note)]),
+    )
+    .await;
+    assert_ok(
+        read_relay_value(&mut member_writer).await,
+        &private_note,
+        true,
+        "",
+    );
+    assert_live_event(
+        read_relay_value(&mut member_reader).await,
+        "private-member-live",
+        &private_note,
+    );
+    expect_no_relay_message(&mut observer).await;
+    assert_count_message(
+        &mut observer,
+        "private-public-count",
+        json!({"kinds":[1], "#h":["PrivateSocket"]}),
+        0,
+    )
+    .await;
+    assert_count_message(
+        &mut member_reader,
+        "private-member-count",
+        json!({"kinds":[1], "#h":["PrivateSocket"]}),
+        1,
+    )
+    .await;
+    assert_empty_req(
+        &mut observer,
+        "private-public-query",
+        json!({"kinds":[1], "#h":["PrivateSocket"]}),
+    )
+    .await;
+    assert_req_event_then_eose(
+        &mut member_reader,
+        "private-member-query",
+        json!({"kinds":[1], "#h":["PrivateSocket"]}),
+        &private_note,
+    )
+    .await;
+
+    let hidden_create = tangle_v2_group_create_event(
+        FixtureKey::Owner,
+        "HiddenSocket",
+        1_714_124_453,
+        &["hidden"],
+    )
+    .expect("hidden create");
+    send_client_value(
+        &mut owner_writer,
+        json!(["EVENT", event_to_value(&hidden_create)]),
+    )
+    .await;
+    assert_ok(
+        read_relay_value(&mut owner_writer).await,
+        &hidden_create,
+        true,
+        "",
+    );
+
+    assert_count_message(
+        &mut observer,
+        "hidden-metadata-public-count",
+        json!({"kinds":[KIND_GROUP_METADATA], "#d":["HiddenSocket"]}),
+        0,
+    )
+    .await;
+    assert_count_message(
+        &mut owner_reader,
+        "hidden-metadata-owner-count",
+        json!({"kinds":[KIND_GROUP_METADATA], "#d":["HiddenSocket"]}),
+        1,
+    )
+    .await;
+    assert_empty_req(
+        &mut observer,
+        "hidden-metadata-public-query",
+        json!({"kinds":[KIND_GROUP_METADATA], "#d":["HiddenSocket"]}),
+    )
+    .await;
+
+    send_client_value(
+        &mut observer,
+        json!(["REQ", "hidden-public-live", {"kinds":[1], "#h":["HiddenSocket"]}]),
+    )
+    .await;
+    assert_eq!(
+        read_relay_value(&mut observer).await,
+        json!(["EOSE", "hidden-public-live"])
+    );
+    send_client_value(
+        &mut owner_reader,
+        json!(["REQ", "hidden-owner-live", {"kinds":[1], "#h":["HiddenSocket"]}]),
+    )
+    .await;
+    assert_eq!(
+        read_relay_value(&mut owner_reader).await,
+        json!(["EOSE", "hidden-owner-live"])
+    );
+
+    let hidden_note = tangle_v2_group_event(
+        FixtureKey::Owner,
+        "HiddenSocket",
+        1_714_124_454,
+        1,
+        "hidden harvest",
+    )
+    .expect("hidden note");
+    send_client_value(
+        &mut owner_writer,
+        json!(["EVENT", event_to_value(&hidden_note)]),
+    )
+    .await;
+    assert_ok(
+        read_relay_value(&mut owner_writer).await,
+        &hidden_note,
+        true,
+        "",
+    );
+    assert_live_event(
+        read_relay_value(&mut owner_reader).await,
+        "hidden-owner-live",
+        &hidden_note,
+    );
+    expect_no_relay_message(&mut observer).await;
+    assert_count_message(
+        &mut observer,
+        "hidden-public-count",
+        json!({"kinds":[1], "#h":["HiddenSocket"]}),
+        0,
+    )
+    .await;
+    assert_count_message(
+        &mut owner_reader,
+        "hidden-owner-count",
+        json!({"kinds":[1], "#h":["HiddenSocket"]}),
+        1,
+    )
+    .await;
+    assert_empty_req(
+        &mut observer,
+        "hidden-public-query",
+        json!({"kinds":[1], "#h":["HiddenSocket"]}),
+    )
+    .await;
+    assert_req_event_then_eose(
+        &mut owner_reader,
+        "hidden-owner-query",
+        json!({"kinds":[1], "#h":["HiddenSocket"]}),
+        &hidden_note,
+    )
+    .await;
+
+    shutdown.request_shutdown();
+    read_websocket_close(&mut owner_writer).await;
+    read_websocket_close(&mut owner_reader).await;
+    read_websocket_close(&mut member_writer).await;
+    read_websocket_close(&mut member_reader).await;
+    read_websocket_close(&mut observer).await;
+    let report = timeout(Duration::from_secs(2), task)
+        .await
+        .expect("shutdown timeout")
+        .expect("task")
+        .expect("serve");
+    assert_eq!(report.listen_addr(), address);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn nip11_includes_cors_headers_and_truthful_supported_nips() {
     let root = temp_root("acceptance-nip11");
     let _ = std::fs::remove_dir_all(&root);
@@ -1254,6 +1557,41 @@ async fn authenticate_client(
     let auth = tangle_v2_auth_event(fixture_key, challenge, created_at).expect("auth");
     send_client_value(socket, json!(["AUTH", event_to_value(&auth)])).await;
     assert_ok(read_relay_value(socket).await, &auth, true, "");
+}
+
+async fn assert_count_message(
+    socket: &mut TestWebSocket,
+    subscription_id: &str,
+    filter: Value,
+    count: u64,
+) {
+    send_client_value(socket, json!(["COUNT", subscription_id, filter])).await;
+    assert_eq!(
+        read_relay_value(socket).await,
+        json!(["COUNT", subscription_id, {"count": count}])
+    );
+}
+
+async fn assert_empty_req(socket: &mut TestWebSocket, subscription_id: &str, filter: Value) {
+    send_client_value(socket, json!(["REQ", subscription_id, filter])).await;
+    assert_eq!(
+        read_relay_value(socket).await,
+        json!(["EOSE", subscription_id])
+    );
+}
+
+async fn assert_req_event_then_eose(
+    socket: &mut TestWebSocket,
+    subscription_id: &str,
+    filter: Value,
+    event: &Event,
+) {
+    send_client_value(socket, json!(["REQ", subscription_id, filter])).await;
+    assert_live_event(read_relay_value(socket).await, subscription_id, event);
+    assert_eq!(
+        read_relay_value(socket).await,
+        json!(["EOSE", subscription_id])
+    );
 }
 
 fn assert_notice_prefix(value: Value, prefix: &str) {
