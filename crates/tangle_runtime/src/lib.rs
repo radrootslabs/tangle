@@ -8,6 +8,7 @@ pub mod groups;
 pub mod nip11;
 pub mod ops;
 pub(crate) mod pocket_conversion;
+pub mod rate_limits;
 pub mod relay;
 pub mod runtime;
 pub mod server;

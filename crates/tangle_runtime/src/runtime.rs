@@ -5,6 +5,7 @@ use crate::{
     errors::BaseRelayError,
     event_bus::{TangleEventBus, TangleEventReceiver},
     ops::BaseRelayReadinessState,
+    rate_limits::TangleRateLimiter,
     relay::{
         auth::BaseAuthState,
         core::{BaseRelay, BaseRelayLimits, BaseRelayShutdownReport},
@@ -29,6 +30,7 @@ pub struct TangleRuntime {
     readiness: BaseRelayReadinessState,
     limits: TangleRuntimeLimits,
     event_bus: TangleEventBus,
+    rate_limiter: TangleRateLimiter,
     metrics: TangleRuntimeMetrics,
     shutdown: TangleShutdownSignal,
 }
@@ -38,11 +40,13 @@ impl TangleRuntime {
         let limits = TangleRuntimeLimits::from_config(&config)?;
         let relay = config.open_relay()?;
         let readiness = relay.readiness_state();
+        let rate_limiter = TangleRateLimiter::new();
         Ok(Self {
             config,
             relay,
             readiness,
             event_bus: TangleEventBus::new(limits.event_bus_capacity())?,
+            rate_limiter,
             metrics: TangleRuntimeMetrics::new(),
             limits,
             shutdown: TangleShutdownSignal::new(),
@@ -75,6 +79,10 @@ impl TangleRuntime {
 
     pub fn event_bus(&self) -> &TangleEventBus {
         &self.event_bus
+    }
+
+    pub fn rate_limiter(&self) -> &TangleRateLimiter {
+        &self.rate_limiter
     }
 
     pub fn metrics(&self) -> &TangleRuntimeMetrics {
@@ -145,6 +153,10 @@ impl TangleRuntimeHandle {
 
     pub async fn subscribe_events(&self) -> TangleEventReceiver {
         self.inner.lock().await.event_bus().subscribe()
+    }
+
+    pub async fn rate_limiter(&self) -> TangleRateLimiter {
+        self.inner.lock().await.rate_limiter().clone()
     }
 
     pub(crate) async fn query_req_with_auth(
@@ -386,6 +398,7 @@ mod tests {
         assert_eq!(runtime.limits().outbound_queue_capacity(), 8);
         assert_eq!(runtime.event_bus().capacity(), 16);
         assert_eq!(runtime.event_bus().receiver_count(), 1);
+        assert_eq!(runtime.rate_limiter().tracked_key_count(), 0);
         assert_eq!(runtime.metrics().active_sessions(), 0);
         assert_eq!(runtime.metrics().stored_event_offsets(), 0);
         assert!(runtime.relay().groups_enabled());
