@@ -1,6 +1,12 @@
 #![forbid(unsafe_code)]
 
-use crate::{errors::BaseRelayError, runtime::TangleRuntime};
+use crate::{
+    errors::BaseRelayError,
+    ops::{BaseRelayReadinessState, base_relay_ops_router},
+    runtime::TangleRuntime,
+};
+use axum::{Router, routing::get};
+use http::StatusCode;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 
@@ -28,31 +34,36 @@ impl TangleServeReport {
 }
 
 pub async fn serve_until_shutdown(
-    mut runtime: TangleRuntime,
+    runtime: TangleRuntime,
 ) -> Result<TangleServeReport, BaseRelayError> {
     let listener = TcpListener::bind(runtime.config().listen_addr())
         .await
         .map_err(|error| BaseRelayError::error(error.to_string()))?;
+    serve_listener_until_shutdown(runtime, listener).await
+}
+
+pub async fn serve_listener_until_shutdown(
+    mut runtime: TangleRuntime,
+    listener: TcpListener,
+) -> Result<TangleServeReport, BaseRelayError> {
     let listen_addr = listener
         .local_addr()
         .map_err(|error| BaseRelayError::error(error.to_string()))?;
+    let router = tangle_http_router(runtime.readiness_state().clone());
     let mut shutdown = runtime.shutdown_signal().subscribe();
-    loop {
-        if *shutdown.borrow() {
-            break;
-        }
-        tokio::select! {
-            accept = listener.accept() => {
-                let (_stream, _peer_addr) = accept.map_err(|error| BaseRelayError::error(error.to_string()))?;
-            }
-            changed = shutdown.changed() => {
-                changed.map_err(|error| BaseRelayError::error(error.to_string()))?;
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            loop {
                 if *shutdown.borrow() {
                     break;
                 }
+                if shutdown.changed().await.is_err() {
+                    break;
+                }
             }
-        }
-    }
+        })
+        .await
+        .map_err(|error| BaseRelayError::error(error.to_string()))?;
     let shutdown = runtime.shutdown()?;
     Ok(TangleServeReport::new(
         listen_addr,
@@ -60,15 +71,32 @@ pub async fn serve_until_shutdown(
     ))
 }
 
+pub fn tangle_http_router(readiness: BaseRelayReadinessState) -> Router {
+    Router::new()
+        .route("/", get(tangle_root_reserved))
+        .merge(base_relay_ops_router(readiness))
+}
+
+async fn tangle_root_reserved() -> (StatusCode, &'static str) {
+    (
+        StatusCode::NOT_FOUND,
+        "relay information requires application/nostr+json",
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::serve_until_shutdown;
+    use super::{serve_until_shutdown, tangle_http_router};
     use crate::{
         config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
+        ops::BaseRelayReadinessState,
         runtime::TangleRuntime,
     };
+    use axum::body::to_bytes;
+    use http::Request;
     use serde_json::json;
     use std::path::{Path, PathBuf};
+    use tower::ServiceExt;
 
     #[tokio::test]
     async fn serve_until_shutdown_binds_listener_and_exits_on_signal() {
@@ -87,6 +115,49 @@ mod tests {
         assert_eq!(report.closed_subscriptions(), 0);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn tangle_http_router_binds_root_health_and_ready_routes() {
+        let router = tangle_http_router(BaseRelayReadinessState::ready());
+        let root = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("root");
+        let health = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("health");
+        let ready = router
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("ready");
+
+        assert_eq!(root.status(), http::StatusCode::NOT_FOUND);
+        assert_eq!(health.status(), http::StatusCode::OK);
+        assert_eq!(ready.status(), http::StatusCode::OK);
+        let root_body = to_bytes(root.into_body(), usize::MAX).await.expect("body");
+        assert_eq!(
+            String::from_utf8(root_body.to_vec()).expect("utf8"),
+            "relay information requires application/nostr+json"
+        );
     }
 
     fn runtime_config(root: &Path) -> BaseRelayRuntimeConfig {
