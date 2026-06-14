@@ -3,8 +3,10 @@
 use std::{fs, panic, path::PathBuf};
 use tangle_crypto::{event_id_matches, verify_event_signature};
 use tangle_groups::{
-    GroupId, GroupRuntimeConfig, KIND_GROUP_ADMINS, KIND_GROUP_DELETE_GROUP, KIND_GROUP_MEMBERS,
-    KIND_GROUP_METADATA, KIND_GROUP_PUT_USER, MemberStatus, parse_group_runtime_config_json,
+    GroupId, GroupRuntimeConfig, KIND_GROUP_ADMINS, KIND_GROUP_DELETE_GROUP,
+    KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA,
+    KIND_GROUP_PUT_USER, MemberStatus, NIP29_RELAY_GENERATED_KIND_VALUES,
+    parse_group_runtime_config_json,
 };
 use tangle_protocol::{
     Event, Filter, RawEventJson, RelayMessage, SubscriptionId, Tag, UnixTimestamp,
@@ -463,6 +465,385 @@ fn metadata_flags_and_read_privacy_cover_req_count_and_fanout() {
             .handle_event_with_auth(closed_normal.clone(), &outsider_auth)
             .expect("closed normal"),
         &closed_normal,
+    );
+}
+
+#[test]
+fn nip29_privacy_leak_suite_covers_relay_exposure_and_rejection_paths() {
+    let config = test_store_config("nip29-leak-suite");
+    let mut relay = BaseRelay::open_with_groups(&config, 16, &group_config()).expect("relay");
+    let owner_auth = authenticated(FixtureKey::Owner);
+    let admin_auth = authenticated(FixtureKey::Admin);
+    let member_auth = authenticated(FixtureKey::Member);
+    let outsider_auth = authenticated(FixtureKey::Outsider);
+
+    let unauthorized_create =
+        tangle_v2_group_create_event(FixtureKey::Owner, "UnauthorizedFarm", 1, &[])
+            .expect("unauthorized");
+    assert_eq!(
+        rejected_message(
+            relay
+                .handle_event(unauthorized_create.clone())
+                .expect("no auth")
+        ),
+        "auth-required: group event author must authenticate with AUTH"
+    );
+    assert_eq!(
+        rejected_message(
+            relay
+                .handle_event_with_auth(unauthorized_create, &outsider_auth)
+                .expect("wrong auth")
+        ),
+        "auth-required: group event author must authenticate with AUTH"
+    );
+    assert_count(
+        relay.handle_count(
+            subscription("unauthorized-generated"),
+            vec![filter_group_tag(
+                KIND_GROUP_METADATA,
+                "d",
+                "UnauthorizedFarm",
+            )],
+        ),
+        0,
+    );
+
+    accept_group_create(&mut relay, "LeakPrivate", &["private"], 10, &owner_auth);
+    let put_member =
+        tangle_v2_put_user_event(FixtureKey::Admin, "LeakPrivate", FixtureKey::Member, 11)
+            .expect("put member");
+    assert_accepted(
+        relay
+            .handle_event_with_auth(put_member.clone(), &admin_auth)
+            .expect("put member"),
+        &put_member,
+    );
+    let private_event = tangle_v2_group_event(FixtureKey::Member, "LeakPrivate", 12, 1, "private")
+        .expect("private");
+    assert_accepted(
+        relay
+            .handle_event_with_auth(private_event.clone(), &member_auth)
+            .expect("private"),
+        &private_event,
+    );
+
+    let private_unauth = subscription("private-leak-unauth");
+    assert_event_query(
+        relay
+            .handle_req(
+                private_unauth.clone(),
+                vec![filter_group_tag(1, "h", "LeakPrivate")],
+            )
+            .expect("private unauth"),
+        &private_unauth,
+        &[],
+    );
+    assert_count(
+        relay.handle_count(
+            subscription("private-count-unauth"),
+            vec![filter_group_tag(1, "h", "LeakPrivate")],
+        ),
+        0,
+    );
+    let private_member = subscription("private-leak-member");
+    assert_event_query(
+        relay
+            .handle_req_with_auth(
+                private_member.clone(),
+                vec![filter_group_tag(1, "h", "LeakPrivate")],
+                &member_auth,
+            )
+            .expect("private member"),
+        &private_member,
+        &[&private_event],
+    );
+    assert_eq!(relay.handle_close(&private_member), CloseResult::Closed);
+
+    let live_unauth = subscription("private-live-unauth");
+    let live_member = subscription("private-live-member");
+    relay
+        .handle_req(live_unauth, vec![filter_group_tag(1, "h", "LeakPrivate")])
+        .expect("private live unauth");
+    relay
+        .handle_req_with_auth(
+            live_member.clone(),
+            vec![filter_group_tag(1, "h", "LeakPrivate")],
+            &member_auth,
+        )
+        .expect("private live member");
+    let live_private = tangle_v2_group_event(FixtureKey::Member, "LeakPrivate", 13, 1, "live")
+        .expect("live private");
+    assert_accepted(
+        relay
+            .handle_event_with_auth(live_private.clone(), &member_auth)
+            .expect("live private"),
+        &live_private,
+    );
+    assert!(matches!(
+        relay.fanout(&live_private).as_slice(),
+        [RelayMessage::Event { subscription_id, event }]
+            if subscription_id == &live_member && event.id() == live_private.id()
+    ));
+
+    assert_count(
+        relay.handle_count(
+            subscription("private-metadata-public"),
+            vec![filter_group_tag(KIND_GROUP_METADATA, "d", "LeakPrivate")],
+        ),
+        1,
+    );
+    assert_count(
+        relay.handle_count(
+            subscription("private-members-public"),
+            vec![filter_group_tag(KIND_GROUP_MEMBERS, "d", "LeakPrivate")],
+        ),
+        0,
+    );
+
+    accept_group_create(&mut relay, "LeakHidden", &["hidden"], 20, &owner_auth);
+    assert_count(
+        relay.handle_count(
+            subscription("hidden-metadata-public"),
+            vec![filter_group_tag(KIND_GROUP_METADATA, "d", "LeakHidden")],
+        ),
+        0,
+    );
+    assert_count(
+        relay.handle_count_with_auth(
+            subscription("hidden-metadata-owner"),
+            vec![filter_group_tag(KIND_GROUP_METADATA, "d", "LeakHidden")],
+            &owner_auth,
+        ),
+        1,
+    );
+
+    accept_group_create(
+        &mut relay,
+        "LeakRestricted",
+        &["restricted"],
+        30,
+        &owner_auth,
+    );
+    let restricted_event =
+        tangle_v2_group_event(FixtureKey::Outsider, "LeakRestricted", 31, 1, "restricted")
+            .expect("restricted");
+    assert_eq!(
+        rejected_message(
+            relay
+                .handle_event_with_auth(restricted_event, &outsider_auth)
+                .expect("restricted")
+        ),
+        "restricted: group is unavailable"
+    );
+    assert_count(
+        relay.handle_count(
+            subscription("restricted-count"),
+            vec![filter_group_tag(1, "h", "LeakRestricted")],
+        ),
+        0,
+    );
+
+    accept_group_create(&mut relay, "LeakClosed", &["closed"], 40, &owner_auth);
+    let closed_join =
+        tangle_v2_join_event(FixtureKey::Outsider, "LeakClosed", 41).expect("closed join");
+    assert_eq!(
+        rejected_message(
+            relay
+                .handle_event_with_auth(closed_join, &outsider_auth)
+                .expect("closed join")
+        ),
+        "restricted: group is unavailable"
+    );
+    assert_count(
+        relay.handle_count(
+            subscription("closed-join-count"),
+            vec![filter_group_tag(KIND_GROUP_JOIN_REQUEST, "h", "LeakClosed")],
+        ),
+        0,
+    );
+    let closed_normal =
+        tangle_v2_group_event(FixtureKey::Outsider, "LeakClosed", 42, 1, "closed normal")
+            .expect("closed normal");
+    assert_accepted(
+        relay
+            .handle_event_with_auth(closed_normal.clone(), &outsider_auth)
+            .expect("closed normal"),
+        &closed_normal,
+    );
+    assert_count(
+        relay.handle_count(
+            subscription("closed-normal-count"),
+            vec![filter_group_tag(1, "h", "LeakClosed")],
+        ),
+        1,
+    );
+
+    let duplicate_join =
+        tangle_v2_join_event(FixtureKey::Member, "LeakPrivate", 50).expect("duplicate join");
+    assert_eq!(
+        rejected_message(
+            relay
+                .handle_event_with_auth(duplicate_join, &member_auth)
+                .expect("duplicate join")
+        ),
+        "duplicate: group member already exists"
+    );
+    assert_count(
+        relay.handle_count(
+            subscription("duplicate-join-count"),
+            vec![filter_group_tag(
+                KIND_GROUP_JOIN_REQUEST,
+                "h",
+                "LeakPrivate",
+            )],
+        ),
+        0,
+    );
+    let duplicate_leave =
+        tangle_v2_leave_event(FixtureKey::Outsider, "LeakPrivate", 51).expect("duplicate leave");
+    assert_eq!(
+        rejected_message(
+            relay
+                .handle_event_with_auth(duplicate_leave, &outsider_auth)
+                .expect("duplicate leave")
+        ),
+        "duplicate: group member does not exist"
+    );
+    assert_count(
+        relay.handle_count(
+            subscription("duplicate-leave-count"),
+            vec![filter_group_tag(
+                KIND_GROUP_LEAVE_REQUEST,
+                "h",
+                "LeakPrivate",
+            )],
+        ),
+        0,
+    );
+
+    for (index, kind) in NIP29_RELAY_GENERATED_KIND_VALUES
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        let generated = tangle_v2_event(
+            FixtureKey::Owner,
+            60 + u64::try_from(index).expect("index"),
+            u64::from(kind),
+            vec![Tag::from_parts("d", &["ClientGenerated"]).expect("d")],
+            "",
+        )
+        .expect("generated");
+        assert_eq!(
+            rejected_message(
+                relay
+                    .handle_event_with_auth(generated, &owner_auth)
+                    .expect("generated")
+            ),
+            "blocked: relay-generated group state events cannot be submitted by clients"
+        );
+        assert_count(
+            relay.handle_count(
+                subscription("client-generated-count"),
+                vec![filter_group_tag(kind, "d", "ClientGenerated")],
+            ),
+            0,
+        );
+    }
+
+    accept_group_create(&mut relay, "LeakDeleted", &[], 70, &owner_auth);
+    let deleted_target = tangle_v2_group_event(FixtureKey::Owner, "LeakDeleted", 71, 1, "deleted")
+        .expect("deleted target");
+    assert_accepted(
+        relay
+            .handle_event_with_auth(deleted_target.clone(), &owner_auth)
+            .expect("deleted target"),
+        &deleted_target,
+    );
+    let delete_target = tangle_test_support::tangle_v2_delete_event_event(
+        FixtureKey::Owner,
+        "LeakDeleted",
+        &deleted_target,
+        72,
+    )
+    .expect("delete target");
+    assert_accepted(
+        relay
+            .handle_event_with_auth(delete_target.clone(), &owner_auth)
+            .expect("delete target"),
+        &delete_target,
+    );
+    assert_count(
+        relay.handle_count(
+            subscription("deleted-target-count"),
+            vec![filter_group_tag(1, "h", "LeakDeleted")],
+        ),
+        0,
+    );
+    let deleted_query = subscription("deleted-target-query");
+    assert_event_query(
+        relay
+            .handle_req(
+                deleted_query.clone(),
+                vec![filter_group_tag(1, "h", "LeakDeleted")],
+            )
+            .expect("deleted query"),
+        &deleted_query,
+        &[],
+    );
+    let delete_group =
+        tangle_v2_delete_group_event(FixtureKey::Owner, "LeakDeleted", 73).expect("delete group");
+    assert_accepted(
+        relay
+            .handle_event_with_auth(delete_group.clone(), &owner_auth)
+            .expect("delete group"),
+        &delete_group,
+    );
+    assert_eq!(
+        rejected_message(
+            relay
+                .handle_event_with_auth(
+                    tangle_v2_group_event(FixtureKey::Owner, "LeakDeleted", 74, 1, "late")
+                        .expect("late deleted"),
+                    &owner_auth,
+                )
+                .expect("late deleted")
+        ),
+        "blocked: group is deleted"
+    );
+
+    accept_group_create(
+        &mut relay,
+        "LeakUnauthorizedCapability",
+        &[],
+        80,
+        &owner_auth,
+    );
+    let unauthorized_put = tangle_v2_put_user_event(
+        FixtureKey::Outsider,
+        "LeakUnauthorizedCapability",
+        FixtureKey::Member,
+        81,
+    )
+    .expect("unauthorized put");
+    assert_eq!(
+        rejected_message(
+            relay
+                .handle_event_with_auth(unauthorized_put, &outsider_auth)
+                .expect("unauthorized put")
+        ),
+        "restricted: missing group capability manage_members"
+    );
+    assert_count(
+        relay.handle_count(
+            subscription("unauthorized-put-count"),
+            vec![filter_group_tag(
+                KIND_GROUP_PUT_USER,
+                "h",
+                "LeakUnauthorizedCapability",
+            )],
+        ),
+        0,
     );
 }
 
