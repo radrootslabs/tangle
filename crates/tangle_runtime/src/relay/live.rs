@@ -10,6 +10,7 @@ pub(crate) struct LiveSubscriptionSet {
     subscriptions: BTreeMap<SubscriptionId, LiveSubscription>,
     pending: BTreeMap<SubscriptionId, usize>,
     max_pending_events: usize,
+    max_subscriptions: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,16 +20,25 @@ struct LiveSubscription {
 }
 
 impl LiveSubscriptionSet {
-    pub(crate) fn new(max_pending_events: usize) -> Result<Self, BaseRelayError> {
+    pub(crate) fn new(
+        max_pending_events: usize,
+        max_subscriptions: usize,
+    ) -> Result<Self, BaseRelayError> {
         if max_pending_events == 0 {
             return Err(BaseRelayError::invalid(
                 "live subscription pending event limit must be greater than zero",
+            ));
+        }
+        if max_subscriptions == 0 {
+            return Err(BaseRelayError::invalid(
+                "live subscription count limit must be greater than zero",
             ));
         }
         Ok(Self {
             subscriptions: BTreeMap::new(),
             pending: BTreeMap::new(),
             max_pending_events,
+            max_subscriptions,
         })
     }
 
@@ -41,6 +51,13 @@ impl LiveSubscriptionSet {
         if filters.is_empty() {
             return Err(BaseRelayError::invalid(
                 "subscription must include at least one filter",
+            ));
+        }
+        if !self.subscriptions.contains_key(&subscription_id)
+            && self.subscriptions.len() >= self.max_subscriptions
+        {
+            return Err(BaseRelayError::invalid(
+                "connection subscription limit exceeded",
             ));
         }
         self.subscriptions
@@ -134,7 +151,7 @@ mod tests {
 
     #[test]
     fn live_subscription_fanout_closes_lagged_subscriptions() {
-        let mut subscriptions = LiveSubscriptionSet::new(1).expect("subscriptions");
+        let mut subscriptions = LiveSubscriptionSet::new(1, 1).expect("subscriptions");
         let subscription_id = SubscriptionId::new("live").expect("subscription");
         subscriptions
             .subscribe(

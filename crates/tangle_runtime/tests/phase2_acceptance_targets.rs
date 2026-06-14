@@ -558,7 +558,17 @@ fn runtime_config(root: &Path, listen_addr: SocketAddr) -> BaseRelayRuntimeConfi
             "created_at_skew_seconds": 600
         },
         "limits": {
-            "max_pending_events": 8
+            "max_message_length": 1048576,
+            "max_subid_length": 64,
+            "max_subscriptions_per_connection": 64,
+            "max_filters_per_request": 10,
+            "max_tag_values_per_filter": 100,
+            "max_limit": 500,
+            "default_limit": 100,
+            "max_event_tags": 200,
+            "max_content_length": 65536,
+            "broadcast_channel_capacity": 8,
+            "per_connection_outbound_queue": 8
         }
     })
     .to_string();

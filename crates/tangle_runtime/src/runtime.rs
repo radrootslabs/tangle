@@ -7,7 +7,7 @@ use crate::{
     ops::BaseRelayReadinessState,
     relay::{
         auth::BaseAuthState,
-        core::{BaseRelay, BaseRelayShutdownReport},
+        core::{BaseRelay, BaseRelayLimits, BaseRelayShutdownReport},
         live::LiveSubscriptionSet,
     },
 };
@@ -125,6 +125,18 @@ impl TangleRuntimeHandle {
                 }
                 Ok(vec![result.into_message()])
             }
+            ClientMessage::Auth(event) => {
+                if let Err(error) = runtime.limits().base_relay_limits().validate_event(&event) {
+                    return Ok(vec![RelayMessage::Ok {
+                        event_id: event.id().clone(),
+                        accepted: false,
+                        message: error.prefixed_message(),
+                    }]);
+                }
+                runtime
+                    .relay_mut()
+                    .handle_client_message(ClientMessage::Auth(event), auth, now)
+            }
             message => runtime
                 .relay_mut()
                 .handle_client_message(message, auth, now),
@@ -185,20 +197,22 @@ impl fmt::Debug for TangleRuntimeHandle {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TangleRuntimeLimits {
-    max_pending_events: usize,
+    max_message_length: usize,
+    base_relay_limits: BaseRelayLimits,
     event_bus_capacity: usize,
     outbound_queue_capacity: usize,
 }
 
 impl TangleRuntimeLimits {
     pub fn new(
-        max_pending_events: usize,
+        max_message_length: usize,
+        base_relay_limits: BaseRelayLimits,
         event_bus_capacity: usize,
         outbound_queue_capacity: usize,
     ) -> Result<Self, BaseRelayError> {
-        if max_pending_events == 0 {
+        if max_message_length == 0 {
             return Err(BaseRelayError::invalid(
-                "runtime max pending events must be greater than zero",
+                "runtime max message length must be greater than zero",
             ));
         }
         if event_bus_capacity == 0 {
@@ -212,22 +226,33 @@ impl TangleRuntimeLimits {
             ));
         }
         Ok(Self {
-            max_pending_events,
+            max_message_length,
+            base_relay_limits,
             event_bus_capacity,
             outbound_queue_capacity,
         })
     }
 
     pub fn from_config(config: &BaseRelayRuntimeConfig) -> Result<Self, BaseRelayError> {
+        let limits = config.limits();
         Self::new(
-            config.max_pending_events(),
-            config.max_pending_events(),
-            config.max_pending_events(),
+            limits.max_message_length(),
+            limits.base_relay_limits()?,
+            limits.broadcast_channel_capacity(),
+            limits.per_connection_outbound_queue(),
         )
     }
 
+    pub fn max_message_length(self) -> usize {
+        self.max_message_length
+    }
+
+    pub fn base_relay_limits(self) -> BaseRelayLimits {
+        self.base_relay_limits
+    }
+
     pub fn max_pending_events(self) -> usize {
-        self.max_pending_events
+        self.base_relay_limits.max_pending_events()
     }
 
     pub fn event_bus_capacity(self) -> usize {
@@ -331,6 +356,7 @@ mod tests {
     use super::{TangleRuntime, TangleRuntimeHandle, TangleRuntimeLimits};
     use crate::config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json};
     use crate::event_bus::{TangleEventBus, TangleEventReceiveError};
+    use crate::relay::core::{BaseRelayLimitSettings, BaseRelayLimits};
     use crate::relay::live::LiveSubscriptionSet;
     use serde_json::json;
     use std::path::{Path, PathBuf};
@@ -355,9 +381,10 @@ mod tests {
         assert_eq!(runtime.config().relay_url(), "wss://relay.radroots.test");
         assert_eq!(runtime.config().listen_addr().to_string(), "127.0.0.1:0");
         assert_eq!(runtime.limits().max_pending_events(), 8);
-        assert_eq!(runtime.limits().event_bus_capacity(), 8);
+        assert_eq!(runtime.limits().max_message_length(), 1_048_576);
+        assert_eq!(runtime.limits().event_bus_capacity(), 16);
         assert_eq!(runtime.limits().outbound_queue_capacity(), 8);
-        assert_eq!(runtime.event_bus().capacity(), 8);
+        assert_eq!(runtime.event_bus().capacity(), 16);
         assert_eq!(runtime.event_bus().receiver_count(), 1);
         assert_eq!(runtime.metrics().active_sessions(), 0);
         assert_eq!(runtime.metrics().stored_event_offsets(), 0);
@@ -398,9 +425,9 @@ mod tests {
 
     #[test]
     fn runtime_limits_and_event_bus_reject_zero_capacity() {
-        assert!(TangleRuntimeLimits::new(0, 1, 1).is_err());
-        assert!(TangleRuntimeLimits::new(1, 0, 1).is_err());
-        assert!(TangleRuntimeLimits::new(1, 1, 0).is_err());
+        assert!(TangleRuntimeLimits::new(0, runtime_relay_limits(1), 1, 1).is_err());
+        assert!(TangleRuntimeLimits::new(1, runtime_relay_limits(1), 0, 1).is_err());
+        assert!(TangleRuntimeLimits::new(1, runtime_relay_limits(1), 1, 0).is_err());
         assert!(TangleEventBus::new(0).is_err());
     }
 
@@ -413,7 +440,7 @@ mod tests {
         );
         let mut offsets = handle.subscribe_events().await;
         let mut auth = handle.auth_state().await.expect("auth");
-        let mut subscriptions = LiveSubscriptionSet::new(8).expect("subscriptions");
+        let mut subscriptions = LiveSubscriptionSet::new(8, 64).expect("subscriptions");
         let subscription_id = SubscriptionId::new("live-offset").expect("subscription");
         subscriptions
             .subscribe(
@@ -491,7 +518,7 @@ mod tests {
             tangle_v2_auth_event(FixtureKey::Owner, "challenge-a", 120).expect("auth event");
         let create = tangle_v2_group_create_event(FixtureKey::Owner, "RuntimeFarm", 121, &[])
             .expect("create");
-        let mut subscriptions = LiveSubscriptionSet::new(8).expect("subscriptions");
+        let mut subscriptions = LiveSubscriptionSet::new(8, 64).expect("subscriptions");
         let subscription_id = SubscriptionId::new("generated-offsets").expect("subscription");
         subscriptions
             .subscribe(
@@ -564,7 +591,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    fn runtime_config(root: &Path, max_pending_events: usize) -> BaseRelayRuntimeConfig {
+    fn runtime_config(root: &Path, per_connection_outbound_queue: usize) -> BaseRelayRuntimeConfig {
         let raw = json!({
             "server": {
                 "listen_addr": "127.0.0.1:0",
@@ -587,11 +614,36 @@ mod tests {
                 "created_at_skew_seconds": 600
             },
             "limits": {
-                "max_pending_events": max_pending_events
+                "max_message_length": 1048576,
+                "max_subid_length": 64,
+                "max_subscriptions_per_connection": 64,
+                "max_filters_per_request": 10,
+                "max_tag_values_per_filter": 100,
+                "max_limit": 500,
+                "default_limit": 100,
+                "max_event_tags": 200,
+                "max_content_length": 65536,
+                "broadcast_channel_capacity": 16,
+                "per_connection_outbound_queue": per_connection_outbound_queue
             }
         })
         .to_string();
         parse_base_relay_runtime_config_json(&raw).expect("config")
+    }
+
+    fn runtime_relay_limits(max_pending_events: usize) -> BaseRelayLimits {
+        BaseRelayLimits::new(BaseRelayLimitSettings {
+            max_pending_events,
+            max_subscription_id_length: 64,
+            max_subscriptions: 64,
+            max_filters_per_request: 10,
+            max_tag_values_per_filter: 100,
+            max_event_tags: 200,
+            max_content_length: 65_536,
+            max_limit: 500,
+            default_limit: 100,
+        })
+        .expect("limits")
     }
 
     fn temp_root(name: &str) -> PathBuf {

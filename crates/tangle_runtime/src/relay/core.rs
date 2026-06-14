@@ -22,6 +22,7 @@ pub struct BaseRelay {
     subscriptions: LiveSubscriptionSet,
     groups: Option<GroupService>,
     readiness: BaseRelayReadinessState,
+    limits: BaseRelayLimits,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -71,44 +72,244 @@ impl BaseRelayShutdownReport {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BaseRelayLimits {
+    max_pending_events: usize,
+    max_subscription_id_length: usize,
+    max_subscriptions: usize,
+    max_filters_per_request: usize,
+    max_tag_values_per_filter: usize,
+    max_event_tags: usize,
+    max_content_length: usize,
+    max_limit: u64,
+    default_limit: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BaseRelayLimitSettings {
+    pub max_pending_events: usize,
+    pub max_subscription_id_length: usize,
+    pub max_subscriptions: usize,
+    pub max_filters_per_request: usize,
+    pub max_tag_values_per_filter: usize,
+    pub max_event_tags: usize,
+    pub max_content_length: usize,
+    pub max_limit: u64,
+    pub default_limit: u64,
+}
+
+impl BaseRelayLimits {
+    pub fn new(settings: BaseRelayLimitSettings) -> Result<Self, BaseRelayError> {
+        let max_pending_events = settings.max_pending_events;
+        let max_subscription_id_length = settings.max_subscription_id_length;
+        let max_subscriptions = settings.max_subscriptions;
+        let max_filters_per_request = settings.max_filters_per_request;
+        let max_tag_values_per_filter = settings.max_tag_values_per_filter;
+        let max_event_tags = settings.max_event_tags;
+        let max_content_length = settings.max_content_length;
+        let max_limit = settings.max_limit;
+        let default_limit = settings.default_limit;
+        if max_pending_events == 0 {
+            return Err(BaseRelayError::invalid(
+                "runtime max pending events must be greater than zero",
+            ));
+        }
+        if max_subscription_id_length == 0 {
+            return Err(BaseRelayError::invalid(
+                "runtime max subscription id length must be greater than zero",
+            ));
+        }
+        if max_subscriptions == 0 {
+            return Err(BaseRelayError::invalid(
+                "runtime max subscriptions per connection must be greater than zero",
+            ));
+        }
+        if max_filters_per_request == 0 {
+            return Err(BaseRelayError::invalid(
+                "runtime max filters per request must be greater than zero",
+            ));
+        }
+        if max_tag_values_per_filter == 0 {
+            return Err(BaseRelayError::invalid(
+                "runtime max tag values per filter must be greater than zero",
+            ));
+        }
+        if max_event_tags == 0 {
+            return Err(BaseRelayError::invalid(
+                "runtime max event tags must be greater than zero",
+            ));
+        }
+        if max_content_length == 0 {
+            return Err(BaseRelayError::invalid(
+                "runtime max content length must be greater than zero",
+            ));
+        }
+        if max_limit == 0 {
+            return Err(BaseRelayError::invalid(
+                "runtime max filter limit must be greater than zero",
+            ));
+        }
+        if default_limit == 0 {
+            return Err(BaseRelayError::invalid(
+                "runtime default filter limit must be greater than zero",
+            ));
+        }
+        if default_limit > max_limit {
+            return Err(BaseRelayError::invalid(
+                "runtime default filter limit must not exceed max filter limit",
+            ));
+        }
+        Ok(Self {
+            max_pending_events,
+            max_subscription_id_length,
+            max_subscriptions,
+            max_filters_per_request,
+            max_tag_values_per_filter,
+            max_event_tags,
+            max_content_length,
+            max_limit,
+            default_limit,
+        })
+    }
+
+    pub fn max_pending_events(self) -> usize {
+        self.max_pending_events
+    }
+
+    pub fn max_subscription_id_length(self) -> usize {
+        self.max_subscription_id_length
+    }
+
+    pub fn max_subscriptions(self) -> usize {
+        self.max_subscriptions
+    }
+
+    pub fn max_filters_per_request(self) -> usize {
+        self.max_filters_per_request
+    }
+
+    pub fn max_tag_values_per_filter(self) -> usize {
+        self.max_tag_values_per_filter
+    }
+
+    pub fn max_event_tags(self) -> usize {
+        self.max_event_tags
+    }
+
+    pub fn max_content_length(self) -> usize {
+        self.max_content_length
+    }
+
+    pub fn max_limit(self) -> u64 {
+        self.max_limit
+    }
+
+    pub fn default_limit(self) -> u64 {
+        self.default_limit
+    }
+
+    pub fn validate_event(&self, event: &Event) -> Result<(), BaseRelayError> {
+        if event.unsigned().tags().len() > self.max_event_tags {
+            return Err(BaseRelayError::invalid(format!(
+                "event tag count exceeds runtime max_event_tags {}",
+                self.max_event_tags
+            )));
+        }
+        if event.unsigned().content().len() > self.max_content_length {
+            return Err(BaseRelayError::invalid(format!(
+                "event content length exceeds runtime max_content_length {}",
+                self.max_content_length
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn validate_subscription_id(
+        &self,
+        subscription_id: &SubscriptionId,
+    ) -> Result<(), BaseRelayError> {
+        let actual = subscription_id.as_str().chars().count();
+        if actual > self.max_subscription_id_length {
+            return Err(BaseRelayError::invalid(format!(
+                "subscription id length exceeds runtime max_subid_length {}",
+                self.max_subscription_id_length
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn validate_filters(&self, filters: &[Filter]) -> Result<(), BaseRelayError> {
+        if filters.is_empty() {
+            return Err(BaseRelayError::invalid(
+                "request must include at least one filter",
+            ));
+        }
+        if filters.len() > self.max_filters_per_request {
+            return Err(BaseRelayError::invalid(format!(
+                "filter count exceeds runtime max_filters_per_request {}",
+                self.max_filters_per_request
+            )));
+        }
+        for filter in filters {
+            let tag_values = filter.tag_filters().values().map(Vec::len).sum::<usize>();
+            if tag_values > self.max_tag_values_per_filter {
+                return Err(BaseRelayError::invalid(format!(
+                    "filter tag value count exceeds runtime max_tag_values_per_filter {}",
+                    self.max_tag_values_per_filter
+                )));
+            }
+            if filter.limit().is_some_and(|limit| limit > self.max_limit) {
+                return Err(BaseRelayError::invalid(format!(
+                    "filter limit exceeds runtime max_limit {}",
+                    self.max_limit
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn effective_filter_limit(self, filter: &Filter) -> usize {
+        usize::try_from(filter.limit().unwrap_or(self.default_limit)).unwrap_or(usize::MAX)
+    }
+}
+
 impl BaseRelay {
     pub fn open(
         config: &PocketStoreConfig,
-        max_pending_events: usize,
+        limits: BaseRelayLimits,
     ) -> Result<Self, BaseRelayError> {
         let store = PocketStoreHandle::open(config).map_err(BaseRelayError::from)?;
-        Self::new(store, max_pending_events)
+        Self::new(store, limits)
     }
 
     pub fn open_with_groups(
         config: &PocketStoreConfig,
-        max_pending_events: usize,
+        limits: BaseRelayLimits,
         groups: &GroupRuntimeConfig,
     ) -> Result<Self, BaseRelayError> {
         let store = PocketStoreHandle::open(config).map_err(BaseRelayError::from)?;
-        Self::new_with_groups(store, max_pending_events, groups)
+        Self::new_with_groups(store, limits, groups)
     }
 
-    pub fn new(
-        store: PocketStoreHandle,
-        max_pending_events: usize,
-    ) -> Result<Self, BaseRelayError> {
-        Self::new_with_groups(store, max_pending_events, &GroupRuntimeConfig::disabled())
+    pub fn new(store: PocketStoreHandle, limits: BaseRelayLimits) -> Result<Self, BaseRelayError> {
+        Self::new_with_groups(store, limits, &GroupRuntimeConfig::disabled())
     }
 
     pub fn new_with_groups(
         store: PocketStoreHandle,
-        max_pending_events: usize,
+        limits: BaseRelayLimits,
         groups: &GroupRuntimeConfig,
     ) -> Result<Self, BaseRelayError> {
         let groups = GroupService::from_config(&store, groups)?;
-        let subscriptions = LiveSubscriptionSet::new(max_pending_events)?;
+        let subscriptions =
+            LiveSubscriptionSet::new(limits.max_pending_events(), limits.max_subscriptions())?;
         let readiness = BaseRelayReadinessState::ready();
         Ok(Self {
             store,
             subscriptions,
             groups,
             readiness,
+            limits,
         })
     }
 
@@ -180,6 +381,7 @@ impl BaseRelay {
         filters: &[Filter],
         auth: &BaseAuthState,
     ) -> Result<Vec<Event>, BaseRelayError> {
+        self.limits.validate_filters(filters)?;
         self.query_events(
             filters,
             &GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned()),
@@ -192,6 +394,13 @@ impl BaseRelay {
         auth: &mut BaseAuthState,
         now: UnixTimestamp,
     ) -> Vec<RelayMessage> {
+        if let Err(error) = self.limits.validate_event(&event) {
+            return vec![RelayMessage::Ok {
+                event_id: event.id().clone(),
+                accepted: false,
+                message: error.prefixed_message(),
+            }];
+        }
         auth.authenticate(&event, now)
             .map(|_| {
                 vec![RelayMessage::Ok {
@@ -258,6 +467,12 @@ impl BaseRelay {
         auth: &GroupAuthContext,
     ) -> Result<BaseRelayEventWrite, BaseRelayError> {
         let event_id = event.id().clone();
+        if let Err(error) = self.limits.validate_event(&event) {
+            return Ok(BaseRelayEventWrite::unstored(ok_rejected(
+                event_id,
+                error.prefixed_message(),
+            )));
+        }
         if let Err(error) = verify_event_signature(&event) {
             return Ok(BaseRelayEventWrite::unstored(ok_rejected(
                 event_id,
@@ -359,6 +574,8 @@ impl BaseRelay {
         filters: Vec<Filter>,
         auth: &GroupAuthContext,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+        self.limits.validate_subscription_id(&subscription_id)?;
+        self.limits.validate_filters(&filters)?;
         self.subscriptions
             .subscribe(subscription_id.clone(), filters.clone(), auth.clone())?;
         self.query_req_with_group_auth(subscription_id, filters, auth)
@@ -370,6 +587,8 @@ impl BaseRelay {
         filters: Vec<Filter>,
         auth: &GroupAuthContext,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+        self.limits.validate_subscription_id(&subscription_id)?;
+        self.limits.validate_filters(&filters)?;
         let mut messages = self
             .query_events(&filters, auth)?
             .into_iter()
@@ -413,6 +632,8 @@ impl BaseRelay {
         filters: Vec<Filter>,
         auth: &GroupAuthContext,
     ) -> Result<RelayMessage, BaseRelayError> {
+        self.limits.validate_subscription_id(&subscription_id)?;
+        self.limits.validate_filters(&filters)?;
         Ok(RelayMessage::Count {
             subscription_id,
             count: self.count_events(&filters, auth)?,
@@ -447,9 +668,7 @@ impl BaseRelay {
         for filter in filters {
             let mut events =
                 Self::sort_and_dedupe_query_events(self.query_filter_events(filter, auth)?);
-            if let Some(limit) = filter.limit() {
-                events.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-            }
+            events.truncate(self.limits.effective_filter_limit(filter));
             output.extend(events);
         }
         Ok(Self::sort_and_dedupe_query_events(output))
@@ -558,7 +777,7 @@ impl BaseRelay {
 
 #[cfg(test)]
 mod tests {
-    use super::BaseRelay;
+    use super::{BaseRelay, BaseRelayLimitSettings, BaseRelayLimits};
     use crate::pocket_conversion::tangle_event_to_pocket;
     use crate::relay::auth::BaseAuthState;
     use crate::relay::live::CloseResult;
@@ -700,6 +919,117 @@ mod tests {
             RelayMessage::Event { event, .. }
                 if event.id() == old_market.id() || event.id() == wrong_tag.id()
         )));
+    }
+
+    #[test]
+    fn base_relay_enforces_runtime_limits() {
+        let config = test_store_config("base-relay-runtime-limits");
+        let mut relay = BaseRelay::open(
+            &config,
+            BaseRelayLimits::new(BaseRelayLimitSettings {
+                max_pending_events: 2,
+                max_subscription_id_length: 3,
+                max_subscriptions: 1,
+                max_filters_per_request: 1,
+                max_tag_values_per_filter: 1,
+                max_event_tags: 1,
+                max_content_length: 4,
+                max_limit: 2,
+                default_limit: 1,
+            })
+            .expect("limits"),
+        )
+        .expect("relay");
+        let first = signed_event_at(7, 1, Vec::new(), "one", 1_714_124_430);
+        let second = signed_event_at(8, 1, Vec::new(), "two", 1_714_124_431);
+
+        assert_accepted(relay.handle_event(first.clone()).expect("first"), &first);
+        assert_accepted(relay.handle_event(second.clone()).expect("second"), &second);
+
+        let limited = relay
+            .handle_req(
+                SubscriptionId::new("lim").expect("sub"),
+                vec![Filter::empty()],
+            )
+            .expect("limited");
+        assert_eq!(
+            limited
+                .iter()
+                .filter(|message| matches!(message, RelayMessage::Event { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            relay.handle_close(&SubscriptionId::new("lim").expect("sub")),
+            CloseResult::Closed
+        );
+
+        assert!(
+            relay
+                .handle_req(
+                    SubscriptionId::new("long").expect("sub"),
+                    vec![Filter::empty()]
+                )
+                .expect_err("subscription id length")
+                .prefixed_message()
+                .contains("max_subid_length 3")
+        );
+        assert!(
+            relay
+                .handle_count(
+                    SubscriptionId::new("cnt").expect("sub"),
+                    vec![Filter::empty(), Filter::empty()]
+                )
+                .expect_err("filter count")
+                .prefixed_message()
+                .contains("max_filters_per_request 1")
+        );
+        assert!(
+            relay
+                .handle_count(
+                    SubscriptionId::new("tag").expect("sub"),
+                    vec![
+                        filter_from_value(&serde_json::json!({"#t":["one", "two"]}))
+                            .expect("filter")
+                    ]
+                )
+                .expect_err("tag values")
+                .prefixed_message()
+                .contains("max_tag_values_per_filter 1")
+        );
+        assert!(
+            relay
+                .handle_count(
+                    SubscriptionId::new("max").expect("sub"),
+                    vec![filter_from_value(&serde_json::json!({"limit":3})).expect("filter")]
+                )
+                .expect_err("max limit")
+                .prefixed_message()
+                .contains("max_limit 2")
+        );
+
+        let too_many_tags = signed_event_at(
+            9,
+            1,
+            vec![
+                Tag::from_parts("t", &["one"]).expect("tag"),
+                Tag::from_parts("p", &["two"]).expect("tag"),
+            ],
+            "ok",
+            1_714_124_432,
+        );
+        assert!(matches!(
+            relay.handle_event(too_many_tags).expect("tags"),
+            RelayMessage::Ok { accepted: false, message, .. }
+                if message.contains("max_event_tags 1")
+        ));
+
+        let too_much_content = signed_event_at(10, 1, Vec::new(), "12345", 1_714_124_433);
+        assert!(matches!(
+            relay.handle_event(too_much_content).expect("content"),
+            RelayMessage::Ok { accepted: false, message, .. }
+                if message.contains("max_content_length 4")
+        ));
     }
 
     #[test]
@@ -1589,7 +1919,7 @@ mod tests {
     #[test]
     fn base_relay_shutdown_closes_live_subscriptions_and_syncs_store() {
         let config = test_store_config("base-relay-shutdown");
-        let mut relay = BaseRelay::open(&config, 4).expect("relay");
+        let mut relay = BaseRelay::open(&config, relay_limits(4)).expect("relay");
         let event = signed_public_event(7, 1, Vec::new(), "shutdown");
         let subscription_id = SubscriptionId::new("sub-shutdown").expect("sub");
 
@@ -1606,7 +1936,7 @@ mod tests {
         assert_eq!(relay.active_subscription_count(), 0);
         assert!(relay.fanout(&event).is_empty());
 
-        let reopened = BaseRelay::open(&config, 4).expect("reopened");
+        let reopened = BaseRelay::open(&config, relay_limits(4)).expect("reopened");
         assert_eq!(count_kind(&reopened, 1), 1);
     }
 
@@ -1652,9 +1982,126 @@ mod tests {
         );
     }
 
+    #[test]
+    fn base_relay_enforces_event_and_filter_runtime_limits() {
+        let config = test_store_config("base-relay-runtime-limits");
+        let mut relay = BaseRelay::open(&config, strict_relay_limits()).expect("relay");
+        let first = signed_public_event(7, 1, Vec::new(), "a");
+        let second = signed_event_at(8, 1, Vec::new(), "b", 1_714_124_434);
+
+        assert_accepted(relay.handle_event(first.clone()).expect("first"), &first);
+        assert_accepted(relay.handle_event(second.clone()).expect("second"), &second);
+        assert_eq!(
+            rejected_message(
+                relay
+                    .handle_event(signed_public_event(7, 1, Vec::new(), "abcde"))
+                    .expect("content")
+            ),
+            "invalid: event content length exceeds runtime max_content_length 4"
+        );
+        assert_eq!(
+            rejected_message(
+                relay
+                    .handle_event(signed_public_event(
+                        7,
+                        1,
+                        vec![
+                            Tag::from_parts("t", &["one"]).expect("tag"),
+                            Tag::from_parts("r", &["two"]).expect("tag"),
+                        ],
+                        "",
+                    ))
+                    .expect("tags")
+            ),
+            "invalid: event tag count exceeds runtime max_event_tags 1"
+        );
+        assert_eq!(
+            relay
+                .handle_req(
+                    SubscriptionId::new("a").expect("sub"),
+                    vec![Filter::empty()]
+                )
+                .expect("default limit")
+                .len(),
+            2
+        );
+        assert!(
+            relay
+                .handle_req(
+                    SubscriptionId::new("a").expect("sub"),
+                    vec![Filter::empty(), Filter::empty()],
+                )
+                .expect_err("filter count")
+                .prefixed_message()
+                .contains("max_filters_per_request 1")
+        );
+        assert!(
+            relay
+                .handle_count(
+                    SubscriptionId::new("a").expect("sub"),
+                    vec![
+                        filter_from_value(&serde_json::json!({"#t":["one", "two"]}))
+                            .expect("filter"),
+                    ],
+                )
+                .expect_err("tag values")
+                .prefixed_message()
+                .contains("max_tag_values_per_filter 1")
+        );
+        assert!(
+            relay
+                .handle_req(
+                    SubscriptionId::new("a").expect("sub"),
+                    vec![filter_from_value(&serde_json::json!({"limit": 3})).expect("filter")],
+                )
+                .expect_err("max limit")
+                .prefixed_message()
+                .contains("max_limit 2")
+        );
+    }
+
+    #[test]
+    fn base_relay_enforces_subscription_id_and_count_limits() {
+        let config = test_store_config("base-relay-subscription-limits");
+        let mut relay = BaseRelay::open(&config, strict_relay_limits()).expect("relay");
+
+        assert!(
+            relay
+                .handle_req(
+                    SubscriptionId::new("abcde").expect("sub"),
+                    vec![Filter::empty()],
+                )
+                .expect_err("sub id length")
+                .prefixed_message()
+                .contains("max_subid_length 4")
+        );
+        relay
+            .handle_req(
+                SubscriptionId::new("a").expect("sub"),
+                vec![Filter::empty()],
+            )
+            .expect("first subscription");
+        assert!(
+            relay
+                .handle_req(
+                    SubscriptionId::new("b").expect("sub"),
+                    vec![Filter::empty()]
+                )
+                .expect_err("subscription count")
+                .prefixed_message()
+                .contains("connection subscription limit exceeded")
+        );
+        relay
+            .handle_req(
+                SubscriptionId::new("a").expect("sub"),
+                vec![Filter::empty()],
+            )
+            .expect("replace subscription");
+    }
+
     fn test_relay(name: &str, max_pending_events: usize) -> BaseRelay {
         let config = test_store_config(name);
-        BaseRelay::open(&config, max_pending_events).expect("relay")
+        BaseRelay::open(&config, relay_limits(max_pending_events)).expect("relay")
     }
 
     fn test_relay_with_groups(
@@ -1663,7 +2110,38 @@ mod tests {
         groups: &tangle_groups::GroupRuntimeConfig,
     ) -> BaseRelay {
         let config = test_store_config(name);
-        BaseRelay::open_with_groups(&config, max_pending_events, groups).expect("relay")
+        BaseRelay::open_with_groups(&config, relay_limits(max_pending_events), groups)
+            .expect("relay")
+    }
+
+    fn relay_limits(max_pending_events: usize) -> BaseRelayLimits {
+        BaseRelayLimits::new(BaseRelayLimitSettings {
+            max_pending_events,
+            max_subscription_id_length: 64,
+            max_subscriptions: 64,
+            max_filters_per_request: 10,
+            max_tag_values_per_filter: 100,
+            max_event_tags: 200,
+            max_content_length: 65_536,
+            max_limit: 500,
+            default_limit: 100,
+        })
+        .expect("limits")
+    }
+
+    fn strict_relay_limits() -> BaseRelayLimits {
+        BaseRelayLimits::new(BaseRelayLimitSettings {
+            max_pending_events: 4,
+            max_subscription_id_length: 4,
+            max_subscriptions: 1,
+            max_filters_per_request: 1,
+            max_tag_values_per_filter: 1,
+            max_event_tags: 1,
+            max_content_length: 4,
+            max_limit: 2,
+            default_limit: 1,
+        })
+        .expect("limits")
     }
 
     fn test_store_config(name: &str) -> PocketStoreConfig {

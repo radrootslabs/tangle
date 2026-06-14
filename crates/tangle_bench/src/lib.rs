@@ -11,7 +11,10 @@ use tangle_groups::{KIND_GROUP_ADMINS, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA, 
 use tangle_protocol::{
     Event, Filter, RelayMessage, SubscriptionId, event_to_value, filter_from_value,
 };
-use tangle_runtime::relay::{auth::BaseAuthState, core::BaseRelay};
+use tangle_runtime::relay::{
+    auth::BaseAuthState,
+    core::{BaseRelay, BaseRelayLimitSettings, BaseRelayLimits},
+};
 use tangle_store_pocket::{PocketStoreConfig, PocketSyncPolicy};
 use tangle_test_support::{
     FixtureKey, TANGLE_V2_RELAY_URL, tangle_v2_auth_event, tangle_v2_event, tangle_v2_group_config,
@@ -708,8 +711,12 @@ fn run_projection_rebuild_benchmark(dataset: &BenchDataset) -> Result<ScenarioRe
         .shutdown()
         .map_err(|error| error.to_string())?;
     let started = Instant::now();
-    let reopened = BaseRelay::open_with_groups(&materialized.store_config, 128, &group_config()?)
-        .map_err(|error| error.to_string())?;
+    let reopened = BaseRelay::open_with_groups(
+        &materialized.store_config,
+        relay_limits(128),
+        &group_config()?,
+    )
+    .map_err(|error| error.to_string())?;
     let elapsed = elapsed_micros(started);
     let projection = reopened
         .group_projection()
@@ -742,13 +749,20 @@ fn run_outbox_replay_benchmark(dataset: &BenchDataset) -> Result<ScenarioReport,
         .shutdown()
         .map_err(|error| error.to_string())?;
     let started = Instant::now();
-    let mut reopened =
-        BaseRelay::open_with_groups(&materialized.store_config, 128, &group_config()?)
-            .map_err(|error| error.to_string())?;
+    let mut reopened = BaseRelay::open_with_groups(
+        &materialized.store_config,
+        relay_limits(128),
+        &group_config()?,
+    )
+    .map_err(|error| error.to_string())?;
     let after_first = generated_state_counts(&reopened)?;
     reopened.shutdown().map_err(|error| error.to_string())?;
-    let reopened = BaseRelay::open_with_groups(&materialized.store_config, 128, &group_config()?)
-        .map_err(|error| error.to_string())?;
+    let reopened = BaseRelay::open_with_groups(
+        &materialized.store_config,
+        relay_limits(128),
+        &group_config()?,
+    )
+    .map_err(|error| error.to_string())?;
     let after_second = generated_state_counts(&reopened)?;
     let elapsed = elapsed_micros(started);
     let accepted = u64::from(before == after_first && before == after_second);
@@ -847,9 +861,12 @@ fn materialize_dataset(
     max_pending_events: usize,
 ) -> Result<MaterializedBenchRelay, String> {
     let store_config = bench_store_config(run_name)?;
-    let mut relay =
-        BaseRelay::open_with_groups(&store_config, max_pending_events, &group_config()?)
-            .map_err(|error| error.to_string())?;
+    let mut relay = BaseRelay::open_with_groups(
+        &store_config,
+        relay_limits(max_pending_events),
+        &group_config()?,
+    )
+    .map_err(|error| error.to_string())?;
     let owner_auth = authenticated(FixtureKey::Owner)?;
     let admin_auth = authenticated(FixtureKey::Admin)?;
     let started = Instant::now();
@@ -891,6 +908,21 @@ fn materialize_dataset(
         store_config,
         ingest_report,
     })
+}
+
+fn relay_limits(max_pending_events: usize) -> BaseRelayLimits {
+    BaseRelayLimits::new(BaseRelayLimitSettings {
+        max_pending_events,
+        max_subscription_id_length: 64,
+        max_subscriptions: 512,
+        max_filters_per_request: 10,
+        max_tag_values_per_filter: 100,
+        max_event_tags: 200,
+        max_content_length: 65_536,
+        max_limit: 500,
+        default_limit: 100,
+    })
+    .expect("benchmark relay limits")
 }
 
 #[derive(Clone)]

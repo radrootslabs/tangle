@@ -4,7 +4,7 @@ use crate::{
     errors::BaseRelayError,
     nip11::{BaseRelayInfoConfig, BaseRelayInfoDocument, base_relay_info_response},
     ops::{BaseRelayReadinessState, base_relay_ops_router},
-    runtime::{TangleRuntime, TangleRuntimeHandle, TangleShutdownSignal},
+    runtime::{TangleRuntime, TangleRuntimeHandle, TangleRuntimeLimits, TangleShutdownSignal},
     session::TangleWebSocketSession,
 };
 use axum::{
@@ -62,13 +62,13 @@ pub async fn serve_listener_until_shutdown(
     let info =
         BaseRelayInfoConfig::new("tangle", runtime.config().groups().clone())?.build_document()?;
     let readiness = runtime.readiness_state().clone();
-    let outbound_queue_capacity = runtime.limits().outbound_queue_capacity();
+    let limits = runtime.limits();
     let shutdown_signal = runtime.shutdown_signal().clone();
     let runtime = TangleRuntimeHandle::new(runtime);
     let router = tangle_http_router(
         readiness,
         info,
-        outbound_queue_capacity,
+        limits,
         shutdown_signal.clone(),
         runtime.clone(),
     );
@@ -96,7 +96,7 @@ pub async fn serve_listener_until_shutdown(
 pub fn tangle_http_router(
     readiness: BaseRelayReadinessState,
     info: BaseRelayInfoDocument,
-    outbound_queue_capacity: usize,
+    limits: TangleRuntimeLimits,
     shutdown: TangleShutdownSignal,
     runtime: TangleRuntimeHandle,
 ) -> Router {
@@ -104,7 +104,7 @@ pub fn tangle_http_router(
         .route("/", get(tangle_root))
         .with_state(TangleHttpState {
             info,
-            outbound_queue_capacity,
+            limits,
             shutdown,
             runtime,
         })
@@ -114,7 +114,7 @@ pub fn tangle_http_router(
 #[derive(Debug, Clone)]
 struct TangleHttpState {
     info: BaseRelayInfoDocument,
-    outbound_queue_capacity: usize,
+    limits: TangleRuntimeLimits,
     shutdown: TangleShutdownSignal,
     runtime: TangleRuntimeHandle,
 }
@@ -128,7 +128,7 @@ async fn tangle_root(
         Ok(websocket) => {
             let session = match state.runtime.auth_state().await {
                 Ok(auth) => TangleWebSocketSession::new(
-                    state.outbound_queue_capacity,
+                    state.limits,
                     state.shutdown.subscribe(),
                     state.runtime.clone(),
                     auth,
@@ -380,12 +380,14 @@ mod tests {
             .expect("info config")
             .build_document()
             .expect("info");
+        let runtime = TangleRuntime::open(config).expect("runtime");
+        let limits = runtime.limits();
         let router = tangle_http_router(
             BaseRelayReadinessState::ready(),
             info,
-            8,
+            limits,
             TangleShutdownSignal::new(),
-            TangleRuntimeHandle::new(TangleRuntime::open(config).expect("runtime")),
+            TangleRuntimeHandle::new(runtime),
         );
         let nip11 = router
             .clone()
@@ -478,7 +480,17 @@ mod tests {
                 "created_at_skew_seconds": 600
             },
             "limits": {
-                "max_pending_events": 8
+                "max_message_length": 1048576,
+                "max_subid_length": 64,
+                "max_subscriptions_per_connection": 64,
+                "max_filters_per_request": 10,
+                "max_tag_values_per_filter": 100,
+                "max_limit": 500,
+                "default_limit": 100,
+                "max_event_tags": 200,
+                "max_content_length": 65536,
+                "broadcast_channel_capacity": 8,
+                "per_connection_outbound_queue": 8
             }
         })
         .to_string();

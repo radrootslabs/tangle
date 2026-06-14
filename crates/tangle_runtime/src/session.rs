@@ -7,7 +7,7 @@ use crate::{
         auth::{BaseAuthState, generate_auth_challenge},
         live::LiveSubscriptionSet,
     },
-    runtime::TangleRuntimeHandle,
+    runtime::{TangleRuntimeHandle, TangleRuntimeLimits},
 };
 use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -24,6 +24,7 @@ pub struct TangleWebSocketSession {
     outbound_receiver: mpsc::Receiver<Message>,
     shutdown: watch::Receiver<bool>,
     runtime: TangleRuntimeHandle,
+    limits: TangleRuntimeLimits,
     auth: BaseAuthState,
     subscriptions: LiveSubscriptionSet,
     events: TangleEventReceiver,
@@ -31,19 +32,18 @@ pub struct TangleWebSocketSession {
 
 impl TangleWebSocketSession {
     pub fn new(
-        outbound_queue_capacity: usize,
+        limits: TangleRuntimeLimits,
         shutdown: watch::Receiver<bool>,
         runtime: TangleRuntimeHandle,
         auth: BaseAuthState,
         events: TangleEventReceiver,
     ) -> Result<Self, BaseRelayError> {
-        if outbound_queue_capacity == 0 {
-            return Err(BaseRelayError::invalid(
-                "runtime outbound queue capacity must be greater than zero",
-            ));
-        }
+        let outbound_queue_capacity = limits.outbound_queue_capacity();
         let (sender, receiver) = mpsc::channel(outbound_queue_capacity);
-        let subscriptions = LiveSubscriptionSet::new(outbound_queue_capacity)?;
+        let subscriptions = LiveSubscriptionSet::new(
+            limits.base_relay_limits().max_pending_events(),
+            limits.base_relay_limits().max_subscriptions(),
+        )?;
         Ok(Self {
             connected_at: Instant::now(),
             outbound: TangleOutboundSender {
@@ -53,6 +53,7 @@ impl TangleWebSocketSession {
             outbound_receiver: receiver,
             shutdown,
             runtime,
+            limits,
             auth,
             subscriptions,
             events,
@@ -186,6 +187,14 @@ impl TangleWebSocketSession {
     }
 
     async fn dispatch_text(&mut self, raw: &str) -> bool {
+        if raw.len() > self.limits.max_message_length() {
+            return self
+                .send_relay_message(RelayMessage::Notice(format!(
+                    "invalid: client message length exceeds runtime max_message_length {}",
+                    self.limits.max_message_length()
+                )))
+                .is_ok();
+        }
         let replies = match parse_client_message(raw) {
             Ok(message) => match self.handle_client_message(message).await {
                 Ok(replies) => replies,
@@ -211,6 +220,9 @@ impl TangleWebSocketSession {
                 filters,
             } => self.handle_req(subscription_id, filters).await,
             ClientMessage::Close(subscription_id) => {
+                self.limits
+                    .base_relay_limits()
+                    .validate_subscription_id(&subscription_id)?;
                 self.subscriptions.close(&subscription_id);
                 Ok(Vec::new())
             }
@@ -227,6 +239,10 @@ impl TangleWebSocketSession {
         subscription_id: SubscriptionId,
         filters: Vec<Filter>,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+        self.limits
+            .base_relay_limits()
+            .validate_subscription_id(&subscription_id)?;
+        self.limits.base_relay_limits().validate_filters(&filters)?;
         self.subscriptions.subscribe(
             subscription_id.clone(),
             filters.clone(),
@@ -313,8 +329,10 @@ mod tests {
     };
     use crate::{
         config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
+        errors::BaseRelayError,
         event_bus::TangleEventReceiver,
-        runtime::{TangleRuntime, TangleRuntimeHandle, TangleShutdownSignal},
+        relay::core::{BaseRelayLimitSettings, BaseRelayLimits},
+        runtime::{TangleRuntime, TangleRuntimeHandle, TangleRuntimeLimits, TangleShutdownSignal},
     };
     use axum::extract::ws::Message;
     use serde_json::json;
@@ -327,34 +345,65 @@ mod tests {
         let before = std::time::Instant::now();
         let shutdown = TangleShutdownSignal::new();
         let (runtime, auth, events) = session_runtime("records-connection-time");
-        let session = TangleWebSocketSession::new(8, shutdown.subscribe(), runtime, auth, events)
-            .expect("session");
+        let session = TangleWebSocketSession::new(
+            session_limits(8),
+            shutdown.subscribe(),
+            runtime,
+            auth,
+            events,
+        )
+        .expect("session");
 
         assert!(session.connected_at() >= before);
     }
 
     #[test]
-    fn websocket_session_rejects_zero_outbound_capacity() {
-        let shutdown = TangleShutdownSignal::new();
-        let (runtime, auth, events) = session_runtime("zero-outbound-capacity");
-
-        assert!(
-            TangleWebSocketSession::new(0, shutdown.subscribe(), runtime, auth, events).is_err()
-        );
+    fn websocket_session_limit_config_rejects_zero_outbound_capacity() {
+        assert!(session_limits_result(0).is_err());
     }
 
     #[test]
     fn websocket_session_observes_shutdown_request() {
         let shutdown = TangleShutdownSignal::new();
         let (runtime, auth, events) = session_runtime("observes-shutdown");
-        let session = TangleWebSocketSession::new(8, shutdown.subscribe(), runtime, auth, events)
-            .expect("session");
+        let session = TangleWebSocketSession::new(
+            session_limits(8),
+            shutdown.subscribe(),
+            runtime,
+            auth,
+            events,
+        )
+        .expect("session");
 
         assert!(!session.shutdown_requested());
 
         shutdown.request_shutdown();
 
         assert!(session.shutdown_requested());
+    }
+
+    #[tokio::test]
+    async fn websocket_session_rejects_overlong_text_before_parsing() {
+        let shutdown = TangleShutdownSignal::new();
+        let (runtime, auth, events) = session_runtime("overlong-text");
+        let mut session = TangleWebSocketSession::new(
+            session_limits_with_message_length(8, 8),
+            shutdown.subscribe(),
+            runtime,
+            auth,
+            events,
+        )
+        .expect("session");
+
+        assert!(session.dispatch_text("123456789").await);
+        let message = session.outbound_receiver.try_recv().expect("notice");
+        let Message::Text(text) = message else {
+            panic!("expected text notice")
+        };
+        assert_eq!(
+            text.as_str(),
+            "[\"NOTICE\",\"invalid: client message length exceeds runtime max_message_length 8\"]"
+        );
     }
 
     #[tokio::test]
@@ -368,12 +417,22 @@ mod tests {
         let auth_b = runtime.auth_state().await.expect("auth b");
         let events_a = runtime.subscribe_events().await;
         let events_b = runtime.subscribe_events().await;
-        let mut first =
-            TangleWebSocketSession::new(8, shutdown.subscribe(), runtime.clone(), auth_a, events_a)
-                .expect("first");
-        let mut second =
-            TangleWebSocketSession::new(8, shutdown.subscribe(), runtime, auth_b, events_b)
-                .expect("second");
+        let mut first = TangleWebSocketSession::new(
+            session_limits(8),
+            shutdown.subscribe(),
+            runtime.clone(),
+            auth_a,
+            events_a,
+        )
+        .expect("first");
+        let mut second = TangleWebSocketSession::new(
+            session_limits(8),
+            shutdown.subscribe(),
+            runtime,
+            auth_b,
+            events_b,
+        )
+        .expect("second");
         let subscription_id = SubscriptionId::new("shared").expect("subscription");
 
         assert_eq!(
@@ -431,13 +490,13 @@ mod tests {
         let root = temp_root("event-receiver-lag");
         let _ = std::fs::remove_dir_all(&root);
         let runtime =
-            TangleRuntime::open(runtime_config_with_max_pending_events(&root, 1)).expect("runtime");
+            TangleRuntime::open(runtime_config_with_outbound_queue(&root, 1)).expect("runtime");
         let auth = runtime.auth_state().expect("auth");
         let events = runtime.event_bus().subscribe();
         assert_eq!(runtime.event_bus().publish(StoreOffset::new(1)), 1);
         assert_eq!(runtime.event_bus().publish(StoreOffset::new(2)), 1);
         let mut session = TangleWebSocketSession::new(
-            1,
+            session_limits(1),
             shutdown.subscribe(),
             TangleRuntimeHandle::new(runtime),
             auth,
@@ -458,8 +517,14 @@ mod tests {
     fn outbound_queue_is_bounded() {
         let shutdown = TangleShutdownSignal::new();
         let (runtime, auth, events) = session_runtime("outbound-queue");
-        let session = TangleWebSocketSession::new(1, shutdown.subscribe(), runtime, auth, events)
-            .expect("session");
+        let session = TangleWebSocketSession::new(
+            session_limits(1),
+            shutdown.subscribe(),
+            runtime,
+            auth,
+            events,
+        )
+        .expect("session");
         let outbound = session.outbound();
 
         assert_eq!(outbound.capacity(), 1);
@@ -497,12 +562,12 @@ mod tests {
     }
 
     fn runtime_config(root: &Path) -> BaseRelayRuntimeConfig {
-        runtime_config_with_max_pending_events(root, 8)
+        runtime_config_with_outbound_queue(root, 8)
     }
 
-    fn runtime_config_with_max_pending_events(
+    fn runtime_config_with_outbound_queue(
         root: &Path,
-        max_pending_events: usize,
+        per_connection_outbound_queue: usize,
     ) -> BaseRelayRuntimeConfig {
         let raw = json!({
             "server": {
@@ -523,11 +588,70 @@ mod tests {
                 "created_at_skew_seconds": 600
             },
             "limits": {
-                "max_pending_events": max_pending_events
+                "max_message_length": 1048576,
+                "max_subid_length": 64,
+                "max_subscriptions_per_connection": 64,
+                "max_filters_per_request": 10,
+                "max_tag_values_per_filter": 100,
+                "max_limit": 500,
+                "default_limit": 100,
+                "max_event_tags": 200,
+                "max_content_length": 65536,
+                "broadcast_channel_capacity": per_connection_outbound_queue,
+                "per_connection_outbound_queue": per_connection_outbound_queue
             }
         })
         .to_string();
         parse_base_relay_runtime_config_json(&raw).expect("config")
+    }
+
+    fn session_limits(per_connection_outbound_queue: usize) -> TangleRuntimeLimits {
+        session_limits_result(per_connection_outbound_queue).expect("limits")
+    }
+
+    fn session_limits_with_message_length(
+        max_message_length: usize,
+        per_connection_outbound_queue: usize,
+    ) -> TangleRuntimeLimits {
+        TangleRuntimeLimits::new(
+            max_message_length,
+            BaseRelayLimits::new(BaseRelayLimitSettings {
+                max_pending_events: per_connection_outbound_queue,
+                max_subscription_id_length: 64,
+                max_subscriptions: 64,
+                max_filters_per_request: 10,
+                max_tag_values_per_filter: 100,
+                max_event_tags: 200,
+                max_content_length: 65_536,
+                max_limit: 500,
+                default_limit: 100,
+            })
+            .expect("relay limits"),
+            16,
+            per_connection_outbound_queue,
+        )
+        .expect("limits")
+    }
+
+    fn session_limits_result(
+        per_connection_outbound_queue: usize,
+    ) -> Result<TangleRuntimeLimits, BaseRelayError> {
+        TangleRuntimeLimits::new(
+            1_048_576,
+            BaseRelayLimits::new(BaseRelayLimitSettings {
+                max_pending_events: per_connection_outbound_queue,
+                max_subscription_id_length: 64,
+                max_subscriptions: 64,
+                max_filters_per_request: 10,
+                max_tag_values_per_filter: 100,
+                max_event_tags: 200,
+                max_content_length: 65_536,
+                max_limit: 500,
+                default_limit: 100,
+            })?,
+            16,
+            per_connection_outbound_queue,
+        )
     }
 
     fn temp_root(name: &str) -> PathBuf {

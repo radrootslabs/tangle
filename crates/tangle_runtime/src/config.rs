@@ -2,11 +2,15 @@
 
 use crate::{
     errors::BaseRelayError,
-    relay::{auth::BaseAuthState, core::BaseRelay},
+    relay::{
+        auth::BaseAuthState,
+        core::{BaseRelay, BaseRelayLimitSettings, BaseRelayLimits},
+    },
 };
 use serde::Deserialize;
 use std::{net::SocketAddr, path::PathBuf};
 use tangle_groups::GroupRuntimeConfig;
+use tangle_protocol::SubscriptionId;
 use tangle_store_pocket::{PocketStoreConfig, PocketSyncPolicy};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,7 +21,7 @@ pub struct BaseRelayRuntimeConfig {
     groups: GroupRuntimeConfig,
     auth_ttl_seconds: u64,
     auth_created_at_skew_seconds: u64,
-    max_pending_events: usize,
+    limits: BaseRelayRuntimeLimitsConfig,
     tracing: BaseRelayTracingConfig,
 }
 
@@ -46,8 +50,8 @@ impl BaseRelayRuntimeConfig {
         self.auth_created_at_skew_seconds
     }
 
-    pub fn max_pending_events(&self) -> usize {
-        self.max_pending_events
+    pub fn limits(&self) -> BaseRelayRuntimeLimitsConfig {
+        self.limits
     }
 
     pub fn tracing(&self) -> &BaseRelayTracingConfig {
@@ -55,7 +59,7 @@ impl BaseRelayRuntimeConfig {
     }
 
     pub fn open_relay(&self) -> Result<BaseRelay, BaseRelayError> {
-        BaseRelay::open_with_groups(&self.pocket, self.max_pending_events, &self.groups)
+        BaseRelay::open_with_groups(&self.pocket, self.limits.base_relay_limits()?, &self.groups)
     }
 
     pub fn auth_state(&self) -> Result<BaseAuthState, BaseRelayError> {
@@ -132,6 +136,134 @@ impl Default for BaseRelayTracingConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BaseRelayRuntimeLimitsConfig {
+    max_message_length: usize,
+    max_subid_length: usize,
+    max_subscriptions_per_connection: usize,
+    max_filters_per_request: usize,
+    max_tag_values_per_filter: usize,
+    max_limit: u64,
+    default_limit: u64,
+    max_event_tags: usize,
+    max_content_length: usize,
+    broadcast_channel_capacity: usize,
+    per_connection_outbound_queue: usize,
+}
+
+impl BaseRelayRuntimeLimitsConfig {
+    fn from_document(document: BaseRelayRuntimeLimitsDocument) -> Result<Self, BaseRelayError> {
+        require_positive("limits.max_message_length", document.max_message_length)?;
+        require_positive("limits.max_subid_length", document.max_subid_length)?;
+        require_positive(
+            "limits.max_subscriptions_per_connection",
+            document.max_subscriptions_per_connection,
+        )?;
+        require_positive(
+            "limits.max_filters_per_request",
+            document.max_filters_per_request,
+        )?;
+        require_positive(
+            "limits.max_tag_values_per_filter",
+            document.max_tag_values_per_filter,
+        )?;
+        require_positive_u64("limits.max_limit", document.max_limit)?;
+        require_positive_u64("limits.default_limit", document.default_limit)?;
+        require_positive("limits.max_event_tags", document.max_event_tags)?;
+        require_positive("limits.max_content_length", document.max_content_length)?;
+        require_positive(
+            "limits.broadcast_channel_capacity",
+            document.broadcast_channel_capacity,
+        )?;
+        require_positive(
+            "limits.per_connection_outbound_queue",
+            document.per_connection_outbound_queue,
+        )?;
+        if document.max_subid_length > SubscriptionId::MAX_LENGTH {
+            return Err(BaseRelayError::invalid(format!(
+                "limits.max_subid_length must be less than or equal to {}",
+                SubscriptionId::MAX_LENGTH
+            )));
+        }
+        if document.default_limit > document.max_limit {
+            return Err(BaseRelayError::invalid(
+                "limits.default_limit must be less than or equal to limits.max_limit",
+            ));
+        }
+        Ok(Self {
+            max_message_length: document.max_message_length,
+            max_subid_length: document.max_subid_length,
+            max_subscriptions_per_connection: document.max_subscriptions_per_connection,
+            max_filters_per_request: document.max_filters_per_request,
+            max_tag_values_per_filter: document.max_tag_values_per_filter,
+            max_limit: document.max_limit,
+            default_limit: document.default_limit,
+            max_event_tags: document.max_event_tags,
+            max_content_length: document.max_content_length,
+            broadcast_channel_capacity: document.broadcast_channel_capacity,
+            per_connection_outbound_queue: document.per_connection_outbound_queue,
+        })
+    }
+
+    pub fn max_message_length(self) -> usize {
+        self.max_message_length
+    }
+
+    pub fn max_subid_length(self) -> usize {
+        self.max_subid_length
+    }
+
+    pub fn max_subscriptions_per_connection(self) -> usize {
+        self.max_subscriptions_per_connection
+    }
+
+    pub fn max_filters_per_request(self) -> usize {
+        self.max_filters_per_request
+    }
+
+    pub fn max_tag_values_per_filter(self) -> usize {
+        self.max_tag_values_per_filter
+    }
+
+    pub fn max_limit(self) -> u64 {
+        self.max_limit
+    }
+
+    pub fn default_limit(self) -> u64 {
+        self.default_limit
+    }
+
+    pub fn max_event_tags(self) -> usize {
+        self.max_event_tags
+    }
+
+    pub fn max_content_length(self) -> usize {
+        self.max_content_length
+    }
+
+    pub fn broadcast_channel_capacity(self) -> usize {
+        self.broadcast_channel_capacity
+    }
+
+    pub fn per_connection_outbound_queue(self) -> usize {
+        self.per_connection_outbound_queue
+    }
+
+    pub fn base_relay_limits(self) -> Result<BaseRelayLimits, BaseRelayError> {
+        BaseRelayLimits::new(BaseRelayLimitSettings {
+            max_pending_events: self.per_connection_outbound_queue,
+            max_subscription_id_length: self.max_subid_length,
+            max_subscriptions: self.max_subscriptions_per_connection,
+            max_filters_per_request: self.max_filters_per_request,
+            max_tag_values_per_filter: self.max_tag_values_per_filter,
+            max_event_tags: self.max_event_tags,
+            max_content_length: self.max_content_length,
+            max_limit: self.max_limit,
+            default_limit: self.default_limit,
+        })
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BaseRelayRuntimeConfigDocument {
@@ -177,7 +309,17 @@ struct BaseRelayAuthConfigDocument {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BaseRelayRuntimeLimitsDocument {
-    max_pending_events: usize,
+    max_message_length: usize,
+    max_subid_length: usize,
+    max_subscriptions_per_connection: usize,
+    max_filters_per_request: usize,
+    max_tag_values_per_filter: usize,
+    max_limit: u64,
+    default_limit: u64,
+    max_event_tags: usize,
+    max_content_length: usize,
+    broadcast_channel_capacity: usize,
+    per_connection_outbound_queue: usize,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -233,11 +375,7 @@ pub fn parse_base_relay_runtime_config_json(
     })?;
     let groups = tangle_groups::parse_group_runtime_config_json(&groups_raw)
         .map_err(|error| BaseRelayError::invalid(error.to_string()))?;
-    if document.limits.max_pending_events == 0 {
-        return Err(BaseRelayError::invalid(
-            "limits.max_pending_events must be greater than zero",
-        ));
-    }
+    let limits = BaseRelayRuntimeLimitsConfig::from_document(document.limits)?;
     if document.auth.created_at_skew_seconds == 0 {
         return Err(BaseRelayError::invalid(
             "auth.created_at_skew_seconds must be greater than zero",
@@ -251,9 +389,27 @@ pub fn parse_base_relay_runtime_config_json(
         groups,
         auth_ttl_seconds: document.auth.challenge_ttl_seconds,
         auth_created_at_skew_seconds: document.auth.created_at_skew_seconds,
-        max_pending_events: document.limits.max_pending_events,
+        limits,
         tracing,
     })
+}
+
+fn require_positive(field: &str, value: usize) -> Result<(), BaseRelayError> {
+    if value == 0 {
+        return Err(BaseRelayError::invalid(format!(
+            "{field} must be greater than zero"
+        )));
+    }
+    Ok(())
+}
+
+fn require_positive_u64(field: &str, value: u64) -> Result<(), BaseRelayError> {
+    if value == 0 {
+        return Err(BaseRelayError::invalid(format!(
+            "{field} must be greater than zero"
+        )));
+    }
+    Ok(())
 }
 
 fn base_relay_tracing_config_from_document(
@@ -303,7 +459,17 @@ mod tests {
         assert!(config.groups().enabled());
         assert_eq!(config.auth_ttl_seconds(), 300);
         assert_eq!(config.auth_created_at_skew_seconds(), 600);
-        assert_eq!(config.max_pending_events(), 1024);
+        assert_eq!(config.limits().max_message_length(), 1_048_576);
+        assert_eq!(config.limits().max_subid_length(), 64);
+        assert_eq!(config.limits().max_subscriptions_per_connection(), 64);
+        assert_eq!(config.limits().max_filters_per_request(), 10);
+        assert_eq!(config.limits().max_tag_values_per_filter(), 100);
+        assert_eq!(config.limits().max_limit(), 500);
+        assert_eq!(config.limits().default_limit(), 100);
+        assert_eq!(config.limits().max_event_tags(), 200);
+        assert_eq!(config.limits().max_content_length(), 65_536);
+        assert_eq!(config.limits().broadcast_channel_capacity(), 4_096);
+        assert_eq!(config.limits().per_connection_outbound_queue(), 256);
         assert!(config.tracing().enabled());
         assert_eq!(config.tracing().format(), BaseRelayTracingFormat::Json);
         config.auth_state().expect("auth");
@@ -330,7 +496,17 @@ mod tests {
                 "created_at_skew_seconds": 0
             },
             "limits": {
-                "max_pending_events": 8
+                "max_message_length": 1048576,
+                "max_subid_length": 64,
+                "max_subscriptions_per_connection": 64,
+                "max_filters_per_request": 10,
+                "max_tag_values_per_filter": 100,
+                "max_limit": 500,
+                "default_limit": 100,
+                "max_event_tags": 200,
+                "max_content_length": 65536,
+                "broadcast_channel_capacity": 4096,
+                "per_connection_outbound_queue": 256
             }
         }"#;
 
@@ -363,7 +539,17 @@ mod tests {
                 "created_at_skew_seconds": 600
             },
             "limits": {
-                "max_pending_events": 8
+                "max_message_length": 1048576,
+                "max_subid_length": 64,
+                "max_subscriptions_per_connection": 64,
+                "max_filters_per_request": 10,
+                "max_tag_values_per_filter": 100,
+                "max_limit": 500,
+                "default_limit": 100,
+                "max_event_tags": 200,
+                "max_content_length": 65536,
+                "broadcast_channel_capacity": 4096,
+                "per_connection_outbound_queue": 256
             },
             "ignored": true
         }"#;
@@ -393,7 +579,17 @@ mod tests {
                 "created_at_skew_seconds": 600
             },
             "limits": {
-                "max_pending_events": 8,
+                "max_message_length": 1048576,
+                "max_subid_length": 64,
+                "max_subscriptions_per_connection": 64,
+                "max_filters_per_request": 10,
+                "max_tag_values_per_filter": 100,
+                "max_limit": 500,
+                "default_limit": 100,
+                "max_event_tags": 200,
+                "max_content_length": 65536,
+                "broadcast_channel_capacity": 4096,
+                "per_connection_outbound_queue": 256,
                 "max_unimplemented_limit": 99
             }
         }"#;
