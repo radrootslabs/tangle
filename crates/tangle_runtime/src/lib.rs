@@ -4,6 +4,7 @@ pub mod base_relay;
 pub mod chorus_pocket;
 pub mod config;
 pub mod errors;
+pub mod groups;
 pub mod nip11;
 pub mod ops;
 pub mod relay;
