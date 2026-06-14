@@ -10,9 +10,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tangle_groups::{
-    GroupAuthority, GroupMetadata, GroupMetadataFlags, GroupMetadataText, GroupProjection,
-    GroupReadDecision, GroupReadGate, GroupState, KIND_GROUP_ADMINS, KIND_GROUP_MEMBERS,
-    KIND_GROUP_METADATA, ProjectionOrderTuple, StoreOffset, SupportedKinds,
+    GroupAuthContext, GroupAuthority, GroupErrorKind, GroupEventClass, GroupId, GroupMetadata,
+    GroupMetadataFlags, GroupMetadataText, GroupPolicyConfig, GroupProjection, GroupReadDecision,
+    GroupReadGate, GroupState, GroupWritePolicy, KIND_GROUP_ADMINS, KIND_GROUP_JOIN_REQUEST,
+    KIND_GROUP_MEMBERS, KIND_GROUP_METADATA, ProjectionOrderTuple, StoreOffset, SupportedKinds,
 };
 use tangle_protocol::{
     Event, EventId, Kind, PublicKeyHex, RelayMessage, SignatureHex, Tag, UnixTimestamp,
@@ -323,11 +324,29 @@ fn private_but_not_hidden_group_metadata_remains_visible() {
 }
 
 #[test]
-#[ignore = "phase2 target: public join policy"]
 fn public_join_defaults_false() {
-    pending(
-        "group join requests must be denied by default unless public join or invite flow allows them",
+    let owner = phase2_pubkey("1");
+    let joiner = phase2_pubkey("2");
+    let projection = phase2_projection_with_group(
+        "Farm",
+        phase2_metadata(false, false, false, false),
+        owner.clone(),
     );
+    let authority = GroupAuthority::new([owner], Vec::<PublicKeyHex>::new());
+    let policy = GroupWritePolicy::new(&projection, &authority, GroupPolicyConfig::strict());
+    let join = phase2_group_event(KIND_GROUP_JOIN_REQUEST, "Farm", joiner.clone());
+    let error = policy
+        .check_event(
+            &join,
+            &GroupEventClass::Normal {
+                group_id: GroupId::new("Farm").expect("group"),
+            },
+            &GroupAuthContext::new([joiner]),
+        )
+        .expect_err("join");
+
+    assert_eq!(error.kind(), GroupErrorKind::GroupUnavailable);
+    assert_eq!(error.prefixed_message(), "restricted: group is unavailable");
 }
 
 #[test]
@@ -585,6 +604,20 @@ fn phase2_snapshot_event(kind: u32, group_id: &str) -> Event {
             "",
         ),
         SignatureHex::new(&"2".repeat(128)).expect("sig"),
+    )
+}
+
+fn phase2_group_event(kind: u32, group_id: &str, author: PublicKeyHex) -> Event {
+    Event::new(
+        phase2_event_id("02"),
+        UnsignedEvent::new(
+            author,
+            UnixTimestamp::new(2),
+            Kind::new(kind.into()).expect("kind"),
+            vec![Tag::from_parts("h", &[group_id]).expect("h")],
+            "",
+        ),
+        SignatureHex::new(&"3".repeat(128)).expect("sig"),
     )
 }
 

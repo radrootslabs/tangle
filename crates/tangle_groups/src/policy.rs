@@ -233,7 +233,7 @@ impl<'a> GroupWritePolicy<'a> {
                 "group member already exists",
             ));
         }
-        if group.metadata().closed() {
+        if group.metadata().closed() || !self.policy.public_join() {
             return Err(non_enumerating_group_error());
         }
         Ok(GroupWriteDecision::Accept)
@@ -616,10 +616,30 @@ mod tests {
         );
         put_member(&mut projection, "Farm", member.clone(), []);
         let authority = GroupAuthority::new([owner], Vec::<PublicKeyHex>::new());
-        let policy = GroupWritePolicy::new(&projection, &authority, GroupPolicyConfig::strict());
+        let strict_policy =
+            GroupWritePolicy::new(&projection, &authority, GroupPolicyConfig::strict());
 
+        let public_join_error = strict_policy
+            .check_event(
+                &event(KIND_GROUP_JOIN_REQUEST, joiner.clone(), vec![h("Farm")]),
+                &GroupEventClass::Normal {
+                    group_id: group("Farm"),
+                },
+                &GroupAuthContext::new([joiner.clone()]),
+            )
+            .expect_err("public join");
+        assert_eq!(public_join_error.kind(), GroupErrorKind::GroupUnavailable);
         assert_eq!(
-            policy
+            public_join_error.prefixed_message(),
+            "restricted: group is unavailable"
+        );
+        let public_policy = GroupWritePolicy::new(
+            &projection,
+            &authority,
+            GroupPolicyConfig::new(true, false).expect("policy"),
+        );
+        assert_eq!(
+            public_policy
                 .check_event(
                     &event(KIND_GROUP_JOIN_REQUEST, joiner.clone(), vec![h("Farm")]),
                     &GroupEventClass::Normal {
@@ -627,11 +647,11 @@ mod tests {
                     },
                     &GroupAuthContext::new([joiner])
                 )
-                .expect("join"),
+                .expect("public join"),
             GroupWriteDecision::Accept
         );
         assert_eq!(
-            policy
+            strict_policy
                 .check_event(
                     &event(KIND_GROUP_JOIN_REQUEST, member.clone(), vec![h("Farm")]),
                     &GroupEventClass::Normal {
@@ -644,7 +664,7 @@ mod tests {
             GroupErrorKind::DuplicateMember
         );
         assert_eq!(
-            policy
+            strict_policy
                 .check_event(
                     &event(KIND_GROUP_LEAVE_REQUEST, member.clone(), vec![h("Farm")]),
                     &GroupEventClass::Normal {
@@ -667,7 +687,11 @@ mod tests {
             owner.clone(),
         );
         let authority = GroupAuthority::new([owner], Vec::<PublicKeyHex>::new());
-        let policy = GroupWritePolicy::new(&projection, &authority, GroupPolicyConfig::strict());
+        let policy = GroupWritePolicy::new(
+            &projection,
+            &authority,
+            GroupPolicyConfig::new(true, false).expect("policy"),
+        );
 
         assert_eq!(
             policy

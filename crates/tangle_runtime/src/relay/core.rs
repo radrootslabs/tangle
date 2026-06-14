@@ -935,12 +935,15 @@ mod tests {
         let mut relay = test_relay_with_groups(
             "base-relay-group-join",
             4,
-            &enabled_groups_for_owner(&owner),
+            &enabled_groups_for_owner_with_public_join(&owner),
         );
         let create = signed_group_create_event(7, "Farm");
-        relay
-            .handle_event_with_auth(create, &authenticated_state(7))
-            .expect("create");
+        assert_accepted(
+            relay
+                .handle_event_with_auth(create.clone(), &authenticated_state(7))
+                .expect("create"),
+            &create,
+        );
         let join = signed_event_at(
             8,
             KIND_GROUP_JOIN_REQUEST.into(),
@@ -970,6 +973,37 @@ mod tests {
                 .status(),
             MemberStatus::Member
         );
+    }
+
+    #[test]
+    fn group_join_requires_public_join_policy() {
+        let owner = signer(7).public_key().clone();
+        let mut relay = test_relay_with_groups(
+            "base-relay-group-join-default-deny",
+            4,
+            &enabled_groups_for_owner(&owner),
+        );
+        let create = signed_group_create_event(7, "Farm");
+        relay
+            .handle_event_with_auth(create, &authenticated_state(7))
+            .expect("create");
+        let join = signed_event_at(
+            8,
+            KIND_GROUP_JOIN_REQUEST.into(),
+            vec![Tag::from_parts("h", &["Farm"]).expect("h")],
+            "",
+            1_714_124_434,
+        );
+
+        assert_eq!(
+            rejected_message(
+                relay
+                    .handle_event_with_auth(join, &authenticated_state(8))
+                    .expect("join")
+            ),
+            "restricted: group is unavailable"
+        );
+        assert_eq!(count_kind(&relay, KIND_GROUP_PUT_USER), 0);
     }
 
     #[test]
@@ -1028,7 +1062,7 @@ mod tests {
         let mut relay = test_relay_with_groups(
             "base-relay-group-member-flow",
             4,
-            &enabled_groups_for_owner(&owner),
+            &enabled_groups_for_owner_with_public_join(&owner),
         );
         let owner_auth = authenticated_state(7);
         let member_auth = authenticated_state(8);
@@ -1635,6 +1669,23 @@ mod tests {
                 "canonical_relay_url": "wss://relay.radroots.test",
                 "relay_secret": "{}",
                 "owner_pubkeys": ["{}"]
+            }}"#,
+            "7".repeat(64),
+            owner.as_str()
+        ))
+        .expect("groups")
+    }
+
+    fn enabled_groups_for_owner_with_public_join(
+        owner: &PublicKeyHex,
+    ) -> tangle_groups::GroupRuntimeConfig {
+        parse_group_runtime_config_json(&format!(
+            r#"{{
+                "enabled": true,
+                "canonical_relay_url": "wss://relay.radroots.test",
+                "relay_secret": "{}",
+                "owner_pubkeys": ["{}"],
+                "policy": {{"public_join": true, "invites_enabled": false}}
             }}"#,
             "7".repeat(64),
             owner.as_str()

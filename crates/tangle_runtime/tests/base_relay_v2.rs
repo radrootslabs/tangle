@@ -4,7 +4,7 @@ use std::{fs, panic, path::PathBuf};
 use tangle_crypto::{event_id_matches, verify_event_signature};
 use tangle_groups::{
     GroupId, GroupRuntimeConfig, KIND_GROUP_ADMINS, KIND_GROUP_DELETE_GROUP, KIND_GROUP_MEMBERS,
-    KIND_GROUP_METADATA, MemberStatus,
+    KIND_GROUP_METADATA, KIND_GROUP_PUT_USER, MemberStatus, parse_group_runtime_config_json,
 };
 use tangle_protocol::{
     Event, Filter, RawEventJson, RelayMessage, SubscriptionId, Tag, UnixTimestamp,
@@ -16,10 +16,11 @@ use tangle_runtime::{
 };
 use tangle_store_pocket::{PocketStoreConfig, PocketSyncPolicy};
 use tangle_test_support::{
-    FixtureKey, TANGLE_V2_RELAY_URL, tangle_v2_auth_event, tangle_v2_delete_group_event,
-    tangle_v2_event, tangle_v2_group_config, tangle_v2_group_create_event, tangle_v2_group_event,
-    tangle_v2_group_metadata_event, tangle_v2_join_event, tangle_v2_leave_event,
-    tangle_v2_put_user_event, tangle_v2_remove_user_event,
+    FixtureKey, TANGLE_V2_RELAY_SECRET_HEX, TANGLE_V2_RELAY_URL, tangle_v2_auth_event,
+    tangle_v2_delete_group_event, tangle_v2_event, tangle_v2_group_config,
+    tangle_v2_group_create_event, tangle_v2_group_event, tangle_v2_group_metadata_event,
+    tangle_v2_join_event, tangle_v2_leave_event, tangle_v2_put_user_event,
+    tangle_v2_remove_user_event,
 };
 
 #[test]
@@ -146,7 +147,8 @@ fn auth_integration_covers_challenge_edges() {
 #[test]
 fn group_auth_lifecycle_membership_and_flag_flows_pass_in_process() {
     let config = test_store_config("group-flows");
-    let mut relay = BaseRelay::open_with_groups(&config, 8, &group_config()).expect("relay");
+    let groups = group_config_with_public_join();
+    let mut relay = BaseRelay::open_with_groups(&config, 8, &groups).expect("relay");
     let owner_auth = authenticated(FixtureKey::Owner);
     let admin_auth = authenticated(FixtureKey::Admin);
     let member_auth = authenticated(FixtureKey::Member);
@@ -265,6 +267,39 @@ fn group_auth_lifecycle_membership_and_flag_flows_pass_in_process() {
         1,
     );
     assert_eq!(member_auth.authenticated_pubkeys().len(), 1);
+}
+
+#[test]
+fn group_join_requests_are_denied_by_default() {
+    let config = test_store_config("group-public-join-default");
+    let mut relay = BaseRelay::open_with_groups(&config, 8, &group_config()).expect("relay");
+    let owner_auth = authenticated(FixtureKey::Owner);
+    let outsider_auth = authenticated(FixtureKey::Outsider);
+    let create = tangle_v2_group_create_event(FixtureKey::Owner, "Farm", 1, &[]).expect("create");
+    assert_accepted(
+        relay
+            .handle_event_with_auth(create.clone(), &owner_auth)
+            .expect("create"),
+        &create,
+    );
+    let join = tangle_v2_join_event(FixtureKey::Outsider, "Farm", 2).expect("join");
+
+    assert_eq!(
+        rejected_message(
+            relay
+                .handle_event_with_auth(join, &outsider_auth)
+                .expect("join")
+        ),
+        "restricted: group is unavailable"
+    );
+    assert!(
+        relay
+            .group_projection()
+            .expect("projection")
+            .member(&group("Farm"), &FixtureKey::Outsider.public_key())
+            .is_none()
+    );
+    assert_eq!(count_kind(&relay, KIND_GROUP_PUT_USER), 0);
 }
 
 #[test]
@@ -691,6 +726,22 @@ fn temp_root(name: &str) -> PathBuf {
 
 fn group_config() -> GroupRuntimeConfig {
     tangle_v2_group_config(FixtureKey::Owner, &[FixtureKey::Admin]).expect("groups")
+}
+
+fn group_config_with_public_join() -> GroupRuntimeConfig {
+    parse_group_runtime_config_json(&format!(
+        r#"{{
+            "enabled": true,
+            "canonical_relay_url": "{TANGLE_V2_RELAY_URL}",
+            "relay_secret": "{TANGLE_V2_RELAY_SECRET_HEX}",
+            "owner_pubkeys": ["{}"],
+            "admin_pubkeys": ["{}"],
+            "policy": {{"public_join": true, "invites_enabled": false}}
+        }}"#,
+        FixtureKey::Owner.public_key().as_str(),
+        FixtureKey::Admin.public_key().as_str()
+    ))
+    .expect("groups")
 }
 
 fn authenticated(key: FixtureKey) -> BaseAuthState {
