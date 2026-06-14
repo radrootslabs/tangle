@@ -14,7 +14,10 @@ use crate::{
     },
     relay::{
         auth::BaseAuthState,
-        core::{BaseRelay, BaseRelayEventWrite, BaseRelayLimits, BaseRelayShutdownReport},
+        core::{
+            BaseRelay, BaseRelayEventWrite, BaseRelayLimits, BaseRelayQueryReport,
+            BaseRelayShutdownReport,
+        },
         live::LiveSubscriptionSet,
     },
 };
@@ -393,6 +396,23 @@ impl TangleRuntimeShared {
             .unwrap_or(0)
     }
 
+    fn query_req_with_auth_report(
+        &self,
+        subscription_id: SubscriptionId,
+        filters: Vec<Filter>,
+        auth: &BaseAuthState,
+    ) -> Result<BaseRelayQueryReport, BaseRelayError> {
+        BaseRelay::query_req_with_shared_services(
+            &self.store,
+            self.groups.as_ref(),
+            self.limits.base_relay_limits(),
+            self.config.pocket_query_config(),
+            subscription_id,
+            filters,
+            auth,
+        )
+    }
+
     fn rate_limit_req(
         &self,
         subscription_id: &SubscriptionId,
@@ -686,11 +706,9 @@ impl TangleRuntimeHandle {
                         .record_query_latency(elapsed_micros(started_at));
                     return Ok(vec![message]);
                 }
-                let report = self.inner.relay.lock().await.query_req_with_auth_report(
-                    subscription_id,
-                    filters,
-                    auth,
-                )?;
+                let report =
+                    self.inner
+                        .query_req_with_auth_report(subscription_id, filters, auth)?;
                 if report.group_read_denied() {
                     self.inner.metrics.record_group_read_denial();
                 }
@@ -822,11 +840,9 @@ impl TangleRuntimeHandle {
         auth: &BaseAuthState,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
         let started_at = Instant::now();
-        let report = self.inner.relay.lock().await.query_req_with_auth_report(
-            subscription_id,
-            filters,
-            auth,
-        )?;
+        let report = self
+            .inner
+            .query_req_with_auth_report(subscription_id, filters, auth)?;
         if report.group_read_denied() {
             self.inner.metrics.record_group_read_denial();
         }

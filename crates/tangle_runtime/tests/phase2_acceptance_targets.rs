@@ -1338,6 +1338,30 @@ fn runtime_event_handling_does_not_lock_relay_state() {
 }
 
 #[test]
+fn runtime_req_handling_does_not_lock_relay_state() {
+    let runtime = include_str!("../src/runtime.rs");
+    let req_branch = runtime
+        .split("ClientMessage::Req {")
+        .nth(1)
+        .expect("req branch")
+        .split("ClientMessage::Count")
+        .next()
+        .expect("count branch");
+    let query_helper = runtime
+        .split("pub(crate) async fn query_req_with_auth")
+        .nth(1)
+        .expect("query helper")
+        .split("pub async fn event_by_offset_with_auth")
+        .next()
+        .expect("offset helper");
+
+    assert!(!req_branch.contains("relay.lock().await"));
+    assert!(!query_helper.contains("relay.lock().await"));
+    assert!(req_branch.contains("query_req_with_auth_report(subscription_id, filters, auth)?"));
+    assert!(query_helper.contains("query_req_with_auth_report(subscription_id, filters, auth)?"));
+}
+
+#[test]
 fn runtime_hot_path_does_not_stringify_and_reparse_events() {
     let conversion_boundary = include_str!("../src/pocket_conversion.rs");
     for forbidden in [
