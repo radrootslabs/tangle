@@ -2,11 +2,11 @@
 
 use crate::{
     errors::BaseRelayError,
+    nip11::{BaseRelayInfoConfig, BaseRelayInfoDocument, base_relay_info_router},
     ops::{BaseRelayReadinessState, base_relay_ops_router},
     runtime::TangleRuntime,
 };
-use axum::{Router, routing::get};
-use http::StatusCode;
+use axum::Router;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 
@@ -49,7 +49,9 @@ pub async fn serve_listener_until_shutdown(
     let listen_addr = listener
         .local_addr()
         .map_err(|error| BaseRelayError::error(error.to_string()))?;
-    let router = tangle_http_router(runtime.readiness_state().clone());
+    let info =
+        BaseRelayInfoConfig::new("tangle", runtime.config().groups().clone())?.build_document()?;
+    let router = tangle_http_router(runtime.readiness_state().clone(), info);
     let mut shutdown = runtime.shutdown_signal().subscribe();
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
@@ -71,17 +73,11 @@ pub async fn serve_listener_until_shutdown(
     ))
 }
 
-pub fn tangle_http_router(readiness: BaseRelayReadinessState) -> Router {
-    Router::new()
-        .route("/", get(tangle_root_reserved))
-        .merge(base_relay_ops_router(readiness))
-}
-
-async fn tangle_root_reserved() -> (StatusCode, &'static str) {
-    (
-        StatusCode::NOT_FOUND,
-        "relay information requires application/nostr+json",
-    )
+pub fn tangle_http_router(
+    readiness: BaseRelayReadinessState,
+    info: BaseRelayInfoDocument,
+) -> Router {
+    base_relay_info_router(info).merge(base_relay_ops_router(readiness))
 }
 
 #[cfg(test)]
@@ -89,11 +85,12 @@ mod tests {
     use super::{serve_until_shutdown, tangle_http_router};
     use crate::{
         config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
+        nip11::BaseRelayInfoConfig,
         ops::BaseRelayReadinessState,
         runtime::TangleRuntime,
     };
     use axum::body::to_bytes;
-    use http::Request;
+    use http::{Request, header};
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use tower::ServiceExt;
@@ -118,9 +115,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tangle_http_router_binds_root_health_and_ready_routes() {
-        let router = tangle_http_router(BaseRelayReadinessState::ready());
-        let root = router
+    async fn tangle_http_router_serves_nip11_health_and_ready_routes() {
+        let root = temp_root("http-router");
+        let config = runtime_config(&root);
+        let info = BaseRelayInfoConfig::new("tangle", config.groups().clone())
+            .expect("info config")
+            .build_document()
+            .expect("info");
+        let router = tangle_http_router(BaseRelayReadinessState::ready(), info);
+        let nip11 = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::ACCEPT, "application/nostr+json")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("nip11");
+        let root_without_accept = router
             .clone()
             .oneshot(
                 Request::builder()
@@ -150,14 +164,31 @@ mod tests {
             .await
             .expect("ready");
 
-        assert_eq!(root.status(), http::StatusCode::NOT_FOUND);
+        assert_eq!(nip11.status(), http::StatusCode::OK);
+        assert_eq!(
+            nip11.headers().get(header::CONTENT_TYPE).expect("type"),
+            "application/nostr+json"
+        );
+        let nip11_body = to_bytes(nip11.into_body(), usize::MAX).await.expect("body");
+        let nip11_value = serde_json::from_slice::<serde_json::Value>(&nip11_body).expect("json");
+        assert_eq!(nip11_value["name"], "tangle");
+        assert!(
+            nip11_value["supported_nips"]
+                .as_array()
+                .expect("nips")
+                .contains(&serde_json::json!(29))
+        );
+        assert_eq!(root_without_accept.status(), http::StatusCode::NOT_FOUND);
         assert_eq!(health.status(), http::StatusCode::OK);
         assert_eq!(ready.status(), http::StatusCode::OK);
-        let root_body = to_bytes(root.into_body(), usize::MAX).await.expect("body");
+        let root_body = to_bytes(root_without_accept.into_body(), usize::MAX)
+            .await
+            .expect("body");
         assert_eq!(
             String::from_utf8(root_body.to_vec()).expect("utf8"),
             "relay information requires application/nostr+json"
         );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn runtime_config(root: &Path) -> BaseRelayRuntimeConfig {
