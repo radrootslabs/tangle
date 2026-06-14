@@ -674,6 +674,47 @@ mod tests {
     }
 
     #[test]
+    fn base_relay_event_path_rejects_invalid_signatures_and_skips_ephemeral_storage() {
+        let mut relay = test_relay("base-relay-event-store-path", 8);
+        let valid = signed_public_event(7, 1, Vec::new(), "valid");
+        let signature_source = signed_public_event(8, 1, Vec::new(), "signature source");
+        let invalid = Event::new(
+            valid.id().clone(),
+            valid.unsigned().clone(),
+            signature_source.sig().clone(),
+        );
+        let ephemeral = signed_public_event(7, 20_001, Vec::new(), "ephemeral");
+
+        assert!(matches!(
+            relay.handle_event(invalid.clone()).expect("invalid"),
+            RelayMessage::Ok {
+                event_id,
+                accepted: false,
+                message
+            } if event_id == *invalid.id()
+                && message == "invalid: event signature verification failed"
+        ));
+        assert_eq!(count_kind(&relay, 1), 0);
+
+        assert_accepted(relay.handle_event(valid.clone()).expect("valid"), &valid);
+        assert_eq!(
+            relay.handle_event(valid.clone()).expect("duplicate"),
+            RelayMessage::Ok {
+                event_id: valid.id().clone(),
+                accepted: true,
+                message: "duplicate: already have this event".to_owned()
+            }
+        );
+        assert_eq!(count_kind(&relay, 1), 1);
+
+        assert_accepted(
+            relay.handle_event(ephemeral.clone()).expect("ephemeral"),
+            &ephemeral,
+        );
+        assert_eq!(count_kind(&relay, 20_001), 0);
+    }
+
+    #[test]
     fn base_relay_rejects_group_marked_events_before_group_service() {
         let mut relay = test_relay("base-relay-group-reject", 4);
         let event = signed_public_event(
