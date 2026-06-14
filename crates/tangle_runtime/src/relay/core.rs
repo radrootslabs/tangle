@@ -79,6 +79,7 @@ pub struct BaseRelayLimits {
     max_subscriptions: usize,
     max_filters_per_request: usize,
     max_tag_values_per_filter: usize,
+    max_query_complexity: usize,
     max_event_tags: usize,
     max_content_length: usize,
     max_limit: u64,
@@ -92,6 +93,7 @@ pub struct BaseRelayLimitSettings {
     pub max_subscriptions: usize,
     pub max_filters_per_request: usize,
     pub max_tag_values_per_filter: usize,
+    pub max_query_complexity: usize,
     pub max_event_tags: usize,
     pub max_content_length: usize,
     pub max_limit: u64,
@@ -105,6 +107,7 @@ impl BaseRelayLimits {
         let max_subscriptions = settings.max_subscriptions;
         let max_filters_per_request = settings.max_filters_per_request;
         let max_tag_values_per_filter = settings.max_tag_values_per_filter;
+        let max_query_complexity = settings.max_query_complexity;
         let max_event_tags = settings.max_event_tags;
         let max_content_length = settings.max_content_length;
         let max_limit = settings.max_limit;
@@ -134,6 +137,11 @@ impl BaseRelayLimits {
                 "runtime max tag values per filter must be greater than zero",
             ));
         }
+        if max_query_complexity == 0 {
+            return Err(BaseRelayError::invalid(
+                "runtime max query complexity must be greater than zero",
+            ));
+        }
         if max_event_tags == 0 {
             return Err(BaseRelayError::invalid(
                 "runtime max event tags must be greater than zero",
@@ -159,12 +167,18 @@ impl BaseRelayLimits {
                 "runtime default filter limit must not exceed max filter limit",
             ));
         }
+        if usize::try_from(default_limit).is_ok_and(|limit| limit > max_query_complexity) {
+            return Err(BaseRelayError::invalid(
+                "runtime default filter limit must not exceed max query complexity",
+            ));
+        }
         Ok(Self {
             max_pending_events,
             max_subscription_id_length,
             max_subscriptions,
             max_filters_per_request,
             max_tag_values_per_filter,
+            max_query_complexity,
             max_event_tags,
             max_content_length,
             max_limit,
@@ -190,6 +204,10 @@ impl BaseRelayLimits {
 
     pub fn max_tag_values_per_filter(self) -> usize {
         self.max_tag_values_per_filter
+    }
+
+    pub fn max_query_complexity(self) -> usize {
+        self.max_query_complexity
     }
 
     pub fn max_event_tags(self) -> usize {
@@ -265,11 +283,43 @@ impl BaseRelayLimits {
                 )));
             }
         }
+        self.validate_query_complexity(filters)?;
         Ok(())
     }
 
     fn effective_filter_limit(self, filter: &Filter) -> usize {
         usize::try_from(filter.limit().unwrap_or(self.default_limit)).unwrap_or(usize::MAX)
+    }
+
+    fn validate_query_complexity(&self, filters: &[Filter]) -> Result<(), BaseRelayError> {
+        let score = filters
+            .iter()
+            .map(|filter| self.filter_complexity(filter))
+            .fold(0_usize, usize::saturating_add);
+        if score > self.max_query_complexity {
+            return Err(BaseRelayError::invalid(format!(
+                "query complexity {score} exceeds runtime max_query_complexity {}",
+                self.max_query_complexity
+            )));
+        }
+        Ok(())
+    }
+
+    fn filter_complexity(&self, filter: &Filter) -> usize {
+        let tag_score = filter
+            .tag_filters()
+            .values()
+            .map(|values| 1_usize.saturating_add(values.len()))
+            .fold(0_usize, usize::saturating_add);
+        1_usize
+            .saturating_add(filter.ids().len())
+            .saturating_add(filter.authors().len())
+            .saturating_add(filter.kinds().len())
+            .saturating_add(tag_score)
+            .saturating_add(usize::from(filter.since().is_some()))
+            .saturating_add(usize::from(filter.until().is_some()))
+            .saturating_add(filter.search().map(str::len).unwrap_or(0))
+            .saturating_add(self.effective_filter_limit(filter))
     }
 }
 
@@ -932,6 +982,7 @@ mod tests {
                 max_subscriptions: 1,
                 max_filters_per_request: 1,
                 max_tag_values_per_filter: 1,
+                max_query_complexity: 4,
                 max_event_tags: 1,
                 max_content_length: 4,
                 max_limit: 2,
@@ -1030,6 +1081,53 @@ mod tests {
             RelayMessage::Ok { accepted: false, message, .. }
                 if message.contains("max_content_length 4")
         ));
+    }
+
+    #[test]
+    fn base_relay_rejects_over_budget_req_and_count() {
+        let config = test_store_config("base-relay-query-complexity");
+        let mut relay = BaseRelay::open(
+            &config,
+            BaseRelayLimits::new(BaseRelayLimitSettings {
+                max_pending_events: 4,
+                max_subscription_id_length: 64,
+                max_subscriptions: 64,
+                max_filters_per_request: 10,
+                max_tag_values_per_filter: 10,
+                max_query_complexity: 4,
+                max_event_tags: 200,
+                max_content_length: 65_536,
+                max_limit: 10,
+                default_limit: 1,
+            })
+            .expect("limits"),
+        )
+        .expect("relay");
+        let complex = filter_from_value(&serde_json::json!({
+            "kinds": [1],
+            "#t": ["market"],
+            "limit": 2
+        }))
+        .expect("filter");
+
+        assert!(
+            relay
+                .handle_req(
+                    SubscriptionId::new("req").expect("sub"),
+                    vec![complex.clone()]
+                )
+                .expect_err("req complexity")
+                .prefixed_message()
+                .contains("max_query_complexity 4")
+        );
+        assert_eq!(relay.active_subscription_count(), 0);
+        assert!(
+            relay
+                .handle_count(SubscriptionId::new("cnt").expect("sub"), vec![complex])
+                .expect_err("count complexity")
+                .prefixed_message()
+                .contains("max_query_complexity 4")
+        );
     }
 
     #[test]
@@ -2121,6 +2219,7 @@ mod tests {
             max_subscriptions: 64,
             max_filters_per_request: 10,
             max_tag_values_per_filter: 100,
+            max_query_complexity: 610,
             max_event_tags: 200,
             max_content_length: 65_536,
             max_limit: 500,
@@ -2136,6 +2235,7 @@ mod tests {
             max_subscriptions: 1,
             max_filters_per_request: 1,
             max_tag_values_per_filter: 1,
+            max_query_complexity: 4,
             max_event_tags: 1,
             max_content_length: 4,
             max_limit: 2,

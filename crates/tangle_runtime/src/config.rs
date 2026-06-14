@@ -256,11 +256,19 @@ impl BaseRelayRuntimeLimitsConfig {
             max_subscriptions: self.max_subscriptions_per_connection,
             max_filters_per_request: self.max_filters_per_request,
             max_tag_values_per_filter: self.max_tag_values_per_filter,
+            max_query_complexity: self.query_complexity_budget(),
             max_event_tags: self.max_event_tags,
             max_content_length: self.max_content_length,
             max_limit: self.max_limit,
             default_limit: self.default_limit,
         })
+    }
+
+    fn query_complexity_budget(self) -> usize {
+        usize::try_from(self.max_limit)
+            .unwrap_or(usize::MAX)
+            .saturating_add(self.max_tag_values_per_filter)
+            .saturating_add(self.max_filters_per_request)
     }
 }
 

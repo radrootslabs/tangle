@@ -917,6 +917,7 @@ fn relay_limits(max_pending_events: usize) -> BaseRelayLimits {
         max_subscriptions: 512,
         max_filters_per_request: 10,
         max_tag_values_per_filter: 100,
+        max_query_complexity: 610,
         max_event_tags: 200,
         max_content_length: 65_536,
         max_limit: 500,
