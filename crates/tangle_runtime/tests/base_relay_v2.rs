@@ -983,6 +983,7 @@ fn projection_rebuild_after_restart_matches_live_state_and_outbox_is_idempotent(
     assert_eq!(count_kind(&relay, KIND_GROUP_MEMBERS), 1);
     let validation = group_extra_table_validation(&config);
     assert!(validation.projection_records() > 0);
+    assert_eq!(validation.outbox_records(), 3);
     assert!(matches!(
         validation.checkpoint_status(),
         &GroupCheckpointStatus::Current { .. }
