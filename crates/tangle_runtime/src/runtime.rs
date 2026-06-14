@@ -119,9 +119,9 @@ impl TangleRuntimeHandle {
                 let result = runtime
                     .relay_mut()
                     .handle_event_with_auth_report(event, auth)?;
-                if let Some(offset) = result.stored_offset() {
+                for offset in result.stored_offsets() {
                     runtime.metrics().record_stored_event_offset();
-                    runtime.event_bus().publish(offset);
+                    runtime.event_bus().publish(*offset);
                 }
                 Ok(vec![result.into_message()])
             }
@@ -334,11 +334,13 @@ mod tests {
     use crate::relay::live::LiveSubscriptionSet;
     use serde_json::json;
     use std::path::{Path, PathBuf};
-    use tangle_groups::{GroupAuthContext, StoreOffset};
+    use tangle_groups::{GroupAuthContext, KIND_GROUP_ADMINS, KIND_GROUP_METADATA, StoreOffset};
     use tangle_protocol::{
         ClientMessage, RelayMessage, SubscriptionId, UnixTimestamp, filter_from_value,
     };
-    use tangle_test_support::{FixtureKey, tangle_v2_event};
+    use tangle_test_support::{
+        FixtureKey, tangle_v2_auth_event, tangle_v2_event, tangle_v2_group_create_event,
+    };
 
     #[test]
     fn tangle_runtime_opens_owned_process_shell_from_config() {
@@ -474,6 +476,94 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn runtime_publishes_generated_group_event_offsets_for_live_fanout() {
+        let root = temp_root("runtime-generated-offset-fanout");
+        let _ = std::fs::remove_dir_all(&root);
+        let handle = TangleRuntimeHandle::new(
+            TangleRuntime::open(runtime_config(&root, 8)).expect("runtime"),
+        );
+        let mut offsets = handle.subscribe_events().await;
+        let mut auth = handle.auth_state().await.expect("auth");
+        auth.issue_challenge("challenge-a", UnixTimestamp::new(100))
+            .expect("challenge");
+        let auth_event =
+            tangle_v2_auth_event(FixtureKey::Owner, "challenge-a", 120).expect("auth event");
+        let create = tangle_v2_group_create_event(FixtureKey::Owner, "RuntimeFarm", 121, &[])
+            .expect("create");
+        let mut subscriptions = LiveSubscriptionSet::new(8).expect("subscriptions");
+        let subscription_id = SubscriptionId::new("generated-offsets").expect("subscription");
+        subscriptions
+            .subscribe(
+                subscription_id.clone(),
+                vec![
+                    filter_from_value(&json!({"kinds":[KIND_GROUP_METADATA, KIND_GROUP_ADMINS]}))
+                        .expect("filter"),
+                ],
+                GroupAuthContext::unauthenticated(),
+            )
+            .expect("subscribe");
+
+        assert_eq!(
+            handle
+                .handle_client_message(
+                    ClientMessage::Auth(auth_event.clone()),
+                    &mut auth,
+                    UnixTimestamp::new(120)
+                )
+                .await
+                .expect("auth"),
+            vec![RelayMessage::Ok {
+                event_id: auth_event.id().clone(),
+                accepted: true,
+                message: String::new()
+            }]
+        );
+        assert_eq!(
+            handle
+                .handle_client_message(
+                    ClientMessage::Event(create.clone()),
+                    &mut auth,
+                    UnixTimestamp::new(121)
+                )
+                .await
+                .expect("create"),
+            vec![RelayMessage::Ok {
+                event_id: create.id().clone(),
+                accepted: true,
+                message: String::new()
+            }]
+        );
+        let source_offset = offsets.try_recv().expect("source offset");
+        let generated_offsets = [
+            offsets.try_recv().expect("first generated offset"),
+            offsets.try_recv().expect("second generated offset"),
+        ];
+        assert!(source_offset < generated_offsets[0]);
+        assert!(generated_offsets[0] < generated_offsets[1]);
+        for offset in generated_offsets {
+            assert!(matches!(
+                handle
+                    .fanout_event_offset(offset, &mut subscriptions)
+                    .await
+                    .expect("fanout")
+                    .as_slice(),
+                [RelayMessage::Event {
+                    subscription_id: delivered,
+                    event
+                }] if delivered == &subscription_id
+                    && [KIND_GROUP_METADATA, KIND_GROUP_ADMINS]
+                        .contains(&event.unsigned().kind().as_u32())
+            ));
+        }
+        assert_eq!(
+            offsets.try_recv().expect_err("only source plus generated"),
+            TangleEventReceiveError::Empty
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn runtime_config(root: &Path, max_pending_events: usize) -> BaseRelayRuntimeConfig {
         let raw = json!({
             "server": {
@@ -490,7 +580,7 @@ mod tests {
                 "enabled": true,
                 "canonical_relay_url": "wss://relay.radroots.test",
                 "relay_secret": "7777777777777777777777777777777777777777777777777777777777777777",
-                "owner_pubkeys": ["0202020202020202020202020202020202020202020202020202020202020202"]
+                "owner_pubkeys": [FixtureKey::Owner.public_key().as_str()]
             },
             "auth": {
                 "challenge_ttl_seconds": 300,

@@ -27,26 +27,26 @@ pub struct BaseRelay {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BaseRelayEventWrite {
     message: RelayMessage,
-    stored_offset: Option<StoreOffset>,
+    stored_offsets: Vec<StoreOffset>,
 }
 
 impl BaseRelayEventWrite {
-    fn stored(message: RelayMessage, stored_offset: StoreOffset) -> Self {
+    fn stored(message: RelayMessage, stored_offsets: Vec<StoreOffset>) -> Self {
         Self {
             message,
-            stored_offset: Some(stored_offset),
+            stored_offsets,
         }
     }
 
     fn unstored(message: RelayMessage) -> Self {
         Self {
             message,
-            stored_offset: None,
+            stored_offsets: Vec::new(),
         }
     }
 
-    pub(crate) fn stored_offset(&self) -> Option<StoreOffset> {
-        self.stored_offset
+    pub(crate) fn stored_offsets(&self) -> &[StoreOffset] {
+        &self.stored_offsets
     }
 
     pub(crate) fn into_message(self) -> RelayMessage {
@@ -310,15 +310,21 @@ impl BaseRelay {
         }
         let pocket_event = tangle_event_to_pocket(&event)?;
         let store_offset = StoreOffset::new(self.store.store_event(&pocket_event)?);
+        let mut stored_offsets = vec![store_offset];
         if !matches!(class, GroupEventClass::NonGroup)
             && let Some(groups) = self.groups.as_mut()
         {
-            groups.after_source_event_stored(&self.store, &event, &class, store_offset)?;
+            stored_offsets.extend(groups.after_source_event_stored(
+                &self.store,
+                &event,
+                &class,
+                store_offset,
+            )?);
         }
         self.store.sync()?;
         Ok(BaseRelayEventWrite::stored(
             ok_accepted(event_id, String::new()),
-            store_offset,
+            stored_offsets,
         ))
     }
 

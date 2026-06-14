@@ -158,7 +158,7 @@ impl GroupService {
         event: &Event,
         class: &GroupEventClass,
         store_offset: StoreOffset,
-    ) -> Result<(), BaseRelayError> {
+    ) -> Result<Vec<StoreOffset>, BaseRelayError> {
         self.projection
             .apply_canonical_event(event, store_offset, self.limits)?;
         if let Some(group_id) = class_group_id(class) {
@@ -218,19 +218,25 @@ impl GroupService {
         Ok(())
     }
 
-    fn materialize_outbox(&mut self, store: &PocketStoreHandle) -> Result<(), BaseRelayError> {
+    fn materialize_outbox(
+        &mut self,
+        store: &PocketStoreHandle,
+    ) -> Result<Vec<StoreOffset>, BaseRelayError> {
+        let mut stored_offsets = Vec::new();
         let records = self.outbox.replay_plan().records().to_vec();
         for record in records {
-            self.materialize_record(store, record)?;
+            if let Some(offset) = self.materialize_record(store, record)? {
+                stored_offsets.push(offset);
+            }
         }
-        Ok(())
+        Ok(stored_offsets)
     }
 
     fn materialize_record(
         &mut self,
         store: &PocketStoreHandle,
         mut record: GroupOutboxRecord,
-    ) -> Result<(), BaseRelayError> {
+    ) -> Result<Option<StoreOffset>, BaseRelayError> {
         if matches!(
             record.key().effect(),
             GroupOutboxEffect::RoleListSnapshot | GroupOutboxEffect::State39004Snapshot
@@ -238,14 +244,14 @@ impl GroupService {
             record.mark_skipped("generated group effect is not supported");
             self.outbox.update(record.clone());
             persist_outbox_record(store, &record)?;
-            return Ok(());
+            return Ok(None);
         }
         match self.store_generated_event(store, &record) {
-            Ok(generated_event_id) => {
+            Ok((generated_event_id, stored_offset)) => {
                 record.mark_stored(generated_event_id);
                 self.outbox.update(record.clone());
                 persist_outbox_record(store, &record)?;
-                Ok(())
+                Ok(stored_offset)
             }
             Err(error) => {
                 record.mark_failed(true, error.prefixed_message());
@@ -260,17 +266,17 @@ impl GroupService {
         &mut self,
         store: &PocketStoreHandle,
         record: &GroupOutboxRecord,
-    ) -> Result<EventId, BaseRelayError> {
+    ) -> Result<(EventId, Option<StoreOffset>), BaseRelayError> {
         let event = self.builder.sign_payload(record.payload())?;
         if store.event_by_id(pocket_event_id(event.id())?)?.is_some() {
-            return Ok(event.id().clone());
+            return Ok((event.id().clone(), None));
         }
         let pocket_event = tangle_event_to_pocket(&event)?;
         let offset = StoreOffset::new(store.store_event(&pocket_event)?);
         self.projection
             .apply_canonical_event(&event, offset, self.limits)?;
         self.persist_group_projection(store, record.key().group_id())?;
-        Ok(event.id().clone())
+        Ok((event.id().clone(), Some(offset)))
     }
 
     fn persist_group_projection(
