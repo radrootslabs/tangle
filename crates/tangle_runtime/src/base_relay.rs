@@ -21,7 +21,6 @@ use tangle_groups::{
     projection_checkpoint_key, role_current_key, tombstone_key,
     validate_client_group_event_structure,
 };
-use tangle_nips::parse_relay_auth_event;
 use tangle_protocol::{
     ClientMessage, Event, EventId, Filter, PublicKeyHex, RelayMessage, SubscriptionId,
     UnixTimestamp, event_to_value, filter_to_value, parse_event_json,
@@ -586,7 +585,7 @@ impl BaseAuthState {
         now: UnixTimestamp,
     ) -> Result<PublicKeyHex, BaseRelayError> {
         verify_event_signature(event).map_err(BaseRelayError::invalid)?;
-        let auth = parse_relay_auth_event(event)
+        let auth = parse_base_relay_auth_event(event)
             .map_err(BaseRelayError::invalid)?
             .ok_or_else(|| BaseRelayError::invalid("AUTH message must contain kind 22242"))?;
         let challenge = self
@@ -625,6 +624,64 @@ impl BaseAuthState {
 struct BaseAuthChallenge {
     value: String,
     issued_at: UnixTimestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BaseRelayAuthEvent {
+    pubkey: PublicKeyHex,
+    relay: String,
+    challenge: String,
+}
+
+impl BaseRelayAuthEvent {
+    fn pubkey(&self) -> &PublicKeyHex {
+        &self.pubkey
+    }
+
+    fn relay(&self) -> &str {
+        &self.relay
+    }
+
+    fn challenge(&self) -> &str {
+        &self.challenge
+    }
+}
+
+fn parse_base_relay_auth_event(event: &Event) -> Result<Option<BaseRelayAuthEvent>, String> {
+    if event.unsigned().kind().as_u32() != 22_242 {
+        return Ok(None);
+    }
+    let relay = required_single_tag_value(event, "relay")?;
+    let challenge = required_single_tag_value(event, "challenge")?;
+    if relay.is_empty() {
+        return Err("relay auth relay tag must not be empty".to_owned());
+    }
+    if challenge.is_empty() {
+        return Err("relay auth challenge tag must not be empty".to_owned());
+    }
+    Ok(Some(BaseRelayAuthEvent {
+        pubkey: event.unsigned().pubkey().clone(),
+        relay,
+        challenge,
+    }))
+}
+
+fn required_single_tag_value(event: &Event, name: &str) -> Result<String, String> {
+    let mut matches = event
+        .unsigned()
+        .tags()
+        .iter()
+        .filter(|tag| tag.name().as_str() == name);
+    let tag = matches
+        .next()
+        .ok_or_else(|| format!("tag `{name}` is required"))?;
+    if matches.next().is_some() {
+        return Err(format!("tag `{name}` must not be repeated"));
+    }
+    tag.values()
+        .get(1)
+        .cloned()
+        .ok_or_else(|| format!("tag `{name}` must include a value"))
 }
 
 pub struct BaseRelay {

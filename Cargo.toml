@@ -2,15 +2,11 @@
 members = [
     "crates/tangle",
     "crates/tangle_bench",
-    "crates/tangle_core",
     "crates/tangle_crypto",
     "crates/tangle_groups",
-    "crates/tangle_nips",
     "crates/tangle_protocol",
     "crates/tangle_runtime",
-    "crates/tangle_store",
     "crates/tangle_store_pocket",
-    "crates/tangle_store_surreal",
     "crates/tangle_test_support",
 ]
 resolver = "2"

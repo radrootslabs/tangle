@@ -12,24 +12,16 @@ axum = { version = "0.8", features = ["ws"] }
 http = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
 tangle_crypto = { path = "../tangle_crypto" }
-tangle_core = { path = "../tangle_core" }
 tangle_groups = { path = "../tangle_groups" }
-tangle_nips = { path = "../tangle_nips" }
 tangle_protocol = { path = "../tangle_protocol" }
-tangle_store = { path = "../tangle_store" }
 tangle_store_pocket = { path = "../tangle_store_pocket" }
-tangle_store_surreal = { path = "../tangle_store_surreal" }
 tokio = { version = "1", features = ["net", "sync"] }
 tracing = "0.1"
-url = "2"
 
 [dev-dependencies]
-futures-util = "0.3"
 tangle_test_support = { path = "../tangle_test_support" }
 tokio = { version = "1", features = ["macros", "rt", "time"] }
-tokio-tungstenite = "0.28"
 tower = { version = "0.5", features = ["util"] }
 
 [lints]

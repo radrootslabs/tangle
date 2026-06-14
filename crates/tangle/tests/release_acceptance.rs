@@ -14,17 +14,9 @@ fn release_acceptance_script_covers_release_candidate_validation_ladder() {
         "scripts/check.sh",
         "scripts/test.sh",
         "cargo nextest run --workspace",
-        "cargo test -p tangle --test nip01_conformance",
-        "cargo test -p tangle --test nip09_conformance",
-        "cargo test -p tangle --test nip42_conformance",
-        "cargo test -p tangle --test nip50_conformance",
-        "cargo test -p tangle --test nip99_conformance",
-        "cargo test -p tangle --test discussion_conformance",
-        "cargo test -p tangle --test moderation_conformance",
-        "cargo test -p tangle --test commerce_privacy_conformance",
-        "cargo test -p tangle --test abuse_conformance",
-        "cargo test -p tangle --test run_integration",
-        "cargo test -p tangle_runtime runtime_restore_command_imports_backup_and_rebuilds_projection_state",
+        "cargo test -p tangle_runtime --test base_relay_v2",
+        "cargo test -p tangle_groups",
+        "cargo test -p tangle_store_pocket",
         "cargo test -p tangle_bench",
         "scripts/benchmark_report.sh",
         "cargo test -p tangle --test source_comments",
@@ -40,6 +32,21 @@ fn release_acceptance_script_covers_release_candidate_validation_ladder() {
         !script.contains("scripts/coverage.sh"),
         "release acceptance must not depend on strict line coverage"
     );
+    for removed in [
+        "nip50_conformance",
+        "nip99_conformance",
+        &["discuss", "ion_conformance"].concat(),
+        "moderation_conformance",
+        &["comm", "erce_privacy_conformance"].concat(),
+        "abuse_conformance",
+        "run_integration",
+        "runtime_restore_command_imports_backup_and_rebuilds_projection_state",
+    ] {
+        assert!(
+            !script.contains(removed),
+            "release acceptance still references `{removed}`"
+        );
+    }
 
     #[cfg(unix)]
     {

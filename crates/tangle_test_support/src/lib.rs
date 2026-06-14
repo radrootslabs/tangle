@@ -3,8 +3,6 @@
 use core::fmt;
 use k256::schnorr::signature::Signer;
 use k256::schnorr::{Signature, SigningKey};
-use serde::Deserialize;
-use std::collections::BTreeMap;
 use tangle_crypto::{RelaySigner, compute_event_id};
 use tangle_groups::{
     CanonicalRelayUrl, GroupGeneratedEventBuilder, GroupLimitsConfig, GroupOutboxPayload,
@@ -12,29 +10,13 @@ use tangle_groups::{
     KIND_GROUP_DELETE_GROUP, KIND_GROUP_EDIT_METADATA, KIND_GROUP_JOIN_REQUEST,
     KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_PUT_USER, KIND_GROUP_REMOVE_USER, RelaySecret,
 };
-use tangle_nips::ListingProjection;
 use tangle_protocol::{
-    AddressCoordinate, Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp,
-    UnsignedEvent, event_to_value,
+    Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
+    event_to_value,
 };
-use tangle_store::{
-    DeletionMarker, DeletionMarkerRepository, ListingProjectionRepository, RawEventRepository,
-    RepositoryError, StoreEventOutcome, StoreProjectionOutcome, StoredEvent,
-};
-
-const VALID_PUBLIC_LISTING_JSON: &str =
-    include_str!("../../../testing/fixtures/canonical/nostr/valid_public_listing.json");
-const PROJECTION_INELIGIBLE_LISTING_JSON: &str =
-    include_str!("../../../testing/fixtures/canonical/nostr/projection_ineligible_listing.json");
-const AUTH_EVENT_JSON: &str =
-    include_str!("../../../testing/fixtures/canonical/nostr/auth_event.json");
-const DELETION_EVENT_JSON: &str =
-    include_str!("../../../testing/fixtures/canonical/nostr/deletion_event.json");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FixtureKey {
-    Seller,
-    Buyer,
     Relay,
     Owner,
     Admin,
@@ -51,8 +33,6 @@ impl FixtureKey {
 
     fn signing_key(self) -> SigningKey {
         match self {
-            Self::Seller => SigningKey::from_bytes(&[7_u8; 32]).expect("seller fixture key"),
-            Self::Buyer => SigningKey::from_bytes(&[8_u8; 32]).expect("buyer fixture key"),
             Self::Relay => SigningKey::from_bytes(&[9_u8; 32]).expect("relay fixture key"),
             Self::Owner => SigningKey::from_bytes(&[10_u8; 32]).expect("owner fixture key"),
             Self::Admin => SigningKey::from_bytes(&[11_u8; 32]).expect("admin fixture key"),
@@ -65,8 +45,6 @@ impl FixtureKey {
 impl fmt::Display for FixtureKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::Seller => "seller",
-            Self::Buyer => "buyer",
             Self::Relay => "relay",
             Self::Owner => "owner",
             Self::Admin => "admin",
@@ -74,87 +52,6 @@ impl fmt::Display for FixtureKey {
             Self::Outsider => "outsider",
         })
     }
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct FixtureEventSpec {
-    name: String,
-    key: String,
-    created_at: u64,
-    kind: u64,
-    tags: Vec<Vec<String>>,
-    content: String,
-}
-
-impl FixtureEventSpec {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn key(&self) -> &str {
-        &self.key
-    }
-
-    pub fn created_at(&self) -> u64 {
-        self.created_at
-    }
-
-    pub fn kind(&self) -> u64 {
-        self.kind
-    }
-
-    pub fn tags(&self) -> &[Vec<String>] {
-        &self.tags
-    }
-
-    pub fn content(&self) -> &str {
-        &self.content
-    }
-
-    pub fn fixture_key(&self) -> Result<FixtureKey, String> {
-        match self.key.as_str() {
-            "seller" => Ok(FixtureKey::Seller),
-            "buyer" => Ok(FixtureKey::Buyer),
-            "relay" => Ok(FixtureKey::Relay),
-            "owner" => Ok(FixtureKey::Owner),
-            "admin" => Ok(FixtureKey::Admin),
-            "member" => Ok(FixtureKey::Member),
-            "outsider" => Ok(FixtureKey::Outsider),
-            value => Err(format!("fixture key `{value}` is unsupported")),
-        }
-    }
-}
-
-pub fn valid_public_listing_spec() -> FixtureEventSpec {
-    fixture_spec_from_json(VALID_PUBLIC_LISTING_JSON).expect("valid listing fixture parses")
-}
-
-pub fn projection_ineligible_listing_spec() -> FixtureEventSpec {
-    fixture_spec_from_json(PROJECTION_INELIGIBLE_LISTING_JSON)
-        .expect("projection-ineligible listing fixture parses")
-}
-
-pub fn auth_event_spec() -> FixtureEventSpec {
-    fixture_spec_from_json(AUTH_EVENT_JSON).expect("auth event fixture parses")
-}
-
-pub fn deletion_event_spec() -> FixtureEventSpec {
-    fixture_spec_from_json(DELETION_EVENT_JSON).expect("deletion event fixture parses")
-}
-
-pub fn fixture_spec_from_json(raw: &str) -> Result<FixtureEventSpec, String> {
-    serde_json::from_str(raw).map_err(|source| format!("fixture JSON is invalid: {source}"))
-}
-
-pub fn build_fixture_event(spec: &FixtureEventSpec) -> Result<Event, String> {
-    let fixture_key = spec.fixture_key()?;
-    build_fixture_event_from_parts(
-        fixture_key,
-        spec.created_at,
-        spec.kind,
-        spec.tags.clone(),
-        &spec.content,
-    )
 }
 
 pub fn build_fixture_event_from_parts(
@@ -425,69 +322,6 @@ pub fn fixture_event_json(event: &Event) -> serde_json::Value {
     event_to_value(event)
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct InMemoryRepository {
-    events: BTreeMap<EventId, StoredEvent>,
-    listing_projections: BTreeMap<AddressCoordinate, ListingProjection>,
-    deletion_markers: Vec<DeletionMarker>,
-}
-
-impl InMemoryRepository {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl RawEventRepository for InMemoryRepository {
-    fn put_event(&mut self, record: StoredEvent) -> Result<StoreEventOutcome, RepositoryError> {
-        let event_id = record.event().id().clone();
-        if self.events.contains_key(&event_id) {
-            return Ok(StoreEventOutcome::Duplicate);
-        }
-        self.events.insert(event_id, record);
-        Ok(StoreEventOutcome::Inserted)
-    }
-
-    fn event_by_id(&self, event_id: &EventId) -> Result<Option<StoredEvent>, RepositoryError> {
-        Ok(self.events.get(event_id).cloned())
-    }
-
-    fn events(&self) -> Result<Vec<StoredEvent>, RepositoryError> {
-        Ok(self.events.values().cloned().collect())
-    }
-}
-
-impl ListingProjectionRepository for InMemoryRepository {
-    fn put_listing_projection(
-        &mut self,
-        projection: ListingProjection,
-    ) -> Result<StoreProjectionOutcome, RepositoryError> {
-        let address = projection.identity().address().clone();
-        match self.listing_projections.insert(address, projection) {
-            Some(_) => Ok(StoreProjectionOutcome::Replaced),
-            None => Ok(StoreProjectionOutcome::Inserted),
-        }
-    }
-
-    fn listing_projection(
-        &self,
-        address: &AddressCoordinate,
-    ) -> Result<Option<ListingProjection>, RepositoryError> {
-        Ok(self.listing_projections.get(address).cloned())
-    }
-}
-
-impl DeletionMarkerRepository for InMemoryRepository {
-    fn put_deletion_marker(&mut self, marker: DeletionMarker) -> Result<(), RepositoryError> {
-        self.deletion_markers.push(marker);
-        Ok(())
-    }
-
-    fn deletion_markers(&self) -> Result<Vec<DeletionMarker>, RepositoryError> {
-        Ok(self.deletion_markers.clone())
-    }
-}
-
 fn sign_unsigned_event(fixture_key: FixtureKey, unsigned: UnsignedEvent) -> Result<Event, String> {
     let signing_key = fixture_key.signing_key();
     let event_id = compute_event_id(&unsigned);
@@ -534,60 +368,29 @@ fn lower_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        FixtureKey, InMemoryRepository, auth_event_spec, build_fixture_event, deletion_event_spec,
-        fixed_hex_bytes, fixture_event_json, fixture_spec_from_json,
-        projection_ineligible_listing_spec, tangle_v2_auth_event, tangle_v2_generated_event,
-        tangle_v2_group_config, tangle_v2_group_create_event, tangle_v2_group_event,
-        tangle_v2_group_metadata_event, tangle_v2_join_event, tangle_v2_put_user_event,
-        valid_public_listing_spec,
+        FixtureKey, build_fixture_event_from_parts, fixed_hex_bytes, fixture_event_json,
+        tangle_v2_auth_event, tangle_v2_generated_event, tangle_v2_group_config,
+        tangle_v2_group_create_event, tangle_v2_group_event, tangle_v2_group_metadata_event,
+        tangle_v2_join_event, tangle_v2_put_user_event,
     };
     use tangle_crypto::{event_id_matches, verify_event_signature};
     use tangle_groups::{GroupOutboxPayload, KIND_GROUP_CREATE_GROUP, KIND_GROUP_METADATA};
-    use tangle_nips::{
-        DeletionTarget, ListingProjectionEvaluation, evaluate_listing_projection,
-        parse_deletion_request, parse_relay_auth_event,
-    };
     use tangle_protocol::UnixTimestamp;
-    use tangle_protocol::{EventId, PublicKeyHex};
-    use tangle_store::{
-        DeletionMarker, DeletionMarkerRepository, ListingProjectionRepository, RawEventRepository,
-        StoreEventOutcome, StoreProjectionOutcome, StoredEvent,
-    };
-
-    #[test]
-    fn fixture_specs_load_from_canonical_json() {
-        let listing = valid_public_listing_spec();
-        let ineligible = projection_ineligible_listing_spec();
-        let auth = auth_event_spec();
-        let deletion = deletion_event_spec();
-
-        assert_eq!(listing.name(), "valid_public_listing");
-        assert_eq!(listing.key(), "seller");
-        assert_eq!(listing.created_at(), 1_714_124_433);
-        assert_eq!(listing.kind(), 30_402);
-        assert_eq!(listing.content(), "Sweet storage carrots.");
-        assert_eq!(listing.tags().len(), 10);
-        assert_eq!(ineligible.name(), "projection_ineligible_listing");
-        assert_eq!(auth.name(), "auth_event");
-        assert_eq!(deletion.name(), "deletion_event");
-    }
 
     #[test]
     fn fixture_keys_have_stable_synthetic_public_keys() {
-        assert_eq!(FixtureKey::Seller.to_string(), "seller");
-        assert_eq!(FixtureKey::Buyer.to_string(), "buyer");
         assert_eq!(FixtureKey::Relay.to_string(), "relay");
         assert_eq!(FixtureKey::Owner.to_string(), "owner");
         assert_eq!(FixtureKey::Admin.to_string(), "admin");
         assert_eq!(FixtureKey::Member.to_string(), "member");
         assert_eq!(FixtureKey::Outsider.to_string(), "outsider");
         assert_eq!(
-            FixtureKey::Seller.public_key().as_str(),
-            "989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f"
+            FixtureKey::Owner.public_key().as_str(),
+            "f76a39d05686e34a4420897e359371836145dd3973e3982568b60f8433adde6e"
         );
         assert_ne!(
-            FixtureKey::Seller.public_key(),
-            FixtureKey::Buyer.public_key()
+            FixtureKey::Owner.public_key(),
+            FixtureKey::Admin.public_key()
         );
     }
 
@@ -605,14 +408,9 @@ mod tests {
         assert_eq!(first.id(), second.id());
         assert_eq!(verify_event_signature(&first), Ok(()));
         assert_eq!(verify_event_signature(&auth), Ok(()));
+        assert!(event_id_matches(&first));
         assert_eq!(first.unsigned().kind().as_u32(), KIND_GROUP_CREATE_GROUP);
-        assert_eq!(
-            parse_relay_auth_event(&auth)
-                .expect("auth parse")
-                .expect("auth")
-                .challenge(),
-            "challenge-001"
-        );
+        assert_eq!(auth.unsigned().kind().as_u32(), 22_242);
     }
 
     #[test]
@@ -653,214 +451,39 @@ mod tests {
     }
 
     #[test]
-    fn fixture_builder_signs_verifiable_public_listing_events() {
-        let event = build_fixture_event(&valid_public_listing_spec()).expect("event");
+    fn fixture_json_uses_signed_event_shape() {
+        let event =
+            build_fixture_event_from_parts(FixtureKey::Member, 1_714_124_440, 1, Vec::new(), "hi")
+                .expect("event");
         let json = fixture_event_json(&event);
 
-        assert!(event_id_matches(&event));
         assert_eq!(verify_event_signature(&event), Ok(()));
-        assert_eq!(json["kind"], 30_402);
-        assert_eq!(json["content"], "Sweet storage carrots.");
-        assert_eq!(
-            evaluate_listing_projection(&event),
-            ListingProjectionEvaluation::Eligible(Box::new(
-                evaluate_listing_projection(&event)
-                    .projection()
-                    .expect("projection")
-                    .clone()
-            ))
-        );
+        assert_eq!(json["kind"], 1);
+        assert_eq!(json["content"], "hi");
     }
 
     #[test]
-    fn projection_ineligible_fixture_is_signed_but_not_projectable() {
-        let event = build_fixture_event(&projection_ineligible_listing_spec()).expect("event");
-        let evaluation = evaluate_listing_projection(&event);
+    fn fixture_builder_rejects_invalid_parts() {
+        let bad_tag = build_fixture_event_from_parts(FixtureKey::Owner, 1, 1, vec![Vec::new()], "")
+            .expect_err("tag");
+        let bad_kind =
+            build_fixture_event_from_parts(FixtureKey::Owner, 1, 4_294_967_296, Vec::new(), "")
+                .expect_err("kind");
 
-        assert_eq!(verify_event_signature(&event), Ok(()));
-        assert_eq!(
-            evaluation.rejection().expect("rejection").reasons(),
-            &["tag `title` is required".to_owned()]
-        );
+        assert_eq!(bad_tag, "tag must not be empty");
+        assert_eq!(bad_kind, "kind must fit in u32, got 4294967296");
     }
 
     #[test]
-    fn auth_and_deletion_fixtures_build_protocol_specific_events() {
-        let auth = build_fixture_event(&auth_event_spec()).expect("auth");
-        let deletion = build_fixture_event(&deletion_event_spec()).expect("deletion");
-        let auth = parse_relay_auth_event(&auth)
-            .expect("auth parse")
-            .expect("auth event");
-        let deletion = parse_deletion_request(&deletion)
-            .expect("deletion parse")
-            .expect("deletion event");
-        let target = EventId::new(&"a".repeat(EventId::HEX_LENGTH)).expect("target");
-
-        assert_eq!(auth.relay(), "wss://relay.radroots.test");
-        assert_eq!(auth.challenge(), "challenge-001");
-        assert_eq!(deletion.targets(), &[DeletionTarget::Event(target)]);
-    }
-
-    #[test]
-    fn fixture_spec_parser_rejects_invalid_json_and_keys() {
-        let invalid = fixture_spec_from_json("{").expect_err("json");
-        let unsupported = fixture_spec_from_json(
-            r#"{"name":"bad","key":"unknown","created_at":1,"kind":1,"tags":[],"content":""}"#,
-        )
-        .expect("fixture");
-
-        assert!(invalid.starts_with("fixture JSON is invalid"));
+    fn fixed_hex_bytes_validates_expected_width_and_lowercase() {
+        assert_eq!(fixed_hex_bytes("0a", 1, "value"), Ok(vec![10]));
         assert_eq!(
-            unsupported.fixture_key().expect_err("key"),
-            "fixture key `unknown` is unsupported"
+            fixed_hex_bytes("0a", 2, "value").expect_err("width"),
+            "value must decode to 2 bytes, got 2 hex characters"
         );
         assert_eq!(
-            FixtureKey::Buyer,
-            fixture_spec_from_json(
-                r#"{"name":"buyer","key":"buyer","created_at":1,"kind":1,"tags":[],"content":""}"#,
-            )
-            .expect("buyer")
-            .fixture_key()
-            .expect("buyer")
-        );
-        assert_eq!(
-            FixtureKey::Relay,
-            fixture_spec_from_json(
-                r#"{"name":"relay","key":"relay","created_at":1,"kind":1,"tags":[],"content":""}"#,
-            )
-            .expect("relay")
-            .fixture_key()
-            .expect("relay")
-        );
-    }
-
-    #[test]
-    fn fixture_builder_rejects_malformed_fixture_shapes() {
-        let bad_key = fixture_spec_from_json(
-            r#"{"name":"bad","key":"unknown","created_at":1,"kind":1,"tags":[],"content":""}"#,
-        )
-        .expect("bad key");
-        let bad_tag = fixture_spec_from_json(
-            r#"{"name":"bad","key":"seller","created_at":1,"kind":1,"tags":[[]],"content":""}"#,
-        )
-        .expect("bad tag");
-        let bad_kind = fixture_spec_from_json(
-            r#"{"name":"bad","key":"seller","created_at":1,"kind":4294967296,"tags":[],"content":""}"#,
-        )
-        .expect("bad kind");
-
-        assert_eq!(
-            build_fixture_event(&bad_tag).expect_err("tag"),
-            "tag must not be empty"
-        );
-        assert_eq!(
-            build_fixture_event(&bad_kind).expect_err("kind"),
-            "kind must fit in u32, got 4294967296"
-        );
-        assert_eq!(
-            PublicKeyHex::HEX_LENGTH,
-            FixtureKey::Relay.public_key().as_str().len()
-        );
-        assert_eq!(
-            build_fixture_event(&bad_key).expect_err("key"),
-            "fixture key `unknown` is unsupported"
-        );
-    }
-
-    #[test]
-    fn fixed_hex_decoder_rejects_bad_lengths_and_characters() {
-        assert_eq!(
-            fixed_hex_bytes("abc", 2, "fixture").expect_err("length"),
-            "fixture must decode to 2 bytes, got 3 hex characters"
-        );
-        assert_eq!(
-            fixed_hex_bytes("0G", 1, "fixture").expect_err("low"),
-            "fixture must be lowercase hex"
-        );
-        assert_eq!(
-            fixed_hex_bytes("G0", 1, "fixture").expect_err("high"),
-            "fixture must be lowercase hex"
-        );
-    }
-
-    #[test]
-    fn in_memory_repository_stores_raw_events_by_id_and_preserves_first_insert() {
-        let mut repository = InMemoryRepository::new();
-        let event = build_fixture_event(&valid_public_listing_spec()).expect("event");
-        let stored = StoredEvent::new(event.clone(), UnixTimestamp::new(100));
-        let duplicate = StoredEvent::new(event.clone(), UnixTimestamp::new(200));
-        let missing = EventId::new(&"f".repeat(EventId::HEX_LENGTH)).expect("missing");
-
-        assert_eq!(
-            repository.put_event(stored.clone()).expect("insert"),
-            StoreEventOutcome::Inserted
-        );
-        assert_eq!(
-            repository.put_event(duplicate).expect("duplicate"),
-            StoreEventOutcome::Duplicate
-        );
-        assert_eq!(
-            repository.event_by_id(event.id()).expect("lookup"),
-            Some(stored.clone())
-        );
-        assert_eq!(repository.event_by_id(&missing).expect("missing"), None);
-        assert_eq!(repository.events().expect("events"), vec![stored]);
-    }
-
-    #[test]
-    fn in_memory_repository_stores_listing_projections_by_address() {
-        let mut repository = InMemoryRepository::new();
-        let event = build_fixture_event(&valid_public_listing_spec()).expect("event");
-        let projection = evaluate_listing_projection(&event)
-            .projection()
-            .expect("projection")
-            .clone();
-        let address = projection.identity().address().clone();
-
-        assert_eq!(
-            repository
-                .put_listing_projection(projection.clone())
-                .expect("insert"),
-            StoreProjectionOutcome::Inserted
-        );
-        assert_eq!(
-            repository
-                .listing_projection(&address)
-                .expect("projection lookup"),
-            Some(projection.clone())
-        );
-        assert_eq!(
-            repository
-                .put_listing_projection(projection)
-                .expect("replace"),
-            StoreProjectionOutcome::Replaced
-        );
-    }
-
-    #[test]
-    fn in_memory_repository_appends_deletion_markers() {
-        let mut repository = InMemoryRepository::new();
-        let deletion = build_fixture_event(&deletion_event_spec()).expect("deletion");
-        let request = parse_deletion_request(&deletion)
-            .expect("deletion parse")
-            .expect("deletion request");
-        let marker = DeletionMarker::new(
-            deletion.id().clone(),
-            deletion.unsigned().pubkey().clone(),
-            request.targets()[0].clone(),
-            UnixTimestamp::new(300),
-        );
-
-        repository
-            .put_deletion_marker(marker.clone())
-            .expect("marker");
-        repository
-            .put_deletion_marker(marker.clone())
-            .expect("marker again");
-
-        assert_eq!(
-            repository.deletion_markers().expect("markers"),
-            vec![marker.clone(), marker]
+            fixed_hex_bytes("0G", 1, "value").expect_err("case"),
+            "value must be lowercase hex"
         );
     }
 }
