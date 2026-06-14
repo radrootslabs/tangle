@@ -1132,7 +1132,7 @@ fn group_config() -> Result<tangle_groups::GroupRuntimeConfig, String> {
 
 fn authenticated(key: FixtureKey) -> Result<BaseAuthState, String> {
     let mut auth =
-        BaseAuthState::new(TANGLE_V2_RELAY_URL, 60).map_err(|error| error.to_string())?;
+        BaseAuthState::new(TANGLE_V2_RELAY_URL, 60, 600).map_err(|error| error.to_string())?;
     auth.issue_challenge("challenge-a", tangle_protocol::UnixTimestamp::new(100))
         .map_err(|error| error.to_string())?;
     let event = tangle_v2_auth_event(key, "challenge-a", 120)?;

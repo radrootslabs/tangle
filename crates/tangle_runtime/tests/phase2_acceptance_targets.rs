@@ -6,12 +6,16 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+use tangle_protocol::{RelayMessage, UnixTimestamp};
 use tangle_runtime::{
     config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
+    relay::auth::BaseAuthState,
     runtime::TangleRuntime,
     server::serve_listener_until_shutdown,
 };
-use tangle_test_support::{FixtureKey, TANGLE_V2_RELAY_SECRET_HEX};
+use tangle_test_support::{
+    FixtureKey, TANGLE_V2_RELAY_SECRET_HEX, TANGLE_V2_RELAY_URL, tangle_v2_auth_event,
+};
 use tokio::{net::TcpListener, time::timeout};
 
 #[tokio::test]
@@ -64,9 +68,39 @@ fn nip11_includes_cors_headers_and_truthful_supported_nips() {
 }
 
 #[test]
-#[ignore = "phase2 target: auth skew"]
 fn auth_rejects_events_outside_created_at_skew() {
-    pending("AUTH must validate created_at against configured skew");
+    let mut auth = BaseAuthState::new(TANGLE_V2_RELAY_URL, 300, 10).expect("auth");
+
+    assert_eq!(
+        auth.issue_challenge("challenge-a", UnixTimestamp::new(100))
+            .expect("challenge"),
+        RelayMessage::Auth("challenge-a".to_owned())
+    );
+
+    auth.authenticate(
+        &tangle_v2_auth_event(FixtureKey::Owner, "challenge-a", 100).expect("fresh"),
+        UnixTimestamp::new(100),
+    )
+    .expect("fresh");
+
+    assert_eq!(
+        auth.authenticate(
+            &tangle_v2_auth_event(FixtureKey::Admin, "challenge-a", 89).expect("auth"),
+            UnixTimestamp::new(100),
+        )
+        .expect_err("stale")
+        .prefixed_message(),
+        "auth-required: auth event created_at is outside configured skew"
+    );
+    assert_eq!(
+        auth.authenticate(
+            &tangle_v2_auth_event(FixtureKey::Member, "challenge-a", 111).expect("auth"),
+            UnixTimestamp::new(100),
+        )
+        .expect_err("future")
+        .prefixed_message(),
+        "auth-required: auth event created_at is outside configured skew"
+    );
 }
 
 #[test]
@@ -144,7 +178,8 @@ fn runtime_config(root: &Path, listen_addr: SocketAddr) -> BaseRelayRuntimeConfi
             "owner_pubkeys": [FixtureKey::Owner.public_key().as_str()]
         },
         "auth": {
-            "challenge_ttl_seconds": 300
+            "challenge_ttl_seconds": 300,
+            "created_at_skew_seconds": 600
         },
         "limits": {
             "max_pending_events": 8

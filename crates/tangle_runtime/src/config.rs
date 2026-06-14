@@ -16,6 +16,7 @@ pub struct BaseRelayRuntimeConfig {
     pocket: PocketStoreConfig,
     groups: GroupRuntimeConfig,
     auth_ttl_seconds: u64,
+    auth_created_at_skew_seconds: u64,
     max_pending_events: usize,
     tracing: BaseRelayTracingConfig,
 }
@@ -41,6 +42,10 @@ impl BaseRelayRuntimeConfig {
         self.auth_ttl_seconds
     }
 
+    pub fn auth_created_at_skew_seconds(&self) -> u64 {
+        self.auth_created_at_skew_seconds
+    }
+
     pub fn max_pending_events(&self) -> usize {
         self.max_pending_events
     }
@@ -54,7 +59,11 @@ impl BaseRelayRuntimeConfig {
     }
 
     pub fn auth_state(&self) -> Result<BaseAuthState, BaseRelayError> {
-        BaseAuthState::new(self.relay_url.clone(), self.auth_ttl_seconds)
+        BaseAuthState::new(
+            self.relay_url.clone(),
+            self.auth_ttl_seconds,
+            self.auth_created_at_skew_seconds,
+        )
     }
 }
 
@@ -158,6 +167,7 @@ enum BaseRelayPocketSyncPolicyDocument {
 #[derive(Debug, Deserialize)]
 struct BaseRelayAuthConfigDocument {
     challenge_ttl_seconds: u64,
+    created_at_skew_seconds: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,6 +231,11 @@ pub fn parse_base_relay_runtime_config_json(
             "limits.max_pending_events must be greater than zero",
         ));
     }
+    if document.auth.created_at_skew_seconds == 0 {
+        return Err(BaseRelayError::invalid(
+            "auth.created_at_skew_seconds must be greater than zero",
+        ));
+    }
     let tracing = base_relay_tracing_config_from_document(document.observability.tracing)?;
     Ok(BaseRelayRuntimeConfig {
         listen_addr,
@@ -228,6 +243,7 @@ pub fn parse_base_relay_runtime_config_json(
         pocket,
         groups,
         auth_ttl_seconds: document.auth.challenge_ttl_seconds,
+        auth_created_at_skew_seconds: document.auth.created_at_skew_seconds,
         max_pending_events: document.limits.max_pending_events,
         tracing,
     })
@@ -279,9 +295,43 @@ mod tests {
         );
         assert!(config.groups().enabled());
         assert_eq!(config.auth_ttl_seconds(), 300);
+        assert_eq!(config.auth_created_at_skew_seconds(), 600);
         assert_eq!(config.max_pending_events(), 1024);
         assert!(config.tracing().enabled());
         assert_eq!(config.tracing().format(), BaseRelayTracingFormat::Json);
         config.auth_state().expect("auth");
+    }
+
+    #[test]
+    fn base_relay_runtime_config_rejects_zero_auth_skew() {
+        let raw = r#"{
+            "server": {
+                "listen_addr": "127.0.0.1:0",
+                "relay_url": "wss://relay.radroots.test"
+            },
+            "pocket": {
+                "data_directory": "runtime/pocket",
+                "map_size_bytes": 1073741824,
+                "reader_slots": 128,
+                "sync_policy": "flush_on_shutdown"
+            },
+            "groups": {
+                "enabled": false
+            },
+            "auth": {
+                "challenge_ttl_seconds": 300,
+                "created_at_skew_seconds": 0
+            },
+            "limits": {
+                "max_pending_events": 8
+            }
+        }"#;
+
+        assert_eq!(
+            parse_base_relay_runtime_config_json(raw)
+                .expect_err("zero skew")
+                .prefixed_message(),
+            "invalid: auth.created_at_skew_seconds must be greater than zero"
+        );
     }
 }

@@ -482,7 +482,7 @@ mod tests {
             4,
             &enabled_groups_for_owner(&owner),
         );
-        let auth = BaseAuthState::new("wss://relay.radroots.test", 60).expect("auth");
+        let auth = BaseAuthState::new("wss://relay.radroots.test", 60, 600).expect("auth");
         let event = signed_group_create_event(7, "Farm");
 
         assert_eq!(
@@ -1136,7 +1136,8 @@ mod tests {
     #[test]
     fn base_relay_client_message_dispatch_handles_count_and_auth() {
         let mut relay = test_relay("base-relay-dispatch", 4);
-        let mut auth = BaseAuthState::new("wss://relay.radroots.test", 60).expect("auth state");
+        let mut auth =
+            BaseAuthState::new("wss://relay.radroots.test", 60, 600).expect("auth state");
         auth.issue_challenge("challenge-a", UnixTimestamp::new(100))
             .expect("challenge");
         let auth_event = signed_auth_event(7, "challenge-a", 120);
@@ -1286,7 +1287,8 @@ mod tests {
     }
 
     fn authenticated_state(secret_byte: u8) -> BaseAuthState {
-        let mut auth = BaseAuthState::new("wss://relay.radroots.test", 60).expect("auth state");
+        let mut auth =
+            BaseAuthState::new("wss://relay.radroots.test", 60, 600).expect("auth state");
         auth.issue_challenge("challenge-a", UnixTimestamp::new(100))
             .expect("challenge");
         let event = signed_auth_event(secret_byte, "challenge-a", 120);

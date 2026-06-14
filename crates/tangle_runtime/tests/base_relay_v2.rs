@@ -86,7 +86,7 @@ fn nip11_integration_reports_group_contracts() {
 
 #[test]
 fn auth_integration_covers_challenge_edges() {
-    let mut auth = BaseAuthState::new(TANGLE_V2_RELAY_URL, 20).expect("auth");
+    let mut auth = BaseAuthState::new(TANGLE_V2_RELAY_URL, 20, 600).expect("auth");
 
     assert_eq!(
         auth.issue_challenge("challenge-a", UnixTimestamp::new(100))
@@ -117,7 +117,7 @@ fn auth_integration_covers_challenge_edges() {
         "auth-required: auth challenge does not match"
     );
 
-    let expired = BaseAuthState::new(TANGLE_V2_RELAY_URL, 1).expect("expired");
+    let expired = BaseAuthState::new(TANGLE_V2_RELAY_URL, 1, 600).expect("expired");
     let mut expired = issue_challenge(expired, "challenge-b", 100);
     assert_eq!(
         expired
@@ -130,7 +130,7 @@ fn auth_integration_covers_challenge_edges() {
         "auth-required: auth challenge expired"
     );
 
-    let mut wrong_relay = BaseAuthState::new("wss://other.radroots.test", 20).expect("relay");
+    let mut wrong_relay = BaseAuthState::new("wss://other.radroots.test", 20, 600).expect("relay");
     wrong_relay
         .issue_challenge("challenge-a", UnixTimestamp::new(100))
         .expect("challenge");
@@ -673,7 +673,7 @@ fn group_config() -> GroupRuntimeConfig {
 }
 
 fn authenticated(key: FixtureKey) -> BaseAuthState {
-    let auth = BaseAuthState::new(TANGLE_V2_RELAY_URL, 60).expect("auth");
+    let auth = BaseAuthState::new(TANGLE_V2_RELAY_URL, 60, 600).expect("auth");
     let mut auth = issue_challenge(auth, "challenge-a", 100);
     let event = tangle_v2_auth_event(key, "challenge-a", 120).expect("auth event");
     auth.authenticate(&event, UnixTimestamp::new(120))

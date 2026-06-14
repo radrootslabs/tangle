@@ -160,7 +160,10 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use http::{Request, header};
     use serde_json::json;
-    use std::path::{Path, PathBuf};
+    use std::{
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
     use tangle_protocol::event_to_value;
     use tangle_test_support::{FixtureKey, tangle_v2_auth_event, tangle_v2_event};
     use tokio::net::TcpListener;
@@ -293,10 +296,15 @@ mod tests {
         assert_eq!(challenge.len(), 64);
         assert_eq!(challenge, challenge.to_ascii_lowercase());
 
-        let owner_auth =
-            tangle_v2_auth_event(FixtureKey::Owner, &challenge, 1_714_124_434).expect("owner auth");
-        let admin_auth =
-            tangle_v2_auth_event(FixtureKey::Admin, &challenge, 1_714_124_435).expect("admin auth");
+        let auth_created_at = current_unix_timestamp();
+        let owner_auth = tangle_v2_auth_event(FixtureKey::Owner, &challenge, auth_created_at)
+            .expect("owner auth");
+        let admin_auth = tangle_v2_auth_event(
+            FixtureKey::Admin,
+            &challenge,
+            auth_created_at.saturating_add(1),
+        )
+        .expect("admin auth");
 
         send_client_text(&mut socket, "{").await;
         let notice = read_relay_value(&mut socket).await;
@@ -461,7 +469,8 @@ mod tests {
                 "owner_pubkeys": ["0202020202020202020202020202020202020202020202020202020202020202"]
             },
             "auth": {
-                "challenge_ttl_seconds": 300
+                "challenge_ttl_seconds": 300,
+                "created_at_skew_seconds": 600
             },
             "limits": {
                 "max_pending_events": 8
@@ -506,5 +515,12 @@ mod tests {
         let auth = read_relay_value(socket).await;
         assert_eq!(auth[0], "AUTH");
         auth[1].as_str().expect("auth challenge").to_owned()
+    }
+
+    fn current_unix_timestamp() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_secs()
     }
 }

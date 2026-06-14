@@ -275,7 +275,8 @@ mod tests {
                 "enabled": false
             },
             "auth": {
-                "challenge_ttl_seconds": 300
+                "challenge_ttl_seconds": 300,
+                "created_at_skew_seconds": 600
             },
             "limits": {
                 "max_pending_events": 8

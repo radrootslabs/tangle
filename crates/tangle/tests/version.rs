@@ -125,7 +125,8 @@ fn tangle_run_starts_server_and_stays_alive_until_shutdown() {
                 }
             },
             "auth": {
-                "challenge_ttl_seconds": 300
+                "challenge_ttl_seconds": 300,
+                "created_at_skew_seconds": 600
             },
             "limits": {
                 "max_pending_events": 1024
