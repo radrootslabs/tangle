@@ -246,6 +246,7 @@ mod tests {
             .expect("websocket");
 
         assert_eq!(response.status(), http::StatusCode::SWITCHING_PROTOCOLS);
+        let _ = read_auth_challenge(&mut socket).await;
 
         shutdown.request_shutdown();
 
@@ -286,10 +287,16 @@ mod tests {
             .expect("websocket");
         let event = tangle_v2_event(FixtureKey::Member, 1_714_124_433, 1, Vec::new(), "hello")
             .expect("event");
-        let auth = tangle_v2_auth_event(FixtureKey::Owner, "missing-challenge", 1_714_124_434)
-            .expect("auth");
 
         assert_eq!(response.status(), http::StatusCode::SWITCHING_PROTOCOLS);
+        let challenge = read_auth_challenge(&mut socket).await;
+        assert_eq!(challenge.len(), 64);
+        assert_eq!(challenge, challenge.to_ascii_lowercase());
+
+        let owner_auth =
+            tangle_v2_auth_event(FixtureKey::Owner, &challenge, 1_714_124_434).expect("owner auth");
+        let admin_auth =
+            tangle_v2_auth_event(FixtureKey::Admin, &challenge, 1_714_124_435).expect("admin auth");
 
         send_client_text(&mut socket, "{").await;
         let notice = read_relay_value(&mut socket).await;
@@ -323,23 +330,23 @@ mod tests {
             json!(["EOSE", "sub-a"])
         );
 
+        send_client_value(&mut socket, json!(["AUTH", event_to_value(&owner_auth)])).await;
+        assert_eq!(
+            read_relay_value(&mut socket).await,
+            json!(["OK", owner_auth.id().as_str(), true, ""])
+        );
+
+        send_client_value(&mut socket, json!(["AUTH", event_to_value(&admin_auth)])).await;
+        assert_eq!(
+            read_relay_value(&mut socket).await,
+            json!(["OK", admin_auth.id().as_str(), true, ""])
+        );
+
         send_client_value(&mut socket, json!(["CLOSE", "sub-a"])).await;
         assert!(
             timeout(Duration::from_millis(50), socket.next())
                 .await
                 .is_err()
-        );
-
-        send_client_value(&mut socket, json!(["AUTH", event_to_value(&auth)])).await;
-        let auth_reply = read_relay_value(&mut socket).await;
-        assert_eq!(auth_reply[0], "OK");
-        assert_eq!(auth_reply[1], auth.id().as_str());
-        assert_eq!(auth_reply[2], false);
-        assert!(
-            auth_reply[3]
-                .as_str()
-                .expect("auth message")
-                .starts_with("auth-required:")
         );
 
         shutdown.request_shutdown();
@@ -493,5 +500,11 @@ mod tests {
             panic!("expected relay text message, got {message:?}");
         };
         serde_json::from_str(text.as_str()).expect("relay json")
+    }
+
+    async fn read_auth_challenge(socket: &mut TestWebSocket) -> String {
+        let auth = read_relay_value(socket).await;
+        assert_eq!(auth[0], "AUTH");
+        auth[1].as_str().expect("auth challenge").to_owned()
     }
 }

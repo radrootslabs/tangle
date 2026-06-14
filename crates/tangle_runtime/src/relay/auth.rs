@@ -5,6 +5,14 @@ use std::collections::BTreeSet;
 use tangle_crypto::verify_event_signature;
 use tangle_protocol::{Event, PublicKeyHex, RelayMessage, UnixTimestamp};
 
+pub fn generate_auth_challenge() -> Result<String, BaseRelayError> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).map_err(|error| {
+        BaseRelayError::error(format!("auth challenge generation failed: {error}"))
+    })?;
+    Ok(lower_hex(&bytes))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaseAuthState {
     relay_url: String,
@@ -153,9 +161,19 @@ fn required_single_tag_value(event: &Event, name: &str) -> Result<String, String
         .ok_or_else(|| format!("tag `{name}` must include a value"))
 }
 
+fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
-    use super::BaseAuthState;
+    use super::{BaseAuthState, generate_auth_challenge};
     use tangle_crypto::RelaySigner;
     use tangle_protocol::{Event, Kind, RelayMessage, Tag, UnixTimestamp, UnsignedEvent};
 
@@ -190,6 +208,17 @@ mod tests {
                 .prefixed_message(),
             "auth-required: auth challenge does not match"
         );
+    }
+
+    #[test]
+    fn generated_auth_challenge_is_lowercase_hex_nonce() {
+        let first = generate_auth_challenge().expect("first");
+        let second = generate_auth_challenge().expect("second");
+
+        assert_eq!(first.len(), 64);
+        assert_ne!(first, second);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(first, first.to_ascii_lowercase());
     }
 
     fn signed_auth_event(secret_byte: u8, challenge: &str, created_at: u64) -> Event {

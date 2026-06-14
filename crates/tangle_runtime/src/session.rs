@@ -1,6 +1,10 @@
 #![forbid(unsafe_code)]
 
-use crate::{errors::BaseRelayError, relay::auth::BaseAuthState, runtime::TangleRuntimeHandle};
+use crate::{
+    errors::BaseRelayError,
+    relay::auth::{BaseAuthState, generate_auth_challenge},
+    runtime::TangleRuntimeHandle,
+};
 use axum::extract::ws::{Message, WebSocket};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tangle_protocol::{RelayMessage, UnixTimestamp, parse_client_message};
@@ -55,6 +59,9 @@ impl TangleWebSocketSession {
     }
 
     pub async fn run(mut self, mut socket: WebSocket) {
+        if !self.issue_auth_challenge() {
+            return;
+        }
         loop {
             if self.shutdown_requested() {
                 let _ = socket.send(Message::Close(None)).await;
@@ -100,6 +107,16 @@ impl TangleWebSocketSession {
             Message::Ping(_) | Message::Pong(_) => true,
             Message::Close(_) => false,
         }
+    }
+
+    fn issue_auth_challenge(&mut self) -> bool {
+        let message = generate_auth_challenge()
+            .and_then(|challenge| {
+                self.auth
+                    .issue_challenge(challenge, current_unix_timestamp())
+            })
+            .unwrap_or_else(|error| RelayMessage::Notice(error.prefixed_message()));
+        self.send_relay_message(message).is_ok()
     }
 
     async fn dispatch_text(&mut self, raw: &str) -> bool {
