@@ -16,7 +16,10 @@ use tangle_runtime::{
     nip11::{BASE_RELAY_SUPPORTED_NIPS, BaseRelayInfoConfig},
     relay::{auth::BaseAuthState, core::BaseRelay, live::CloseResult},
 };
-use tangle_store_pocket::{PocketStoreConfig, PocketSyncPolicy};
+use tangle_store_pocket::{
+    PocketStoreConfig, PocketStoreHandle, PocketSyncPolicy, TANGLE_GROUP_CHECKPOINT_TABLE,
+    TANGLE_GROUP_OUTBOX_TABLE, TANGLE_GROUP_PROJECTION_TABLE,
+};
 use tangle_test_support::{
     FixtureKey, TANGLE_V2_RELAY_SECRET_HEX, TANGLE_V2_RELAY_URL, tangle_v2_auth_event,
     tangle_v2_delete_group_event, tangle_v2_event, tangle_v2_group_config,
@@ -948,6 +951,7 @@ fn projection_rebuild_after_restart_matches_live_state_and_outbox_is_idempotent(
         assert_eq!(count_kind(&relay, KIND_GROUP_MEMBERS), 1);
         relay.shutdown().expect("shutdown");
     }
+    delete_group_extra_records(&config);
 
     let relay = BaseRelay::open_with_groups(&config, 8, &group_config()).expect("reopen");
     assert!(
@@ -965,6 +969,13 @@ fn projection_rebuild_after_restart_matches_live_state_and_outbox_is_idempotent(
             .expect("member")
             .status(),
         MemberStatus::Member
+    );
+    assert!(
+        relay
+            .group_projection()
+            .expect("projection")
+            .checkpoint()
+            .is_some()
     );
     assert_eq!(count_kind(&relay, KIND_GROUP_METADATA), 1);
     assert_eq!(count_kind(&relay, KIND_GROUP_ADMINS), 1);
@@ -1099,6 +1110,20 @@ fn test_store_config(name: &str) -> PocketStoreConfig {
         PocketSyncPolicy::FlushOnShutdown,
     )
     .expect("config")
+}
+
+fn delete_group_extra_records(config: &PocketStoreConfig) {
+    let store = PocketStoreHandle::open(config).expect("store");
+    for table in [
+        TANGLE_GROUP_PROJECTION_TABLE,
+        TANGLE_GROUP_OUTBOX_TABLE,
+        TANGLE_GROUP_CHECKPOINT_TABLE,
+    ] {
+        for (key, _) in store.scan_extra_records(table).expect("scan") {
+            store.delete_extra_record(table, &key).expect("delete");
+        }
+    }
+    store.sync().expect("sync");
 }
 
 fn temp_root(name: &str) -> PathBuf {

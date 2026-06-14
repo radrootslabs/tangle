@@ -4,7 +4,10 @@ use crate::{
     errors::BaseRelayError,
     pocket_conversion::{pocket_event_id, pocket_event_to_tangle, tangle_event_to_pocket},
 };
-use std::str;
+use std::{
+    str,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tangle_crypto::RelaySigner;
 use tangle_groups::{
     CanonicalGroupEvent, GroupAuthContext, GroupAuthority, GroupError, GroupErrorKind,
@@ -16,7 +19,7 @@ use tangle_groups::{
     KIND_GROUP_MEMBERS, KIND_GROUP_PUT_USER, KIND_GROUP_REMOVE_USER, MemberState,
     ProjectedRoleDefinition, ProjectionCheckpoint, StoreOffset, event_deletion_key,
     event_view::GroupEventView, group_current_key, member_current_key, projection_checkpoint_key,
-    role_current_key, tombstone_key,
+    rebuild_group_projection, role_current_key, tombstone_key,
 };
 use tangle_protocol::{Event, EventId, PublicKeyHex, UnixTimestamp};
 use tangle_store_pocket::{
@@ -47,7 +50,7 @@ impl GroupService {
             .ok_or_else(|| BaseRelayError::invalid("groups.relay_secret is required"))?;
         let signer = RelaySigner::from_secret_hex(relay_secret.expose_for_signing())
             .map_err(BaseRelayError::invalid)?;
-        let storage = load_group_storage(store)?;
+        let storage = load_group_storage(store, config.limits())?;
         let mut service = Self {
             builder: GroupGeneratedEventBuilder::new(signer),
             authority: GroupAuthority::new(
@@ -416,26 +419,27 @@ struct GroupStorageState {
     outbox: GroupOutbox,
 }
 
-fn load_group_storage(store: &PocketStoreHandle) -> Result<GroupStorageState, BaseRelayError> {
-    validate_group_extra_tables(store)?;
-    let checkpoint = load_projection_checkpoint(store)?;
-    let projection_records = store.scan_extra_records(TANGLE_GROUP_PROJECTION_TABLE)?;
+fn load_group_storage(
+    store: &PocketStoreHandle,
+    limits: GroupLimitsConfig,
+) -> Result<GroupStorageState, BaseRelayError> {
+    let checkpoint_status = validate_group_checkpoint(store)?;
     let outbox_records = store.scan_extra_records(TANGLE_GROUP_OUTBOX_TABLE)?;
+    if checkpoint_status.requires_rebuild() {
+        let scan = scan_canonical_group_events(store, limits)?;
+        let report =
+            rebuild_group_projection(scan.into_events(), limits, projection_rebuilt_at()?)?;
+        return Ok(GroupStorageState {
+            projection: report.into_projection(),
+            outbox: load_group_outbox(outbox_records)?,
+        });
+    }
+    let checkpoint = checkpoint_status.checkpoint().cloned();
+    let projection_records = store.scan_extra_records(TANGLE_GROUP_PROJECTION_TABLE)?;
     Ok(GroupStorageState {
         projection: load_group_projection(projection_records, checkpoint)?,
         outbox: load_group_outbox(outbox_records)?,
     })
-}
-
-fn load_projection_checkpoint(
-    store: &PocketStoreHandle,
-) -> Result<Option<ProjectionCheckpoint>, BaseRelayError> {
-    let Some(raw) =
-        store.get_extra_record(TANGLE_GROUP_CHECKPOINT_TABLE, &projection_checkpoint_key())?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(ProjectionCheckpoint::from_json_bytes(&raw)?))
 }
 
 fn load_group_projection(
@@ -590,6 +594,17 @@ fn validate_group_checkpoint(
     }
 }
 
+fn projection_rebuilt_at() -> Result<UnixTimestamp, BaseRelayError> {
+    Ok(UnixTimestamp::new(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| {
+                BaseRelayError::error(format!("system clock is before UNIX epoch: {error}"))
+            })?
+            .as_secs(),
+    ))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalGroupEventScan {
     events: Vec<CanonicalGroupEvent>,
@@ -708,12 +723,12 @@ fn delete_target_event_id(event: &Event) -> Result<EventId, GroupError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GroupCheckpointStatus, GroupService, scan_canonical_group_events,
+        GroupCheckpointStatus, GroupService, load_group_storage, scan_canonical_group_events,
         scan_canonical_group_events_after, validate_group_extra_tables,
     };
     use crate::pocket_conversion::tangle_event_to_pocket;
     use tangle_groups::{
-        GroupRuntimeConfig, KIND_GROUP_METADATA, ProjectionCheckpoint, StoreOffset,
+        GroupId, GroupRuntimeConfig, KIND_GROUP_METADATA, ProjectionCheckpoint, StoreOffset,
         projection_checkpoint_key,
     };
     use tangle_protocol::{Tag, UnixTimestamp};
