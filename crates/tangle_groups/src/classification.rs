@@ -53,14 +53,13 @@ pub fn classify_group_event(
             .clone();
         return Ok(GroupEventClass::Normal { group_id });
     }
-    if has_group_identity_tag(event.unsigned().tags()) {
-        if let Some(group_tag) =
+    if has_group_identity_tag(event.unsigned().tags())
+        && let Some(group_tag) =
             extract_group_tag(event.unsigned().tags(), GroupTagName::H, limits)?
-        {
-            return Ok(GroupEventClass::Normal {
-                group_id: group_tag.group_id().clone(),
-            });
-        }
+    {
+        return Ok(GroupEventClass::Normal {
+            group_id: group_tag.group_id().clone(),
+        });
     }
     Ok(GroupEventClass::NonGroup)
 }

@@ -77,10 +77,10 @@ pub fn extract_group_tag(
 ) -> Result<Option<GroupTag>, GroupError> {
     let mut found: Option<GroupId> = None;
     for tag in tags {
-        if !tag
+        if tag
             .values()
             .first()
-            .is_some_and(|tag_name| tag_name == name.as_str())
+            .is_none_or(|tag_name| tag_name != name.as_str())
         {
             continue;
         }

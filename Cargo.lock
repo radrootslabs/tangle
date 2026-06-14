@@ -4441,6 +4441,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tangle_crypto",
+ "tangle_groups",
  "tangle_nips",
  "tangle_protocol",
  "tangle_store",

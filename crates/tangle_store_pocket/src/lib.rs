@@ -22,6 +22,8 @@ pub type PocketOwnedFilter = OwnedFilter;
 pub type PocketPubkey = Pubkey;
 pub type PocketScreenResult = ScreenResult;
 pub type PocketStore = Store;
+pub type PocketExtraRecord = (Vec<u8>, Vec<u8>);
+pub type PocketExtraRecords = Vec<PocketExtraRecord>;
 
 pub const TANGLE_GROUP_PROJECTION_TABLE: &str = "group_projection";
 pub const TANGLE_GROUP_OUTBOX_TABLE: &str = "group_outbox";
@@ -159,7 +161,7 @@ impl PocketStoreHandle {
     pub fn scan_extra_records(
         &self,
         table: &'static str,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, PocketStoreError> {
+    ) -> Result<PocketExtraRecords, PocketStoreError> {
         let table_handle = self.extra_table(table)?;
         let txn = self.store.read_txn().map_err(|error| {
             PocketStoreError::from_extra_table(table, "read transaction", error)

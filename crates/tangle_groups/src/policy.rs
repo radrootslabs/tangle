@@ -142,12 +142,11 @@ impl<'a> GroupWritePolicy<'a> {
                 ));
             }
         }
-        if kind == KIND_GROUP_EDIT_METADATA {
-            if group.metadata().hidden()
-                && !self.can_read_group(group_id, Some(event.unsigned().pubkey()))
-            {
-                return Err(non_enumerating_group_error());
-            }
+        if kind == KIND_GROUP_EDIT_METADATA
+            && group.metadata().hidden()
+            && !self.can_read_group(group_id, Some(event.unsigned().pubkey()))
+        {
+            return Err(non_enumerating_group_error());
         }
         Ok(GroupWriteDecision::Accept)
     }
@@ -343,10 +342,10 @@ fn has_role_tag(tags: &[Tag]) -> bool {
 
 fn target_pubkey(event: &Event, tag_name: &str) -> Result<PublicKeyHex, GroupError> {
     for tag in event.unsigned().tags() {
-        if !tag
+        if tag
             .values()
             .first()
-            .is_some_and(|candidate| candidate == tag_name)
+            .is_none_or(|candidate| candidate != tag_name)
         {
             continue;
         }
@@ -374,11 +373,11 @@ mod tests {
     use super::{GroupAuthority, GroupWriteDecision, GroupWritePolicy};
     use crate::{
         Capability, CapabilitySet, GroupAuthContext, GroupErrorKind, GroupEventClass, GroupId,
-        GroupMetadata, GroupProjection, GroupState, KIND_GROUP_CREATE_GROUP,
-        KIND_GROUP_CREATE_INVITE, KIND_GROUP_DELETE_GROUP, KIND_GROUP_JOIN_REQUEST,
-        KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_REMOVE_USER, MemberState, MemberStatus,
-        ProjectedRoleDefinition, ProjectionOrderTuple, RoleDefinition, RoleName, StoreOffset,
-        SupportedKinds,
+        GroupMetadata, GroupMetadataFlags, GroupMetadataText, GroupProjection, GroupState,
+        KIND_GROUP_CREATE_GROUP, KIND_GROUP_CREATE_INVITE, KIND_GROUP_DELETE_GROUP,
+        KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_REMOVE_USER, MemberState,
+        MemberStatus, ProjectedRoleDefinition, ProjectionOrderTuple, RoleDefinition, RoleName,
+        StoreOffset, SupportedKinds,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -731,14 +730,9 @@ mod tests {
         closed: bool,
         supported_kinds: SupportedKinds,
     ) -> GroupMetadata {
-        GroupMetadata::new(
-            None,
-            None,
-            None,
-            private,
-            restricted,
-            hidden,
-            closed,
+        GroupMetadata::from_parts(
+            GroupMetadataText::empty(),
+            GroupMetadataFlags::new(private, restricted, hidden, closed),
             supported_kinds,
         )
     }

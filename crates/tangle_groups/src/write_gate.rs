@@ -89,11 +89,7 @@ fn require_valid_p_tag(event: &Event) -> Result<(), GroupError> {
 
 fn require_indexed_tag_value<'a>(event: &'a Event, name: &str) -> Result<&'a str, GroupError> {
     for tag in event.unsigned().tags() {
-        if !tag
-            .values()
-            .first()
-            .is_some_and(|tag_name| tag_name == name)
-        {
+        if tag.values().first().is_none_or(|tag_name| tag_name != name) {
             continue;
         }
         let Some((_, value)) = tag.indexed_pair() else {

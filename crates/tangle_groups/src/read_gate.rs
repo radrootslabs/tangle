@@ -91,10 +91,10 @@ impl<'a> GroupReadGate<'a> {
         let Some(group) = self.projection.group(group_id) else {
             return Ok(GroupReadDecision::Hidden);
         };
-        if !self
+        if self
             .projection
             .tombstone(group_id)
-            .is_some_and(|tombstone| tombstone.delete_event_id() == event.id())
+            .is_none_or(|tombstone| tombstone.delete_event_id() != event.id())
         {
             return self.screen_normal_event(group_id, reader);
         }
@@ -142,9 +142,10 @@ impl<'a> GroupReadGate<'a> {
 mod tests {
     use super::{GroupReadDecision, GroupReadGate};
     use crate::{
-        GroupAuthority, GroupEventDeletion, GroupId, GroupMetadata, GroupProjection, GroupState,
-        GroupTombstone, KIND_GROUP_DELETE_GROUP, KIND_GROUP_METADATA, MemberState, MemberStatus,
-        ProjectionOrderTuple, StoreOffset, SupportedKinds,
+        GroupAuthority, GroupEventDeletion, GroupId, GroupMetadata, GroupMetadataFlags,
+        GroupMetadataText, GroupProjection, GroupState, GroupTombstone, KIND_GROUP_DELETE_GROUP,
+        KIND_GROUP_METADATA, MemberState, MemberStatus, ProjectionOrderTuple, StoreOffset,
+        SupportedKinds,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -153,20 +154,7 @@ mod tests {
     #[test]
     fn read_gate_allows_public_group_events_and_hides_unknown_groups() {
         let owner = pubkey("1");
-        let projection = projection_with_group(
-            "Farm",
-            GroupMetadata::new(
-                None,
-                None,
-                None,
-                false,
-                false,
-                false,
-                false,
-                SupportedKinds::UnspecifiedAll,
-            ),
-            owner,
-        );
+        let projection = projection_with_group("Farm", metadata(false, false, false, false), owner);
         let authority = GroupAuthority::empty();
         let gate = GroupReadGate::new(&projection, &authority);
 
@@ -187,20 +175,8 @@ mod tests {
         let owner = pubkey("1");
         let member = pubkey("2");
         let outsider = pubkey("3");
-        let mut projection = projection_with_group(
-            "Farm",
-            GroupMetadata::new(
-                None,
-                None,
-                None,
-                true,
-                false,
-                true,
-                false,
-                SupportedKinds::UnspecifiedAll,
-            ),
-            owner.clone(),
-        );
+        let mut projection =
+            projection_with_group("Farm", metadata(true, false, true, false), owner.clone());
         put_member(&mut projection, "Farm", member.clone());
         let authority = GroupAuthority::new([owner.clone()], Vec::<PublicKeyHex>::new());
         let gate = GroupReadGate::new(&projection, &authority);
@@ -233,20 +209,8 @@ mod tests {
     #[test]
     fn read_gate_hides_hidden_and_private_snapshots_from_non_members() {
         let owner = pubkey("1");
-        let projection = projection_with_group(
-            "Farm",
-            GroupMetadata::new(
-                None,
-                None,
-                None,
-                true,
-                false,
-                true,
-                false,
-                SupportedKinds::UnspecifiedAll,
-            ),
-            owner.clone(),
-        );
+        let projection =
+            projection_with_group("Farm", metadata(true, false, true, false), owner.clone());
         let authority = GroupAuthority::new([owner.clone()], Vec::<PublicKeyHex>::new());
         let gate = GroupReadGate::new(&projection, &authority);
 
@@ -273,20 +237,7 @@ mod tests {
     #[test]
     fn require_visible_uses_non_enumerating_error() {
         let owner = pubkey("1");
-        let projection = projection_with_group(
-            "Farm",
-            GroupMetadata::new(
-                None,
-                None,
-                None,
-                true,
-                false,
-                true,
-                false,
-                SupportedKinds::UnspecifiedAll,
-            ),
-            owner,
-        );
+        let projection = projection_with_group("Farm", metadata(true, false, true, false), owner);
         let authority = GroupAuthority::empty();
         let gate = GroupReadGate::new(&projection, &authority);
 
@@ -301,20 +252,8 @@ mod tests {
     #[test]
     fn read_gate_hides_deleted_target_events() {
         let owner = pubkey("1");
-        let mut projection = projection_with_group(
-            "Farm",
-            GroupMetadata::new(
-                None,
-                None,
-                None,
-                false,
-                false,
-                false,
-                false,
-                SupportedKinds::UnspecifiedAll,
-            ),
-            owner,
-        );
+        let mut projection =
+            projection_with_group("Farm", metadata(false, false, false, false), owner);
         let target = event(1, vec![h("Farm")]);
         projection.put_event_deletion(GroupEventDeletion::new(
             GroupId::new("Farm").expect("group"),
@@ -337,20 +276,8 @@ mod tests {
     #[test]
     fn read_gate_keeps_group_delete_marker_under_group_visibility_policy() {
         let owner = pubkey("1");
-        let mut projection = projection_with_group(
-            "Farm",
-            GroupMetadata::new(
-                None,
-                None,
-                None,
-                false,
-                false,
-                false,
-                false,
-                SupportedKinds::UnspecifiedAll,
-            ),
-            owner,
-        );
+        let mut projection =
+            projection_with_group("Farm", metadata(false, false, false, false), owner);
         let marker = event(KIND_GROUP_DELETE_GROUP, vec![h("Farm")]);
         projection.put_tombstone(GroupTombstone::new(
             GroupId::new("Farm").expect("group"),
@@ -401,6 +328,14 @@ mod tests {
                 tuple(20, "20", 2),
             ),
         );
+    }
+
+    fn metadata(private: bool, restricted: bool, hidden: bool, closed: bool) -> GroupMetadata {
+        GroupMetadata::from_parts(
+            GroupMetadataText::empty(),
+            GroupMetadataFlags::new(private, restricted, hidden, closed),
+            SupportedKinds::UnspecifiedAll,
+        )
     }
 
     fn event(kind_value: u32, tags: Vec<Tag>) -> Event {

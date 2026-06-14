@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     CapabilitySet, GroupError, GroupErrorKind, GroupEventClass, GroupId, GroupLimitsConfig,
-    GroupMetadata, RoleDefinition, RoleName, SupportedKinds, classify_group_event,
-    parse_group_metadata,
+    GroupMetadata, GroupMetadataFlags, GroupMetadataText, RoleDefinition, RoleName, SupportedKinds,
+    classify_group_event, parse_group_metadata,
 };
 use serde::{Deserialize, Serialize};
 use tangle_protocol::{Event, EventId, Kind, PublicKeyHex, Tag, UnixTimestamp};
@@ -975,11 +975,7 @@ fn prefixed_key(prefix: &str, first: &str, second: Option<&str>) -> Vec<u8> {
 
 fn first_tag_value<'a>(tags: &'a [Tag], name: &str) -> Result<&'a str, GroupError> {
     for tag in tags {
-        if !tag
-            .values()
-            .first()
-            .is_some_and(|tag_name| tag_name == name)
-        {
+        if tag.values().first().is_none_or(|tag_name| tag_name != name) {
             continue;
         }
         let Some((_, value)) = tag.indexed_pair() else {
@@ -1060,14 +1056,9 @@ impl MetadataDocument {
     }
 
     fn into_metadata(self) -> Result<GroupMetadata, GroupError> {
-        Ok(GroupMetadata::new(
-            self.name,
-            self.picture,
-            self.about,
-            self.private,
-            self.restricted,
-            self.hidden,
-            self.closed,
+        Ok(GroupMetadata::from_parts(
+            GroupMetadataText::new(self.name, self.picture, self.about),
+            GroupMetadataFlags::new(self.private, self.restricted, self.hidden, self.closed),
             self.supported_kinds.into_supported()?,
         ))
     }
@@ -1429,7 +1420,7 @@ mod tests {
 
     #[test]
     fn projection_order_tuple_sorts_by_created_event_and_offset() {
-        let mut tuples = vec![
+        let mut tuples = [
             tuple(2, "b", 1),
             tuple(1, "c", 2),
             tuple(1, "a", 3),
@@ -1634,14 +1625,9 @@ mod tests {
         let base_tuple = tuple(10, "10", 1);
         let state = super::GroupState::new(
             GroupId::new("Farm").expect("group"),
-            crate::GroupMetadata::new(
-                Some("Farmers".to_owned()),
-                None,
-                None,
-                true,
-                false,
-                false,
-                false,
+            crate::GroupMetadata::from_parts(
+                crate::GroupMetadataText::new(Some("Farmers".to_owned()), None, None),
+                crate::GroupMetadataFlags::new(true, false, false, false),
                 SupportedKinds::UnspecifiedAll,
             ),
             PublicKeyHex::new(&"1".repeat(64)).expect("pubkey"),

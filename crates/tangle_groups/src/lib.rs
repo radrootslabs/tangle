@@ -29,7 +29,9 @@ pub use kinds::{
     NIP29_MODERATION_KIND_VALUES, NIP29_RELAY_GENERATED_KIND_VALUES,
     NIP29_USER_REQUEST_KIND_VALUES,
 };
-pub use metadata::{GroupMetadata, SupportedKinds, parse_group_metadata};
+pub use metadata::{
+    GroupMetadata, GroupMetadataFlags, GroupMetadataText, SupportedKinds, parse_group_metadata,
+};
 pub use outbox::{
     GroupCrashHooks, GroupCrashPoint, GroupOutbox, GroupOutboxEffect, GroupOutboxKey,
     GroupOutboxPayload, GroupOutboxRecord, GroupOutboxStatus, OutboxRecoveryReadiness,

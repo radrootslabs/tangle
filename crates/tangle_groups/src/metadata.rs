@@ -23,24 +23,19 @@ pub struct GroupMetadata {
 }
 
 impl GroupMetadata {
-    pub fn new(
-        name: Option<String>,
-        picture: Option<String>,
-        about: Option<String>,
-        private: bool,
-        restricted: bool,
-        hidden: bool,
-        closed: bool,
+    pub fn from_parts(
+        text: GroupMetadataText,
+        flags: GroupMetadataFlags,
         supported_kinds: SupportedKinds,
     ) -> Self {
         Self {
-            name,
-            picture,
-            about,
-            private,
-            restricted,
-            hidden,
-            closed,
+            name: text.name,
+            picture: text.picture,
+            about: text.about,
+            private: flags.private,
+            restricted: flags.restricted,
+            hidden: flags.hidden,
+            closed: flags.closed,
             supported_kinds,
         }
     }
@@ -88,6 +83,50 @@ impl GroupMetadata {
 
     pub fn supported_kinds(&self) -> &SupportedKinds {
         &self.supported_kinds
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupMetadataText {
+    name: Option<String>,
+    picture: Option<String>,
+    about: Option<String>,
+}
+
+impl GroupMetadataText {
+    pub fn new(name: Option<String>, picture: Option<String>, about: Option<String>) -> Self {
+        Self {
+            name,
+            picture,
+            about,
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            name: None,
+            picture: None,
+            about: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GroupMetadataFlags {
+    private: bool,
+    restricted: bool,
+    hidden: bool,
+    closed: bool,
+}
+
+impl GroupMetadataFlags {
+    pub fn new(private: bool, restricted: bool, hidden: bool, closed: bool) -> Self {
+        Self {
+            private,
+            restricted,
+            hidden,
+            closed,
+        }
     }
 }
 

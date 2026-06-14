@@ -1396,7 +1396,7 @@ fn class_group_id(class: &GroupEventClass) -> Option<&GroupId> {
 
 fn delete_target_event_id(event: &Event) -> Result<EventId, GroupError> {
     for tag in event.unsigned().tags() {
-        if !tag.values().first().is_some_and(|name| name == "e") {
+        if tag.values().first().is_none_or(|name| name != "e") {
             continue;
         }
         let Some((_, value)) = tag.indexed_pair() else {

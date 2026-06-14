@@ -5,7 +5,13 @@ use k256::schnorr::signature::Signer;
 use k256::schnorr::{Signature, SigningKey};
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use tangle_crypto::compute_event_id;
+use tangle_crypto::{RelaySigner, compute_event_id};
+use tangle_groups::{
+    CanonicalRelayUrl, GroupGeneratedEventBuilder, GroupLimitsConfig, GroupOutboxPayload,
+    GroupRedactionConfig, GroupRuntimeConfig, KIND_GROUP_CREATE_GROUP, KIND_GROUP_DELETE_EVENT,
+    KIND_GROUP_DELETE_GROUP, KIND_GROUP_EDIT_METADATA, KIND_GROUP_JOIN_REQUEST,
+    KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_PUT_USER, KIND_GROUP_REMOVE_USER, RelaySecret,
+};
 use tangle_nips::ListingProjection;
 use tangle_protocol::{
     AddressCoordinate, Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp,
@@ -30,6 +36,10 @@ pub enum FixtureKey {
     Seller,
     Buyer,
     Relay,
+    Owner,
+    Admin,
+    Member,
+    Outsider,
 }
 
 impl FixtureKey {
@@ -44,6 +54,10 @@ impl FixtureKey {
             Self::Seller => SigningKey::from_bytes(&[7_u8; 32]).expect("seller fixture key"),
             Self::Buyer => SigningKey::from_bytes(&[8_u8; 32]).expect("buyer fixture key"),
             Self::Relay => SigningKey::from_bytes(&[9_u8; 32]).expect("relay fixture key"),
+            Self::Owner => SigningKey::from_bytes(&[10_u8; 32]).expect("owner fixture key"),
+            Self::Admin => SigningKey::from_bytes(&[11_u8; 32]).expect("admin fixture key"),
+            Self::Member => SigningKey::from_bytes(&[12_u8; 32]).expect("member fixture key"),
+            Self::Outsider => SigningKey::from_bytes(&[13_u8; 32]).expect("outsider fixture key"),
         }
     }
 }
@@ -54,6 +68,10 @@ impl fmt::Display for FixtureKey {
             Self::Seller => "seller",
             Self::Buyer => "buyer",
             Self::Relay => "relay",
+            Self::Owner => "owner",
+            Self::Admin => "admin",
+            Self::Member => "member",
+            Self::Outsider => "outsider",
         })
     }
 }
@@ -98,6 +116,10 @@ impl FixtureEventSpec {
             "seller" => Ok(FixtureKey::Seller),
             "buyer" => Ok(FixtureKey::Buyer),
             "relay" => Ok(FixtureKey::Relay),
+            "owner" => Ok(FixtureKey::Owner),
+            "admin" => Ok(FixtureKey::Admin),
+            "member" => Ok(FixtureKey::Member),
+            "outsider" => Ok(FixtureKey::Outsider),
             value => Err(format!("fixture key `{value}` is unsupported")),
         }
     }
@@ -152,6 +174,251 @@ pub fn build_fixture_event_from_parts(
         content,
     );
     sign_unsigned_event(fixture_key, unsigned)
+}
+
+pub const TANGLE_V2_RELAY_URL: &str = "wss://relay.radroots.test";
+pub const TANGLE_V2_RELAY_SECRET_HEX: &str =
+    "7777777777777777777777777777777777777777777777777777777777777777";
+
+pub fn tangle_v2_group_config(
+    owner: FixtureKey,
+    admins: &[FixtureKey],
+) -> Result<GroupRuntimeConfig, String> {
+    GroupRuntimeConfig::new(
+        true,
+        Some(CanonicalRelayUrl::new(TANGLE_V2_RELAY_URL).map_err(|error| error.to_string())?),
+        Some(RelaySecret::from_hex(TANGLE_V2_RELAY_SECRET_HEX).map_err(|error| error.to_string())?),
+        vec![owner.public_key()],
+        admins.iter().map(|admin| admin.public_key()).collect(),
+        GroupRedactionConfig::strict(),
+        GroupLimitsConfig::default(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+pub fn tangle_v2_relay_signer() -> Result<RelaySigner, String> {
+    RelaySigner::from_secret_hex(TANGLE_V2_RELAY_SECRET_HEX).map_err(|error| error.to_string())
+}
+
+pub fn tangle_v2_generated_event(payload: &GroupOutboxPayload) -> Result<Event, String> {
+    GroupGeneratedEventBuilder::new(tangle_v2_relay_signer()?)
+        .sign_payload(payload)
+        .map_err(|error| error.to_string())
+}
+
+pub fn tangle_v2_event(
+    fixture_key: FixtureKey,
+    created_at: u64,
+    kind: u64,
+    tags: Vec<Tag>,
+    content: &str,
+) -> Result<Event, String> {
+    let unsigned = UnsignedEvent::new(
+        fixture_key.public_key(),
+        UnixTimestamp::new(created_at),
+        Kind::new(kind)?,
+        tags,
+        content,
+    );
+    sign_unsigned_event(fixture_key, unsigned)
+}
+
+pub fn tangle_v2_auth_event(
+    fixture_key: FixtureKey,
+    challenge: &str,
+    created_at: u64,
+) -> Result<Event, String> {
+    tangle_v2_event(
+        fixture_key,
+        created_at,
+        22_242,
+        vec![
+            tangle_v2_tag("relay", &[TANGLE_V2_RELAY_URL])?,
+            tangle_v2_tag("challenge", &[challenge])?,
+        ],
+        "",
+    )
+}
+
+pub fn tangle_v2_group_create_event(
+    fixture_key: FixtureKey,
+    group_id: &str,
+    created_at: u64,
+    flags: &[&str],
+) -> Result<Event, String> {
+    let mut tags = vec![
+        tangle_v2_group_tag(group_id)?,
+        tangle_v2_tag("name", &[group_id])?,
+    ];
+    for flag in flags {
+        tags.push(tangle_v2_tag(flag, &[])?);
+    }
+    tangle_v2_event(
+        fixture_key,
+        created_at,
+        KIND_GROUP_CREATE_GROUP.into(),
+        tags,
+        "",
+    )
+}
+
+pub fn tangle_v2_group_metadata_event(
+    fixture_key: FixtureKey,
+    group_id: &str,
+    name: &str,
+    created_at: u64,
+    flags: &[&str],
+) -> Result<Event, String> {
+    let mut tags = vec![
+        tangle_v2_group_tag(group_id)?,
+        tangle_v2_tag("name", &[name])?,
+    ];
+    for flag in flags {
+        tags.push(tangle_v2_tag(flag, &[])?);
+    }
+    tangle_v2_event(
+        fixture_key,
+        created_at,
+        KIND_GROUP_EDIT_METADATA.into(),
+        tags,
+        "",
+    )
+}
+
+pub fn tangle_v2_put_user_event(
+    fixture_key: FixtureKey,
+    group_id: &str,
+    target: FixtureKey,
+    created_at: u64,
+) -> Result<Event, String> {
+    tangle_v2_event(
+        fixture_key,
+        created_at,
+        KIND_GROUP_PUT_USER.into(),
+        vec![
+            tangle_v2_group_tag(group_id)?,
+            tangle_v2_pubkey_tag(target)?,
+        ],
+        "",
+    )
+}
+
+pub fn tangle_v2_remove_user_event(
+    fixture_key: FixtureKey,
+    group_id: &str,
+    target: FixtureKey,
+    created_at: u64,
+) -> Result<Event, String> {
+    tangle_v2_event(
+        fixture_key,
+        created_at,
+        KIND_GROUP_REMOVE_USER.into(),
+        vec![
+            tangle_v2_group_tag(group_id)?,
+            tangle_v2_pubkey_tag(target)?,
+        ],
+        "",
+    )
+}
+
+pub fn tangle_v2_join_event(
+    fixture_key: FixtureKey,
+    group_id: &str,
+    created_at: u64,
+) -> Result<Event, String> {
+    tangle_v2_group_event(
+        fixture_key,
+        group_id,
+        created_at,
+        KIND_GROUP_JOIN_REQUEST.into(),
+        "",
+    )
+}
+
+pub fn tangle_v2_leave_event(
+    fixture_key: FixtureKey,
+    group_id: &str,
+    created_at: u64,
+) -> Result<Event, String> {
+    tangle_v2_group_event(
+        fixture_key,
+        group_id,
+        created_at,
+        KIND_GROUP_LEAVE_REQUEST.into(),
+        "",
+    )
+}
+
+pub fn tangle_v2_delete_event_event(
+    fixture_key: FixtureKey,
+    group_id: &str,
+    target: &Event,
+    created_at: u64,
+) -> Result<Event, String> {
+    tangle_v2_event(
+        fixture_key,
+        created_at,
+        KIND_GROUP_DELETE_EVENT.into(),
+        vec![
+            tangle_v2_group_tag(group_id)?,
+            tangle_v2_event_tag(target.id())?,
+        ],
+        "",
+    )
+}
+
+pub fn tangle_v2_delete_group_event(
+    fixture_key: FixtureKey,
+    group_id: &str,
+    created_at: u64,
+) -> Result<Event, String> {
+    tangle_v2_group_event(
+        fixture_key,
+        group_id,
+        created_at,
+        KIND_GROUP_DELETE_GROUP.into(),
+        "",
+    )
+}
+
+pub fn tangle_v2_group_event(
+    fixture_key: FixtureKey,
+    group_id: &str,
+    created_at: u64,
+    kind: u64,
+    content: &str,
+) -> Result<Event, String> {
+    tangle_v2_event(
+        fixture_key,
+        created_at,
+        kind,
+        vec![tangle_v2_group_tag(group_id)?],
+        content,
+    )
+}
+
+pub fn tangle_v2_group_tag(group_id: &str) -> Result<Tag, String> {
+    tangle_v2_tag("h", &[group_id])
+}
+
+pub fn tangle_v2_address_group_tag(group_id: &str) -> Result<Tag, String> {
+    tangle_v2_tag("d", &[group_id])
+}
+
+pub fn tangle_v2_pubkey_tag(fixture_key: FixtureKey) -> Result<Tag, String> {
+    let pubkey = fixture_key.public_key();
+    tangle_v2_tag("p", &[pubkey.as_str()])
+}
+
+pub fn tangle_v2_event_tag(event_id: &EventId) -> Result<Tag, String> {
+    tangle_v2_tag("e", &[event_id.as_str()])
+}
+
+pub fn tangle_v2_tag(name: &str, values: &[&str]) -> Result<Tag, String> {
+    let mut parts = Vec::with_capacity(values.len() + 1);
+    parts.push(name.to_owned());
+    parts.extend(values.iter().map(|value| (*value).to_owned()));
+    Tag::new(parts)
 }
 
 pub fn fixture_event_json(event: &Event) -> serde_json::Value {
@@ -269,9 +536,13 @@ mod tests {
     use super::{
         FixtureKey, InMemoryRepository, auth_event_spec, build_fixture_event, deletion_event_spec,
         fixed_hex_bytes, fixture_event_json, fixture_spec_from_json,
-        projection_ineligible_listing_spec, valid_public_listing_spec,
+        projection_ineligible_listing_spec, tangle_v2_auth_event, tangle_v2_generated_event,
+        tangle_v2_group_config, tangle_v2_group_create_event, tangle_v2_group_event,
+        tangle_v2_group_metadata_event, tangle_v2_join_event, tangle_v2_put_user_event,
+        valid_public_listing_spec,
     };
     use tangle_crypto::{event_id_matches, verify_event_signature};
+    use tangle_groups::{GroupOutboxPayload, KIND_GROUP_CREATE_GROUP, KIND_GROUP_METADATA};
     use tangle_nips::{
         DeletionTarget, ListingProjectionEvaluation, evaluate_listing_projection,
         parse_deletion_request, parse_relay_auth_event,
@@ -306,6 +577,10 @@ mod tests {
         assert_eq!(FixtureKey::Seller.to_string(), "seller");
         assert_eq!(FixtureKey::Buyer.to_string(), "buyer");
         assert_eq!(FixtureKey::Relay.to_string(), "relay");
+        assert_eq!(FixtureKey::Owner.to_string(), "owner");
+        assert_eq!(FixtureKey::Admin.to_string(), "admin");
+        assert_eq!(FixtureKey::Member.to_string(), "member");
+        assert_eq!(FixtureKey::Outsider.to_string(), "outsider");
         assert_eq!(
             FixtureKey::Seller.public_key().as_str(),
             "989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f"
@@ -314,6 +589,67 @@ mod tests {
             FixtureKey::Seller.public_key(),
             FixtureKey::Buyer.public_key()
         );
+    }
+
+    #[test]
+    fn tangle_v2_builders_create_deterministic_signed_events() {
+        let first =
+            tangle_v2_group_create_event(FixtureKey::Owner, "Farm", 1_714_124_433, &["private"])
+                .expect("first");
+        let second =
+            tangle_v2_group_create_event(FixtureKey::Owner, "Farm", 1_714_124_433, &["private"])
+                .expect("second");
+        let auth =
+            tangle_v2_auth_event(FixtureKey::Owner, "challenge-001", 1_714_124_434).expect("auth");
+
+        assert_eq!(first.id(), second.id());
+        assert_eq!(verify_event_signature(&first), Ok(()));
+        assert_eq!(verify_event_signature(&auth), Ok(()));
+        assert_eq!(first.unsigned().kind().as_u32(), KIND_GROUP_CREATE_GROUP);
+        assert_eq!(
+            parse_relay_auth_event(&auth)
+                .expect("auth parse")
+                .expect("auth")
+                .challenge(),
+            "challenge-001"
+        );
+    }
+
+    #[test]
+    fn tangle_v2_builders_cover_group_config_and_generated_events() {
+        let config =
+            tangle_v2_group_config(FixtureKey::Owner, &[FixtureKey::Admin]).expect("config");
+        let metadata = tangle_v2_group_metadata_event(
+            FixtureKey::Owner,
+            "Farm",
+            "Market",
+            1_714_124_435,
+            &["hidden"],
+        )
+        .expect("metadata");
+        let put =
+            tangle_v2_put_user_event(FixtureKey::Admin, "Farm", FixtureKey::Member, 1_714_124_436)
+                .expect("put");
+        let join = tangle_v2_join_event(FixtureKey::Member, "Farm", 1_714_124_437).expect("join");
+        let normal = tangle_v2_group_event(FixtureKey::Member, "Farm", 1_714_124_438, 1, "harvest")
+            .expect("normal");
+        let payload = GroupOutboxPayload::new(
+            KIND_GROUP_METADATA,
+            UnixTimestamp::new(1_714_124_439),
+            vec![vec!["d".to_owned(), "Farm".to_owned()]],
+            "",
+        );
+        let generated = tangle_v2_generated_event(&payload).expect("generated");
+
+        assert!(config.enabled());
+        assert_eq!(config.owner_pubkeys(), &[FixtureKey::Owner.public_key()]);
+        assert_eq!(config.admin_pubkeys(), &[FixtureKey::Admin.public_key()]);
+        assert_eq!(verify_event_signature(&metadata), Ok(()));
+        assert_eq!(verify_event_signature(&put), Ok(()));
+        assert_eq!(verify_event_signature(&join), Ok(()));
+        assert_eq!(verify_event_signature(&normal), Ok(()));
+        assert_eq!(verify_event_signature(&generated), Ok(()));
+        assert_eq!(generated.unsigned().kind().as_u32(), KIND_GROUP_METADATA);
     }
 
     #[test]
