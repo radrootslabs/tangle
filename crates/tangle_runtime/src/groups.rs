@@ -67,7 +67,6 @@ impl GroupService {
         };
         service.derive_missing_outbox_records(store)?;
         service.materialize_outbox(store)?;
-        store.sync()?;
         Ok(Some(service))
     }
 

@@ -710,7 +710,6 @@ impl BaseRelay {
                 store_offset,
             )?);
         }
-        self.store.sync()?;
         Ok(BaseRelayEventWrite::stored(
             ok_accepted(event_id, String::new()),
             stored_offsets,
