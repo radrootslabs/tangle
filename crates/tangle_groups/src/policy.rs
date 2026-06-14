@@ -5,10 +5,10 @@ use crate::{
     GroupLifecycleState, GroupProjection, KIND_GROUP_CREATE_GROUP, KIND_GROUP_CREATE_INVITE,
     KIND_GROUP_DELETE_EVENT, KIND_GROUP_DELETE_GROUP, KIND_GROUP_EDIT_METADATA,
     KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_PUT_USER, KIND_GROUP_REMOVE_USER,
-    MemberStatus, RoleDefinition, RoleName, SupportedKinds, require_group_auth_as_author,
-    resolve_capabilities,
+    MemberStatus, RoleDefinition, RoleName, SupportedKinds, event_view::GroupEventView,
+    require_group_auth_as_author, resolve_capabilities,
 };
-use tangle_protocol::{Event, PublicKeyHex, Tag};
+use tangle_protocol::PublicKeyHex;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GroupAuthority {
@@ -74,7 +74,7 @@ impl<'a> GroupWritePolicy<'a> {
 
     pub fn check_event(
         &self,
-        event: &Event,
+        event: &(impl GroupEventView + ?Sized),
         class: &GroupEventClass,
         auth: &crate::GroupAuthContext,
     ) -> Result<GroupWriteDecision, GroupError> {
@@ -115,7 +115,7 @@ impl<'a> GroupWritePolicy<'a> {
 
     fn check_moderation_event(
         &self,
-        event: &Event,
+        event: &(impl GroupEventView + ?Sized),
         kind: u32,
         group_id: &GroupId,
     ) -> Result<GroupWriteDecision, GroupError> {
@@ -129,9 +129,10 @@ impl<'a> GroupWritePolicy<'a> {
                 "invites not enabled",
             ));
         }
-        let required = required_capability(kind, event.unsigned().tags())?;
+        let actor = event.pubkey()?;
+        let required = required_capability(kind, event)?;
         if let Some(required) = required {
-            self.require_capability(group_id, event.unsigned().pubkey(), required)?;
+            self.require_capability(group_id, &actor, required)?;
         }
         if kind == KIND_GROUP_REMOVE_USER {
             let target = target_pubkey(event, "p")?;
@@ -144,7 +145,7 @@ impl<'a> GroupWritePolicy<'a> {
         }
         if kind == KIND_GROUP_EDIT_METADATA
             && group.metadata().hidden()
-            && !self.can_read_group(group_id, Some(event.unsigned().pubkey()))
+            && !self.can_read_group(group_id, Some(&actor))
         {
             return Err(non_enumerating_group_error());
         }
@@ -153,10 +154,10 @@ impl<'a> GroupWritePolicy<'a> {
 
     fn check_create_group(
         &self,
-        event: &Event,
+        event: &(impl GroupEventView + ?Sized),
         group_id: &GroupId,
     ) -> Result<GroupWriteDecision, GroupError> {
-        if !self.authority.is_owner(event.unsigned().pubkey()) {
+        if !self.authority.is_owner(&event.pubkey()?) {
             return Err(GroupError::restricted(
                 GroupErrorKind::MissingCapability,
                 "group creation is restricted to relay owners",
@@ -179,19 +180,19 @@ impl<'a> GroupWritePolicy<'a> {
 
     fn check_normal_event(
         &self,
-        event: &Event,
+        event: &(impl GroupEventView + ?Sized),
         group_id: &GroupId,
     ) -> Result<GroupWriteDecision, GroupError> {
         let group = self.require_active_group(group_id)?;
-        match event.unsigned().kind().as_u32() {
+        match event.kind_u32() {
             KIND_GROUP_JOIN_REQUEST => self.check_join(event, group_id),
             KIND_GROUP_LEAVE_REQUEST => self.check_leave(event, group_id),
             _ => {
-                if group.metadata().restricted()
-                    && !self.can_read_group(group_id, Some(event.unsigned().pubkey()))
-                {
+                let actor = event.pubkey()?;
+                if group.metadata().restricted() && !self.can_read_group(group_id, Some(&actor)) {
                     return Err(non_enumerating_group_error());
                 }
+                let kind = event.kind()?;
                 match group.metadata().supported_kinds() {
                     SupportedKinds::UnspecifiedAll => {}
                     SupportedKinds::None => {
@@ -201,7 +202,7 @@ impl<'a> GroupWritePolicy<'a> {
                         ));
                     }
                     SupportedKinds::Only(kinds) => {
-                        if !kinds.contains(&event.unsigned().kind()) {
+                        if !kinds.contains(&kind) {
                             return Err(GroupError::restricted(
                                 GroupErrorKind::UnsupportedGroupKind,
                                 "event kind is not supported by this group",
@@ -216,11 +217,11 @@ impl<'a> GroupWritePolicy<'a> {
 
     fn check_join(
         &self,
-        event: &Event,
+        event: &(impl GroupEventView + ?Sized),
         group_id: &GroupId,
     ) -> Result<GroupWriteDecision, GroupError> {
         let group = self.require_active_group(group_id)?;
-        if self.is_current_member(group_id, event.unsigned().pubkey()) {
+        if self.is_current_member(group_id, &event.pubkey()?) {
             return Err(GroupError::invalid(
                 GroupErrorKind::DuplicateMember,
                 "group member already exists",
@@ -234,11 +235,11 @@ impl<'a> GroupWritePolicy<'a> {
 
     fn check_leave(
         &self,
-        event: &Event,
+        event: &(impl GroupEventView + ?Sized),
         group_id: &GroupId,
     ) -> Result<GroupWriteDecision, GroupError> {
         self.require_active_group(group_id)?;
-        if !self.is_current_member(group_id, event.unsigned().pubkey()) {
+        if !self.is_current_member(group_id, &event.pubkey()?) {
             return Err(GroupError::invalid(
                 GroupErrorKind::DuplicateMember,
                 "group member does not exist",
@@ -317,10 +318,13 @@ pub fn non_enumerating_group_error() -> GroupError {
     GroupError::restricted(GroupErrorKind::GroupUnavailable, "group is unavailable")
 }
 
-fn required_capability(kind: u32, tags: &[Tag]) -> Result<Option<Capability>, GroupError> {
+fn required_capability(
+    kind: u32,
+    event: &(impl GroupEventView + ?Sized),
+) -> Result<Option<Capability>, GroupError> {
     match kind {
         KIND_GROUP_PUT_USER => {
-            if has_role_tag(tags) {
+            if has_role_tag(event)? {
                 Ok(Some(Capability::ManageRoles))
             } else {
                 Ok(Some(Capability::ManageMembers))
@@ -335,19 +339,28 @@ fn required_capability(kind: u32, tags: &[Tag]) -> Result<Option<Capability>, Gr
     }
 }
 
-fn has_role_tag(tags: &[Tag]) -> bool {
-    tags.iter()
-        .any(|tag| tag.values().first().is_some_and(|name| name == "role"))
+fn has_role_tag(event: &(impl GroupEventView + ?Sized)) -> Result<bool, GroupError> {
+    let mut found = false;
+    event.visit_tags(|tag| {
+        if tag.first_value().is_some_and(|name| name == "role") {
+            found = true;
+        }
+        Ok(())
+    })?;
+    Ok(found)
 }
 
-fn target_pubkey(event: &Event, tag_name: &str) -> Result<PublicKeyHex, GroupError> {
-    for tag in event.unsigned().tags() {
+fn target_pubkey(
+    event: &(impl GroupEventView + ?Sized),
+    tag_name: &str,
+) -> Result<PublicKeyHex, GroupError> {
+    let mut found = None;
+    event.visit_tags(|tag| {
         if tag
-            .values()
-            .first()
+            .first_value()
             .is_none_or(|candidate| candidate != tag_name)
         {
-            continue;
+            return Ok(());
         }
         let Some((_, value)) = tag.indexed_pair() else {
             return Err(GroupError::invalid(
@@ -355,17 +368,20 @@ fn target_pubkey(event: &Event, tag_name: &str) -> Result<PublicKeyHex, GroupErr
                 format!("malformed {tag_name} target tag"),
             ));
         };
-        return PublicKeyHex::new(value).map_err(|reason| {
+        found = Some(PublicKeyHex::new(value).map_err(|reason| {
             GroupError::invalid(
                 GroupErrorKind::MalformedTargetTag,
                 format!("malformed {tag_name} target tag: {reason}"),
             )
-        });
-    }
-    Err(GroupError::invalid(
-        GroupErrorKind::MissingTargetTag,
-        format!("missing {tag_name} target tag"),
-    ))
+        })?);
+        Ok(())
+    })?;
+    found.ok_or_else(|| {
+        GroupError::invalid(
+            GroupErrorKind::MissingTargetTag,
+            format!("missing {tag_name} target tag"),
+        )
+    })
 }
 
 #[cfg(test)]

@@ -1,8 +1,9 @@
 use crate::{
     GroupAuthority, GroupError, GroupEventClass, GroupId, GroupLimitsConfig, GroupProjection,
-    KIND_GROUP_DELETE_GROUP, MemberStatus, classify_group_event, non_enumerating_group_error,
+    KIND_GROUP_DELETE_GROUP, MemberStatus, classify_group_event, event_view::GroupEventView,
+    non_enumerating_group_error,
 };
-use tangle_protocol::{Event, PublicKeyHex};
+use tangle_protocol::{EventId, PublicKeyHex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupReadDecision {
@@ -26,19 +27,20 @@ impl<'a> GroupReadGate<'a> {
 
     pub fn screen_event(
         &self,
-        event: &Event,
+        event: &(impl GroupEventView + ?Sized),
         reader: Option<&PublicKeyHex>,
         limits: GroupLimitsConfig,
     ) -> Result<GroupReadDecision, GroupError> {
-        if self.projection.event_deletion(event.id()).is_some() {
+        let event_id = event.id()?;
+        if self.projection.event_deletion(&event_id).is_some() {
             return Ok(GroupReadDecision::Hidden);
         }
         match classify_group_event(event, limits)? {
             GroupEventClass::NonGroup => Ok(GroupReadDecision::Visible),
             GroupEventClass::Normal { group_id } => self.screen_normal_event(&group_id, reader),
             GroupEventClass::Moderation { group_id, .. } => {
-                if event.unsigned().kind().as_u32() == KIND_GROUP_DELETE_GROUP {
-                    self.screen_delete_group_marker(event, &group_id, reader)
+                if event.kind_u32() == KIND_GROUP_DELETE_GROUP {
+                    self.screen_delete_group_marker(&event_id, &group_id, reader)
                 } else {
                     self.screen_normal_event(&group_id, reader)
                 }
@@ -51,7 +53,7 @@ impl<'a> GroupReadGate<'a> {
 
     pub fn require_visible(
         &self,
-        event: &Event,
+        event: &(impl GroupEventView + ?Sized),
         reader: Option<&PublicKeyHex>,
         limits: GroupLimitsConfig,
     ) -> Result<(), GroupError> {
@@ -84,7 +86,7 @@ impl<'a> GroupReadGate<'a> {
 
     fn screen_delete_group_marker(
         &self,
-        event: &Event,
+        event_id: &EventId,
         group_id: &GroupId,
         reader: Option<&PublicKeyHex>,
     ) -> Result<GroupReadDecision, GroupError> {
@@ -94,7 +96,7 @@ impl<'a> GroupReadGate<'a> {
         if self
             .projection
             .tombstone(group_id)
-            .is_none_or(|tombstone| tombstone.delete_event_id() != event.id())
+            .is_none_or(|tombstone| tombstone.delete_event_id() != event_id)
         {
             return self.screen_normal_event(group_id, reader);
         }
@@ -147,8 +149,10 @@ mod tests {
         KIND_GROUP_METADATA, MemberState, MemberStatus, ProjectionOrderTuple, StoreOffset,
         SupportedKinds,
     };
+    use pocket_types::Event as PocketEvent;
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
+        event_to_value,
     };
 
     #[test]
@@ -167,6 +171,22 @@ mod tests {
             gate.screen_event(&event(1, vec![h("Other")]), None, Default::default())
                 .expect("unknown"),
             GroupReadDecision::Hidden
+        );
+    }
+
+    #[test]
+    fn read_gate_screens_pocket_events_through_event_view() {
+        let owner = pubkey("1");
+        let projection = projection_with_group("Farm", metadata(false, false, false, false), owner);
+        let authority = GroupAuthority::empty();
+        let gate = GroupReadGate::new(&projection, &authority);
+        let event = event(1, vec![h("Farm")]);
+        let mut buffer = vec![0; 4096];
+
+        assert_eq!(
+            gate.screen_event(pocket_event(&event, &mut buffer), None, Default::default())
+                .expect("pocket"),
+            GroupReadDecision::Visible
         );
     }
 
@@ -350,6 +370,12 @@ mod tests {
             ),
             SignatureHex::new(&"2".repeat(128)).expect("sig"),
         )
+    }
+
+    fn pocket_event<'a>(event: &Event, buffer: &'a mut [u8]) -> &'a PocketEvent {
+        let raw = event_to_value(event).to_string();
+        let (_, pocket) = PocketEvent::from_json(raw.as_bytes(), buffer).expect("pocket");
+        pocket
     }
 
     fn h(group_id: &str) -> Tag {

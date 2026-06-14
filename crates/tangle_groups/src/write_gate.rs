@@ -2,11 +2,12 @@ use crate::{
     GroupEventClass, GroupLimitsConfig,
     classification::classify_group_event,
     errors::{GroupError, GroupErrorKind},
+    event_view::GroupEventView,
     kinds::{KIND_GROUP_DELETE_EVENT, KIND_GROUP_PUT_USER, KIND_GROUP_REMOVE_USER},
     tags::ensure_group_tag_limit,
 };
 use std::collections::BTreeSet;
-use tangle_protocol::{Event, PublicKeyHex};
+use tangle_protocol::PublicKeyHex;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GroupAuthContext {
@@ -34,10 +35,10 @@ impl GroupAuthContext {
 }
 
 pub fn validate_client_group_event_structure(
-    event: &Event,
+    event: &(impl GroupEventView + ?Sized),
     limits: GroupLimitsConfig,
 ) -> Result<GroupEventClass, GroupError> {
-    ensure_group_tag_limit(event.unsigned().tags(), limits)?;
+    ensure_group_tag_limit(event, limits)?;
     let class = classify_group_event(event, limits)?;
     match &class {
         GroupEventClass::RelayGeneratedSnapshot { .. } => Err(GroupError::blocked(
@@ -53,14 +54,14 @@ pub fn validate_client_group_event_structure(
 }
 
 pub fn require_group_auth_as_author(
-    event: &Event,
+    event: &(impl GroupEventView + ?Sized),
     class: &GroupEventClass,
     auth: &GroupAuthContext,
 ) -> Result<(), GroupError> {
     if matches!(class, GroupEventClass::NonGroup) {
         return Ok(());
     }
-    if auth.contains(event.unsigned().pubkey()) {
+    if auth.contains(&event.pubkey()?) {
         return Ok(());
     }
     Err(GroupError::auth_required(
@@ -68,7 +69,10 @@ pub fn require_group_auth_as_author(
     ))
 }
 
-fn validate_moderation_targets(event: &Event, kind: u32) -> Result<(), GroupError> {
+fn validate_moderation_targets(
+    event: &(impl GroupEventView + ?Sized),
+    kind: u32,
+) -> Result<(), GroupError> {
     match kind {
         KIND_GROUP_PUT_USER | KIND_GROUP_REMOVE_USER => require_valid_p_tag(event),
         KIND_GROUP_DELETE_EVENT => require_indexed_tag_value(event, "e").map(|_| ()),
@@ -76,9 +80,9 @@ fn validate_moderation_targets(event: &Event, kind: u32) -> Result<(), GroupErro
     }
 }
 
-fn require_valid_p_tag(event: &Event) -> Result<(), GroupError> {
+fn require_valid_p_tag(event: &(impl GroupEventView + ?Sized)) -> Result<(), GroupError> {
     let value = require_indexed_tag_value(event, "p")?;
-    PublicKeyHex::new(value).map_err(|reason| {
+    PublicKeyHex::new(&value).map_err(|reason| {
         GroupError::invalid(
             GroupErrorKind::MalformedTargetTag,
             format!("malformed p target tag: {reason}"),
@@ -87,10 +91,14 @@ fn require_valid_p_tag(event: &Event) -> Result<(), GroupError> {
     Ok(())
 }
 
-fn require_indexed_tag_value<'a>(event: &'a Event, name: &str) -> Result<&'a str, GroupError> {
-    for tag in event.unsigned().tags() {
-        if tag.values().first().is_none_or(|tag_name| tag_name != name) {
-            continue;
+fn require_indexed_tag_value(
+    event: &(impl GroupEventView + ?Sized),
+    name: &str,
+) -> Result<String, GroupError> {
+    let mut found = None;
+    event.visit_tags(|tag| {
+        if tag.first_value().is_none_or(|tag_name| tag_name != name) {
+            return Ok(());
         }
         let Some((_, value)) = tag.indexed_pair() else {
             return Err(GroupError::invalid(
@@ -98,12 +106,15 @@ fn require_indexed_tag_value<'a>(event: &'a Event, name: &str) -> Result<&'a str
                 format!("malformed {name} target tag"),
             ));
         };
-        return Ok(value);
-    }
-    Err(GroupError::invalid(
-        GroupErrorKind::MissingTargetTag,
-        format!("missing {name} target tag"),
-    ))
+        found = Some(value.to_owned());
+        Ok(())
+    })?;
+    found.ok_or_else(|| {
+        GroupError::invalid(
+            GroupErrorKind::MissingTargetTag,
+            format!("missing {name} target tag"),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -115,26 +126,34 @@ mod tests {
         GroupErrorKind, GroupEventClass, GroupLimitsConfig, KIND_GROUP_DELETE_EVENT,
         KIND_GROUP_JOIN_REQUEST, KIND_GROUP_METADATA, KIND_GROUP_PUT_USER,
     };
+    use pocket_types::Event as PocketEvent;
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
+        event_to_value,
     };
 
     #[test]
     fn client_submitted_relay_generated_events_are_rejected() {
-        let error = validate_client_group_event_structure(
-            &event(
-                KIND_GROUP_METADATA,
-                vec![Tag::from_parts("d", &["Farm"]).expect("d")],
-            ),
-            GroupLimitsConfig::default(),
-        )
-        .expect_err("relay generated");
+        let event = event(
+            KIND_GROUP_METADATA,
+            vec![Tag::from_parts("d", &["Farm"]).expect("d")],
+        );
+        let error = validate_client_group_event_structure(&event, GroupLimitsConfig::default())
+            .expect_err("relay generated");
 
         assert_eq!(error.kind(), GroupErrorKind::DirectRelayGeneratedSubmission);
         assert_eq!(
             error.prefixed_message(),
             "blocked: relay-generated group state events cannot be submitted by clients"
         );
+
+        let mut buffer = vec![0; 4096];
+        let error = validate_client_group_event_structure(
+            pocket_event(&event, &mut buffer),
+            GroupLimitsConfig::default(),
+        )
+        .expect_err("pocket relay generated");
+        assert_eq!(error.kind(), GroupErrorKind::DirectRelayGeneratedSubmission);
     }
 
     #[test]
@@ -268,5 +287,11 @@ mod tests {
             ),
             SignatureHex::new(&"2".repeat(128)).expect("sig"),
         )
+    }
+
+    fn pocket_event<'a>(event: &Event, buffer: &'a mut [u8]) -> &'a PocketEvent {
+        let raw = event_to_value(event).to_string();
+        let (_, pocket) = PocketEvent::from_json(raw.as_bytes(), buffer).expect("pocket");
+        pocket
     }
 }

@@ -1,9 +1,7 @@
 use crate::errors::{GroupError, GroupErrorKind};
-use pocket_types::{
-    Event as PocketEvent, OwnedEvent as PocketOwnedEvent, TagsStringIter as PocketTagsStringIter,
-};
+use pocket_types::{Event as PocketEvent, OwnedEvent as PocketOwnedEvent, TagsStringIter};
 use std::str;
-use tangle_protocol::{Event, Tag, TagName};
+use tangle_protocol::{Event, EventId, Kind, PublicKeyHex, Tag, TagName};
 
 pub trait GroupEventView {
     fn id_hex(&self) -> String;
@@ -15,46 +13,51 @@ pub trait GroupEventView {
     fn visit_tags<'a, F>(&'a self, visitor: F) -> Result<(), GroupError>
     where
         F: FnMut(GroupEventTag<'a>) -> Result<(), GroupError>;
+
+    fn id(&self) -> Result<EventId, GroupError> {
+        EventId::new(&self.id_hex()).map_err(event_view_scalar_error)
+    }
+
+    fn pubkey(&self) -> Result<PublicKeyHex, GroupError> {
+        PublicKeyHex::new(&self.pubkey_hex()).map_err(event_view_scalar_error)
+    }
+
+    fn kind(&self) -> Result<Kind, GroupError> {
+        Kind::new(u64::from(self.kind_u32())).map_err(event_view_scalar_error)
+    }
 }
 
-#[derive(Debug)]
-pub enum GroupEventTag<'a> {
-    Tangle(&'a Tag),
-    Pocket(PocketTagsStringIter<'a>),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupEventTag<'a> {
+    name: Option<&'a str>,
+    value: Option<&'a str>,
 }
 
 impl<'a> GroupEventTag<'a> {
-    pub fn first_value(self) -> Result<Option<&'a str>, GroupError> {
-        match self {
-            Self::Tangle(tag) => Ok(tag.values().first().map(String::as_str)),
-            Self::Pocket(mut values) => values.next().map(tag_value_utf8).transpose(),
+    pub fn first_value(&self) -> Option<&'a str> {
+        self.name
+    }
+
+    pub fn indexed_pair(&self) -> Option<(&'a str, &'a str)> {
+        let name = self.name?;
+        if !TagName::is_indexable_name(name) {
+            return None;
+        }
+        self.value.map(|value| (name, value))
+    }
+
+    fn from_tangle(tag: &'a Tag) -> Self {
+        Self {
+            name: tag.values().first().map(String::as_str),
+            value: tag.values().get(1).map(String::as_str),
         }
     }
 
-    pub fn indexed_pair(self) -> Result<Option<(&'a str, &'a str)>, GroupError> {
-        match self {
-            Self::Tangle(tag) => Ok(tag.indexed_pair()),
-            Self::Pocket(mut values) => {
-                let Some(name) = values.next() else {
-                    return Ok(None);
-                };
-                let name = tag_value_utf8(name)?;
-                if !TagName::is_indexable_name(name) {
-                    return Ok(None);
-                }
-                let Some(value) = values.next() else {
-                    return Ok(None);
-                };
-                Ok(Some((name, tag_value_utf8(value)?)))
-            }
-        }
-    }
-
-    pub fn values(self) -> Result<Vec<&'a str>, GroupError> {
-        match self {
-            Self::Tangle(tag) => Ok(tag.values().iter().map(String::as_str).collect()),
-            Self::Pocket(values) => values.map(tag_value_utf8).collect(),
-        }
+    fn from_pocket(mut values: TagsStringIter<'a>) -> Result<Self, GroupError> {
+        Ok(Self {
+            name: values.next().map(tag_value_utf8).transpose()?,
+            value: values.next().map(tag_value_utf8).transpose()?,
+        })
     }
 }
 
@@ -76,7 +79,7 @@ impl GroupEventView for Event {
         F: FnMut(GroupEventTag<'a>) -> Result<(), GroupError>,
     {
         for tag in self.unsigned().tags() {
-            visitor(GroupEventTag::Tangle(tag))?;
+            visitor(GroupEventTag::from_tangle(tag))?;
         }
         Ok(())
     }
@@ -101,7 +104,7 @@ impl GroupEventView for PocketEvent {
     {
         let tags = self.tags().map_err(pocket_tags_error)?;
         for tag in tags.iter() {
-            visitor(GroupEventTag::Pocket(tag))?;
+            visitor(GroupEventTag::from_pocket(tag)?)?;
         }
         Ok(())
     }
@@ -148,6 +151,10 @@ fn pocket_tags_error(error: pocket_types::Error) -> GroupError {
     )
 }
 
+fn event_view_scalar_error(error: String) -> GroupError {
+    GroupError::internal(error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::GroupEventView;
@@ -168,13 +175,6 @@ mod tests {
             indexed_pairs(&event),
             vec![("h".to_owned(), "Farm".to_owned())]
         );
-        assert_eq!(
-            tag_values(&event),
-            vec![
-                vec!["h".to_owned(), "Farm".to_owned()],
-                vec!["summary".to_owned(), "Harvest".to_owned()],
-            ]
-        );
     }
 
     #[test]
@@ -191,37 +191,19 @@ mod tests {
             indexed_pairs(pocket),
             vec![("h".to_owned(), "Farm".to_owned())]
         );
-        assert_eq!(
-            tag_values(pocket),
-            vec![
-                vec!["h".to_owned(), "Farm".to_owned()],
-                vec!["summary".to_owned(), "Harvest".to_owned()],
-            ]
-        );
     }
 
     fn indexed_pairs<E: GroupEventView + ?Sized>(event: &E) -> Vec<(String, String)> {
         let mut pairs = Vec::new();
         event
             .visit_tags(|tag| {
-                if let Some((name, value)) = tag.indexed_pair()? {
+                if let Some((name, value)) = tag.indexed_pair() {
                     pairs.push((name.to_owned(), value.to_owned()));
                 }
                 Ok(())
             })
             .expect("visit tags");
         pairs
-    }
-
-    fn tag_values<E: GroupEventView + ?Sized>(event: &E) -> Vec<Vec<String>> {
-        let mut tags = Vec::new();
-        event
-            .visit_tags(|tag| {
-                tags.push(tag.values()?.into_iter().map(str::to_owned).collect());
-                Ok(())
-            })
-            .expect("visit tags");
-        tags
     }
 
     fn event() -> Event {
