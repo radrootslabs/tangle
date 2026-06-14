@@ -14,7 +14,7 @@ use crate::{
     },
     relay::{
         auth::BaseAuthState,
-        core::{BaseRelay, BaseRelayLimits, BaseRelayShutdownReport},
+        core::{BaseRelay, BaseRelayEventWrite, BaseRelayLimits, BaseRelayShutdownReport},
         live::LiveSubscriptionSet,
     },
 };
@@ -372,6 +372,27 @@ impl TangleRuntimeShared {
                 .is_ok_and(|class| !matches!(class, GroupEventClass::NonGroup))
     }
 
+    fn handle_event_with_auth_report(
+        &self,
+        event: Event,
+        auth: &BaseAuthState,
+    ) -> Result<BaseRelayEventWrite, BaseRelayError> {
+        BaseRelay::handle_event_with_shared_services(
+            &self.store,
+            self.groups.as_ref(),
+            self.limits.base_relay_limits(),
+            event,
+            auth,
+        )
+    }
+
+    fn group_outbox_pending_events(&self) -> usize {
+        self.groups
+            .as_ref()
+            .map(GroupServiceHandle::outbox_pending_events)
+            .unwrap_or(0)
+    }
+
     fn rate_limit_req(
         &self,
         subscription_id: &SubscriptionId,
@@ -605,13 +626,9 @@ impl TangleRuntimeHandle {
                     record_event_metrics(&self.inner.metrics, &message, is_group_event, started_at);
                     return Ok(vec![message]);
                 }
-                let (result, group_outbox_pending_events) = {
-                    let relay = self.inner.relay.lock().await;
-                    let result = relay.handle_event_with_auth_report(event, auth)?;
-                    let pending_events =
-                        is_group_event.then(|| relay.group_outbox_pending_events());
-                    (result, pending_events)
-                };
+                let result = self.inner.handle_event_with_auth_report(event, auth)?;
+                let group_outbox_pending_events =
+                    is_group_event.then(|| self.inner.group_outbox_pending_events());
                 if is_group_event {
                     for _ in 0..result.stored_offsets().len().saturating_sub(1) {
                         self.inner.metrics.record_outbox_replayed_event();

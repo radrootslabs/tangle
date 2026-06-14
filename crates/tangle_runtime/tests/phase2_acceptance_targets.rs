@@ -1323,6 +1323,21 @@ fn req_count_and_live_fanout_share_one_group_read_gate() {
 }
 
 #[test]
+fn runtime_event_handling_does_not_lock_relay_state() {
+    let runtime = include_str!("../src/runtime.rs");
+    let event_branch = runtime
+        .split("ClientMessage::Event(event) => {")
+        .nth(1)
+        .expect("event branch")
+        .split("ClientMessage::Req")
+        .next()
+        .expect("req branch");
+
+    assert!(!event_branch.contains("relay.lock().await"));
+    assert!(event_branch.contains("self.inner.handle_event_with_auth_report(event, auth)?"));
+}
+
+#[test]
 fn runtime_hot_path_does_not_stringify_and_reparse_events() {
     let conversion_boundary = include_str!("../src/pocket_conversion.rs");
     for forbidden in [

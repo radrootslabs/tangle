@@ -596,7 +596,26 @@ impl BaseRelay {
         event: Event,
         auth: &BaseAuthState,
     ) -> Result<BaseRelayEventWrite, BaseRelayError> {
-        self.handle_event_with_group_auth(
+        Self::handle_event_with_shared_services(
+            &self.store,
+            self.groups.as_ref(),
+            self.limits,
+            event,
+            auth,
+        )
+    }
+
+    pub(crate) fn handle_event_with_shared_services(
+        store: &PocketStoreHandle,
+        groups: Option<&GroupServiceHandle>,
+        limits: BaseRelayLimits,
+        event: Event,
+        auth: &BaseAuthState,
+    ) -> Result<BaseRelayEventWrite, BaseRelayError> {
+        Self::handle_event_with_group_auth_and_services(
+            store,
+            groups,
+            limits,
             event,
             &GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned()),
         )
@@ -640,8 +659,24 @@ impl BaseRelay {
         event: Event,
         auth: &GroupAuthContext,
     ) -> Result<BaseRelayEventWrite, BaseRelayError> {
+        Self::handle_event_with_group_auth_and_services(
+            &self.store,
+            self.groups.as_ref(),
+            self.limits,
+            event,
+            auth,
+        )
+    }
+
+    fn handle_event_with_group_auth_and_services(
+        store: &PocketStoreHandle,
+        groups: Option<&GroupServiceHandle>,
+        limits: BaseRelayLimits,
+        event: Event,
+        auth: &GroupAuthContext,
+    ) -> Result<BaseRelayEventWrite, BaseRelayError> {
         let event_id = event.id().clone();
-        if let Err(error) = self.limits.validate_event(&event) {
+        if let Err(error) = limits.validate_event(&event) {
             return Ok(BaseRelayEventWrite::unstored(ok_rejected(
                 event_id,
                 error.prefixed_message(),
@@ -662,11 +697,7 @@ impl BaseRelay {
                 .prefixed_message(),
             )));
         }
-        let group_limits = self
-            .groups
-            .as_ref()
-            .map(GroupServiceHandle::limits)
-            .unwrap_or_default();
+        let group_limits = groups.map(GroupServiceHandle::limits).unwrap_or_default();
         let audit_class = classify_group_event(&event, group_limits).ok();
         let class = match validate_client_group_event_structure(&event, group_limits) {
             Ok(class) => class,
@@ -685,7 +716,7 @@ impl BaseRelay {
             }
         };
         if !matches!(class, GroupEventClass::NonGroup) {
-            let Some(groups) = self.groups.as_ref() else {
+            let Some(groups) = groups else {
                 logging::log_group_moderation_audit(
                     &event,
                     &class,
@@ -696,7 +727,7 @@ impl BaseRelay {
                     "blocked: NIP-29 group events are not accepted before group service".to_owned(),
                 )));
             };
-            if let Err(error) = groups.check_event(&self.store, &event, &class, auth) {
+            if let Err(error) = groups.check_event(store, &event, &class, auth) {
                 logging::log_group_moderation_audit(
                     &event,
                     &class,
@@ -719,24 +750,20 @@ impl BaseRelay {
                 String::new(),
             )));
         }
-        if self
-            .store
-            .event_by_id(pocket_event_id(&event_id)?)?
-            .is_some()
-        {
+        if store.event_by_id(pocket_event_id(&event_id)?)?.is_some() {
             return Ok(BaseRelayEventWrite::unstored(ok_accepted(
                 event_id,
                 "duplicate: already have this event".to_owned(),
             )));
         }
         let pocket_event = tangle_event_to_pocket(&event)?;
-        let store_offset = StoreOffset::new(self.store.store_event(&pocket_event)?);
+        let store_offset = StoreOffset::new(store.store_event(&pocket_event)?);
         let mut stored_offsets = vec![store_offset];
         if !matches!(class, GroupEventClass::NonGroup)
-            && let Some(groups) = self.groups.as_ref()
+            && let Some(groups) = groups
         {
             stored_offsets.extend(groups.after_source_event_stored(
-                &self.store,
+                store,
                 &event,
                 &class,
                 store_offset,
