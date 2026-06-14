@@ -438,8 +438,10 @@ fn load_group_storage(
     }
     let checkpoint = checkpoint_status.checkpoint().cloned();
     let projection_records = store.scan_extra_records(TANGLE_GROUP_PROJECTION_TABLE)?;
+    let mut projection = load_group_projection(projection_records, checkpoint)?;
+    apply_canonical_events_after_checkpoint(store, &mut projection, limits)?;
     Ok(GroupStorageState {
-        projection: load_group_projection(projection_records, checkpoint)?,
+        projection,
         outbox: load_group_outbox(outbox_records)?,
     })
 }
@@ -484,6 +486,32 @@ fn load_group_outbox(records: Vec<(Vec<u8>, Vec<u8>)>) -> Result<GroupOutbox, Ba
         outbox.update(GroupOutboxRecord::from_json_bytes(&value)?);
     }
     Ok(outbox)
+}
+
+fn apply_canonical_events_after_checkpoint(
+    store: &PocketStoreHandle,
+    projection: &mut GroupProjection,
+    limits: GroupLimitsConfig,
+) -> Result<(), BaseRelayError> {
+    let last_offset = projection
+        .checkpoint()
+        .and_then(ProjectionCheckpoint::last_offset);
+    let scan = scan_canonical_group_events_after(store, last_offset, limits)?;
+    if scan.events().is_empty() {
+        return Ok(());
+    }
+    let mut events = scan.into_events();
+    let next_offset = events.iter().map(CanonicalGroupEvent::store_offset).max();
+    events.sort_by_key(CanonicalGroupEvent::tuple);
+    for item in events {
+        projection.apply_canonical_event(item.event(), item.store_offset(), limits)?;
+    }
+    projection.set_checkpoint(ProjectionCheckpoint::current(
+        next_offset,
+        projection_rebuilt_at()?,
+    ));
+    persist_group_projection_snapshot(store, projection)?;
+    validate_rebuilt_group_projection(store)
 }
 
 fn persist_group_projection_snapshot(

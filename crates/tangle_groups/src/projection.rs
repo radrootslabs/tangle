@@ -920,7 +920,11 @@ pub fn rebuild_group_projection(
     let mut skipped_events = 0;
     let mut last_offset = None;
     for item in events {
-        last_offset = Some(item.store_offset());
+        last_offset = Some(
+            last_offset
+                .map(|current: StoreOffset| current.max(item.store_offset()))
+                .unwrap_or_else(|| item.store_offset()),
+        );
         match projection.apply_canonical_event(item.event(), item.store_offset(), limits)? {
             ProjectionApplyOutcome::Applied => applied_events += 1,
             ProjectionApplyOutcome::Ignored => ignored_events += 1,
@@ -1578,6 +1582,15 @@ mod tests {
                 ),
                 CanonicalGroupEvent::new(
                     event(
+                        1,
+                        "40",
+                        5,
+                        vec![Tag::from_parts("h", &["Farm"]).expect("h")],
+                    ),
+                    StoreOffset::new(99),
+                ),
+                CanonicalGroupEvent::new(
+                    event(
                         KIND_GROUP_CREATE_GROUP,
                         "10",
                         10,
@@ -1610,7 +1623,8 @@ mod tests {
 
         assert_eq!(group.metadata().name(), Some("New"));
         assert_eq!(report.applied_events(), 3);
-        assert_eq!(report.last_offset(), Some(StoreOffset::new(3)));
+        assert_eq!(report.ignored_events(), 1);
+        assert_eq!(report.last_offset(), Some(StoreOffset::new(99)));
         assert!(
             report
                 .projection()

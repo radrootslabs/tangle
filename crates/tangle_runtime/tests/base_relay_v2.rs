@@ -5,8 +5,8 @@ use tangle_crypto::{event_id_matches, verify_event_signature};
 use tangle_groups::{
     GroupId, GroupRuntimeConfig, KIND_GROUP_ADMINS, KIND_GROUP_DELETE_GROUP,
     KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA,
-    KIND_GROUP_PUT_USER, MemberStatus, NIP29_RELAY_GENERATED_KIND_VALUES,
-    parse_group_runtime_config_json,
+    KIND_GROUP_PUT_USER, MemberStatus, NIP29_RELAY_GENERATED_KIND_VALUES, ProjectionCheckpoint,
+    StoreOffset, member_current_key, parse_group_runtime_config_json, projection_checkpoint_key,
 };
 use tangle_protocol::{
     Event, Filter, RawEventJson, RelayMessage, SubscriptionId, Tag, UnixTimestamp,
@@ -995,6 +995,54 @@ fn projection_rebuild_after_restart_matches_live_state_and_outbox_is_idempotent(
 }
 
 #[test]
+fn projection_applies_canonical_events_after_checkpoint_on_restart() {
+    let config = test_store_config("projection-incremental");
+    let owner_auth = authenticated(FixtureKey::Owner);
+    let admin_auth = authenticated(FixtureKey::Admin);
+    let create =
+        tangle_v2_group_create_event(FixtureKey::Owner, "IncrementalFarm", 1, &[]).expect("create");
+    let put = tangle_v2_put_user_event(FixtureKey::Admin, "IncrementalFarm", FixtureKey::Member, 2)
+        .expect("put");
+    {
+        let mut relay = BaseRelay::open_with_groups(&config, 8, &group_config()).expect("relay");
+        assert_accepted(
+            relay
+                .handle_event_with_auth(create.clone(), &owner_auth)
+                .expect("create"),
+            &create,
+        );
+        assert_accepted(
+            relay
+                .handle_event_with_auth(put.clone(), &admin_auth)
+                .expect("put"),
+            &put,
+        );
+        relay.shutdown().expect("shutdown");
+    }
+    let create_offset = stored_event_offset(&config, &create);
+    regress_member_projection_to_checkpoint(&config, create_offset, "IncrementalFarm");
+
+    let relay = BaseRelay::open_with_groups(&config, 8, &group_config()).expect("reopen");
+    assert_eq!(
+        relay
+            .group_projection()
+            .expect("projection")
+            .member(&group("IncrementalFarm"), &FixtureKey::Member.public_key())
+            .expect("member")
+            .status(),
+        MemberStatus::Member
+    );
+    let validation = group_extra_table_validation(&config);
+    assert!(matches!(
+        validation.checkpoint_status(),
+        GroupCheckpointStatus::Current { checkpoint }
+            if checkpoint
+                .last_offset()
+                .is_some_and(|offset| offset.as_u64() > create_offset)
+    ));
+}
+
+#[test]
 fn same_timestamp_conflicts_are_deterministic_across_ingest_order() {
     let first = tangle_v2_group_metadata_event(FixtureKey::Owner, "ClockFarm", "Alpha", 100, &[])
         .expect("first");
@@ -1138,6 +1186,44 @@ fn group_extra_table_validation(
 ) -> tangle_runtime::groups::GroupExtraTableValidation {
     let store = PocketStoreHandle::open(config).expect("store");
     validate_group_extra_tables(&store).expect("validation")
+}
+
+fn stored_event_offset(config: &PocketStoreConfig, event: &Event) -> u64 {
+    let store = PocketStoreHandle::open(config).expect("store");
+    store
+        .scan_events()
+        .expect("events")
+        .into_iter()
+        .find(|stored| stored.event().id().as_hex_string() == event.id().as_str())
+        .expect("stored event")
+        .store_offset()
+}
+
+fn regress_member_projection_to_checkpoint(
+    config: &PocketStoreConfig,
+    checkpoint_offset: u64,
+    group_id: &str,
+) {
+    let store = PocketStoreHandle::open(config).expect("store");
+    let group_id = GroupId::new(group_id).expect("group");
+    let checkpoint = ProjectionCheckpoint::current(
+        Some(StoreOffset::new(checkpoint_offset)),
+        UnixTimestamp::new(1_714_999_999),
+    );
+    store
+        .put_extra_record(
+            TANGLE_GROUP_CHECKPOINT_TABLE,
+            &projection_checkpoint_key(),
+            &checkpoint.to_json_bytes().expect("checkpoint"),
+        )
+        .expect("checkpoint");
+    store
+        .delete_extra_record(
+            TANGLE_GROUP_PROJECTION_TABLE,
+            &member_current_key(&group_id, &FixtureKey::Member.public_key()),
+        )
+        .expect("delete member");
+    store.sync().expect("sync");
 }
 
 fn temp_root(name: &str) -> PathBuf {
