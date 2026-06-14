@@ -29,7 +29,7 @@ use tangle_runtime::{
 };
 use tangle_test_support::{
     FixtureKey, TANGLE_V2_RELAY_SECRET_HEX, TANGLE_V2_RELAY_URL, tangle_v2_auth_event,
-    tangle_v2_event,
+    tangle_v2_event, tangle_v2_group_create_event,
 };
 use tokio::{net::TcpListener, time::timeout};
 use tokio_tungstenite::tungstenite::{Message as TungsteniteMessage, client::IntoClientRequest};
@@ -143,6 +143,23 @@ async fn websocket_clients_use_nip01_nip42_and_nip45_flows() {
         false,
         "auth-required: auth challenge does not match",
     );
+
+    let group_create = tangle_v2_group_create_event(
+        FixtureKey::Owner,
+        "WebsocketFarm",
+        auth_created_at.saturating_add(3),
+        &[],
+    )
+    .expect("group create");
+    send_client_value(&mut second, json!(["EVENT", event_to_value(&group_create)])).await;
+    assert_ok(
+        read_relay_value(&mut second).await,
+        &group_create,
+        false,
+        "auth-required: group event author must authenticate with AUTH",
+    );
+    send_client_value(&mut first, json!(["EVENT", event_to_value(&group_create)])).await;
+    assert_ok(read_relay_value(&mut first).await, &group_create, true, "");
 
     send_client_value(&mut first, json!(["EVENT", event_to_value(&first_event)])).await;
     assert_ok(read_relay_value(&mut first).await, &first_event, true, "");
