@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    fmt::Write as _,
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     process::{Child, Command, Output, Stdio},
@@ -137,9 +136,28 @@ fn tangle_run_starts_server_and_stays_alive_until_shutdown() {
     .expect("write config");
 
     let mut child = TangleChild::spawn(&config_path);
-    let response = wait_for_http_ok(listen_addr, "/healthz");
+    let health = wait_for_http_ok(listen_addr, "/healthz", None);
+    let ready = wait_for_http_ok(listen_addr, "/readyz", None);
+    let nip11 = wait_for_http_ok(listen_addr, "/", Some("application/nostr+json"));
+    let health_value =
+        serde_json::from_str::<serde_json::Value>(response_body(&health)).expect("health json");
+    let ready_value =
+        serde_json::from_str::<serde_json::Value>(response_body(&ready)).expect("ready json");
+    let nip11_value =
+        serde_json::from_str::<serde_json::Value>(response_body(&nip11)).expect("nip11 json");
 
-    assert!(response.contains(r#""status":"ok""#));
+    assert_eq!(health_value["status"], "ok");
+    assert_eq!(ready_value["status"], "ready");
+    assert_eq!(ready_value["checks"]["pocket_storage"], "ready");
+    assert_eq!(nip11_value["name"], "tangle");
+    assert_eq!(nip11_value["limitation"]["payment_required"], false);
+    assert_eq!(nip11_value["limitation"]["restricted_writes"], true);
+    assert!(
+        nip11_value["supported_nips"]
+            .as_array()
+            .expect("supported nips")
+            .contains(&serde_json::json!(29))
+    );
     assert!(child.try_wait().expect("child status").is_none());
     assert!(data_dir.exists());
 
@@ -198,18 +216,17 @@ fn reserve_loopback_addr() -> SocketAddr {
     listener.local_addr().expect("loopback address")
 }
 
-fn wait_for_http_ok(address: SocketAddr, path: &str) -> String {
+fn wait_for_http_ok(address: SocketAddr, path: &str, accept: Option<&str>) -> String {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut last_error = String::new();
     while Instant::now() < deadline {
-        match http_get(address, path) {
+        match http_get(address, path, accept) {
             Ok(response) if response.starts_with("HTTP/1.1 200 OK") => return response,
             Ok(response) => {
                 last_error = response.lines().next().unwrap_or("").to_owned();
             }
             Err(error) => {
-                last_error.clear();
-                write!(&mut last_error, "{error}").expect("format error");
+                last_error = error.to_string();
             }
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -217,15 +234,23 @@ fn wait_for_http_ok(address: SocketAddr, path: &str) -> String {
     panic!("server did not answer {path}: {last_error}");
 }
 
-fn http_get(address: SocketAddr, path: &str) -> std::io::Result<String> {
+fn http_get(address: SocketAddr, path: &str, accept: Option<&str>) -> std::io::Result<String> {
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(200))?;
     stream.set_read_timeout(Some(Duration::from_millis(500)))?;
     stream.set_write_timeout(Some(Duration::from_millis(500)))?;
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
-    )?;
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {address}\r\n");
+    if let Some(accept) = accept {
+        request.push_str("Accept: ");
+        request.push_str(accept);
+        request.push_str("\r\n");
+    }
+    request.push_str("Connection: close\r\n\r\n");
+    stream.write_all(request.as_bytes())?;
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
     Ok(response)
+}
+
+fn response_body(response: &str) -> &str {
+    response.split_once("\r\n\r\n").expect("response body").1
 }
