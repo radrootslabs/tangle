@@ -3,6 +3,7 @@
 pub mod chorus_pocket;
 pub mod config;
 pub mod errors;
+pub mod event_bus;
 pub mod groups;
 pub mod nip11;
 pub mod ops;
@@ -30,6 +31,20 @@ pub struct TangleRuntimeStartupReport {
 }
 
 impl TangleRuntimeStartupReport {
+    pub(crate) fn new(
+        relay_url: impl Into<String>,
+        data_directory: PathBuf,
+        groups_enabled: bool,
+        readiness: BaseRelayReadinessState,
+    ) -> Self {
+        Self {
+            relay_url: relay_url.into(),
+            data_directory,
+            groups_enabled,
+            readiness,
+        }
+    }
+
     pub fn relay_url(&self) -> &str {
         &self.relay_url
     }
@@ -91,20 +106,17 @@ pub fn load_base_relay_runtime_config(
 pub fn open_base_relay_from_config_path(
     path: impl AsRef<Path>,
 ) -> Result<TangleRuntimeStartupReport, TangleRuntimeLoadError> {
-    let config = load_base_relay_runtime_config(path)?;
-    let mut runtime = TangleRuntime::open(config).map_err(TangleRuntimeLoadError::OpenRelay)?;
-    let readiness = runtime.readiness().clone();
+    let mut runtime = open_tangle_runtime_from_config_path(path)?;
+    let report = runtime.startup_report();
     runtime
         .shutdown()
         .map_err(TangleRuntimeLoadError::ShutdownRelay)?;
-    Ok(TangleRuntimeStartupReport {
-        relay_url: runtime.config().relay_url().to_owned(),
-        data_directory: runtime
-            .config()
-            .pocket_config()
-            .data_directory()
-            .to_path_buf(),
-        groups_enabled: runtime.config().groups().enabled(),
-        readiness,
-    })
+    Ok(report)
+}
+
+pub fn open_tangle_runtime_from_config_path(
+    path: impl AsRef<Path>,
+) -> Result<TangleRuntime, TangleRuntimeLoadError> {
+    let config = load_base_relay_runtime_config(path)?;
+    TangleRuntime::open(config).map_err(TangleRuntimeLoadError::OpenRelay)
 }
