@@ -137,10 +137,24 @@ async fn base_relay_info(
     }
     (
         StatusCode::OK,
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/nostr+json"),
-        )],
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/nostr+json"),
+            ),
+            (
+                header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                HeaderValue::from_static("*"),
+            ),
+            (
+                header::ACCESS_CONTROL_ALLOW_HEADERS,
+                HeaderValue::from_static("*"),
+            ),
+            (
+                header::ACCESS_CONTROL_ALLOW_METHODS,
+                HeaderValue::from_static("*"),
+            ),
+        ],
         Json(document),
     )
         .into_response()
@@ -219,6 +233,27 @@ mod tests {
         assert_eq!(
             response.headers().get(header::CONTENT_TYPE).expect("type"),
             "application/nostr+json"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .expect("origin"),
+            "*"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+                .expect("headers"),
+            "*"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+                .expect("methods"),
+            "*"
         );
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
