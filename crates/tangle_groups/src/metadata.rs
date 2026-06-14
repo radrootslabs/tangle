@@ -23,6 +23,41 @@ pub struct GroupMetadata {
 }
 
 impl GroupMetadata {
+    pub fn new(
+        name: Option<String>,
+        picture: Option<String>,
+        about: Option<String>,
+        private: bool,
+        restricted: bool,
+        hidden: bool,
+        closed: bool,
+        supported_kinds: SupportedKinds,
+    ) -> Self {
+        Self {
+            name,
+            picture,
+            about,
+            private,
+            restricted,
+            hidden,
+            closed,
+            supported_kinds,
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            name: None,
+            picture: None,
+            about: None,
+            private: false,
+            restricted: false,
+            hidden: false,
+            closed: false,
+            supported_kinds: SupportedKinds::UnspecifiedAll,
+        }
+    }
+
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }

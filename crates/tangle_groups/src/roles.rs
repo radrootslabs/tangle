@@ -47,6 +47,12 @@ impl RoleName {
     }
 }
 
+impl core::fmt::Display for RoleName {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 impl core::fmt::Debug for RoleName {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter.debug_tuple("RoleName").field(&self.0).finish()
@@ -91,6 +97,23 @@ impl Capability {
             Self::RelayOverride => "relay_override",
         }
     }
+
+    pub fn from_label(value: &str) -> Result<Self, GroupError> {
+        match value {
+            "manage_members" => Ok(Self::ManageMembers),
+            "manage_roles" => Ok(Self::ManageRoles),
+            "manage_metadata" => Ok(Self::ManageMetadata),
+            "delete_events" => Ok(Self::DeleteEvents),
+            "delete_group" => Ok(Self::DeleteGroup),
+            "create_invites" => Ok(Self::CreateInvites),
+            "manage_invites" => Ok(Self::ManageInvites),
+            "relay_override" => Ok(Self::RelayOverride),
+            _ => Err(GroupError::invalid(
+                GroupErrorKind::MissingCapability,
+                format!("unknown group capability {value}"),
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -127,6 +150,18 @@ impl CapabilitySet {
 
     pub fn iter(&self) -> impl Iterator<Item = Capability> + '_ {
         self.capabilities.iter().copied()
+    }
+
+    pub fn labels(&self) -> Vec<&'static str> {
+        self.iter().map(Capability::as_str).collect()
+    }
+
+    pub fn from_labels(labels: &[String]) -> Result<Self, GroupError> {
+        labels
+            .iter()
+            .map(|label| Capability::from_label(label))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Self::new)
     }
 
     fn extend_from(&mut self, other: &CapabilitySet) {

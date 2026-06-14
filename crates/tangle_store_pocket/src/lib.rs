@@ -1,7 +1,10 @@
 #![forbid(unsafe_code)]
 
 use core::fmt;
-use pocket_db::{ScreenResult, Store};
+use pocket_db::{
+    ScreenResult, Store,
+    heed::{Database, types::Bytes},
+};
 use pocket_types::{Event, Filter, Id, OwnedEvent, OwnedFilter, Pubkey};
 use std::{
     io,
@@ -20,8 +23,14 @@ pub type PocketPubkey = Pubkey;
 pub type PocketScreenResult = ScreenResult;
 pub type PocketStore = Store;
 
-pub const TANGLE_POCKET_EXTRA_TABLES: [&str; 3] =
-    ["group_projection", "group_outbox", "group_checkpoint"];
+pub const TANGLE_GROUP_PROJECTION_TABLE: &str = "group_projection";
+pub const TANGLE_GROUP_OUTBOX_TABLE: &str = "group_outbox";
+pub const TANGLE_GROUP_CHECKPOINT_TABLE: &str = "group_checkpoint";
+pub const TANGLE_POCKET_EXTRA_TABLES: [&str; 3] = [
+    TANGLE_GROUP_PROJECTION_TABLE,
+    TANGLE_GROUP_OUTBOX_TABLE,
+    TANGLE_GROUP_CHECKPOINT_TABLE,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PocketDependencyBoundary {
@@ -99,8 +108,82 @@ impl PocketStoreHandle {
             .map(|events| u64::try_from(events.len()).expect("usize count fits in u64"))
     }
 
+    pub fn put_extra_record(
+        &self,
+        table: &'static str,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), PocketStoreError> {
+        let table_handle = self.extra_table(table)?;
+        let mut txn = self.store.write_txn().map_err(|error| {
+            PocketStoreError::from_extra_table(table, "write transaction", error)
+        })?;
+        table_handle
+            .put(&mut txn, key, value)
+            .map_err(|error| PocketStoreError::from_extra_table(table, "put", error))?;
+        txn.commit()
+            .map_err(|error| PocketStoreError::from_extra_table(table, "commit", error))
+    }
+
+    pub fn get_extra_record(
+        &self,
+        table: &'static str,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, PocketStoreError> {
+        let table_handle = self.extra_table(table)?;
+        let txn = self.store.read_txn().map_err(|error| {
+            PocketStoreError::from_extra_table(table, "read transaction", error)
+        })?;
+        table_handle
+            .get(&txn, key)
+            .map(|value| value.map(<[u8]>::to_vec))
+            .map_err(|error| PocketStoreError::from_extra_table(table, "get", error))
+    }
+
+    pub fn delete_extra_record(
+        &self,
+        table: &'static str,
+        key: &[u8],
+    ) -> Result<(), PocketStoreError> {
+        let table_handle = self.extra_table(table)?;
+        let mut txn = self.store.write_txn().map_err(|error| {
+            PocketStoreError::from_extra_table(table, "write transaction", error)
+        })?;
+        table_handle
+            .delete(&mut txn, key)
+            .map_err(|error| PocketStoreError::from_extra_table(table, "delete", error))?;
+        txn.commit()
+            .map_err(|error| PocketStoreError::from_extra_table(table, "commit", error))
+    }
+
+    pub fn scan_extra_records(
+        &self,
+        table: &'static str,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, PocketStoreError> {
+        let table_handle = self.extra_table(table)?;
+        let txn = self.store.read_txn().map_err(|error| {
+            PocketStoreError::from_extra_table(table, "read transaction", error)
+        })?;
+        let mut records = Vec::new();
+        let iter = table_handle
+            .iter(&txn)
+            .map_err(|error| PocketStoreError::from_extra_table(table, "scan", error))?;
+        for item in iter {
+            let (key, value) =
+                item.map_err(|error| PocketStoreError::from_extra_table(table, "scan", error))?;
+            records.push((key.to_vec(), value.to_vec()));
+        }
+        Ok(records)
+    }
+
     pub fn into_inner(self) -> PocketStore {
         self.store
+    }
+
+    fn extra_table(&self, table: &'static str) -> Result<Database<Bytes, Bytes>, PocketStoreError> {
+        self.store
+            .extra_table(table)
+            .ok_or_else(|| PocketStoreError::missing_table(table))
     }
 }
 
@@ -253,6 +336,22 @@ impl PocketStoreError {
         }
     }
 
+    pub fn missing_table(table: &'static str) -> Self {
+        Self {
+            message: format!("missing Pocket extra table {table}"),
+        }
+    }
+
+    pub fn from_extra_table(
+        table: &'static str,
+        operation: &'static str,
+        error: impl fmt::Display,
+    ) -> Self {
+        Self {
+            message: format!("Pocket extra table {table} {operation} failed: {error}"),
+        }
+    }
+
     pub fn message(&self) -> &str {
         &self.message
     }
@@ -274,9 +373,11 @@ fn pocket_json_buffer_len(raw_len: usize) -> usize {
 mod tests {
     use super::{
         POCKET_SOURCE_REPOSITORY, POCKET_SOURCE_REVISION, PocketDependencyBoundary,
-        PocketStoreConfig, PocketStoreHandle, PocketSyncPolicy, TANGLE_POCKET_EXTRA_TABLES,
+        PocketStoreConfig, PocketStoreHandle, PocketSyncPolicy, TANGLE_GROUP_CHECKPOINT_TABLE,
+        TANGLE_GROUP_OUTBOX_TABLE, TANGLE_GROUP_PROJECTION_TABLE, TANGLE_POCKET_EXTRA_TABLES,
         parse_pocket_event_json, parse_pocket_filter_json,
     };
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn pocket_dependency_boundary_pins_triesap_revision() {
@@ -344,6 +445,76 @@ mod tests {
         assert_eq!(found[0].id(), event.id());
         assert_eq!(handle.count_events(&filter).expect("count"), 1);
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pocket_store_handle_persists_extra_table_records() {
+        let root = temp_root("tangle-pocket-extra");
+        let config = PocketStoreConfig::new(
+            root.join("pocket"),
+            1024 * 1024 * 1024,
+            128,
+            PocketSyncPolicy::FlushOnShutdown,
+        )
+        .expect("config");
+        let handle = PocketStoreHandle::open(&config).expect("open");
+
+        handle
+            .put_extra_record(TANGLE_GROUP_PROJECTION_TABLE, b"group\0Farm", b"state-v1")
+            .expect("put projection");
+        handle
+            .put_extra_record(TANGLE_GROUP_PROJECTION_TABLE, b"group\0Farm", b"state-v2")
+            .expect("update projection");
+        handle
+            .put_extra_record(TANGLE_GROUP_OUTBOX_TABLE, b"outbox\0b", b"record-1")
+            .expect("put outbox one");
+        handle
+            .put_extra_record(TANGLE_GROUP_OUTBOX_TABLE, b"outbox\0a", b"record-0")
+            .expect("put outbox zero");
+        handle
+            .put_extra_record(
+                TANGLE_GROUP_CHECKPOINT_TABLE,
+                b"checkpoint\0groups",
+                b"checkpoint",
+            )
+            .expect("put checkpoint");
+
+        assert_eq!(
+            handle
+                .get_extra_record(TANGLE_GROUP_PROJECTION_TABLE, b"group\0Farm")
+                .expect("get projection"),
+            Some(b"state-v2".to_vec())
+        );
+        assert_eq!(
+            handle
+                .scan_extra_records(TANGLE_GROUP_OUTBOX_TABLE)
+                .expect("scan outbox"),
+            vec![
+                (b"outbox\0a".to_vec(), b"record-0".to_vec()),
+                (b"outbox\0b".to_vec(), b"record-1".to_vec()),
+            ]
+        );
+        handle
+            .delete_extra_record(TANGLE_GROUP_PROJECTION_TABLE, b"group\0Farm")
+            .expect("delete projection");
+        assert_eq!(
+            handle
+                .get_extra_record(TANGLE_GROUP_PROJECTION_TABLE, b"group\0Farm")
+                .expect("deleted projection"),
+            None
+        );
+        drop(handle);
+
+        let reopened = PocketStoreHandle::open(&config).expect("reopen");
+        assert_eq!(
+            reopened
+                .get_extra_record(TANGLE_GROUP_CHECKPOINT_TABLE, b"checkpoint\0groups")
+                .expect("checkpoint"),
+            Some(b"checkpoint".to_vec())
+        );
+
+        drop(reopened);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -418,5 +589,17 @@ mod tests {
     fn filter_json() -> String {
         r#"{"ids":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"limit":10}"#
             .to_owned()
+    }
+
+    fn temp_root(prefix: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "{}-{}-{}",
+            prefix,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ))
     }
 }

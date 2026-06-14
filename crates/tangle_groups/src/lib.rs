@@ -30,6 +30,19 @@ pub use kinds::{
     NIP29_USER_REQUEST_KIND_VALUES,
 };
 pub use metadata::{GroupMetadata, SupportedKinds, parse_group_metadata};
+pub use outbox::{
+    GroupCrashHooks, GroupCrashPoint, GroupOutbox, GroupOutboxEffect, GroupOutboxKey,
+    GroupOutboxPayload, GroupOutboxRecord, GroupOutboxStatus, OutboxRecoveryReadiness,
+    OutboxReplayPlan,
+};
+pub use projection::{
+    CanonicalGroupEvent, GROUP_POLICY_VERSION, GROUP_PROJECTION_SCHEMA_VERSION,
+    GroupLifecycleState, GroupProjection, GroupRecoveryReadiness, GroupSnapshotIds, GroupState,
+    GroupTombstone, MemberState, MemberStatus, ProjectedRoleDefinition, ProjectionApplyOutcome,
+    ProjectionCheckpoint, ProjectionOrderTuple, ProjectionRebuildReport, StoreOffset,
+    group_current_key, member_current_key, projection_checkpoint_key, rebuild_group_projection,
+    role_current_key, tombstone_key,
+};
 pub use roles::{
     Capability, CapabilitySet, PERMANENT_RELAY_OVERRIDE_ROLE, RoleDefinition, RoleName,
     resolve_capabilities,
@@ -94,30 +107,6 @@ impl CanonicalRelayUrl {
 impl fmt::Display for CanonicalRelayUrl {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-pub struct GroupCompatibilityConfig {
-    #[serde(default)]
-    zooid_closed_means_restricted: bool,
-}
-
-impl GroupCompatibilityConfig {
-    pub fn strict() -> Self {
-        Self {
-            zooid_closed_means_restricted: false,
-        }
-    }
-
-    pub fn zooid_closed_means_restricted(&self) -> bool {
-        self.zooid_closed_means_restricted
-    }
-}
-
-impl Default for GroupCompatibilityConfig {
-    fn default() -> Self {
-        Self::strict()
     }
 }
 
@@ -246,7 +235,6 @@ pub struct GroupRuntimeConfig {
     relay_secret: Option<RelaySecret>,
     owner_pubkeys: Vec<PublicKeyHex>,
     admin_pubkeys: Vec<PublicKeyHex>,
-    compatibility: GroupCompatibilityConfig,
     redaction: GroupRedactionConfig,
     limits: GroupLimitsConfig,
 }
@@ -259,7 +247,6 @@ impl GroupRuntimeConfig {
             relay_secret: None,
             owner_pubkeys: Vec::new(),
             admin_pubkeys: Vec::new(),
-            compatibility: GroupCompatibilityConfig::default(),
             redaction: GroupRedactionConfig::default(),
             limits: GroupLimitsConfig::default(),
         }
@@ -271,7 +258,6 @@ impl GroupRuntimeConfig {
         relay_secret: Option<RelaySecret>,
         owner_pubkeys: Vec<PublicKeyHex>,
         admin_pubkeys: Vec<PublicKeyHex>,
-        compatibility: GroupCompatibilityConfig,
         redaction: GroupRedactionConfig,
         limits: GroupLimitsConfig,
     ) -> Result<Self, GroupConfigError> {
@@ -292,7 +278,6 @@ impl GroupRuntimeConfig {
             relay_secret,
             owner_pubkeys,
             admin_pubkeys,
-            compatibility,
             redaction,
             limits,
         })
@@ -316,10 +301,6 @@ impl GroupRuntimeConfig {
 
     pub fn admin_pubkeys(&self) -> &[PublicKeyHex] {
         &self.admin_pubkeys
-    }
-
-    pub fn compatibility(&self) -> GroupCompatibilityConfig {
-        self.compatibility
     }
 
     pub fn redaction(&self) -> GroupRedactionConfig {
@@ -366,8 +347,6 @@ struct GroupRuntimeConfigDocument {
     #[serde(default)]
     admin_pubkeys: Vec<String>,
     #[serde(default)]
-    compatibility: GroupCompatibilityConfig,
-    #[serde(default)]
     redaction: GroupRedactionConfig,
     #[serde(default)]
     limits: GroupLimitsConfig,
@@ -393,7 +372,6 @@ pub fn parse_group_runtime_config_json(raw: &str) -> Result<GroupRuntimeConfig, 
         relay_secret,
         parse_pubkeys("groups.owner_pubkeys", document.owner_pubkeys)?,
         parse_pubkeys("groups.admin_pubkeys", document.admin_pubkeys)?,
-        document.compatibility,
         document.redaction,
         document.limits,
     )
@@ -492,7 +470,6 @@ mod tests {
                 "relay_secret": "{secret}",
                 "owner_pubkeys": ["{owner}"],
                 "admin_pubkeys": ["{admin}"],
-                "compatibility": {{"zooid_closed_means_restricted": true}},
                 "redaction": {{"redact_private_tags": true, "redact_invite_codes": true}},
                 "limits": {{
                     "max_group_id_bytes": 64,
@@ -513,7 +490,6 @@ mod tests {
         );
         assert_eq!(config.owner_pubkeys().len(), 1);
         assert_eq!(config.admin_pubkeys().len(), 1);
-        assert!(config.compatibility().zooid_closed_means_restricted());
         assert!(config.redaction().redact_private_tags());
         assert!(config.redaction().redact_invite_codes());
         assert_eq!(config.limits().max_group_id_bytes(), 64);
