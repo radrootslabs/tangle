@@ -16,7 +16,9 @@ use tangle_groups::{
     StoreOffset, classify_group_event, validate_client_group_event_structure,
 };
 use tangle_protocol::{ClientMessage, Event, Filter, RelayMessage, SubscriptionId, UnixTimestamp};
-use tangle_store_pocket::{PocketScreenResult, PocketStoreConfig, PocketStoreHandle};
+use tangle_store_pocket::{
+    PocketQueryConfig, PocketScreenResult, PocketStoreConfig, PocketStoreHandle,
+};
 
 pub struct BaseRelay {
     store: PocketStoreHandle,
@@ -24,6 +26,7 @@ pub struct BaseRelay {
     groups: Option<GroupService>,
     readiness: BaseRelayReadinessState,
     limits: BaseRelayLimits,
+    query: PocketQueryConfig,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -412,28 +415,35 @@ impl BaseRelay {
     pub fn open(
         config: &PocketStoreConfig,
         limits: BaseRelayLimits,
+        query: PocketQueryConfig,
     ) -> Result<Self, BaseRelayError> {
         let store = PocketStoreHandle::open(config).map_err(BaseRelayError::from)?;
-        Self::new(store, limits)
+        Self::new(store, limits, query)
     }
 
     pub fn open_with_groups(
         config: &PocketStoreConfig,
         limits: BaseRelayLimits,
         groups: &GroupRuntimeConfig,
+        query: PocketQueryConfig,
     ) -> Result<Self, BaseRelayError> {
         let store = PocketStoreHandle::open(config).map_err(BaseRelayError::from)?;
-        Self::new_with_groups(store, limits, groups)
+        Self::new_with_groups(store, limits, groups, query)
     }
 
-    pub fn new(store: PocketStoreHandle, limits: BaseRelayLimits) -> Result<Self, BaseRelayError> {
-        Self::new_with_groups(store, limits, &GroupRuntimeConfig::disabled())
+    pub fn new(
+        store: PocketStoreHandle,
+        limits: BaseRelayLimits,
+        query: PocketQueryConfig,
+    ) -> Result<Self, BaseRelayError> {
+        Self::new_with_groups(store, limits, &GroupRuntimeConfig::disabled(), query)
     }
 
     pub fn new_with_groups(
         store: PocketStoreHandle,
         limits: BaseRelayLimits,
         groups: &GroupRuntimeConfig,
+        query: PocketQueryConfig,
     ) -> Result<Self, BaseRelayError> {
         let groups = GroupService::from_config(&store, groups)?;
         let subscriptions =
@@ -445,6 +455,7 @@ impl BaseRelay {
             groups,
             readiness,
             limits,
+            query,
         })
     }
 
@@ -922,38 +933,36 @@ impl BaseRelay {
         filter: &Filter,
         auth: &GroupAuthContext,
     ) -> Result<BaseRelayEventQueryReport, BaseRelayError> {
-        let pocket_filter = tangle_filter_to_pocket(filter)?;
+        let effective_filter = self.filter_with_effective_limit(filter);
+        let pocket_filter = tangle_filter_to_pocket(&effective_filter)?;
         let screen_error = RefCell::new(None);
-        let screened = self.store.find_events_with_screen(
-            &pocket_filter,
-            true,
-            0,
-            u64::MAX,
-            |pocket_event| {
-                if screen_error.borrow().is_some() {
-                    return PocketScreenResult::Mismatch;
-                }
-                match pocket_filter.event_matches(pocket_event) {
-                    Ok(false) => PocketScreenResult::Mismatch,
-                    Ok(true) => match Self::group_read_gate_visible_to_auth(
-                        self.groups.as_ref(),
-                        pocket_event,
-                        auth,
-                    ) {
-                        Ok(true) => PocketScreenResult::Match,
-                        Ok(false) => PocketScreenResult::Redacted,
+        let screened =
+            self.store
+                .find_events_with_screen(&pocket_filter, self.query, |pocket_event| {
+                    if screen_error.borrow().is_some() {
+                        return PocketScreenResult::Mismatch;
+                    }
+                    match pocket_filter.event_matches(pocket_event) {
+                        Ok(false) => PocketScreenResult::Mismatch,
+                        Ok(true) => match Self::group_read_gate_visible_to_auth(
+                            self.groups.as_ref(),
+                            pocket_event,
+                            auth,
+                        ) {
+                            Ok(true) => PocketScreenResult::Match,
+                            Ok(false) => PocketScreenResult::Redacted,
+                            Err(error) => {
+                                *screen_error.borrow_mut() = Some(error);
+                                PocketScreenResult::Mismatch
+                            }
+                        },
                         Err(error) => {
-                            *screen_error.borrow_mut() = Some(error);
+                            *screen_error.borrow_mut() =
+                                Some(BaseRelayError::error(error.to_string()));
                             PocketScreenResult::Mismatch
                         }
-                    },
-                    Err(error) => {
-                        *screen_error.borrow_mut() = Some(BaseRelayError::error(error.to_string()));
-                        PocketScreenResult::Mismatch
                     }
-                }
-            },
-        )?;
+                })?;
         if let Some(error) = screen_error.into_inner() {
             return Err(error);
         }
@@ -964,6 +973,13 @@ impl BaseRelay {
             .map(|pocket_event| pocket_event_to_tangle(&pocket_event))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(BaseRelayEventQueryReport::new(events, group_read_denied))
+    }
+
+    fn filter_with_effective_limit(&self, filter: &Filter) -> Filter {
+        match filter.limit() {
+            Some(_) => filter.clone(),
+            None => filter.with_limit(self.limits.default_limit()),
+        }
     }
 
     fn sort_and_dedupe_query_events(mut events: Vec<Event>) -> Vec<Event> {
@@ -1023,7 +1039,7 @@ mod tests {
         ClientMessage, Event, EventId, Filter, Kind, PublicKeyHex, RelayMessage, SubscriptionId,
         Tag, UnixTimestamp, UnsignedEvent, filter_from_value,
     };
-    use tangle_store_pocket::{PocketStoreConfig, PocketSyncPolicy};
+    use tangle_store_pocket::{PocketQueryConfig, PocketStoreConfig, PocketSyncPolicy};
     #[test]
     fn base_relay_stores_queries_counts_closes_and_fans_out_public_events() {
         let mut relay = test_relay("base-relay-public", 4);
@@ -1072,6 +1088,60 @@ mod tests {
         assert_eq!(relay.handle_close(&subscription_id), CloseResult::Closed);
         assert_eq!(relay.active_subscription_count(), 0);
         assert!(relay.fanout(&event).is_empty());
+    }
+
+    #[test]
+    fn base_relay_uses_configured_pocket_query_scrape_controls() {
+        let strict_config = test_store_config("base-relay-query-strict");
+        let mut strict = BaseRelay::open(
+            &strict_config,
+            relay_limits(4),
+            PocketQueryConfig::new(false, 0, 0),
+        )
+        .expect("strict");
+        let strict_event = signed_public_event(7, 1, Vec::new(), "strict");
+        let broad = filter_from_value(&serde_json::json!({"limit":1})).expect("filter");
+
+        assert_accepted(
+            strict
+                .handle_event(strict_event.clone())
+                .expect("strict event"),
+            &strict_event,
+        );
+        assert!(
+            strict
+                .handle_req(
+                    SubscriptionId::new("strict").expect("sub"),
+                    vec![broad.clone()]
+                )
+                .expect_err("strict scrape")
+                .prefixed_message()
+                .to_lowercase()
+                .contains("scraper")
+        );
+
+        let limited_config = test_store_config("base-relay-query-limited");
+        let mut limited = BaseRelay::open(
+            &limited_config,
+            relay_limits(4),
+            PocketQueryConfig::new(false, 1, 0),
+        )
+        .expect("limited");
+        let limited_event = signed_public_event(8, 1, Vec::new(), "limited");
+
+        assert_accepted(
+            limited
+                .handle_event(limited_event.clone())
+                .expect("limited event"),
+            &limited_event,
+        );
+        let messages = limited
+            .handle_req(SubscriptionId::new("limited").expect("sub"), vec![broad])
+            .expect("limited scrape");
+
+        assert!(
+            matches!(&messages[0], RelayMessage::Event { event, .. } if event.id() == limited_event.id())
+        );
     }
 
     #[test]
@@ -1169,6 +1239,7 @@ mod tests {
                 default_limit: 1,
             })
             .expect("limits"),
+            PocketQueryConfig::default(),
         )
         .expect("relay");
         let first = signed_event_at(7, 1, Vec::new(), "one", 1_714_124_430);
@@ -1281,6 +1352,7 @@ mod tests {
                 default_limit: 1,
             })
             .expect("limits"),
+            PocketQueryConfig::default(),
         )
         .expect("relay");
         let complex = filter_from_value(&serde_json::json!({
@@ -2230,7 +2302,8 @@ mod tests {
     #[test]
     fn base_relay_shutdown_closes_live_subscriptions_and_syncs_store() {
         let config = test_store_config("base-relay-shutdown");
-        let mut relay = BaseRelay::open(&config, relay_limits(4)).expect("relay");
+        let mut relay =
+            BaseRelay::open(&config, relay_limits(4), PocketQueryConfig::default()).expect("relay");
         let event = signed_public_event(7, 1, Vec::new(), "shutdown");
         let subscription_id = SubscriptionId::new("sub-shutdown").expect("sub");
 
@@ -2247,7 +2320,8 @@ mod tests {
         assert_eq!(relay.active_subscription_count(), 0);
         assert!(relay.fanout(&event).is_empty());
 
-        let reopened = BaseRelay::open(&config, relay_limits(4)).expect("reopened");
+        let reopened = BaseRelay::open(&config, relay_limits(4), PocketQueryConfig::default())
+            .expect("reopened");
         assert_eq!(count_kind(&reopened, 1), 1);
     }
 
@@ -2296,7 +2370,9 @@ mod tests {
     #[test]
     fn base_relay_enforces_event_and_filter_runtime_limits() {
         let config = test_store_config("base-relay-event-filter-runtime-limits");
-        let mut relay = BaseRelay::open(&config, strict_relay_limits()).expect("relay");
+        let mut relay =
+            BaseRelay::open(&config, strict_relay_limits(), PocketQueryConfig::default())
+                .expect("relay");
         let first = signed_public_event(7, 1, Vec::new(), "a");
         let second = signed_event_at(8, 1, Vec::new(), "b", 1_714_124_434);
 
@@ -2374,7 +2450,9 @@ mod tests {
     #[test]
     fn base_relay_enforces_subscription_id_and_count_limits() {
         let config = test_store_config("base-relay-subscription-limits");
-        let mut relay = BaseRelay::open(&config, strict_relay_limits()).expect("relay");
+        let mut relay =
+            BaseRelay::open(&config, strict_relay_limits(), PocketQueryConfig::default())
+                .expect("relay");
 
         assert!(
             relay
@@ -2412,7 +2490,12 @@ mod tests {
 
     fn test_relay(name: &str, max_pending_events: usize) -> BaseRelay {
         let config = test_store_config(name);
-        BaseRelay::open(&config, relay_limits(max_pending_events)).expect("relay")
+        BaseRelay::open(
+            &config,
+            relay_limits(max_pending_events),
+            PocketQueryConfig::default(),
+        )
+        .expect("relay")
     }
 
     fn test_relay_with_groups(
@@ -2421,8 +2504,13 @@ mod tests {
         groups: &tangle_groups::GroupRuntimeConfig,
     ) -> BaseRelay {
         let config = test_store_config(name);
-        BaseRelay::open_with_groups(&config, relay_limits(max_pending_events), groups)
-            .expect("relay")
+        BaseRelay::open_with_groups(
+            &config,
+            relay_limits(max_pending_events),
+            groups,
+            PocketQueryConfig::default(),
+        )
+        .expect("relay")
     }
 
     fn relay_limits(max_pending_events: usize) -> BaseRelayLimits {

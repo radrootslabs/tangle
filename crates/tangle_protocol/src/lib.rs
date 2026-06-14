@@ -692,6 +692,12 @@ impl Filter {
         filter
     }
 
+    pub fn with_limit(&self, limit: u64) -> Self {
+        let mut filter = self.clone();
+        filter.limit = Some(limit);
+        filter
+    }
+
     pub fn search(&self) -> Option<&str> {
         self.search.as_deref()
     }
@@ -1985,6 +1991,10 @@ mod tests {
         assert_eq!(without_limit.limit(), None);
         assert_eq!(without_limit.search(), filter.search());
         assert!(without_limit.matches(&event));
+        let with_limit = without_limit.with_limit(2);
+        assert_eq!(with_limit.limit(), Some(2));
+        assert_eq!(with_limit.search(), filter.search());
+        assert!(with_limit.matches(&event));
         assert_eq!(
             filter_from_value(&filter_to_value(&filter)).expect("encoded"),
             filter

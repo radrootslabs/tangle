@@ -25,8 +25,9 @@ use tangle_runtime::{
     },
 };
 use tangle_store_pocket::{
-    PocketStoreConfig, PocketStoreHandle, PocketSyncPolicy, TANGLE_GROUP_CHECKPOINT_TABLE,
-    TANGLE_GROUP_OUTBOX_TABLE, TANGLE_GROUP_PROJECTION_TABLE, parse_pocket_event_json,
+    PocketQueryConfig, PocketStoreConfig, PocketStoreHandle, PocketSyncPolicy,
+    TANGLE_GROUP_CHECKPOINT_TABLE, TANGLE_GROUP_OUTBOX_TABLE, TANGLE_GROUP_PROJECTION_TABLE,
+    parse_pocket_event_json,
 };
 use tangle_test_support::{
     FixtureKey, TANGLE_V2_RELAY_SECRET_HEX, TANGLE_V2_RELAY_URL, tangle_v2_auth_event,
@@ -40,7 +41,8 @@ use tangle_test_support::{
 #[test]
 fn public_relay_smoke_stores_queries_counts_and_fans_out() {
     let config = test_store_config("public-smoke");
-    let mut relay = BaseRelay::open(&config, relay_limits(4)).expect("relay");
+    let mut relay =
+        BaseRelay::open(&config, relay_limits(4), PocketQueryConfig::default()).expect("relay");
     let first =
         tangle_v2_event(FixtureKey::Member, 1_714_124_433, 1, Vec::new(), "hello").expect("first");
     let query_id = subscription("public-query");
@@ -177,7 +179,13 @@ fn auth_integration_covers_challenge_edges() {
 fn group_auth_lifecycle_membership_and_flag_flows_pass_in_process() {
     let config = test_store_config("group-flows");
     let groups = group_config_with_public_join();
-    let mut relay = BaseRelay::open_with_groups(&config, relay_limits(8), &groups).expect("relay");
+    let mut relay = BaseRelay::open_with_groups(
+        &config,
+        relay_limits(8),
+        &groups,
+        PocketQueryConfig::default(),
+    )
+    .expect("relay");
     let owner_auth = authenticated(FixtureKey::Owner);
     let admin_auth = authenticated(FixtureKey::Admin);
     let member_auth = authenticated(FixtureKey::Member);
@@ -301,8 +309,13 @@ fn group_auth_lifecycle_membership_and_flag_flows_pass_in_process() {
 #[test]
 fn relay_override_role_changes_generate_admin_snapshots() {
     let config = test_store_config("role-admin-snapshots");
-    let mut relay =
-        BaseRelay::open_with_groups(&config, relay_limits(8), &group_config()).expect("relay");
+    let mut relay = BaseRelay::open_with_groups(
+        &config,
+        relay_limits(8),
+        &group_config(),
+        PocketQueryConfig::default(),
+    )
+    .expect("relay");
     let owner_auth = authenticated(FixtureKey::Owner);
     let admin_auth = authenticated(FixtureKey::Admin);
     let member = FixtureKey::Member.public_key().as_str().to_owned();
@@ -374,8 +387,13 @@ fn relay_override_role_changes_generate_admin_snapshots() {
 #[test]
 fn group_join_requests_are_denied_by_default() {
     let config = test_store_config("group-public-join-default");
-    let mut relay =
-        BaseRelay::open_with_groups(&config, relay_limits(8), &group_config()).expect("relay");
+    let mut relay = BaseRelay::open_with_groups(
+        &config,
+        relay_limits(8),
+        &group_config(),
+        PocketQueryConfig::default(),
+    )
+    .expect("relay");
     let owner_auth = authenticated(FixtureKey::Owner);
     let outsider_auth = authenticated(FixtureKey::Outsider);
     let create = tangle_v2_group_create_event(FixtureKey::Owner, "Farm", 1, &[]).expect("create");
@@ -408,8 +426,13 @@ fn group_join_requests_are_denied_by_default() {
 #[test]
 fn metadata_flags_and_read_privacy_cover_req_count_and_fanout() {
     let config = test_store_config("privacy-flags");
-    let mut relay =
-        BaseRelay::open_with_groups(&config, relay_limits(8), &group_config()).expect("relay");
+    let mut relay = BaseRelay::open_with_groups(
+        &config,
+        relay_limits(8),
+        &group_config(),
+        PocketQueryConfig::default(),
+    )
+    .expect("relay");
     let owner_auth = authenticated(FixtureKey::Owner);
     let outsider_auth = authenticated(FixtureKey::Outsider);
 
@@ -573,8 +596,13 @@ fn metadata_flags_and_read_privacy_cover_req_count_and_fanout() {
 #[test]
 fn nip29_privacy_leak_suite_covers_relay_exposure_and_rejection_paths() {
     let config = test_store_config("nip29-leak-suite");
-    let mut relay =
-        BaseRelay::open_with_groups(&config, relay_limits(16), &group_config()).expect("relay");
+    let mut relay = BaseRelay::open_with_groups(
+        &config,
+        relay_limits(16),
+        &group_config(),
+        PocketQueryConfig::default(),
+    )
+    .expect("relay");
     let owner_auth = authenticated(FixtureKey::Owner);
     let admin_auth = authenticated(FixtureKey::Admin);
     let member_auth = authenticated(FixtureKey::Member);
@@ -953,8 +981,13 @@ fn nip29_privacy_leak_suite_covers_relay_exposure_and_rejection_paths() {
 #[test]
 fn delete_and_secondary_privacy_surfaces_are_read_gated_or_absent() {
     let config = test_store_config("delete-privacy");
-    let mut relay =
-        BaseRelay::open_with_groups(&config, relay_limits(8), &group_config()).expect("relay");
+    let mut relay = BaseRelay::open_with_groups(
+        &config,
+        relay_limits(8),
+        &group_config(),
+        PocketQueryConfig::default(),
+    )
+    .expect("relay");
     let owner_auth = authenticated(FixtureKey::Owner);
 
     accept_group_create(&mut relay, "DeleteFarm", &[], 1, &owner_auth);
@@ -1037,8 +1070,13 @@ fn projection_rebuild_after_restart_matches_live_state_and_outbox_is_idempotent(
     let config = test_store_config("projection-restart");
     let owner_auth = authenticated(FixtureKey::Owner);
     {
-        let mut relay =
-            BaseRelay::open_with_groups(&config, relay_limits(8), &group_config()).expect("relay");
+        let mut relay = BaseRelay::open_with_groups(
+            &config,
+            relay_limits(8),
+            &group_config(),
+            PocketQueryConfig::default(),
+        )
+        .expect("relay");
         accept_group_create(&mut relay, "RestartFarm", &[], 1, &owner_auth);
         let put = tangle_v2_put_user_event(FixtureKey::Admin, "RestartFarm", FixtureKey::Member, 2)
             .expect("put");
@@ -1056,8 +1094,13 @@ fn projection_rebuild_after_restart_matches_live_state_and_outbox_is_idempotent(
     }
     delete_group_extra_records(&config);
 
-    let relay =
-        BaseRelay::open_with_groups(&config, relay_limits(8), &group_config()).expect("reopen");
+    let relay = BaseRelay::open_with_groups(
+        &config,
+        relay_limits(8),
+        &group_config(),
+        PocketQueryConfig::default(),
+    )
+    .expect("reopen");
     assert_eq!(
         relay
             .readiness_state()
@@ -1100,8 +1143,13 @@ fn projection_rebuild_after_restart_matches_live_state_and_outbox_is_idempotent(
         &GroupCheckpointStatus::Current { .. }
     ));
 
-    let relay = BaseRelay::open_with_groups(&config, relay_limits(8), &group_config())
-        .expect("second reopen");
+    let relay = BaseRelay::open_with_groups(
+        &config,
+        relay_limits(8),
+        &group_config(),
+        PocketQueryConfig::default(),
+    )
+    .expect("second reopen");
     assert_eq!(count_kind(&relay, KIND_GROUP_METADATA), 1);
     assert_eq!(count_kind(&relay, KIND_GROUP_ADMINS), 1);
     assert_eq!(count_kind(&relay, KIND_GROUP_MEMBERS), 1);
@@ -1117,8 +1165,13 @@ fn projection_applies_canonical_events_after_checkpoint_on_restart() {
     let put = tangle_v2_put_user_event(FixtureKey::Admin, "IncrementalFarm", FixtureKey::Member, 2)
         .expect("put");
     {
-        let mut relay =
-            BaseRelay::open_with_groups(&config, relay_limits(8), &group_config()).expect("relay");
+        let mut relay = BaseRelay::open_with_groups(
+            &config,
+            relay_limits(8),
+            &group_config(),
+            PocketQueryConfig::default(),
+        )
+        .expect("relay");
         assert_accepted(
             relay
                 .handle_event_with_auth(create.clone(), &owner_auth)
@@ -1136,8 +1189,13 @@ fn projection_applies_canonical_events_after_checkpoint_on_restart() {
     let create_offset = stored_event_offset(&config, &create);
     regress_member_projection_to_checkpoint(&config, create_offset, "IncrementalFarm");
 
-    let relay =
-        BaseRelay::open_with_groups(&config, relay_limits(8), &group_config()).expect("reopen");
+    let relay = BaseRelay::open_with_groups(
+        &config,
+        relay_limits(8),
+        &group_config(),
+        PocketQueryConfig::default(),
+    )
+    .expect("reopen");
     assert_eq!(
         relay
             .group_projection()
@@ -1168,8 +1226,13 @@ fn source_store_crash_recovery_rebuilds_projection_outbox_and_generated_events()
 
     store_source_events(&config, &[create, put]);
 
-    let relay =
-        BaseRelay::open_with_groups(&config, relay_limits(8), &group_config()).expect("reopen");
+    let relay = BaseRelay::open_with_groups(
+        &config,
+        relay_limits(8),
+        &group_config(),
+        PocketQueryConfig::default(),
+    )
+    .expect("reopen");
     assert_eq!(
         relay
             .readiness_state()
@@ -1224,8 +1287,13 @@ fn rebuilt_projection_matches_live_projection_for_moderation_stream() {
     let members_before;
 
     {
-        let mut relay =
-            BaseRelay::open_with_groups(&config, relay_limits(16), &group_config()).expect("relay");
+        let mut relay = BaseRelay::open_with_groups(
+            &config,
+            relay_limits(16),
+            &group_config(),
+            PocketQueryConfig::default(),
+        )
+        .expect("relay");
         accept_group_create(&mut relay, "EquivFarm", &[], 1, &owner_auth);
         let metadata =
             tangle_v2_group_metadata_event(FixtureKey::Admin, "EquivFarm", "Market", 2, &[])
@@ -1304,8 +1372,13 @@ fn rebuilt_projection_matches_live_projection_for_moderation_stream() {
 
     delete_group_extra_records(&config);
 
-    let relay =
-        BaseRelay::open_with_groups(&config, relay_limits(16), &group_config()).expect("reopen");
+    let relay = BaseRelay::open_with_groups(
+        &config,
+        relay_limits(16),
+        &group_config(),
+        PocketQueryConfig::default(),
+    )
+    .expect("reopen");
     assert_projection_without_checkpoint_eq(
         &live_projection,
         relay.group_projection().expect("projection"),
@@ -1329,8 +1402,13 @@ fn pending_and_retryable_group_outbox_records_materialize_on_restart() {
     let config = test_store_config("outbox-retryable-restart");
     let owner_auth = authenticated(FixtureKey::Owner);
     {
-        let mut relay =
-            BaseRelay::open_with_groups(&config, relay_limits(8), &group_config()).expect("relay");
+        let mut relay = BaseRelay::open_with_groups(
+            &config,
+            relay_limits(8),
+            &group_config(),
+            PocketQueryConfig::default(),
+        )
+        .expect("relay");
         accept_group_create(&mut relay, "OutboxFarm", &[], 1, &owner_auth);
         relay.shutdown().expect("shutdown");
     }
@@ -1338,8 +1416,13 @@ fn pending_and_retryable_group_outbox_records_materialize_on_restart() {
     assert_eq!(outbox_status_counts(&config).pending, 1);
     assert_eq!(outbox_status_counts(&config).retryable, 1);
 
-    let relay =
-        BaseRelay::open_with_groups(&config, relay_limits(8), &group_config()).expect("reopen");
+    let relay = BaseRelay::open_with_groups(
+        &config,
+        relay_limits(8),
+        &group_config(),
+        PocketQueryConfig::default(),
+    )
+    .expect("reopen");
     assert_eq!(
         relay
             .readiness_state()
@@ -1360,9 +1443,13 @@ fn pending_and_retryable_group_outbox_records_materialize_on_restart() {
 fn max_outbox_replay_batch_one_drains_all_pending_generated_records() {
     let config = test_store_config("outbox-batch-one");
     let owner_auth = authenticated(FixtureKey::Owner);
-    let mut relay =
-        BaseRelay::open_with_groups(&config, relay_limits(8), &group_config_with_outbox_batch(1))
-            .expect("relay");
+    let mut relay = BaseRelay::open_with_groups(
+        &config,
+        relay_limits(8),
+        &group_config_with_outbox_batch(1),
+        PocketQueryConfig::default(),
+    )
+    .expect("relay");
 
     accept_group_create(&mut relay, "BatchFarm", &[], 1, &owner_auth);
 
@@ -1379,8 +1466,13 @@ fn already_stored_generated_events_mark_outbox_stored_without_duplication_on_res
     let config = test_store_config("outbox-generated-already-stored");
     let owner_auth = authenticated(FixtureKey::Owner);
     {
-        let mut relay =
-            BaseRelay::open_with_groups(&config, relay_limits(8), &group_config()).expect("relay");
+        let mut relay = BaseRelay::open_with_groups(
+            &config,
+            relay_limits(8),
+            &group_config(),
+            PocketQueryConfig::default(),
+        )
+        .expect("relay");
         accept_group_create(&mut relay, "StoredGeneratedFarm", &[], 1, &owner_auth);
         relay.shutdown().expect("shutdown");
     }
@@ -1392,8 +1484,13 @@ fn already_stored_generated_events_mark_outbox_stored_without_duplication_on_res
     regress_outbox_records_to_pending(&config);
     assert_eq!(outbox_status_counts(&config).pending, 2);
 
-    let relay =
-        BaseRelay::open_with_groups(&config, relay_limits(8), &group_config()).expect("reopen");
+    let relay = BaseRelay::open_with_groups(
+        &config,
+        relay_limits(8),
+        &group_config(),
+        PocketQueryConfig::default(),
+    )
+    .expect("reopen");
     assert_eq!(count_kind(&relay, KIND_GROUP_METADATA), 1);
     assert_eq!(count_kind(&relay, KIND_GROUP_ADMINS), 1);
     assert_eq!(
@@ -1416,8 +1513,13 @@ fn crash_point_recovery_states_match_live_projection_and_generated_events() {
     let pending_outbox_config = test_store_config("crash-equivalence-pending-outbox");
     let events = recovery_equivalence_events();
     let expected = {
-        let mut relay = BaseRelay::open_with_groups(&live_config, relay_limits(8), &group_config())
-            .expect("live");
+        let mut relay = BaseRelay::open_with_groups(
+            &live_config,
+            relay_limits(8),
+            &group_config(),
+            PocketQueryConfig::default(),
+        )
+        .expect("live");
         let owner_auth = authenticated(FixtureKey::Owner);
         let admin_auth = authenticated(FixtureKey::Admin);
         assert_accepted(
@@ -1438,17 +1540,25 @@ fn crash_point_recovery_states_match_live_projection_and_generated_events() {
     };
 
     store_source_events(&source_only_config, &events);
-    let mut source_only =
-        BaseRelay::open_with_groups(&source_only_config, relay_limits(8), &group_config())
-            .expect("source only");
+    let mut source_only = BaseRelay::open_with_groups(
+        &source_only_config,
+        relay_limits(8),
+        &group_config(),
+        PocketQueryConfig::default(),
+    )
+    .expect("source only");
     assert_eq!(recovery_summary(&mut source_only, "CrashFarm"), expected);
     assert_eq!(outbox_status_counts(&source_only_config).stored, 5);
 
     let offsets = store_source_events(&pending_outbox_config, &events);
     seed_pending_create_outbox_records(&pending_outbox_config, &events[0], offsets[0]);
-    let mut pending_outbox =
-        BaseRelay::open_with_groups(&pending_outbox_config, relay_limits(8), &group_config())
-            .expect("pending outbox");
+    let mut pending_outbox = BaseRelay::open_with_groups(
+        &pending_outbox_config,
+        relay_limits(8),
+        &group_config(),
+        PocketQueryConfig::default(),
+    )
+    .expect("pending outbox");
     assert_eq!(recovery_summary(&mut pending_outbox, "CrashFarm"), expected);
     let counts = outbox_status_counts(&pending_outbox_config);
     assert_eq!(counts.pending, 0);
@@ -1763,8 +1873,13 @@ fn sorted_strings(values: impl IntoIterator<Item = String>) -> Vec<String> {
 
 fn final_group_name_for_order(name: &str, edits: [&Event; 2]) -> String {
     let config = test_store_config(name);
-    let mut relay =
-        BaseRelay::open_with_groups(&config, relay_limits(8), &group_config()).expect("relay");
+    let mut relay = BaseRelay::open_with_groups(
+        &config,
+        relay_limits(8),
+        &group_config(),
+        PocketQueryConfig::default(),
+    )
+    .expect("relay");
     let auth = authenticated(FixtureKey::Owner);
     accept_group_create(&mut relay, "ClockFarm", &[], 1, &auth);
     for edit in edits {
@@ -1981,7 +2096,12 @@ fn runtime_config(groups_enabled: bool) -> BaseRelayRuntimeConfig {
             },
             "pocket": {
                 "data_directory": "runtime/pocket",
-                "sync_policy": "flush_on_shutdown"
+                "sync_policy": "flush_on_shutdown",
+                "query": {
+                  "allow_scraping": false,
+                  "allow_scrape_if_limited_to": 100,
+                  "allow_scrape_if_max_seconds": 3600
+                }
             },
             "groups": groups,
             "auth": {

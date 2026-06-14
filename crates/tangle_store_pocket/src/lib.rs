@@ -93,6 +93,45 @@ pub const TANGLE_POCKET_EXTRA_TABLES: [&str; 3] = [
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PocketQueryConfig {
+    allow_scraping: bool,
+    allow_scrape_if_limited_to: u32,
+    allow_scrape_if_max_seconds: u64,
+}
+
+impl PocketQueryConfig {
+    pub const fn new(
+        allow_scraping: bool,
+        allow_scrape_if_limited_to: u32,
+        allow_scrape_if_max_seconds: u64,
+    ) -> Self {
+        Self {
+            allow_scraping,
+            allow_scrape_if_limited_to,
+            allow_scrape_if_max_seconds,
+        }
+    }
+
+    pub fn allow_scraping(self) -> bool {
+        self.allow_scraping
+    }
+
+    pub fn allow_scrape_if_limited_to(self) -> u32 {
+        self.allow_scrape_if_limited_to
+    }
+
+    pub fn allow_scrape_if_max_seconds(self) -> u64 {
+        self.allow_scrape_if_max_seconds
+    }
+}
+
+impl Default for PocketQueryConfig {
+    fn default() -> Self {
+        Self::new(false, 100, 3_600)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PocketDependencyBoundary {
     source_repository: &'static str,
     source_revision: &'static str,
@@ -173,17 +212,16 @@ impl PocketStoreHandle {
     pub fn find_events(
         &self,
         filter: &PocketFilter,
+        query: PocketQueryConfig,
     ) -> Result<Vec<PocketOwnedEvent>, PocketStoreError> {
-        self.find_events_with_screen(filter, true, 0, u64::MAX, |_| PocketScreenResult::Match)
+        self.find_events_with_screen(filter, query, |_| PocketScreenResult::Match)
             .map(PocketScreenedEvents::into_events)
     }
 
     pub fn find_events_with_screen<F>(
         &self,
         filter: &PocketFilter,
-        allow_scraping: bool,
-        allow_scrape_if_limited_to: u32,
-        allow_scrape_if_max_seconds: u64,
+        query: PocketQueryConfig,
         screen: F,
     ) -> Result<PocketScreenedEvents, PocketStoreError>
     where
@@ -193,9 +231,9 @@ impl PocketStoreHandle {
             .store
             .find_events(
                 filter,
-                allow_scraping,
-                allow_scrape_if_limited_to,
-                allow_scrape_if_max_seconds,
+                query.allow_scraping(),
+                query.allow_scrape_if_limited_to(),
+                query.allow_scrape_if_max_seconds(),
                 screen,
             )
             .map_err(PocketStoreError::from_pocket)?;
@@ -205,8 +243,12 @@ impl PocketStoreHandle {
         ))
     }
 
-    pub fn count_events(&self, filter: &PocketFilter) -> Result<u64, PocketStoreError> {
-        self.find_events(filter)
+    pub fn count_events(
+        &self,
+        filter: &PocketFilter,
+        query: PocketQueryConfig,
+    ) -> Result<u64, PocketStoreError> {
+        self.find_events(filter, query)
             .map(|events| u64::try_from(events.len()).expect("usize count fits in u64"))
     }
 
@@ -517,9 +559,9 @@ fn event_len_u64(event: &PocketEvent) -> Result<u64, PocketStoreError> {
 mod tests {
     use super::{
         POCKET_SOURCE_REPOSITORY, POCKET_SOURCE_REVISION, PocketDependencyBoundary,
-        PocketStoreConfig, PocketStoreHandle, PocketSyncPolicy, TANGLE_GROUP_CHECKPOINT_TABLE,
-        TANGLE_GROUP_OUTBOX_TABLE, TANGLE_GROUP_PROJECTION_TABLE, TANGLE_POCKET_EXTRA_TABLES,
-        parse_pocket_event_json, parse_pocket_filter_json,
+        PocketQueryConfig, PocketStoreConfig, PocketStoreHandle, PocketSyncPolicy,
+        TANGLE_GROUP_CHECKPOINT_TABLE, TANGLE_GROUP_OUTBOX_TABLE, TANGLE_GROUP_PROJECTION_TABLE,
+        TANGLE_POCKET_EXTRA_TABLES, parse_pocket_event_json, parse_pocket_filter_json,
     };
     use pocket_db::ScreenResult;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -575,13 +617,20 @@ mod tests {
             .expect("lookup")
             .expect("event");
         let offset_event = handle.event_by_offset(offset).expect("offset lookup");
-        let found = handle.find_events(&filter).expect("find");
+        let found = handle
+            .find_events(&filter, PocketQueryConfig::default())
+            .expect("find");
 
         assert_eq!(stored.id(), event.id());
         assert_eq!(offset_event.id(), event.id());
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id(), event.id());
-        assert_eq!(handle.count_events(&filter).expect("count"), 1);
+        assert_eq!(
+            handle
+                .count_events(&filter, PocketQueryConfig::default())
+                .expect("count"),
+            1
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -632,7 +681,7 @@ mod tests {
         handle.store_event(&redacted).expect("store redacted");
 
         let screened = handle
-            .find_events_with_screen(&filter, true, 0, u64::MAX, |event| {
+            .find_events_with_screen(&filter, PocketQueryConfig::default(), |event| {
                 if event.id() == visible.id() {
                     ScreenResult::Match
                 } else {
@@ -644,6 +693,35 @@ mod tests {
         assert!(screened.redacted());
         assert_eq!(screened.events().len(), 1);
         assert_eq!(screened.events()[0].id(), visible.id());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pocket_store_query_config_controls_scraping() {
+        let root = temp_root("tangle-pocket-query-config");
+        let config = PocketStoreConfig::new(root.join("pocket"), PocketSyncPolicy::FlushOnShutdown)
+            .expect("config");
+        let handle = PocketStoreHandle::open(&config).expect("open");
+        let event =
+            parse_pocket_event_json(event_json_with("f", "6", "scrape").as_bytes()).expect("event");
+        let broad = parse_pocket_filter_json(r#"{"limit":1}"#.as_bytes()).expect("filter");
+
+        handle.store_event(&event).expect("store");
+
+        assert!(
+            handle
+                .find_events(&broad, PocketQueryConfig::new(false, 0, 0))
+                .expect_err("scrape rejected")
+                .message()
+                .contains("scraper")
+        );
+        let found = handle
+            .find_events(&broad, PocketQueryConfig::new(false, 1, 0))
+            .expect("limited scrape");
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id(), event.id());
 
         let _ = std::fs::remove_dir_all(root);
     }

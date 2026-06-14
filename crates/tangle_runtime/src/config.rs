@@ -15,13 +15,16 @@ use serde::Deserialize;
 use std::{net::SocketAddr, path::PathBuf};
 use tangle_groups::GroupRuntimeConfig;
 use tangle_protocol::SubscriptionId;
-use tangle_store_pocket::{PocketStoreConfig, PocketSyncPolicy};
+use tangle_store_pocket::{PocketQueryConfig, PocketStoreConfig, PocketSyncPolicy};
+
+const MAX_POCKET_QUERY_SCRAPE_WINDOW_SECONDS: u64 = 86_400;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaseRelayRuntimeConfig {
     listen_addr: SocketAddr,
     relay_url: String,
     pocket: PocketStoreConfig,
+    pocket_query: PocketQueryConfig,
     groups: GroupRuntimeConfig,
     auth_ttl_seconds: u64,
     auth_created_at_skew_seconds: u64,
@@ -41,6 +44,10 @@ impl BaseRelayRuntimeConfig {
 
     pub fn pocket_config(&self) -> &PocketStoreConfig {
         &self.pocket
+    }
+
+    pub fn pocket_query_config(&self) -> PocketQueryConfig {
+        self.pocket_query
     }
 
     pub fn groups(&self) -> &GroupRuntimeConfig {
@@ -68,7 +75,12 @@ impl BaseRelayRuntimeConfig {
     }
 
     pub fn open_relay(&self) -> Result<BaseRelay, BaseRelayError> {
-        BaseRelay::open_with_groups(&self.pocket, self.limits.base_relay_limits()?, &self.groups)
+        BaseRelay::open_with_groups(
+            &self.pocket,
+            self.limits.base_relay_limits()?,
+            &self.groups,
+            self.pocket_query,
+        )
     }
 
     pub fn auth_state(&self) -> Result<BaseAuthState, BaseRelayError> {
@@ -306,6 +318,15 @@ struct BaseRelayServerConfigDocument {
 struct BaseRelayPocketConfigDocument {
     data_directory: String,
     sync_policy: BaseRelayPocketSyncPolicyDocument,
+    query: BaseRelayPocketQueryConfigDocument,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BaseRelayPocketQueryConfigDocument {
+    allow_scraping: bool,
+    allow_scrape_if_limited_to: u32,
+    allow_scrape_if_max_seconds: u64,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -433,9 +454,10 @@ pub fn parse_base_relay_runtime_config_json(
         .map_err(|error| {
             BaseRelayError::invalid(format!("server.listen_addr is invalid: {error}"))
         })?;
+    let pocket_document = document.pocket;
     let pocket = PocketStoreConfig::new(
-        PathBuf::from(document.pocket.data_directory),
-        match document.pocket.sync_policy {
+        PathBuf::from(pocket_document.data_directory),
+        match pocket_document.sync_policy {
             BaseRelayPocketSyncPolicyDocument::FlushOnWrite => PocketSyncPolicy::FlushOnWrite,
             BaseRelayPocketSyncPolicyDocument::FlushOnShutdown => PocketSyncPolicy::FlushOnShutdown,
         },
@@ -447,6 +469,7 @@ pub fn parse_base_relay_runtime_config_json(
     let groups = tangle_groups::parse_group_runtime_config_json(&groups_raw)
         .map_err(|error| BaseRelayError::invalid(error.to_string()))?;
     let limits = BaseRelayRuntimeLimitsConfig::from_document(document.limits)?;
+    let pocket_query = pocket_query_config_from_document(pocket_document.query, limits)?;
     let rate_limits = base_relay_rate_limits_from_document(document.rate_limits)?;
     if document.auth.created_at_skew_seconds == 0 {
         return Err(BaseRelayError::invalid(
@@ -458,6 +481,7 @@ pub fn parse_base_relay_runtime_config_json(
         listen_addr,
         relay_url: document.server.relay_url,
         pocket,
+        pocket_query,
         groups,
         auth_ttl_seconds: document.auth.challenge_ttl_seconds,
         auth_created_at_skew_seconds: document.auth.created_at_skew_seconds,
@@ -465,6 +489,27 @@ pub fn parse_base_relay_runtime_config_json(
         rate_limits,
         tracing,
     })
+}
+
+fn pocket_query_config_from_document(
+    document: BaseRelayPocketQueryConfigDocument,
+    limits: BaseRelayRuntimeLimitsConfig,
+) -> Result<PocketQueryConfig, BaseRelayError> {
+    if u64::from(document.allow_scrape_if_limited_to) > limits.max_limit() {
+        return Err(BaseRelayError::invalid(
+            "pocket.query.allow_scrape_if_limited_to must be less than or equal to limits.max_limit",
+        ));
+    }
+    if document.allow_scrape_if_max_seconds > MAX_POCKET_QUERY_SCRAPE_WINDOW_SECONDS {
+        return Err(BaseRelayError::invalid(format!(
+            "pocket.query.allow_scrape_if_max_seconds must be less than or equal to {MAX_POCKET_QUERY_SCRAPE_WINDOW_SECONDS}"
+        )));
+    }
+    Ok(PocketQueryConfig::new(
+        document.allow_scraping,
+        document.allow_scrape_if_limited_to,
+        document.allow_scrape_if_max_seconds,
+    ))
 }
 
 fn require_positive(field: &str, value: usize) -> Result<(), BaseRelayError> {
@@ -626,6 +671,15 @@ mod tests {
             config.pocket_config().sync_policy(),
             PocketSyncPolicy::FlushOnShutdown
         );
+        assert!(!config.pocket_query_config().allow_scraping());
+        assert_eq!(
+            config.pocket_query_config().allow_scrape_if_limited_to(),
+            100
+        );
+        assert_eq!(
+            config.pocket_query_config().allow_scrape_if_max_seconds(),
+            3_600
+        );
         assert!(config.groups().enabled());
         assert!(!config.groups().policy().public_join());
         assert!(!config.groups().policy().invites_enabled());
@@ -694,7 +748,12 @@ mod tests {
             },
             "pocket": {
                 "data_directory": "runtime/pocket",
-                "sync_policy": "flush_on_shutdown"
+                "sync_policy": "flush_on_shutdown",
+                "query": {
+                  "allow_scraping": false,
+                  "allow_scrape_if_limited_to": 100,
+                  "allow_scrape_if_max_seconds": 3600
+                }
             },
             "groups": {
                 "enabled": false
@@ -773,7 +832,12 @@ mod tests {
             },
             "pocket": {
                 "data_directory": "runtime/pocket",
-                "sync_policy": "flush_on_shutdown"
+                "sync_policy": "flush_on_shutdown",
+                "query": {
+                  "allow_scraping": false,
+                  "allow_scrape_if_limited_to": 100,
+                  "allow_scrape_if_max_seconds": 3600
+                }
             },
             "groups": {
                 "enabled": false
@@ -849,7 +913,12 @@ mod tests {
             },
             "pocket": {
                 "data_directory": "runtime/pocket",
-                "sync_policy": "flush_on_shutdown"
+                "sync_policy": "flush_on_shutdown",
+                "query": {
+                  "allow_scraping": false,
+                  "allow_scrape_if_limited_to": 100,
+                  "allow_scrape_if_max_seconds": 3600
+                }
             },
             "groups": {
                 "enabled": false
@@ -941,6 +1010,31 @@ mod tests {
                 .expect_err("removed readers")
                 .prefixed_message()
                 .contains("unknown field `reader_slots`")
+        );
+    }
+
+    #[test]
+    fn base_relay_runtime_config_validates_pocket_query_controls() {
+        let raw = include_str!("../../../config/tangle.example.json").replace(
+            "    \"allow_scrape_if_limited_to\": 100,\n",
+            "    \"allow_scrape_if_limited_to\": 501,\n",
+        );
+        assert_eq!(
+            parse_base_relay_runtime_config_json(&raw)
+                .expect_err("query scrape limit")
+                .prefixed_message(),
+            "invalid: pocket.query.allow_scrape_if_limited_to must be less than or equal to limits.max_limit"
+        );
+
+        let raw = include_str!("../../../config/tangle.example.json").replace(
+            "    \"allow_scrape_if_max_seconds\": 3600\n",
+            "    \"allow_scrape_if_max_seconds\": 86401\n",
+        );
+        assert_eq!(
+            parse_base_relay_runtime_config_json(&raw)
+                .expect_err("query scrape window")
+                .prefixed_message(),
+            "invalid: pocket.query.allow_scrape_if_max_seconds must be less than or equal to 86400"
         );
     }
 

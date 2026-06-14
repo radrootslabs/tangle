@@ -102,7 +102,12 @@ fn tangle_run_starts_server_and_stays_alive_until_shutdown() {
             },
             "pocket": {
                 "data_directory": data_dir,
-                "sync_policy": "flush_on_shutdown"
+                "sync_policy": "flush_on_shutdown",
+                "query": {
+                  "allow_scraping": false,
+                  "allow_scrape_if_limited_to": 100,
+                  "allow_scrape_if_max_seconds": 3600
+                }
             },
             "groups": {
                 "enabled": true,

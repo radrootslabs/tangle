@@ -1605,7 +1605,12 @@ fn runtime_config_value(root: &Path, listen_addr: SocketAddr) -> Value {
         },
         "pocket": {
             "data_directory": root.join("pocket"),
-            "sync_policy": "flush_on_shutdown"
+            "sync_policy": "flush_on_shutdown",
+            "query": {
+              "allow_scraping": false,
+              "allow_scrape_if_limited_to": 100,
+              "allow_scrape_if_max_seconds": 3600
+            }
         },
         "groups": {
             "enabled": true,

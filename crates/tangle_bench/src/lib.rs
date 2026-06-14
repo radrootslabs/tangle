@@ -15,7 +15,7 @@ use tangle_runtime::relay::{
     auth::BaseAuthState,
     core::{BaseRelay, BaseRelayLimitSettings, BaseRelayLimits},
 };
-use tangle_store_pocket::{PocketStoreConfig, PocketSyncPolicy};
+use tangle_store_pocket::{PocketQueryConfig, PocketStoreConfig, PocketSyncPolicy};
 use tangle_test_support::{
     FixtureKey, TANGLE_V2_RELAY_URL, tangle_v2_auth_event, tangle_v2_event, tangle_v2_group_config,
     tangle_v2_group_create_event, tangle_v2_group_event, tangle_v2_put_user_event, tangle_v2_tag,
@@ -959,6 +959,7 @@ fn run_projection_rebuild_benchmark(dataset: &BenchDataset) -> Result<ScenarioRe
         &materialized.store_config,
         relay_limits(128),
         &group_config()?,
+        PocketQueryConfig::default(),
     )
     .map_err(|error| error.to_string())?;
     let elapsed = elapsed_micros(started);
@@ -997,6 +998,7 @@ fn run_outbox_replay_benchmark(dataset: &BenchDataset) -> Result<ScenarioReport,
         &materialized.store_config,
         relay_limits(128),
         &group_config()?,
+        PocketQueryConfig::default(),
     )
     .map_err(|error| error.to_string())?;
     let after_first = generated_state_counts(&reopened)?;
@@ -1005,6 +1007,7 @@ fn run_outbox_replay_benchmark(dataset: &BenchDataset) -> Result<ScenarioReport,
         &materialized.store_config,
         relay_limits(128),
         &group_config()?,
+        PocketQueryConfig::default(),
     )
     .map_err(|error| error.to_string())?;
     let after_second = generated_state_counts(&reopened)?;
@@ -1109,6 +1112,7 @@ fn materialize_dataset(
         &store_config,
         relay_limits(max_pending_events),
         &group_config()?,
+        PocketQueryConfig::default(),
     )
     .map_err(|error| error.to_string())?;
     let owner_auth = authenticated(FixtureKey::Owner)?;
