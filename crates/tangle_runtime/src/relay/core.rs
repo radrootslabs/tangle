@@ -15,7 +15,7 @@ use tangle_groups::{
     validate_client_group_event_structure,
 };
 use tangle_protocol::{ClientMessage, Event, Filter, RelayMessage, SubscriptionId, UnixTimestamp};
-use tangle_store_pocket::{PocketScreenResult, PocketStoreConfig, PocketStoreHandle};
+use tangle_store_pocket::{PocketEvent, PocketScreenResult, PocketStoreConfig, PocketStoreHandle};
 
 pub struct BaseRelay {
     store: PocketStoreHandle,
@@ -477,9 +477,9 @@ impl BaseRelay {
                 if screen_error.borrow().is_some() {
                     return PocketScreenResult::Mismatch;
                 }
-                match pocket_event_to_tangle(pocket_event) {
-                    Ok(event) if !filter.matches(&event) => PocketScreenResult::Mismatch,
-                    Ok(event) => match self.event_visible_to_auth(&event, auth) {
+                match pocket_filter.event_matches(pocket_event) {
+                    Ok(false) => PocketScreenResult::Mismatch,
+                    Ok(true) => match self.pocket_event_visible_to_auth(pocket_event, auth) {
                         Ok(true) => PocketScreenResult::Match,
                         Ok(false) => PocketScreenResult::Redacted,
                         Err(error) => {
@@ -488,7 +488,7 @@ impl BaseRelay {
                         }
                     },
                     Err(error) => {
-                        *screen_error.borrow_mut() = Some(error);
+                        *screen_error.borrow_mut() = Some(BaseRelayError::error(error.to_string()));
                         PocketScreenResult::Mismatch
                     }
                 }
@@ -522,6 +522,18 @@ impl BaseRelay {
     fn event_visible_to_auth(
         &self,
         event: &Event,
+        auth: &GroupAuthContext,
+    ) -> Result<bool, BaseRelayError> {
+        self.groups
+            .as_ref()
+            .map(|groups| groups.event_visible_to_auth(event, auth))
+            .unwrap_or(Ok(true))
+            .map_err(BaseRelayError::from)
+    }
+
+    fn pocket_event_visible_to_auth(
+        &self,
+        event: &PocketEvent,
         auth: &GroupAuthContext,
     ) -> Result<bool, BaseRelayError> {
         self.groups

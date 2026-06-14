@@ -5,7 +5,9 @@ use pocket_db::{
     ScreenResult, Store,
     heed::{Database, types::Bytes},
 };
-use pocket_types::{Event, Filter, Id, OwnedEvent, OwnedFilter, Pubkey};
+use pocket_types::{
+    Event, Filter, Id, Kind, OwnedEvent, OwnedFilter, OwnedTags, Pubkey, Sig, Tags, Time,
+};
 use std::{
     io,
     path::{Path, PathBuf},
@@ -17,9 +19,14 @@ pub const POCKET_SOURCE_REVISION: &str = "329334f20948c796c6016b673b92551ac4855a
 pub type PocketEvent = Event;
 pub type PocketEventId = Id;
 pub type PocketFilter = Filter;
+pub type PocketKind = Kind;
 pub type PocketOwnedEvent = OwnedEvent;
 pub type PocketOwnedFilter = OwnedFilter;
+pub type PocketOwnedTags = OwnedTags;
 pub type PocketPubkey = Pubkey;
+pub type PocketSig = Sig;
+pub type PocketTags = Tags;
+pub type PocketTime = Time;
 pub type PocketScreenResult = ScreenResult;
 pub type PocketStore = Store;
 pub type PocketExtraRecord = (Vec<u8>, Vec<u8>);

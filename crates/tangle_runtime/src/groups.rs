@@ -2,7 +2,7 @@
 
 use crate::{
     errors::BaseRelayError,
-    pocket_conversion::{pocket_event_id, pocket_event_to_tangle, tangle_event_to_pocket},
+    pocket_conversion::{pocket_event_id, tangle_event_to_pocket},
 };
 use std::str;
 use tangle_crypto::RelaySigner;
@@ -14,8 +14,8 @@ use tangle_groups::{
     KIND_GROUP_CREATE_GROUP, KIND_GROUP_DELETE_EVENT, KIND_GROUP_EDIT_METADATA,
     KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_PUT_USER,
     KIND_GROUP_REMOVE_USER, MemberState, ProjectedRoleDefinition, ProjectionCheckpoint,
-    StoreOffset, event_deletion_key, group_current_key, member_current_key,
-    projection_checkpoint_key, role_current_key, tombstone_key,
+    StoreOffset, event_deletion_key, event_view::GroupEventView, group_current_key,
+    member_current_key, projection_checkpoint_key, role_current_key, tombstone_key,
 };
 use tangle_protocol::{Event, EventId, PublicKeyHex, UnixTimestamp};
 use tangle_store_pocket::{
@@ -115,8 +115,6 @@ impl GroupService {
                 "delete target event is unavailable",
             ));
         };
-        let target = pocket_event_to_tangle(&target)
-            .map_err(|error| GroupError::internal(error.prefixed_message()))?;
         let target_class = tangle_groups::classify_group_event(&target, self.limits)?;
         if target_class.group_id() != Some(group_id) {
             return Err(GroupError::invalid(
@@ -129,7 +127,7 @@ impl GroupService {
 
     pub(crate) fn event_visible_to_auth(
         &self,
-        event: &Event,
+        event: &(impl GroupEventView + ?Sized),
         auth: &GroupAuthContext,
     ) -> Result<bool, GroupError> {
         let gate = GroupReadGate::new(&self.projection, &self.authority);

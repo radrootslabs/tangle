@@ -287,9 +287,21 @@ fn req_count_and_live_fanout_share_one_group_read_gate() {
 }
 
 #[test]
-#[ignore = "phase2 target: hot path representation"]
 fn runtime_hot_path_does_not_stringify_and_reparse_events() {
-    pending("runtime hot paths must use Pocket event and filter types or EventView");
+    let conversion_boundary = include_str!("../src/pocket_conversion.rs");
+    for forbidden in [
+        "event_to_value",
+        "filter_to_value",
+        "parse_event_json",
+        "parse_pocket_event_json",
+        "parse_pocket_filter_json",
+        ".as_json()",
+    ] {
+        assert!(
+            !conversion_boundary.contains(forbidden),
+            "runtime Pocket conversion boundary contains forbidden JSON bridge `{forbidden}`"
+        );
+    }
 }
 
 #[test]
