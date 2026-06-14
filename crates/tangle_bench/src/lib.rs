@@ -60,6 +60,14 @@ impl BenchDatasetConfig {
         Self::new(6, 4, 3, 6, 3)
     }
 
+    pub fn medium() -> Self {
+        Self::new(24, 8, 6, 24, 5)
+    }
+
+    pub fn production() -> Self {
+        Self::new(120, 24, 16, 120, 12)
+    }
+
     pub fn validate(self) -> Result<Self, String> {
         if self.group_count < 3 {
             return Err("group-count must be at least 3".to_owned());
@@ -74,6 +82,150 @@ impl BenchDatasetConfig {
             return Err("member-count must be greater than zero".to_owned());
         }
         Ok(self)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchmarkProfileName {
+    Smoke,
+    Medium,
+    Production,
+}
+
+impl BenchmarkProfileName {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "smoke" => Ok(Self::Smoke),
+            "medium" => Ok(Self::Medium),
+            "production" => Ok(Self::Production),
+            _ => Err(format!(
+                "unknown benchmark profile `{value}`; expected smoke, medium, or production"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Smoke => "smoke",
+            Self::Medium => "medium",
+            Self::Production => "production",
+        }
+    }
+
+    pub fn all() -> [Self; 3] {
+        [Self::Smoke, Self::Medium, Self::Production]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BenchmarkProfile {
+    name: BenchmarkProfileName,
+    dataset_config: BenchDatasetConfig,
+    thresholds: BenchmarkThresholds,
+    threshold_source: String,
+    target_hardware_evidence: Option<String>,
+}
+
+impl BenchmarkProfile {
+    pub fn from_name(name: BenchmarkProfileName) -> Self {
+        match name {
+            BenchmarkProfileName::Smoke => Self::smoke(),
+            BenchmarkProfileName::Medium => Self::medium(),
+            BenchmarkProfileName::Production => Self::production(),
+        }
+    }
+
+    pub fn smoke() -> Self {
+        Self::new(
+            BenchmarkProfileName::Smoke,
+            BenchDatasetConfig::smoke(),
+            BenchmarkThresholds::smoke(),
+        )
+    }
+
+    pub fn medium() -> Self {
+        Self::new(
+            BenchmarkProfileName::Medium,
+            BenchDatasetConfig::medium(),
+            BenchmarkThresholds::medium(),
+        )
+    }
+
+    pub fn production() -> Self {
+        Self::new(
+            BenchmarkProfileName::Production,
+            BenchDatasetConfig::production(),
+            BenchmarkThresholds::production(),
+        )
+    }
+
+    fn new(
+        name: BenchmarkProfileName,
+        dataset_config: BenchDatasetConfig,
+        thresholds: BenchmarkThresholds,
+    ) -> Self {
+        Self {
+            name,
+            dataset_config,
+            thresholds,
+            threshold_source: format!("builtin:{}", name.as_str()),
+            target_hardware_evidence: None,
+        }
+    }
+
+    pub fn name(&self) -> BenchmarkProfileName {
+        self.name
+    }
+
+    pub fn dataset_config(&self) -> BenchDatasetConfig {
+        self.dataset_config
+    }
+
+    pub fn thresholds(&self) -> BenchmarkThresholds {
+        self.thresholds
+    }
+
+    pub fn threshold_source(&self) -> &str {
+        &self.threshold_source
+    }
+
+    pub fn target_hardware_evidence(&self) -> Option<&str> {
+        self.target_hardware_evidence.as_deref()
+    }
+
+    pub fn with_dataset_config(mut self, config: BenchDatasetConfig) -> Result<Self, String> {
+        self.dataset_config = config.validate()?;
+        Ok(self)
+    }
+
+    pub fn with_thresholds(
+        mut self,
+        thresholds: BenchmarkThresholds,
+        source: impl Into<String>,
+    ) -> Result<Self, String> {
+        let source = source.into();
+        if source.is_empty() {
+            return Err("benchmark threshold source must not be empty".to_owned());
+        }
+        self.thresholds = thresholds;
+        self.threshold_source = source;
+        Ok(self)
+    }
+
+    pub fn with_target_hardware_evidence(
+        mut self,
+        evidence: impl Into<String>,
+    ) -> Result<Self, String> {
+        let evidence = evidence.into();
+        if evidence.is_empty() {
+            return Err("target hardware evidence must not be empty".to_owned());
+        }
+        self.target_hardware_evidence = Some(evidence);
+        Ok(self)
+    }
+
+    pub fn production_claim_eligible(&self) -> bool {
+        self.name == BenchmarkProfileName::Production && self.target_hardware_evidence.is_some()
     }
 }
 
@@ -459,7 +611,57 @@ impl BenchmarkThresholds {
         }
     }
 
-    fn to_json(self) -> serde_json::Value {
+    pub fn medium() -> Self {
+        Self {
+            pocket_query_p95_micros: 2_500_000,
+            read_gate_p95_micros: 2_500_000,
+            projection_rebuild_elapsed_micros: 15_000_000,
+            outbox_replay_elapsed_micros: 15_000_000,
+            broadcast_lag_p95_micros: 2_500_000,
+            memory_profile_max_bytes: 768 * 1024 * 1024,
+        }
+    }
+
+    pub fn production() -> Self {
+        Self {
+            pocket_query_p95_micros: 5_000_000,
+            read_gate_p95_micros: 5_000_000,
+            projection_rebuild_elapsed_micros: 60_000_000,
+            outbox_replay_elapsed_micros: 60_000_000,
+            broadcast_lag_p95_micros: 5_000_000,
+            memory_profile_max_bytes: 1024 * 1024 * 1024,
+        }
+    }
+
+    pub fn from_json_str(raw: &str) -> Result<Self, String> {
+        let value = serde_json::from_str::<serde_json::Value>(raw)
+            .map_err(|error| format!("benchmark thresholds JSON is invalid: {error}"))?;
+        Self::from_json_value(&value)
+    }
+
+    pub fn from_json_value(value: &serde_json::Value) -> Result<Self, String> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| "benchmark thresholds JSON must be an object".to_owned())?;
+        for key in object.keys() {
+            if !benchmark_threshold_fields().contains(&key.as_str()) {
+                return Err(format!("unknown benchmark threshold field `{key}`"));
+            }
+        }
+        Ok(Self {
+            pocket_query_p95_micros: threshold_u64(value, "pocket_query_p95_micros")?,
+            read_gate_p95_micros: threshold_u64(value, "read_gate_p95_micros")?,
+            projection_rebuild_elapsed_micros: threshold_u64(
+                value,
+                "projection_rebuild_elapsed_micros",
+            )?,
+            outbox_replay_elapsed_micros: threshold_u64(value, "outbox_replay_elapsed_micros")?,
+            broadcast_lag_p95_micros: threshold_u64(value, "broadcast_lag_p95_micros")?,
+            memory_profile_max_bytes: threshold_u64(value, "memory_profile_max_bytes")?,
+        })
+    }
+
+    pub fn to_json(self) -> serde_json::Value {
         json!({
             "pocket_query_p95_micros": self.pocket_query_p95_micros,
             "read_gate_p95_micros": self.read_gate_p95_micros,
@@ -471,19 +673,47 @@ impl BenchmarkThresholds {
     }
 }
 
+fn benchmark_threshold_fields() -> [&'static str; 6] {
+    [
+        "pocket_query_p95_micros",
+        "read_gate_p95_micros",
+        "projection_rebuild_elapsed_micros",
+        "outbox_replay_elapsed_micros",
+        "broadcast_lag_p95_micros",
+        "memory_profile_max_bytes",
+    ]
+}
+
+fn threshold_u64(value: &serde_json::Value, field: &str) -> Result<u64, String> {
+    let value = value
+        .get(field)
+        .ok_or_else(|| format!("missing benchmark threshold field `{field}`"))?;
+    let Some(value) = value.as_u64() else {
+        return Err(format!(
+            "benchmark threshold field `{field}` must be an unsigned integer"
+        ));
+    };
+    if value == 0 {
+        return Err(format!(
+            "benchmark threshold field `{field}` must be greater than zero"
+        ));
+    }
+    Ok(value)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BenchmarkRunReport {
     dataset: BenchDataset,
     dataset_profile: DatasetProfile,
+    profile: BenchmarkProfile,
     scenarios: Vec<ScenarioReport>,
-    thresholds: BenchmarkThresholds,
     validation_summary: BTreeMap<String, String>,
 }
 
 impl BenchmarkRunReport {
-    pub fn run(config: BenchDatasetConfig) -> Result<Self, String> {
-        let dataset = BenchDataset::generate(config)?;
-        let thresholds = BenchmarkThresholds::smoke();
+    pub fn run(profile: BenchmarkProfile) -> Result<Self, String> {
+        let dataset = BenchDataset::generate(profile.dataset_config())?;
+        let thresholds = profile.thresholds();
         let pocket_query = run_pocket_query_benchmark(&dataset)?;
         let read_gate = run_read_gate_benchmark(&dataset)?;
         let projection_rebuild = run_projection_rebuild_benchmark(&dataset)?;
@@ -503,8 +733,8 @@ impl BenchmarkRunReport {
         Ok(Self {
             dataset,
             dataset_profile,
+            profile,
             scenarios,
-            thresholds,
             validation_summary,
         })
     }
@@ -515,6 +745,10 @@ impl BenchmarkRunReport {
 
     pub fn dataset_profile(&self) -> &DatasetProfile {
         &self.dataset_profile
+    }
+
+    pub fn profile(&self) -> &BenchmarkProfile {
+        &self.profile
     }
 
     pub fn scenarios(&self) -> &[ScenarioReport] {
@@ -536,10 +770,20 @@ impl BenchmarkRunReport {
             "schema": 1,
             "run_id": run_id,
             "artifact_directory": artifact_directory.to_string_lossy(),
+            "profile": self.profile.name().as_str(),
             "dataset": self.dataset_profile.to_json(),
             "scenarios": self.scenarios.iter().map(ScenarioReport::to_json).collect::<Vec<_>>(),
-            "thresholds": self.thresholds.to_json(),
+            "threshold_source": self.profile.threshold_source(),
+            "thresholds": self.profile.thresholds().to_json(),
             "validation_summary": self.validation_summary,
+            "production_claim": {
+                "eligible": self.profile.production_claim_eligible(),
+                "profile_required": "production",
+                "target_hardware_evidence": self
+                    .profile
+                    .target_hardware_evidence()
+                    .unwrap_or("absent")
+            },
             "artifacts": {
                 "summary_json": "summary.json",
                 "dataset_events_jsonl": "dataset-events.jsonl"
@@ -1272,10 +1516,11 @@ fn lower_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BenchDataset, BenchDatasetConfig, BenchGroupVisibility, BenchmarkRunReport,
-        BenchmarkThresholds, SCENARIO_BROADCAST_LAG, SCENARIO_GROUP_READ_GATE_OVERHEAD,
-        SCENARIO_MEMORY_PROFILE, SCENARIO_OUTBOX_REPLAY, SCENARIO_POCKET_QUERY_VISIBLE_EVENTS,
-        SCENARIO_PROJECTION_REBUILD, ScenarioReport, generated_state_counts, materialize_dataset,
+        BenchDataset, BenchDatasetConfig, BenchGroupVisibility, BenchmarkProfile,
+        BenchmarkProfileName, BenchmarkRunReport, BenchmarkThresholds, SCENARIO_BROADCAST_LAG,
+        SCENARIO_GROUP_READ_GATE_OVERHEAD, SCENARIO_MEMORY_PROFILE, SCENARIO_OUTBOX_REPLAY,
+        SCENARIO_POCKET_QUERY_VISIBLE_EVENTS, SCENARIO_PROJECTION_REBUILD, ScenarioReport,
+        generated_state_counts, materialize_dataset,
     };
     use std::collections::BTreeSet;
     use tangle_groups::{GroupId, KIND_GROUP_ADMINS, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA};
@@ -1361,8 +1606,8 @@ mod tests {
 
     #[test]
     fn benchmark_suite_runs_all_required_v2_scenarios() {
-        let report =
-            BenchmarkRunReport::run(BenchDatasetConfig::new(3, 1, 1, 2, 1)).expect("report");
+        let report = BenchmarkRunReport::run(smoke_profile(BenchDatasetConfig::new(3, 1, 1, 2, 1)))
+            .expect("report");
 
         for name in [
             SCENARIO_POCKET_QUERY_VISIBLE_EVENTS,
@@ -1384,6 +1629,119 @@ mod tests {
                 .validation_summary()
                 .values()
                 .all(|status| status == "pass")
+        );
+    }
+
+    #[test]
+    fn benchmark_profiles_are_explicit_and_unknown_profiles_fail_closed() {
+        assert_eq!(
+            BenchmarkProfileName::all()
+                .iter()
+                .map(|profile| profile.as_str())
+                .collect::<Vec<_>>(),
+            vec!["smoke", "medium", "production"]
+        );
+        assert_eq!(
+            BenchmarkProfileName::parse("smoke")
+                .expect("smoke")
+                .as_str(),
+            "smoke"
+        );
+        assert_eq!(
+            BenchmarkProfileName::parse("medium")
+                .expect("medium")
+                .as_str(),
+            "medium"
+        );
+        assert_eq!(
+            BenchmarkProfileName::parse("production")
+                .expect("production")
+                .as_str(),
+            "production"
+        );
+        assert!(
+            BenchmarkProfileName::parse("local")
+                .expect_err("unknown")
+                .contains("unknown benchmark profile")
+        );
+        assert_eq!(
+            BenchmarkProfile::smoke().dataset_config(),
+            BenchDatasetConfig::smoke()
+        );
+        assert_eq!(
+            BenchmarkProfile::medium().dataset_config(),
+            BenchDatasetConfig::medium()
+        );
+        assert_eq!(
+            BenchmarkProfile::production().dataset_config(),
+            BenchDatasetConfig::production()
+        );
+    }
+
+    #[test]
+    fn benchmark_threshold_json_rejects_missing_unknown_or_zero_fields() {
+        let valid = BenchmarkThresholds::from_json_value(&BenchmarkThresholds::smoke().to_json())
+            .expect("valid thresholds");
+        assert_eq!(valid, BenchmarkThresholds::smoke());
+
+        let missing = serde_json::json!({
+            "pocket_query_p95_micros": 1,
+            "read_gate_p95_micros": 1,
+            "projection_rebuild_elapsed_micros": 1,
+            "outbox_replay_elapsed_micros": 1,
+            "broadcast_lag_p95_micros": 1
+        });
+        assert!(
+            BenchmarkThresholds::from_json_value(&missing)
+                .expect_err("missing")
+                .contains("memory_profile_max_bytes")
+        );
+
+        let unknown = serde_json::json!({
+            "pocket_query_p95_micros": 1,
+            "read_gate_p95_micros": 1,
+            "projection_rebuild_elapsed_micros": 1,
+            "outbox_replay_elapsed_micros": 1,
+            "broadcast_lag_p95_micros": 1,
+            "memory_profile_max_bytes": 1,
+            "extra": 1
+        });
+        assert!(
+            BenchmarkThresholds::from_json_value(&unknown)
+                .expect_err("unknown")
+                .contains("unknown benchmark threshold field")
+        );
+
+        let zero = serde_json::json!({
+            "pocket_query_p95_micros": 0,
+            "read_gate_p95_micros": 1,
+            "projection_rebuild_elapsed_micros": 1,
+            "outbox_replay_elapsed_micros": 1,
+            "broadcast_lag_p95_micros": 1,
+            "memory_profile_max_bytes": 1
+        });
+        assert!(
+            BenchmarkThresholds::from_json_value(&zero)
+                .expect_err("zero")
+                .contains("greater than zero")
+        );
+    }
+
+    #[test]
+    fn production_claim_eligibility_requires_production_profile_and_hardware_evidence() {
+        assert!(!BenchmarkProfile::smoke().production_claim_eligible());
+        assert!(
+            !BenchmarkProfile::smoke()
+                .with_target_hardware_evidence("target-hardware:ci")
+                .expect("evidence")
+                .production_claim_eligible()
+        );
+        assert!(!BenchmarkProfile::production().production_claim_eligible());
+        assert!(
+            BenchmarkProfile::production()
+                .with_target_hardware_evidence("target-hardware:prod-node-001")
+                .expect("evidence")
+                .production_claim_eligible()
         );
     }
 
@@ -1419,12 +1777,19 @@ mod tests {
 
     #[test]
     fn benchmark_summary_json_matches_report_template_surface() {
-        let report =
-            BenchmarkRunReport::run(BenchDatasetConfig::new(3, 1, 1, 1, 1)).expect("report");
+        let report = BenchmarkRunReport::run(smoke_profile(BenchDatasetConfig::new(3, 1, 1, 1, 1)))
+            .expect("report");
         let summary = report.summary_json("unit-run", std::path::Path::new(".local/unit"));
 
         assert_eq!(summary["schema"], 1);
         assert_eq!(summary["run_id"], "unit-run");
+        assert_eq!(summary["profile"], "smoke");
+        assert_eq!(summary["threshold_source"], "builtin:smoke");
+        assert_eq!(summary["production_claim"]["eligible"], false);
+        assert_eq!(
+            summary["production_claim"]["target_hardware_evidence"],
+            "absent"
+        );
         assert_eq!(
             summary["dataset"]["fixture_family"],
             "synthetic repo-owned fixtures"
@@ -1499,5 +1864,11 @@ mod tests {
 
     fn passing_scenario(name: &str) -> ScenarioReport {
         ScenarioReport::new(name, 1, 1, 0, 10, vec![1], 128)
+    }
+
+    fn smoke_profile(config: BenchDatasetConfig) -> BenchmarkProfile {
+        BenchmarkProfile::smoke()
+            .with_dataset_config(config)
+            .expect("smoke profile")
     }
 }
