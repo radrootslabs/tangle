@@ -145,11 +145,15 @@ mod tests {
         runtime::{TangleRuntime, TangleShutdownSignal},
     };
     use axum::body::to_bytes;
+    use futures_util::StreamExt;
     use http::{Request, header};
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use tokio::net::TcpListener;
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio::time::{Duration, timeout};
+    use tokio_tungstenite::tungstenite::{
+        Message as TungsteniteMessage, client::IntoClientRequest,
+    };
     use tower::ServiceExt;
 
     #[tokio::test]
@@ -203,6 +207,46 @@ mod tests {
 
         shutdown.request_shutdown();
         let report = task.await.expect("task").expect("serve");
+        assert_eq!(report.listen_addr(), address);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn serve_until_shutdown_closes_websocket_sessions() {
+        let root = temp_root("websocket-shutdown");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntime::open(runtime_config(&root)).expect("runtime");
+        let shutdown = runtime.shutdown_signal().clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("address");
+        let task = tokio::spawn(super::serve_listener_until_shutdown(runtime, listener));
+        let mut request = format!("ws://{address}/")
+            .into_client_request()
+            .expect("request");
+        request.headers_mut().insert(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            http::HeaderValue::from_static("nostr"),
+        );
+        let (mut socket, response) = tokio_tungstenite::connect_async(request)
+            .await
+            .expect("websocket");
+
+        assert_eq!(response.status(), http::StatusCode::SWITCHING_PROTOCOLS);
+
+        shutdown.request_shutdown();
+
+        let next = timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("websocket close");
+        match next {
+            Some(Ok(TungsteniteMessage::Close(_))) | None => {}
+            other => panic!("expected websocket close, got {other:?}"),
+        }
+        let report = timeout(Duration::from_secs(1), task)
+            .await
+            .expect("server shutdown")
+            .expect("task")
+            .expect("serve");
         assert_eq!(report.listen_addr(), address);
         let _ = std::fs::remove_dir_all(root);
     }

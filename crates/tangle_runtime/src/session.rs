@@ -43,9 +43,14 @@ impl TangleWebSocketSession {
         self.outbound.clone()
     }
 
+    pub fn shutdown_requested(&self) -> bool {
+        *self.shutdown.borrow()
+    }
+
     pub async fn run(mut self, mut socket: WebSocket) {
         loop {
-            if *self.shutdown.borrow() {
+            if self.shutdown_requested() {
+                let _ = socket.send(Message::Close(None)).await;
                 break;
             }
             tokio::select! {
@@ -64,7 +69,8 @@ impl TangleWebSocketSession {
                     }
                 }
                 changed = self.shutdown.changed() => {
-                    if changed.is_err() || *self.shutdown.borrow() {
+                    if changed.is_err() || self.shutdown_requested() {
+                        let _ = socket.send(Message::Close(None)).await;
                         break;
                     }
                 }
@@ -122,7 +128,20 @@ mod tests {
     #[test]
     fn websocket_session_rejects_zero_outbound_capacity() {
         let shutdown = TangleShutdownSignal::new();
+
         assert!(TangleWebSocketSession::new(0, shutdown.subscribe()).is_err());
+    }
+
+    #[test]
+    fn websocket_session_observes_shutdown_request() {
+        let shutdown = TangleShutdownSignal::new();
+        let session = TangleWebSocketSession::new(8, shutdown.subscribe()).expect("session");
+
+        assert!(!session.shutdown_requested());
+
+        shutdown.request_shutdown();
+
+        assert!(session.shutdown_requested());
     }
 
     #[test]
