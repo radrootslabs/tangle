@@ -381,6 +381,32 @@ fn protected_events_require_author_auth_before_nip70_is_advertised() {
 }
 
 #[test]
+fn negentropy_remains_unconfigurable_and_unadvertised_until_read_gated() {
+    let root = temp_root("acceptance-negentropy");
+    let mut raw = runtime_config_value(&root, SocketAddr::from(([127, 0, 0, 1], 0)));
+    raw.as_object_mut()
+        .expect("config object")
+        .insert("negentropy".to_owned(), json!({"enabled": true}));
+
+    let error =
+        parse_base_relay_runtime_config_json(&raw.to_string()).expect_err("negentropy rejected");
+    assert!(error.message().contains("unknown field `negentropy`"));
+
+    raw.as_object_mut()
+        .expect("config object")
+        .remove("negentropy")
+        .expect("negentropy field");
+    let config = parse_base_relay_runtime_config_json(&raw.to_string()).expect("config");
+    let document = BaseRelayInfoConfig::new("tangle", &config)
+        .expect("info config")
+        .build_document()
+        .expect("document");
+    assert!(!document.supported_nips.contains(&77));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn private_but_not_hidden_group_metadata_remains_visible() {
     let owner = phase2_pubkey("1");
     let projection = phase2_projection_with_group(
@@ -628,7 +654,12 @@ fn pending(target: &str) {
 }
 
 fn runtime_config(root: &Path, listen_addr: SocketAddr) -> BaseRelayRuntimeConfig {
-    let raw = serde_json::json!({
+    parse_base_relay_runtime_config_json(&runtime_config_value(root, listen_addr).to_string())
+        .expect("config")
+}
+
+fn runtime_config_value(root: &Path, listen_addr: SocketAddr) -> Value {
+    json!({
         "server": {
             "listen_addr": listen_addr.to_string(),
             "relay_url": "wss://relay.radroots.test"
@@ -695,8 +726,6 @@ fn runtime_config(root: &Path, listen_addr: SocketAddr) -> BaseRelayRuntimeConfi
             }
         }
     })
-    .to_string();
-    parse_base_relay_runtime_config_json(&raw).expect("config")
 }
 
 async fn wait_for_http_ok(
