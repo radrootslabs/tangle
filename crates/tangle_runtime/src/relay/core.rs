@@ -907,7 +907,31 @@ impl BaseRelay {
         filters: Vec<Filter>,
         auth: &BaseAuthState,
     ) -> Result<BaseRelayCountReport, BaseRelayError> {
-        self.handle_count_with_group_auth_report(
+        Self::handle_count_with_shared_services(
+            &self.store,
+            self.groups.as_ref(),
+            self.limits,
+            self.query,
+            subscription_id,
+            filters,
+            auth,
+        )
+    }
+
+    pub(crate) fn handle_count_with_shared_services(
+        store: &PocketStoreHandle,
+        groups: Option<&GroupServiceHandle>,
+        limits: BaseRelayLimits,
+        query: PocketQueryConfig,
+        subscription_id: SubscriptionId,
+        filters: Vec<Filter>,
+        auth: &BaseAuthState,
+    ) -> Result<BaseRelayCountReport, BaseRelayError> {
+        Self::handle_count_with_group_auth_shared_services(
+            store,
+            groups,
+            limits,
+            query,
             subscription_id,
             filters,
             &GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned()),
@@ -930,12 +954,33 @@ impl BaseRelay {
         filters: Vec<Filter>,
         auth: &GroupAuthContext,
     ) -> Result<BaseRelayCountReport, BaseRelayError> {
-        self.limits.validate_subscription_id(&subscription_id)?;
-        self.limits.validate_filters(&filters)?;
+        Self::handle_count_with_group_auth_shared_services(
+            &self.store,
+            self.groups.as_ref(),
+            self.limits,
+            self.query,
+            subscription_id,
+            filters,
+            auth,
+        )
+    }
+
+    fn handle_count_with_group_auth_shared_services(
+        store: &PocketStoreHandle,
+        groups: Option<&GroupServiceHandle>,
+        limits: BaseRelayLimits,
+        query: PocketQueryConfig,
+        subscription_id: SubscriptionId,
+        filters: Vec<Filter>,
+        auth: &GroupAuthContext,
+    ) -> Result<BaseRelayCountReport, BaseRelayError> {
+        limits.validate_subscription_id(&subscription_id)?;
+        limits.validate_filters(&filters)?;
         if let Some(message) = Self::unsupported_search_closed(&subscription_id, &filters) {
             return Ok(BaseRelayCountReport::new(message, false));
         }
-        let report = self.count_events_report(&filters, auth)?;
+        let report =
+            Self::count_events_report_with_services(store, groups, limits, query, &filters, auth)?;
         Ok(BaseRelayCountReport::new(
             RelayMessage::Count {
                 subscription_id,
@@ -1013,8 +1058,11 @@ impl BaseRelay {
         ))
     }
 
-    fn count_events_report(
-        &self,
+    fn count_events_report_with_services(
+        store: &PocketStoreHandle,
+        groups: Option<&GroupServiceHandle>,
+        limits: BaseRelayLimits,
+        query: PocketQueryConfig,
         filters: &[Filter],
         auth: &GroupAuthContext,
     ) -> Result<BaseRelayCountEventsReport, BaseRelayError> {
@@ -1022,7 +1070,9 @@ impl BaseRelay {
         let mut group_read_denied = false;
         for filter in filters {
             let filter = filter.without_limit();
-            let report = self.query_filter_events_report(&filter, auth)?;
+            let report = Self::query_filter_events_report_with_services(
+                store, groups, limits, query, &filter, auth,
+            )?;
             group_read_denied |= report.group_read_denied;
             for event in report.events {
                 seen.insert(event.id().clone());
@@ -1031,21 +1081,6 @@ impl BaseRelay {
         let count = u64::try_from(seen.len())
             .map_err(|_| BaseRelayError::error("visible event count overflow"))?;
         Ok(BaseRelayCountEventsReport::new(count, group_read_denied))
-    }
-
-    fn query_filter_events_report(
-        &self,
-        filter: &Filter,
-        auth: &GroupAuthContext,
-    ) -> Result<BaseRelayEventQueryReport, BaseRelayError> {
-        Self::query_filter_events_report_with_services(
-            &self.store,
-            self.groups.as_ref(),
-            self.limits,
-            self.query,
-            filter,
-            auth,
-        )
     }
 
     fn query_filter_events_report_with_services(

@@ -1362,6 +1362,23 @@ fn runtime_req_handling_does_not_lock_relay_state() {
 }
 
 #[test]
+fn runtime_count_handling_does_not_lock_relay_state() {
+    let runtime = include_str!("../src/runtime.rs");
+    let count_branch = runtime
+        .split("ClientMessage::Count {")
+        .nth(1)
+        .expect("count branch")
+        .split("ClientMessage::Auth")
+        .next()
+        .expect("auth branch");
+
+    assert!(!count_branch.contains("relay.lock().await"));
+    assert!(
+        count_branch.contains("handle_count_with_auth_report(subscription_id, filters, auth)?")
+    );
+}
+
+#[test]
 fn runtime_hot_path_does_not_stringify_and_reparse_events() {
     let conversion_boundary = include_str!("../src/pocket_conversion.rs");
     for forbidden in [
