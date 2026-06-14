@@ -25,6 +25,30 @@ pub type PocketStore = Store;
 pub type PocketExtraRecord = (Vec<u8>, Vec<u8>);
 pub type PocketExtraRecords = Vec<PocketExtraRecord>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PocketScreenedEvents {
+    events: Vec<PocketOwnedEvent>,
+    redacted: bool,
+}
+
+impl PocketScreenedEvents {
+    pub fn new(events: Vec<PocketOwnedEvent>, redacted: bool) -> Self {
+        Self { events, redacted }
+    }
+
+    pub fn events(&self) -> &[PocketOwnedEvent] {
+        &self.events
+    }
+
+    pub fn redacted(&self) -> bool {
+        self.redacted
+    }
+
+    pub fn into_events(self) -> Vec<PocketOwnedEvent> {
+        self.events
+    }
+}
+
 pub const TANGLE_GROUP_PROJECTION_TABLE: &str = "group_projection";
 pub const TANGLE_GROUP_OUTBOX_TABLE: &str = "group_outbox";
 pub const TANGLE_GROUP_CHECKPOINT_TABLE: &str = "group_checkpoint";
@@ -94,15 +118,46 @@ impl PocketStoreHandle {
             .map_err(PocketStoreError::from_pocket)
     }
 
+    pub fn event_by_offset(&self, offset: u64) -> Result<PocketOwnedEvent, PocketStoreError> {
+        self.store
+            .get_event_by_offset(offset)
+            .map(PocketEvent::to_owned)
+            .map_err(PocketStoreError::from_pocket)
+    }
+
     pub fn find_events(
         &self,
         filter: &PocketFilter,
     ) -> Result<Vec<PocketOwnedEvent>, PocketStoreError> {
-        let (events, _) = self
+        self.find_events_with_screen(filter, true, 0, u64::MAX, |_| PocketScreenResult::Match)
+            .map(PocketScreenedEvents::into_events)
+    }
+
+    pub fn find_events_with_screen<F>(
+        &self,
+        filter: &PocketFilter,
+        allow_scraping: bool,
+        allow_scrape_if_limited_to: u32,
+        allow_scrape_if_max_seconds: u64,
+        screen: F,
+    ) -> Result<PocketScreenedEvents, PocketStoreError>
+    where
+        F: Fn(&PocketEvent) -> PocketScreenResult,
+    {
+        let (events, redacted) = self
             .store
-            .find_events(filter, true, 0, u64::MAX, |_| PocketScreenResult::Match)
+            .find_events(
+                filter,
+                allow_scraping,
+                allow_scrape_if_limited_to,
+                allow_scrape_if_max_seconds,
+                screen,
+            )
             .map_err(PocketStoreError::from_pocket)?;
-        Ok(events.into_iter().map(PocketEvent::to_owned).collect())
+        Ok(PocketScreenedEvents::new(
+            events.into_iter().map(PocketEvent::to_owned).collect(),
+            redacted,
+        ))
     }
 
     pub fn count_events(&self, filter: &PocketFilter) -> Result<u64, PocketStoreError> {
@@ -379,6 +434,7 @@ mod tests {
         TANGLE_GROUP_OUTBOX_TABLE, TANGLE_GROUP_PROJECTION_TABLE, TANGLE_POCKET_EXTRA_TABLES,
         parse_pocket_event_json, parse_pocket_filter_json,
     };
+    use pocket_db::ScreenResult;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -435,17 +491,56 @@ mod tests {
         let event = parse_pocket_event_json(event_json().as_bytes()).expect("event");
         let filter = parse_pocket_filter_json(filter_json().as_bytes()).expect("filter");
 
-        let _offset = handle.store_event(&event).expect("store");
+        let offset = handle.store_event(&event).expect("store");
         let stored = handle
             .event_by_id(event.id())
             .expect("lookup")
             .expect("event");
+        let offset_event = handle.event_by_offset(offset).expect("offset lookup");
         let found = handle.find_events(&filter).expect("find");
 
         assert_eq!(stored.id(), event.id());
+        assert_eq!(offset_event.id(), event.id());
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id(), event.id());
         assert_eq!(handle.count_events(&filter).expect("count"), 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pocket_store_handle_screens_events_before_materialization() {
+        let root = temp_root("tangle-pocket-screen");
+        let config = PocketStoreConfig::new(
+            root.join("pocket"),
+            1024 * 1024 * 1024,
+            128,
+            PocketSyncPolicy::FlushOnShutdown,
+        )
+        .expect("config");
+        let handle = PocketStoreHandle::open(&config).expect("open");
+        let visible = parse_pocket_event_json(event_json_with("a", "1", "visible").as_bytes())
+            .expect("visible");
+        let redacted = parse_pocket_event_json(event_json_with("c", "2", "redacted").as_bytes())
+            .expect("redacted");
+        let filter = parse_pocket_filter_json(kind_filter_json().as_bytes()).expect("filter");
+
+        handle.store_event(&visible).expect("store visible");
+        handle.store_event(&redacted).expect("store redacted");
+
+        let screened = handle
+            .find_events_with_screen(&filter, true, 0, u64::MAX, |event| {
+                if event.id() == visible.id() {
+                    ScreenResult::Match
+                } else {
+                    ScreenResult::Redacted
+                }
+            })
+            .expect("screened");
+
+        assert!(screened.redacted());
+        assert_eq!(screened.events().len(), 1);
+        assert_eq!(screened.events()[0].id(), visible.id());
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -572,6 +667,10 @@ mod tests {
     }
 
     fn event_json() -> String {
+        event_json_with("a", "1", "hello")
+    }
+
+    fn event_json_with(id_hex: &str, pubkey_hex: &str, content: &str) -> String {
         format!(
             r#"{{
                 "id":"{}",
@@ -579,11 +678,12 @@ mod tests {
                 "created_at":1714124433,
                 "kind":1,
                 "tags":[["t","radroots"]],
-                "content":"hello",
+                "content":"{}",
                 "sig":"{}"
             }}"#,
-            "a".repeat(64),
-            "1".repeat(64),
+            id_hex.repeat(64),
+            pubkey_hex.repeat(64),
+            content,
             "b".repeat(128)
         )
     }
@@ -591,6 +691,10 @@ mod tests {
     fn filter_json() -> String {
         r#"{"ids":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"limit":10}"#
             .to_owned()
+    }
+
+    fn kind_filter_json() -> String {
+        r#"{"kinds":[1],"limit":10}"#.to_owned()
     }
 
     fn temp_root(prefix: &str) -> std::path::PathBuf {

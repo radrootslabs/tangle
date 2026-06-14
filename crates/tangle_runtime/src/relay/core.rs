@@ -8,14 +8,14 @@ use crate::relay::{
     auth::BaseAuthState,
     live::{CloseResult, LiveSubscriptionSet},
 };
-use std::collections::BTreeSet;
+use std::{cell::RefCell, collections::BTreeSet};
 use tangle_crypto::verify_event_signature;
 use tangle_groups::{
     GroupAuthContext, GroupEventClass, GroupProjection, GroupRuntimeConfig, StoreOffset,
     validate_client_group_event_structure,
 };
 use tangle_protocol::{ClientMessage, Event, Filter, RelayMessage, SubscriptionId, UnixTimestamp};
-use tangle_store_pocket::{PocketStoreConfig, PocketStoreHandle};
+use tangle_store_pocket::{PocketScreenResult, PocketStoreConfig, PocketStoreHandle};
 
 pub struct BaseRelay {
     store: PocketStoreHandle,
@@ -114,6 +114,38 @@ impl BaseRelay {
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
         self.query_req_with_group_auth(
             subscription_id,
+            filters,
+            &GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned()),
+        )
+    }
+
+    fn event_by_offset(&self, offset: StoreOffset) -> Result<Event, BaseRelayError> {
+        let event = self.store.event_by_offset(offset.as_u64())?;
+        pocket_event_to_tangle(&event)
+    }
+
+    pub fn event_by_offset_with_auth(
+        &self,
+        offset: StoreOffset,
+        auth: &BaseAuthState,
+    ) -> Result<Option<Event>, BaseRelayError> {
+        let event = self.event_by_offset(offset)?;
+        if self.event_visible_to_auth(
+            &event,
+            &GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned()),
+        )? {
+            Ok(Some(event))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn query_events_with_auth(
+        &self,
+        filters: &[Filter],
+        auth: &BaseAuthState,
+    ) -> Result<Vec<Event>, BaseRelayError> {
+        self.query_events(
             filters,
             &GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned()),
         )
@@ -349,9 +381,34 @@ impl BaseRelay {
         let mut output = Vec::new();
         for filter in filters {
             let pocket_filter = tangle_filter_to_pocket(filter)?;
-            for pocket_event in self.store.find_events(&pocket_filter)? {
+            let screen_error = RefCell::new(None);
+            let screened = self.store.find_events_with_screen(
+                &pocket_filter,
+                true,
+                0,
+                u64::MAX,
+                |pocket_event| {
+                    if screen_error.borrow().is_some() {
+                        return PocketScreenResult::Mismatch;
+                    }
+                    match pocket_event_to_tangle(pocket_event)
+                        .and_then(|event| self.event_visible_to_auth(&event, auth))
+                    {
+                        Ok(true) => PocketScreenResult::Match,
+                        Ok(false) => PocketScreenResult::Redacted,
+                        Err(error) => {
+                            *screen_error.borrow_mut() = Some(error);
+                            PocketScreenResult::Mismatch
+                        }
+                    }
+                },
+            )?;
+            if let Some(error) = screen_error.into_inner() {
+                return Err(error);
+            }
+            for pocket_event in screened.into_events() {
                 let event = pocket_event_to_tangle(&pocket_event)?;
-                if seen.insert(event.id().clone()) && self.event_visible_to_auth(&event, auth)? {
+                if seen.insert(event.id().clone()) {
                     output.push(event);
                 }
             }
@@ -375,6 +432,7 @@ impl BaseRelay {
 #[cfg(test)]
 mod tests {
     use super::BaseRelay;
+    use crate::pocket_conversion::tangle_event_to_pocket;
     use crate::relay::auth::BaseAuthState;
     use crate::relay::live::CloseResult;
     use tangle_crypto::RelaySigner;
@@ -382,7 +440,8 @@ mod tests {
         GroupId, KIND_GROUP_ADMINS, KIND_GROUP_CREATE_GROUP, KIND_GROUP_CREATE_INVITE,
         KIND_GROUP_DELETE_EVENT, KIND_GROUP_DELETE_GROUP, KIND_GROUP_EDIT_METADATA,
         KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA,
-        KIND_GROUP_PUT_USER, KIND_GROUP_REMOVE_USER, MemberStatus, parse_group_runtime_config_json,
+        KIND_GROUP_PUT_USER, KIND_GROUP_REMOVE_USER, MemberStatus, StoreOffset,
+        parse_group_runtime_config_json,
     };
     use tangle_protocol::{
         ClientMessage, Event, EventId, Filter, Kind, PublicKeyHex, RelayMessage, SubscriptionId,
@@ -437,6 +496,16 @@ mod tests {
         assert_eq!(relay.handle_close(&subscription_id), CloseResult::Closed);
         assert_eq!(relay.active_subscription_count(), 0);
         assert!(relay.fanout(&event).is_empty());
+    }
+
+    #[test]
+    fn base_relay_fetches_events_by_store_offset() {
+        let relay = test_relay("base-relay-offset-lookup", 4);
+        let event = signed_public_event(7, 1, Vec::new(), "offset");
+        let pocket = tangle_event_to_pocket(&event).expect("pocket");
+        let offset = StoreOffset::new(relay.store.store_event(&pocket).expect("store"));
+
+        assert_eq!(relay.event_by_offset(offset).expect("offset"), event);
     }
 
     #[test]
@@ -1074,6 +1143,42 @@ mod tests {
         assert_eq!(count_kind_with_auth(&relay, 1, &auth), 1);
         assert_eq!(count_kind(&relay, KIND_GROUP_METADATA), 0);
         assert_eq!(count_kind_with_auth(&relay, KIND_GROUP_METADATA, &auth), 1);
+    }
+
+    #[test]
+    fn private_group_offset_lookup_uses_reader_auth() {
+        let owner = signer(7).public_key().clone();
+        let owner_auth = authenticated_state(7);
+        let unauth = BaseAuthState::new("wss://relay.radroots.test", 60, 600).expect("auth state");
+        let mut relay = test_relay_with_groups(
+            "base-relay-private-offset-read",
+            4,
+            &enabled_groups_for_owner(&owner),
+        );
+        relay
+            .handle_event_with_auth(signed_private_group_create_event(7, "Farm"), &owner_auth)
+            .expect("create");
+        let private_event = signed_event_at(
+            7,
+            1,
+            vec![Tag::from_parts("h", &["Farm"]).expect("h")],
+            "private harvest",
+            1_714_124_435,
+        );
+        let pocket = tangle_event_to_pocket(&private_event).expect("pocket");
+        let offset = StoreOffset::new(relay.store.store_event(&pocket).expect("store"));
+
+        assert_eq!(
+            relay
+                .event_by_offset_with_auth(offset, &unauth)
+                .expect("unauth offset"),
+            None
+        );
+        let visible = relay
+            .event_by_offset_with_auth(offset, &owner_auth)
+            .expect("owner offset")
+            .expect("visible");
+        assert_eq!(visible.id(), private_event.id());
     }
 
     #[test]

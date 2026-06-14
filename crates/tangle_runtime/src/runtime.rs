@@ -18,7 +18,8 @@ use std::{
     },
     time::Instant,
 };
-use tangle_protocol::{ClientMessage, Filter, RelayMessage, SubscriptionId, UnixTimestamp};
+use tangle_groups::StoreOffset;
+use tangle_protocol::{ClientMessage, Event, Filter, RelayMessage, SubscriptionId, UnixTimestamp};
 use tokio::sync::{Mutex, watch};
 
 pub struct TangleRuntime {
@@ -129,6 +130,18 @@ impl TangleRuntimeHandle {
             .await
             .relay()
             .query_req_with_auth(subscription_id, filters, auth)
+    }
+
+    pub async fn event_by_offset_with_auth(
+        &self,
+        offset: StoreOffset,
+        auth: &BaseAuthState,
+    ) -> Result<Option<Event>, BaseRelayError> {
+        self.inner
+            .lock()
+            .await
+            .relay()
+            .event_by_offset_with_auth(offset, auth)
     }
 
     pub async fn shutdown(&self) -> Result<BaseRelayShutdownReport, BaseRelayError> {
