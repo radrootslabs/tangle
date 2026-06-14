@@ -4,7 +4,7 @@ use crate::{
     errors::BaseRelayError,
     nip11::{BaseRelayInfoConfig, BaseRelayInfoDocument, base_relay_info_response},
     ops::{BaseRelayReadinessState, base_relay_ops_router},
-    runtime::TangleRuntime,
+    runtime::{TangleRuntime, TangleShutdownSignal},
     session::TangleWebSocketSession,
 };
 use axum::{
@@ -65,6 +65,7 @@ pub async fn serve_listener_until_shutdown(
         runtime.readiness_state().clone(),
         info,
         runtime.limits().outbound_queue_capacity(),
+        runtime.shutdown_signal().clone(),
     );
     let mut shutdown = runtime.shutdown_signal().subscribe();
     axum::serve(listener, router)
@@ -91,12 +92,14 @@ pub fn tangle_http_router(
     readiness: BaseRelayReadinessState,
     info: BaseRelayInfoDocument,
     outbound_queue_capacity: usize,
+    shutdown: TangleShutdownSignal,
 ) -> Router {
     Router::new()
         .route("/", get(tangle_root))
         .with_state(TangleHttpState {
             info,
             outbound_queue_capacity,
+            shutdown,
         })
         .merge(base_relay_ops_router(readiness))
 }
@@ -105,6 +108,7 @@ pub fn tangle_http_router(
 struct TangleHttpState {
     info: BaseRelayInfoDocument,
     outbound_queue_capacity: usize,
+    shutdown: TangleShutdownSignal,
 }
 
 async fn tangle_root(
@@ -113,7 +117,10 @@ async fn tangle_root(
     headers: HeaderMap,
 ) -> Response {
     match websocket {
-        Ok(websocket) => match TangleWebSocketSession::new(state.outbound_queue_capacity) {
+        Ok(websocket) => match TangleWebSocketSession::new(
+            state.outbound_queue_capacity,
+            state.shutdown.subscribe(),
+        ) {
             Ok(session) => websocket
                 .protocols(["nostr"])
                 .on_upgrade(move |socket| session.run(socket))
@@ -135,7 +142,7 @@ mod tests {
         config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
         nip11::BaseRelayInfoConfig,
         ops::BaseRelayReadinessState,
-        runtime::TangleRuntime,
+        runtime::{TangleRuntime, TangleShutdownSignal},
     };
     use axum::body::to_bytes;
     use http::{Request, header};
@@ -208,7 +215,12 @@ mod tests {
             .expect("info config")
             .build_document()
             .expect("info");
-        let router = tangle_http_router(BaseRelayReadinessState::ready(), info, 8);
+        let router = tangle_http_router(
+            BaseRelayReadinessState::ready(),
+            info,
+            8,
+            TangleShutdownSignal::new(),
+        );
         let nip11 = router
             .clone()
             .oneshot(

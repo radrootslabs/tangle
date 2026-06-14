@@ -3,17 +3,21 @@
 use crate::errors::BaseRelayError;
 use axum::extract::ws::{Message, WebSocket};
 use std::time::Instant;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 #[derive(Debug)]
 pub struct TangleWebSocketSession {
     connected_at: Instant,
     outbound: TangleOutboundSender,
     outbound_receiver: mpsc::Receiver<Message>,
+    shutdown: watch::Receiver<bool>,
 }
 
 impl TangleWebSocketSession {
-    pub fn new(outbound_queue_capacity: usize) -> Result<Self, BaseRelayError> {
+    pub fn new(
+        outbound_queue_capacity: usize,
+        shutdown: watch::Receiver<bool>,
+    ) -> Result<Self, BaseRelayError> {
         if outbound_queue_capacity == 0 {
             return Err(BaseRelayError::invalid(
                 "runtime outbound queue capacity must be greater than zero",
@@ -27,6 +31,7 @@ impl TangleWebSocketSession {
                 capacity: outbound_queue_capacity,
             },
             outbound_receiver: receiver,
+            shutdown,
         })
     }
 
@@ -40,6 +45,9 @@ impl TangleWebSocketSession {
 
     pub async fn run(mut self, mut socket: WebSocket) {
         loop {
+            if *self.shutdown.borrow() {
+                break;
+            }
             tokio::select! {
                 incoming = socket.recv() => {
                     match incoming {
@@ -52,6 +60,11 @@ impl TangleWebSocketSession {
                         break;
                     };
                     if socket.send(message).await.is_err() {
+                        break;
+                    }
+                }
+                changed = self.shutdown.changed() => {
+                    if changed.is_err() || *self.shutdown.borrow() {
                         break;
                     }
                 }
@@ -94,24 +107,28 @@ impl From<mpsc::error::TrySendError<Message>> for TangleOutboundQueueError {
 #[cfg(test)]
 mod tests {
     use super::{TangleOutboundQueueError, TangleWebSocketSession};
+    use crate::runtime::TangleShutdownSignal;
     use axum::extract::ws::Message;
 
     #[test]
     fn websocket_session_records_connection_time() {
         let before = std::time::Instant::now();
-        let session = TangleWebSocketSession::new(8).expect("session");
+        let shutdown = TangleShutdownSignal::new();
+        let session = TangleWebSocketSession::new(8, shutdown.subscribe()).expect("session");
 
         assert!(session.connected_at() >= before);
     }
 
     #[test]
     fn websocket_session_rejects_zero_outbound_capacity() {
-        assert!(TangleWebSocketSession::new(0).is_err());
+        let shutdown = TangleShutdownSignal::new();
+        assert!(TangleWebSocketSession::new(0, shutdown.subscribe()).is_err());
     }
 
     #[test]
     fn outbound_queue_is_bounded() {
-        let session = TangleWebSocketSession::new(1).expect("session");
+        let shutdown = TangleShutdownSignal::new();
+        let session = TangleWebSocketSession::new(1, shutdown.subscribe()).expect("session");
         let outbound = session.outbound();
 
         assert_eq!(outbound.capacity(), 1);
