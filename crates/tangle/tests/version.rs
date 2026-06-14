@@ -187,6 +187,7 @@ fn tangle_run_starts_server_and_stays_alive_until_shutdown() {
 
     assert_eq!(health_value["status"], "ok");
     assert_eq!(ready_value["status"], "ready");
+    assert_eq!(ready_value["checks"]["server_bind"], "ready");
     assert_eq!(ready_value["checks"]["pocket_storage"], "ready");
     assert_eq!(nip11_value["name"], "tangle");
     assert_eq!(nip11_value["limitation"]["max_message_length"], 1_048_576);

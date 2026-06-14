@@ -27,6 +27,7 @@ impl BaseRelayReadinessCheckStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaseRelayReadinessState {
     config: BaseRelayReadinessCheckStatus,
+    server_bind: BaseRelayReadinessCheckStatus,
     relay_identity: BaseRelayReadinessCheckStatus,
     pocket_storage: BaseRelayReadinessCheckStatus,
     group_projection: BaseRelayReadinessCheckStatus,
@@ -36,6 +37,7 @@ pub struct BaseRelayReadinessState {
 impl BaseRelayReadinessState {
     pub fn new(
         config: BaseRelayReadinessCheckStatus,
+        server_bind: BaseRelayReadinessCheckStatus,
         relay_identity: BaseRelayReadinessCheckStatus,
         pocket_storage: BaseRelayReadinessCheckStatus,
         group_projection: BaseRelayReadinessCheckStatus,
@@ -43,6 +45,7 @@ impl BaseRelayReadinessState {
     ) -> Self {
         Self {
             config,
+            server_bind,
             relay_identity,
             pocket_storage,
             group_projection,
@@ -57,12 +60,30 @@ impl BaseRelayReadinessState {
             BaseRelayReadinessCheckStatus::Ready,
             BaseRelayReadinessCheckStatus::Ready,
             BaseRelayReadinessCheckStatus::Ready,
+            BaseRelayReadinessCheckStatus::Ready,
         )
+    }
+
+    pub fn runtime_ready_before_bind() -> Self {
+        Self::new(
+            BaseRelayReadinessCheckStatus::Ready,
+            BaseRelayReadinessCheckStatus::NotReady,
+            BaseRelayReadinessCheckStatus::Ready,
+            BaseRelayReadinessCheckStatus::Ready,
+            BaseRelayReadinessCheckStatus::Ready,
+            BaseRelayReadinessCheckStatus::Ready,
+        )
+    }
+
+    pub fn with_server_bind(mut self, server_bind: BaseRelayReadinessCheckStatus) -> Self {
+        self.server_bind = server_bind;
+        self
     }
 
     pub fn is_ready(&self) -> bool {
         [
             self.config,
+            self.server_bind,
             self.relay_identity,
             self.pocket_storage,
             self.group_projection,
@@ -81,6 +102,7 @@ impl BaseRelayReadinessState {
             },
             checks: BaseRelayReadinessChecksDocument {
                 config: self.config.as_str().to_owned(),
+                server_bind: self.server_bind.as_str().to_owned(),
                 relay_identity: self.relay_identity.as_str().to_owned(),
                 pocket_storage: self.pocket_storage.as_str().to_owned(),
                 group_projection: self.group_projection.as_str().to_owned(),
@@ -104,6 +126,7 @@ pub struct BaseRelayReadinessDocument {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BaseRelayReadinessChecksDocument {
     pub config: String,
+    pub server_bind: String,
     pub relay_identity: String,
     pub pocket_storage: String,
     pub group_projection: String,
@@ -195,6 +218,7 @@ mod tests {
         let ready_body = to_bytes(ready.into_body(), usize::MAX).await.expect("body");
         let ready_value = serde_json::from_slice::<serde_json::Value>(&ready_body).expect("json");
         assert_eq!(ready_value["status"], "ready");
+        assert_eq!(ready_value["checks"]["server_bind"], "ready");
         assert_eq!(ready_value["checks"]["group_outbox_replay"], "ready");
         let metrics_response = base_relay_ops_router(BaseRelayReadinessState::ready(), metrics)
             .oneshot(
@@ -222,6 +246,7 @@ mod tests {
             BaseRelayReadinessCheckStatus::Ready,
             BaseRelayReadinessCheckStatus::Ready,
             BaseRelayReadinessCheckStatus::Ready,
+            BaseRelayReadinessCheckStatus::Ready,
             BaseRelayReadinessCheckStatus::NotReady,
             BaseRelayReadinessCheckStatus::Ready,
         );
@@ -242,6 +267,7 @@ mod tests {
         let rejected_value =
             serde_json::from_slice::<serde_json::Value>(&rejected_body).expect("json");
         assert_eq!(rejected_value["status"], "not_ready");
+        assert_eq!(rejected_value["checks"]["server_bind"], "ready");
         assert_eq!(rejected_value["checks"]["group_projection"], "not_ready");
     }
 }

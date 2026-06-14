@@ -4,7 +4,7 @@ use crate::{
     errors::BaseRelayError,
     logging,
     nip11::{BaseRelayInfoConfig, BaseRelayInfoDocument, base_relay_info_response},
-    ops::{BaseRelayReadinessState, base_relay_ops_router},
+    ops::{BaseRelayReadinessCheckStatus, BaseRelayReadinessState, base_relay_ops_router},
     runtime::{
         TangleRuntime, TangleRuntimeHandle, TangleRuntimeLimits, TangleRuntimeMetrics,
         TangleShutdownSignal,
@@ -65,7 +65,10 @@ pub async fn serve_listener_until_shutdown(
         .map_err(|error| BaseRelayError::error(error.to_string()))?;
     let relay_url = runtime.config().relay_url().to_owned();
     let info = BaseRelayInfoConfig::new("tangle", runtime.config())?.build_document()?;
-    let readiness = runtime.readiness_state().clone();
+    let readiness = runtime
+        .readiness_state()
+        .clone()
+        .with_server_bind(BaseRelayReadinessCheckStatus::Ready);
     let limits = runtime.limits();
     let metrics = runtime.metrics().clone();
     let shutdown_signal = runtime.shutdown_signal().clone();
@@ -487,6 +490,9 @@ mod tests {
         assert_eq!(root_without_accept.status(), http::StatusCode::NOT_FOUND);
         assert_eq!(health.status(), http::StatusCode::OK);
         assert_eq!(ready.status(), http::StatusCode::OK);
+        let ready_body = to_bytes(ready.into_body(), usize::MAX).await.expect("body");
+        let ready_value = serde_json::from_slice::<serde_json::Value>(&ready_body).expect("json");
+        assert_eq!(ready_value["checks"]["server_bind"], "ready");
         assert_eq!(metrics.status(), http::StatusCode::OK);
         let metrics_body = to_bytes(metrics.into_body(), usize::MAX)
             .await

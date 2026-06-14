@@ -1095,7 +1095,19 @@ mod tests {
         assert_eq!(runtime.metrics().active_sessions(), 0);
         assert_eq!(runtime.metrics().stored_event_offsets(), 0);
         assert!(runtime.relay().groups_enabled());
-        assert!(runtime.readiness_state().is_ready());
+        assert!(!runtime.readiness_state().is_ready());
+        assert_eq!(
+            runtime.readiness_state().response().checks.server_bind,
+            "not_ready"
+        );
+        assert_eq!(
+            runtime
+                .readiness_state()
+                .response()
+                .checks
+                .group_outbox_replay,
+            "ready"
+        );
         assert!(!*shutdown.borrow());
 
         assert_eq!(runtime.event_bus().publish(StoreOffset::new(42)), 1);

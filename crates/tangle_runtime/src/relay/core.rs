@@ -361,7 +361,7 @@ impl BaseRelay {
         let groups = GroupService::from_config(&store, groups)?;
         let subscriptions =
             LiveSubscriptionSet::new(limits.max_pending_events(), limits.max_subscriptions())?;
-        let readiness = BaseRelayReadinessState::ready();
+        let readiness = BaseRelayReadinessState::runtime_ready_before_bind();
         Ok(Self {
             store,
             subscriptions,
