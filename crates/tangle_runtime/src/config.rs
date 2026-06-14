@@ -616,7 +616,7 @@ mod tests {
     #[test]
     fn base_relay_runtime_config_parses_v2_production_example() {
         let config = parse_base_relay_runtime_config_json(include_str!(
-            "../../../ops/production/tangle-v2.example.json"
+            "../../../config/tangle.example.json"
         ))
         .expect("config");
 
@@ -933,7 +933,7 @@ mod tests {
 
     #[test]
     fn base_relay_runtime_config_requires_explicit_query_complexity() {
-        let raw = include_str!("../../../ops/production/tangle-v2.example.json")
+        let raw = include_str!("../../../config/tangle.example.json")
             .replace("    \"max_query_complexity\": 2048,\n", "");
         assert!(
             parse_base_relay_runtime_config_json(&raw)
@@ -945,7 +945,7 @@ mod tests {
 
     #[test]
     fn base_relay_runtime_config_requires_ip_scoped_rate_limits() {
-        let raw = include_str!("../../../ops/production/tangle-v2.example.json").replace(
+        let raw = include_str!("../../../config/tangle.example.json").replace(
             "      \"per_ip\": {\n        \"window_seconds\": 60,\n        \"max_hits\": 120\n      },\n",
             "",
         );
@@ -956,7 +956,7 @@ mod tests {
                 .contains("missing field `per_ip`")
         );
 
-        let raw = include_str!("../../../ops/production/tangle-v2.example.json").replace(
+        let raw = include_str!("../../../config/tangle.example.json").replace(
             "      \"failures\": {\n        \"window_seconds\": 300,\n        \"max_hits\": 5\n      },\n      \"failures_per_ip\": {\n        \"window_seconds\": 300,\n        \"max_hits\": 20\n      }\n",
             "      \"failures\": {\n        \"window_seconds\": 300,\n        \"max_hits\": 5\n      }\n",
         );
@@ -967,7 +967,7 @@ mod tests {
                 .contains("missing field `failures_per_ip`")
         );
 
-        let raw = include_str!("../../../ops/production/tangle-v2.example.json").replace(
+        let raw = include_str!("../../../config/tangle.example.json").replace(
             "      \"per_ip\": {\n        \"window_seconds\": 60,\n        \"max_hits\": 600\n      },\n",
             "",
         );
@@ -978,7 +978,7 @@ mod tests {
                 .contains("missing field `per_ip`")
         );
 
-        let raw = include_str!("../../../ops/production/tangle-v2.example.json").replace(
+        let raw = include_str!("../../../config/tangle.example.json").replace(
             "      \"write_per_ip\": {\n        \"window_seconds\": 60,\n        \"max_hits\": 300\n      },\n",
             "",
         );
@@ -989,7 +989,7 @@ mod tests {
                 .contains("missing field `write_per_ip`")
         );
 
-        let raw = include_str!("../../../ops/production/tangle-v2.example.json").replace(
+        let raw = include_str!("../../../config/tangle.example.json").replace(
             "      \"join_flow\": {\n        \"window_seconds\": 300,\n        \"max_hits\": 10\n      },\n      \"join_flow_per_ip\": {\n        \"window_seconds\": 300,\n        \"max_hits\": 30\n      }\n",
             "      \"join_flow\": {\n        \"window_seconds\": 300,\n        \"max_hits\": 10\n      }\n",
         );

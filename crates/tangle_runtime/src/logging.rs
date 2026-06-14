@@ -419,7 +419,7 @@ mod tests {
 
     #[test]
     fn runtime_log_summary_never_contains_relay_secret() {
-        let raw = include_str!("../../../ops/production/tangle-v2.example.json");
+        let raw = include_str!("../../../config/tangle.example.json");
         let config = parse_base_relay_runtime_config_json(raw).expect("config");
         let secret = "7".repeat(64);
         let summary = TangleRuntimeLogSummary::from_config(&config);
@@ -434,7 +434,7 @@ mod tests {
 
     #[test]
     fn structured_runtime_config_log_redacts_relay_secret() {
-        let raw = include_str!("../../../ops/production/tangle-v2.example.json");
+        let raw = include_str!("../../../config/tangle.example.json");
         let config = parse_base_relay_runtime_config_json(raw).expect("config");
         let secret = "7".repeat(64);
         let writer = CapturedWriter::default();

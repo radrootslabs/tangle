@@ -193,11 +193,11 @@ mod tests {
             TangleInvocation::new(TangleCommand::Version, None)
         );
         assert_eq!(
-            parse_tangle_invocation(["run", "--config", "ops/production/tangle-v2.example.json"])
+            parse_tangle_invocation(["run", "--config", "config/tangle.example.json"])
                 .expect("run"),
             TangleInvocation::new(
                 TangleCommand::Run,
-                Some("ops/production/tangle-v2.example.json".to_owned())
+                Some("config/tangle.example.json".to_owned())
             )
         );
     }
