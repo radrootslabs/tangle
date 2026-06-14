@@ -412,6 +412,19 @@ impl BaseRelayLimits {
 }
 
 impl BaseRelay {
+    pub(crate) fn unsupported_search_closed(
+        subscription_id: &SubscriptionId,
+        filters: &[Filter],
+    ) -> Option<RelayMessage> {
+        filters
+            .iter()
+            .any(|filter| filter.search().is_some())
+            .then(|| RelayMessage::Closed {
+                subscription_id: subscription_id.clone(),
+                message: "unsupported: search filters are not supported".to_owned(),
+            })
+    }
+
     pub fn open(
         config: &PocketStoreConfig,
         limits: BaseRelayLimits,
@@ -770,6 +783,9 @@ impl BaseRelay {
     ) -> Result<BaseRelayQueryReport, BaseRelayError> {
         self.limits.validate_subscription_id(&subscription_id)?;
         self.limits.validate_filters(&filters)?;
+        if let Some(message) = Self::unsupported_search_closed(&subscription_id, &filters) {
+            return Ok(BaseRelayQueryReport::new(vec![message], false));
+        }
         self.subscriptions
             .subscribe(subscription_id.clone(), filters.clone(), auth.clone())?;
         self.query_req_with_group_auth_report(subscription_id, filters, auth)
@@ -783,6 +799,9 @@ impl BaseRelay {
     ) -> Result<BaseRelayQueryReport, BaseRelayError> {
         self.limits.validate_subscription_id(&subscription_id)?;
         self.limits.validate_filters(&filters)?;
+        if let Some(message) = Self::unsupported_search_closed(&subscription_id, &filters) {
+            return Ok(BaseRelayQueryReport::new(vec![message], false));
+        }
         let report = self.query_events_report(&filters, auth)?;
         let group_read_denied = report.group_read_denied;
         let mut messages = report
@@ -850,6 +869,9 @@ impl BaseRelay {
     ) -> Result<BaseRelayCountReport, BaseRelayError> {
         self.limits.validate_subscription_id(&subscription_id)?;
         self.limits.validate_filters(&filters)?;
+        if let Some(message) = Self::unsupported_search_closed(&subscription_id, &filters) {
+            return Ok(BaseRelayCountReport::new(message, false));
+        }
         let report = self.count_events_report(&filters, auth)?;
         Ok(BaseRelayCountReport::new(
             RelayMessage::Count {
@@ -1141,6 +1163,38 @@ mod tests {
 
         assert!(
             matches!(&messages[0], RelayMessage::Event { event, .. } if event.id() == limited_event.id())
+        );
+    }
+
+    #[test]
+    fn base_relay_rejects_search_req_and_count_as_unsupported() {
+        let mut relay = test_relay("base-relay-search-unsupported", 4);
+        let req_id = SubscriptionId::new("search-req").expect("req");
+        let count_id = SubscriptionId::new("search-count").expect("count");
+        let search = filter_from_value(&serde_json::json!({
+            "search": "fresh carrots",
+            "limit": 1
+        }))
+        .expect("filter");
+
+        assert_eq!(
+            relay
+                .handle_req(req_id.clone(), vec![search.clone()])
+                .expect("req"),
+            vec![RelayMessage::Closed {
+                subscription_id: req_id,
+                message: "unsupported: search filters are not supported".to_owned()
+            }]
+        );
+        assert_eq!(relay.active_subscription_count(), 0);
+        assert_eq!(
+            relay
+                .handle_count(count_id.clone(), vec![search])
+                .expect("count"),
+            RelayMessage::Closed {
+                subscription_id: count_id,
+                message: "unsupported: search filters are not supported".to_owned()
+            }
         );
     }
 

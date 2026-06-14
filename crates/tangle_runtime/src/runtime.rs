@@ -597,6 +597,14 @@ impl TangleRuntimeHandle {
                     .limits()
                     .base_relay_limits()
                     .validate_filters(&filters)?;
+                if let Some(message) =
+                    BaseRelay::unsupported_search_closed(&subscription_id, &filters)
+                {
+                    runtime
+                        .metrics()
+                        .record_query_latency(elapsed_micros(started_at));
+                    return Ok(vec![message]);
+                }
                 if let Some(message) = runtime.rate_limit_req(
                     &subscription_id,
                     &filters,
@@ -635,6 +643,14 @@ impl TangleRuntimeHandle {
                     .limits()
                     .base_relay_limits()
                     .validate_filters(&filters)?;
+                if let Some(message) =
+                    BaseRelay::unsupported_search_closed(&subscription_id, &filters)
+                {
+                    runtime
+                        .metrics()
+                        .record_query_latency(elapsed_micros(started_at));
+                    return Ok(vec![message]);
+                }
                 if let Some(message) = runtime.rate_limit_count(
                     &subscription_id,
                     &filters,
@@ -2529,6 +2545,57 @@ mod tests {
             vec![RelayMessage::Closed {
                 subscription_id,
                 message: "rate-limited: count ip rate limit exceeded until 1714124493".to_owned()
+            }]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_rejects_search_req_and_count_as_unsupported() {
+        let root = temp_root("runtime-search-unsupported");
+        let _ = std::fs::remove_dir_all(&root);
+        let handle = TangleRuntimeHandle::new(
+            TangleRuntime::open(runtime_config(&root, 8)).expect("runtime"),
+        );
+        let mut auth = handle.auth_state().await.expect("auth");
+        let req_id = SubscriptionId::new("search-req").expect("req");
+        let count_id = SubscriptionId::new("search-count").expect("count");
+        let search =
+            filter_from_value(&json!({"search": "fresh carrots", "limit": 1})).expect("filter");
+
+        assert_eq!(
+            handle
+                .handle_client_message(
+                    ClientMessage::Req {
+                        subscription_id: req_id.clone(),
+                        filters: vec![search.clone()]
+                    },
+                    &mut auth,
+                    UnixTimestamp::new(1_714_124_433)
+                )
+                .await
+                .expect("req"),
+            vec![RelayMessage::Closed {
+                subscription_id: req_id,
+                message: "unsupported: search filters are not supported".to_owned()
+            }]
+        );
+        assert_eq!(
+            handle
+                .handle_client_message(
+                    ClientMessage::Count {
+                        subscription_id: count_id.clone(),
+                        filters: vec![search]
+                    },
+                    &mut auth,
+                    UnixTimestamp::new(1_714_124_434)
+                )
+                .await
+                .expect("count"),
+            vec![RelayMessage::Closed {
+                subscription_id: count_id,
+                message: "unsupported: search filters are not supported".to_owned()
             }]
         );
 

@@ -6,6 +6,7 @@ use crate::{
     logging,
     relay::{
         auth::{BaseAuthState, generate_auth_challenge},
+        core::BaseRelay,
         live::{CloseResult, LiveSubscriptionSet},
     },
     runtime::{
@@ -320,6 +321,9 @@ impl TangleWebSocketSession {
             .base_relay_limits()
             .validate_subscription_id(&subscription_id)?;
         self.limits.base_relay_limits().validate_filters(&filters)?;
+        if let Some(message) = BaseRelay::unsupported_search_closed(&subscription_id, &filters) {
+            return Ok(vec![message]);
+        }
         if let Some(message) = self
             .runtime
             .rate_limit_req(

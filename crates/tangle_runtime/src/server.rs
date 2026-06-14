@@ -359,6 +359,20 @@ mod tests {
             json!(["EOSE", "sub-a"])
         );
 
+        send_client_value(
+            &mut socket,
+            json!(["REQ", "sub-search", {"search": "fresh carrots", "limit": 1}]),
+        )
+        .await;
+        assert_eq!(
+            read_relay_value(&mut socket).await,
+            json!([
+                "CLOSED",
+                "sub-search",
+                "unsupported: search filters are not supported"
+            ])
+        );
+
         send_client_value(&mut socket, json!(["AUTH", event_to_value(&owner_auth)])).await;
         assert_eq!(
             read_relay_value(&mut socket).await,
