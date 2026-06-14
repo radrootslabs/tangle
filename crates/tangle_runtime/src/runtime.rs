@@ -6,8 +6,8 @@ use crate::{
     event_bus::{TangleEventBus, TangleEventReceiver},
     ops::BaseRelayReadinessState,
     rate_limits::{
-        TangleRateLimitDecision, TangleRateLimitKey, TangleRateLimitRule, TangleRateLimitScope,
-        TangleRateLimiter,
+        TangleQueryRateLimitConfig, TangleRateLimitDecision, TangleRateLimitKey,
+        TangleRateLimitQueryClass, TangleRateLimitRule, TangleRateLimitScope, TangleRateLimiter,
     },
     relay::{
         auth::BaseAuthState,
@@ -16,15 +16,21 @@ use crate::{
     },
 };
 use std::{
+    collections::BTreeSet,
     fmt,
+    net::IpAddr,
     sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Instant,
 };
-use tangle_groups::{KIND_GROUP_JOIN_REQUEST, StoreOffset, validate_client_group_event_structure};
-use tangle_protocol::{ClientMessage, Event, Filter, RelayMessage, SubscriptionId, UnixTimestamp};
+use tangle_groups::{
+    GroupId, KIND_GROUP_JOIN_REQUEST, StoreOffset, validate_client_group_event_structure,
+};
+use tangle_protocol::{
+    ClientMessage, Event, Filter, Kind, RelayMessage, SubscriptionId, UnixTimestamp,
+};
 use tokio::sync::{Mutex, watch};
 
 pub struct TangleRuntime {
@@ -36,6 +42,32 @@ pub struct TangleRuntime {
     rate_limiter: TangleRateLimiter,
     metrics: TangleRuntimeMetrics,
     shutdown: TangleShutdownSignal,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TangleQueryRateLimitContext {
+    peer_ip: Option<IpAddr>,
+    connection_id: Option<u64>,
+}
+
+impl TangleQueryRateLimitContext {
+    pub fn new(peer_ip: Option<IpAddr>, connection_id: Option<u64>) -> Self {
+        Self {
+            peer_ip,
+            connection_id,
+        }
+    }
+}
+
+struct TangleQueryRateLimitRequest<'a> {
+    scope: TangleRateLimitScope,
+    rules: TangleQueryRateLimitConfig,
+    label: &'static str,
+    subscription_id: &'a SubscriptionId,
+    filters: &'a [Filter],
+    auth: &'a BaseAuthState,
+    context: TangleQueryRateLimitContext,
+    now: UnixTimestamp,
 }
 
 impl TangleRuntime {
@@ -198,6 +230,143 @@ impl TangleRuntime {
         )
     }
 
+    fn rate_limit_req(
+        &self,
+        subscription_id: &SubscriptionId,
+        filters: &[Filter],
+        auth: &BaseAuthState,
+        context: TangleQueryRateLimitContext,
+        now: UnixTimestamp,
+    ) -> Option<RelayMessage> {
+        self.rate_limit_query(TangleQueryRateLimitRequest {
+            scope: TangleRateLimitScope::Req,
+            rules: self.config.rate_limits().req(),
+            label: "req",
+            subscription_id,
+            filters,
+            auth,
+            context,
+            now,
+        })
+    }
+
+    fn rate_limit_count(
+        &self,
+        subscription_id: &SubscriptionId,
+        filters: &[Filter],
+        auth: &BaseAuthState,
+        context: TangleQueryRateLimitContext,
+        now: UnixTimestamp,
+    ) -> Option<RelayMessage> {
+        self.rate_limit_query(TangleQueryRateLimitRequest {
+            scope: TangleRateLimitScope::Count,
+            rules: self.config.rate_limits().count(),
+            label: "count",
+            subscription_id,
+            filters,
+            auth,
+            context,
+            now,
+        })
+    }
+
+    fn rate_limit_query(&self, request: TangleQueryRateLimitRequest<'_>) -> Option<RelayMessage> {
+        if let Some(peer_ip) = request.context.peer_ip
+            && let Some(message) = self.rate_limit_closed(
+                request.subscription_id,
+                TangleRateLimitKey::ip(request.scope, peer_ip),
+                request.rules.per_ip(),
+                request.label,
+                "ip",
+                request.now,
+            )
+        {
+            return Some(message);
+        }
+        if let Some(connection_id) = request.context.connection_id
+            && let Some(message) = self.rate_limit_closed(
+                request.subscription_id,
+                TangleRateLimitKey::connection(request.scope, connection_id),
+                request.rules.per_connection(),
+                request.label,
+                "connection",
+                request.now,
+            )
+        {
+            return Some(message);
+        }
+        for pubkey in request.auth.authenticated_pubkeys() {
+            if let Some(message) = self.rate_limit_closed(
+                request.subscription_id,
+                TangleRateLimitKey::pubkey(request.scope, pubkey.clone()),
+                request.rules.per_pubkey(),
+                request.label,
+                "pubkey",
+                request.now,
+            ) {
+                return Some(message);
+            }
+        }
+        for group_id in filter_group_ids(request.filters) {
+            if let Some(message) = self.rate_limit_closed(
+                request.subscription_id,
+                TangleRateLimitKey::group(request.scope, group_id),
+                request.rules.per_group(),
+                request.label,
+                "group",
+                request.now,
+            ) {
+                return Some(message);
+            }
+        }
+        for kind in filter_kinds(request.filters) {
+            if let Some(message) = self.rate_limit_closed(
+                request.subscription_id,
+                TangleRateLimitKey::kind(request.scope, kind),
+                request.rules.per_kind(),
+                request.label,
+                "kind",
+                request.now,
+            ) {
+                return Some(message);
+            }
+        }
+        if query_is_broad(request.filters)
+            && let Some(message) = self.rate_limit_closed(
+                request.subscription_id,
+                TangleRateLimitKey::query_class(request.scope, TangleRateLimitQueryClass::Broad),
+                request.rules.broad(),
+                request.label,
+                "broad",
+                request.now,
+            )
+        {
+            return Some(message);
+        }
+        None
+    }
+
+    fn rate_limit_closed(
+        &self,
+        subscription_id: &SubscriptionId,
+        key: TangleRateLimitKey,
+        rule: TangleRateLimitRule,
+        label: &'static str,
+        dimension: &'static str,
+        now: UnixTimestamp,
+    ) -> Option<RelayMessage> {
+        match self.rate_limiter.record(key, rule, now) {
+            TangleRateLimitDecision::Allowed { .. } => None,
+            TangleRateLimitDecision::Rejected { reset_at } => Some(RelayMessage::Closed {
+                subscription_id: subscription_id.clone(),
+                message: BaseRelayError::rate_limited(format!(
+                    "{label} {dimension} rate limit exceeded until {reset_at}"
+                ))
+                .prefixed_message(),
+            }),
+        }
+    }
+
     fn rate_limit_ok(
         &self,
         event: &Event,
@@ -242,6 +411,22 @@ impl TangleRuntimeHandle {
         auth: &mut BaseAuthState,
         now: UnixTimestamp,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+        self.handle_client_message_with_query_context(
+            message,
+            auth,
+            TangleQueryRateLimitContext::default(),
+            now,
+        )
+        .await
+    }
+
+    pub async fn handle_client_message_with_query_context(
+        &self,
+        message: ClientMessage,
+        auth: &mut BaseAuthState,
+        query_context: TangleQueryRateLimitContext,
+        now: UnixTimestamp,
+    ) -> Result<Vec<RelayMessage>, BaseRelayError> {
         let mut runtime = self.inner.lock().await;
         match message {
             ClientMessage::Event(event) => {
@@ -259,6 +444,58 @@ impl TangleRuntimeHandle {
                     runtime.event_bus().publish(*offset);
                 }
                 Ok(vec![result.into_message()])
+            }
+            ClientMessage::Req {
+                subscription_id,
+                filters,
+            } => {
+                runtime
+                    .limits()
+                    .base_relay_limits()
+                    .validate_subscription_id(&subscription_id)?;
+                runtime
+                    .limits()
+                    .base_relay_limits()
+                    .validate_filters(&filters)?;
+                if let Some(message) =
+                    runtime.rate_limit_req(&subscription_id, &filters, auth, query_context, now)
+                {
+                    return Ok(vec![message]);
+                }
+                runtime.relay_mut().handle_client_message(
+                    ClientMessage::Req {
+                        subscription_id,
+                        filters,
+                    },
+                    auth,
+                    now,
+                )
+            }
+            ClientMessage::Count {
+                subscription_id,
+                filters,
+            } => {
+                runtime
+                    .limits()
+                    .base_relay_limits()
+                    .validate_subscription_id(&subscription_id)?;
+                runtime
+                    .limits()
+                    .base_relay_limits()
+                    .validate_filters(&filters)?;
+                if let Some(message) =
+                    runtime.rate_limit_count(&subscription_id, &filters, auth, query_context, now)
+                {
+                    return Ok(vec![message]);
+                }
+                runtime.relay_mut().handle_client_message(
+                    ClientMessage::Count {
+                        subscription_id,
+                        filters,
+                    },
+                    auth,
+                    now,
+                )
             }
             ClientMessage::Auth(event) => {
                 if let Err(error) = runtime.limits().base_relay_limits().validate_event(&event) {
@@ -296,6 +533,20 @@ impl TangleRuntimeHandle {
 
     pub async fn rate_limiter(&self) -> TangleRateLimiter {
         self.inner.lock().await.rate_limiter().clone()
+    }
+
+    pub async fn rate_limit_req(
+        &self,
+        subscription_id: &SubscriptionId,
+        filters: &[Filter],
+        auth: &BaseAuthState,
+        query_context: TangleQueryRateLimitContext,
+        now: UnixTimestamp,
+    ) -> Option<RelayMessage> {
+        self.inner
+            .lock()
+            .await
+            .rate_limit_req(subscription_id, filters, auth, query_context, now)
     }
 
     pub(crate) async fn query_req_with_auth(
@@ -349,6 +600,38 @@ fn auth_response_failed(replies: &[RelayMessage]) -> bool {
                 ..
             }
         )
+    })
+}
+
+fn filter_group_ids(filters: &[Filter]) -> Vec<GroupId> {
+    filters
+        .iter()
+        .flat_map(|filter| filter.tag_filters())
+        .filter(|(name, _)| matches!(name.as_str(), "h" | "d"))
+        .flat_map(|(_, values)| values)
+        .filter_map(|value| GroupId::new(value.as_str()).ok())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn filter_kinds(filters: &[Filter]) -> Vec<Kind> {
+    filters
+        .iter()
+        .flat_map(Filter::kinds)
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn query_is_broad(filters: &[Filter]) -> bool {
+    filters.iter().any(|filter| {
+        filter.ids().is_empty()
+            && filter.authors().is_empty()
+            && filter.kinds().is_empty()
+            && filter.tag_filters().is_empty()
+            && filter.search().is_none()
     })
 }
 
@@ -516,20 +799,25 @@ impl Default for TangleShutdownSignal {
 
 #[cfg(test)]
 mod tests {
-    use super::{TangleRuntime, TangleRuntimeHandle, TangleRuntimeLimits};
+    use super::{
+        TangleQueryRateLimitContext, TangleRuntime, TangleRuntimeHandle, TangleRuntimeLimits,
+    };
     use crate::config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json};
     use crate::event_bus::{TangleEventBus, TangleEventReceiveError};
-    use crate::rate_limits::{TangleRateLimitKey, TangleRateLimitScope};
+    use crate::rate_limits::{TangleRateLimitKey, TangleRateLimitQueryClass, TangleRateLimitScope};
     use crate::relay::core::{BaseRelayLimitSettings, BaseRelayLimits};
     use crate::relay::live::LiveSubscriptionSet;
     use serde_json::json;
-    use std::path::{Path, PathBuf};
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        path::{Path, PathBuf},
+    };
     use tangle_groups::{
         GroupAuthContext, GroupId, KIND_GROUP_ADMINS, KIND_GROUP_JOIN_REQUEST, KIND_GROUP_METADATA,
         StoreOffset,
     };
     use tangle_protocol::{
-        ClientMessage, RelayMessage, SubscriptionId, Tag, UnixTimestamp, filter_from_value,
+        ClientMessage, Kind, RelayMessage, SubscriptionId, Tag, UnixTimestamp, filter_from_value,
     };
     use tangle_test_support::{
         FixtureKey, tangle_v2_auth_event, tangle_v2_event, tangle_v2_group_create_event,
@@ -1004,6 +1292,265 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_rate_limits_req_authenticated_pubkeys() {
+        let root = temp_root("runtime-req-pubkey-rate-limit");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let rule = runtime.config().rate_limits().req().per_pubkey();
+        let handle = TangleRuntimeHandle::new(runtime);
+        let mut auth = handle.auth_state().await.expect("auth");
+        auth.issue_challenge("challenge-a", UnixTimestamp::new(100))
+            .expect("challenge");
+        let auth_event =
+            tangle_v2_auth_event(FixtureKey::Member, "challenge-a", 120).expect("auth event");
+
+        assert_eq!(
+            handle
+                .handle_client_message(
+                    ClientMessage::Auth(auth_event.clone()),
+                    &mut auth,
+                    UnixTimestamp::new(120)
+                )
+                .await
+                .expect("auth"),
+            vec![RelayMessage::Ok {
+                event_id: auth_event.id().clone(),
+                accepted: true,
+                message: String::new()
+            }]
+        );
+        let key =
+            TangleRateLimitKey::pubkey(TangleRateLimitScope::Req, FixtureKey::Member.public_key());
+        let limiter = handle.rate_limiter().await;
+        for _ in 0..rule.max_hits() {
+            limiter.record(key.clone(), rule, UnixTimestamp::new(120));
+        }
+        let subscription_id = SubscriptionId::new("limited-req-pubkey").expect("subscription");
+        let filters = vec![filter_from_value(&json!({"limit": 1})).expect("filter")];
+
+        assert_eq!(
+            handle
+                .handle_client_message(
+                    ClientMessage::Req {
+                        subscription_id: subscription_id.clone(),
+                        filters
+                    },
+                    &mut auth,
+                    UnixTimestamp::new(120)
+                )
+                .await
+                .expect("req"),
+            vec![RelayMessage::Closed {
+                subscription_id,
+                message: "rate-limited: req pubkey rate limit exceeded until 180".to_owned()
+            }]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_rate_limits_req_connections() {
+        let root = temp_root("runtime-req-connection-rate-limit");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let rule = runtime.config().rate_limits().req().per_connection();
+        let key = TangleRateLimitKey::connection(TangleRateLimitScope::Req, 77);
+        for _ in 0..rule.max_hits() {
+            runtime
+                .rate_limiter()
+                .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
+        }
+        let handle = TangleRuntimeHandle::new(runtime);
+        let mut auth = handle.auth_state().await.expect("auth");
+        let subscription_id = SubscriptionId::new("limited-req-connection").expect("subscription");
+        let filters = vec![filter_from_value(&json!({"kinds": [1], "limit": 1})).expect("filter")];
+
+        assert_eq!(
+            handle
+                .handle_client_message_with_query_context(
+                    ClientMessage::Req {
+                        subscription_id: subscription_id.clone(),
+                        filters
+                    },
+                    &mut auth,
+                    TangleQueryRateLimitContext::new(None, Some(77)),
+                    UnixTimestamp::new(1_714_124_433)
+                )
+                .await
+                .expect("req"),
+            vec![RelayMessage::Closed {
+                subscription_id,
+                message: "rate-limited: req connection rate limit exceeded until 1714124493"
+                    .to_owned()
+            }]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_rate_limits_req_filter_groups() {
+        let root = temp_root("runtime-req-group-rate-limit");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let group_id = GroupId::new("Farm").expect("group");
+        let rule = runtime.config().rate_limits().req().per_group();
+        let key = TangleRateLimitKey::group(TangleRateLimitScope::Req, group_id);
+        for _ in 0..rule.max_hits() {
+            runtime
+                .rate_limiter()
+                .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
+        }
+        let handle = TangleRuntimeHandle::new(runtime);
+        let mut auth = handle.auth_state().await.expect("auth");
+        let subscription_id = SubscriptionId::new("limited-req-group").expect("subscription");
+        let filters =
+            vec![filter_from_value(&json!({"#h": ["Farm"], "limit": 1})).expect("filter")];
+
+        assert_eq!(
+            handle
+                .handle_client_message(
+                    ClientMessage::Req {
+                        subscription_id: subscription_id.clone(),
+                        filters
+                    },
+                    &mut auth,
+                    UnixTimestamp::new(1_714_124_433)
+                )
+                .await
+                .expect("req"),
+            vec![RelayMessage::Closed {
+                subscription_id,
+                message: "rate-limited: req group rate limit exceeded until 1714124493".to_owned()
+            }]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_rate_limits_count_peer_ips() {
+        let root = temp_root("runtime-count-ip-rate-limit");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let rule = runtime.config().rate_limits().count().per_ip();
+        let peer_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 9));
+        let key = TangleRateLimitKey::ip(TangleRateLimitScope::Count, peer_ip);
+        for _ in 0..rule.max_hits() {
+            runtime
+                .rate_limiter()
+                .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
+        }
+        let handle = TangleRuntimeHandle::new(runtime);
+        let mut auth = handle.auth_state().await.expect("auth");
+        let subscription_id = SubscriptionId::new("limited-count-ip").expect("subscription");
+        let filters = vec![filter_from_value(&json!({"kinds": [1], "limit": 1})).expect("filter")];
+
+        assert_eq!(
+            handle
+                .handle_client_message_with_query_context(
+                    ClientMessage::Count {
+                        subscription_id: subscription_id.clone(),
+                        filters
+                    },
+                    &mut auth,
+                    TangleQueryRateLimitContext::new(Some(peer_ip), None),
+                    UnixTimestamp::new(1_714_124_433)
+                )
+                .await
+                .expect("count"),
+            vec![RelayMessage::Closed {
+                subscription_id,
+                message: "rate-limited: count ip rate limit exceeded until 1714124493".to_owned()
+            }]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_rate_limits_count_filter_kinds() {
+        let root = temp_root("runtime-count-kind-rate-limit");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let kind = Kind::new(1).expect("kind");
+        let rule = runtime.config().rate_limits().count().per_kind();
+        let key = TangleRateLimitKey::kind(TangleRateLimitScope::Count, kind);
+        for _ in 0..rule.max_hits() {
+            runtime
+                .rate_limiter()
+                .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
+        }
+        let handle = TangleRuntimeHandle::new(runtime);
+        let mut auth = handle.auth_state().await.expect("auth");
+        let subscription_id = SubscriptionId::new("limited-count-kind").expect("subscription");
+        let filters = vec![filter_from_value(&json!({"kinds": [1], "limit": 1})).expect("filter")];
+
+        assert_eq!(
+            handle
+                .handle_client_message(
+                    ClientMessage::Count {
+                        subscription_id: subscription_id.clone(),
+                        filters
+                    },
+                    &mut auth,
+                    UnixTimestamp::new(1_714_124_433)
+                )
+                .await
+                .expect("count"),
+            vec![RelayMessage::Closed {
+                subscription_id,
+                message: "rate-limited: count kind rate limit exceeded until 1714124493".to_owned()
+            }]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_rate_limits_count_broad_queries() {
+        let root = temp_root("runtime-count-broad-rate-limit");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let rule = runtime.config().rate_limits().count().broad();
+        let key = TangleRateLimitKey::query_class(
+            TangleRateLimitScope::Count,
+            TangleRateLimitQueryClass::Broad,
+        );
+        for _ in 0..rule.max_hits() {
+            runtime
+                .rate_limiter()
+                .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
+        }
+        let handle = TangleRuntimeHandle::new(runtime);
+        let mut auth = handle.auth_state().await.expect("auth");
+        let subscription_id = SubscriptionId::new("limited-count-broad").expect("subscription");
+        let filters = vec![filter_from_value(&json!({"limit": 1})).expect("filter")];
+
+        assert_eq!(
+            handle
+                .handle_client_message(
+                    ClientMessage::Count {
+                        subscription_id: subscription_id.clone(),
+                        filters
+                    },
+                    &mut auth,
+                    UnixTimestamp::new(1_714_124_433)
+                )
+                .await
+                .expect("count"),
+            vec![RelayMessage::Closed {
+                subscription_id,
+                message: "rate-limited: count broad rate limit exceeded until 1714124493"
+                    .to_owned()
+            }]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn runtime_publishes_generated_group_event_offsets_for_live_fanout() {
         let root = temp_root("runtime-generated-offset-fanout");
         let _ = std::fs::remove_dir_all(&root);
@@ -1140,6 +1687,22 @@ mod tests {
                     "write_per_group": {"window_seconds": 60, "max_hits": 90},
                     "write_per_kind": {"window_seconds": 60, "max_hits": 300},
                     "join_flow": {"window_seconds": 300, "max_hits": 10}
+                },
+                "req": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 600},
+                    "per_connection": {"window_seconds": 60, "max_hits": 120},
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 240},
+                    "per_group": {"window_seconds": 60, "max_hits": 240},
+                    "per_kind": {"window_seconds": 60, "max_hits": 500},
+                    "broad": {"window_seconds": 60, "max_hits": 30}
+                },
+                "count": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 300},
+                    "per_connection": {"window_seconds": 60, "max_hits": 60},
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 120},
+                    "per_group": {"window_seconds": 60, "max_hits": 120},
+                    "per_kind": {"window_seconds": 60, "max_hits": 240},
+                    "broad": {"window_seconds": 60, "max_hits": 20}
                 }
             }
         })

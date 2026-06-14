@@ -4,7 +4,7 @@ use crate::{
     errors::BaseRelayError,
     rate_limits::{
         TangleAuthRateLimitConfig, TangleEventRateLimitConfig, TangleGroupRateLimitConfig,
-        TangleRateLimitConfig, TangleRateLimitRule,
+        TangleQueryRateLimitConfig, TangleRateLimitConfig, TangleRateLimitRule,
     },
     relay::{
         auth::BaseAuthState,
@@ -346,6 +346,8 @@ struct BaseRelayRateLimitsDocument {
     auth: BaseRelayAuthRateLimitsDocument,
     event: BaseRelayEventRateLimitsDocument,
     group: BaseRelayGroupRateLimitsDocument,
+    req: BaseRelayQueryRateLimitsDocument,
+    count: BaseRelayQueryRateLimitsDocument,
 }
 
 #[derive(Debug, Deserialize)]
@@ -369,6 +371,17 @@ struct BaseRelayGroupRateLimitsDocument {
     write_per_group: BaseRelayRateLimitRuleDocument,
     write_per_kind: BaseRelayRateLimitRuleDocument,
     join_flow: BaseRelayRateLimitRuleDocument,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BaseRelayQueryRateLimitsDocument {
+    per_ip: BaseRelayRateLimitRuleDocument,
+    per_connection: BaseRelayRateLimitRuleDocument,
+    per_pubkey: BaseRelayRateLimitRuleDocument,
+    per_group: BaseRelayRateLimitRuleDocument,
+    per_kind: BaseRelayRateLimitRuleDocument,
+    broad: BaseRelayRateLimitRuleDocument,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -512,6 +525,31 @@ fn base_relay_rate_limits_from_document(
                 document.group.join_flow,
             )?,
         ),
+        base_relay_query_rate_limits_from_document("rate_limits.req", document.req)?,
+        base_relay_query_rate_limits_from_document("rate_limits.count", document.count)?,
+    ))
+}
+
+fn base_relay_query_rate_limits_from_document(
+    field: &str,
+    document: BaseRelayQueryRateLimitsDocument,
+) -> Result<TangleQueryRateLimitConfig, BaseRelayError> {
+    Ok(TangleQueryRateLimitConfig::new(
+        base_relay_rate_limit_rule_from_document(&format!("{field}.per_ip"), document.per_ip)?,
+        base_relay_rate_limit_rule_from_document(
+            &format!("{field}.per_connection"),
+            document.per_connection,
+        )?,
+        base_relay_rate_limit_rule_from_document(
+            &format!("{field}.per_pubkey"),
+            document.per_pubkey,
+        )?,
+        base_relay_rate_limit_rule_from_document(
+            &format!("{field}.per_group"),
+            document.per_group,
+        )?,
+        base_relay_rate_limit_rule_from_document(&format!("{field}.per_kind"), document.per_kind)?,
+        base_relay_rate_limit_rule_from_document(&format!("{field}.broad"), document.broad)?,
     ))
 }
 
@@ -599,6 +637,18 @@ mod tests {
             300
         );
         assert_eq!(config.rate_limits().group().join_flow().max_hits(), 10);
+        assert_eq!(config.rate_limits().req().per_ip().max_hits(), 600);
+        assert_eq!(config.rate_limits().req().per_connection().max_hits(), 120);
+        assert_eq!(config.rate_limits().req().per_pubkey().max_hits(), 240);
+        assert_eq!(config.rate_limits().req().per_group().max_hits(), 240);
+        assert_eq!(config.rate_limits().req().per_kind().max_hits(), 500);
+        assert_eq!(config.rate_limits().req().broad().max_hits(), 30);
+        assert_eq!(config.rate_limits().count().per_ip().max_hits(), 300);
+        assert_eq!(config.rate_limits().count().per_connection().max_hits(), 60);
+        assert_eq!(config.rate_limits().count().per_pubkey().max_hits(), 120);
+        assert_eq!(config.rate_limits().count().per_group().max_hits(), 120);
+        assert_eq!(config.rate_limits().count().per_kind().max_hits(), 240);
+        assert_eq!(config.rate_limits().count().broad().max_hits(), 20);
         assert!(config.tracing().enabled());
         assert_eq!(config.tracing().format(), BaseRelayTracingFormat::Json);
         config.auth_state().expect("auth");
@@ -651,6 +701,22 @@ mod tests {
                     "write_per_group": {"window_seconds": 60, "max_hits": 90},
                     "write_per_kind": {"window_seconds": 60, "max_hits": 300},
                     "join_flow": {"window_seconds": 300, "max_hits": 10}
+                },
+                "req": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 600},
+                    "per_connection": {"window_seconds": 60, "max_hits": 120},
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 240},
+                    "per_group": {"window_seconds": 60, "max_hits": 240},
+                    "per_kind": {"window_seconds": 60, "max_hits": 500},
+                    "broad": {"window_seconds": 60, "max_hits": 30}
+                },
+                "count": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 300},
+                    "per_connection": {"window_seconds": 60, "max_hits": 60},
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 120},
+                    "per_group": {"window_seconds": 60, "max_hits": 120},
+                    "per_kind": {"window_seconds": 60, "max_hits": 240},
+                    "broad": {"window_seconds": 60, "max_hits": 20}
                 }
             }
         }"#;
@@ -710,6 +776,22 @@ mod tests {
                     "write_per_group": {"window_seconds": 60, "max_hits": 90},
                     "write_per_kind": {"window_seconds": 60, "max_hits": 300},
                     "join_flow": {"window_seconds": 300, "max_hits": 10}
+                },
+                "req": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 600},
+                    "per_connection": {"window_seconds": 60, "max_hits": 120},
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 240},
+                    "per_group": {"window_seconds": 60, "max_hits": 240},
+                    "per_kind": {"window_seconds": 60, "max_hits": 500},
+                    "broad": {"window_seconds": 60, "max_hits": 30}
+                },
+                "count": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 300},
+                    "per_connection": {"window_seconds": 60, "max_hits": 60},
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 120},
+                    "per_group": {"window_seconds": 60, "max_hits": 120},
+                    "per_kind": {"window_seconds": 60, "max_hits": 240},
+                    "broad": {"window_seconds": 60, "max_hits": 20}
                 }
             },
             "ignored": true
@@ -767,6 +849,22 @@ mod tests {
                     "write_per_group": {"window_seconds": 60, "max_hits": 90},
                     "write_per_kind": {"window_seconds": 60, "max_hits": 300},
                     "join_flow": {"window_seconds": 300, "max_hits": 10}
+                },
+                "req": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 600},
+                    "per_connection": {"window_seconds": 60, "max_hits": 120},
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 240},
+                    "per_group": {"window_seconds": 60, "max_hits": 240},
+                    "per_kind": {"window_seconds": 60, "max_hits": 500},
+                    "broad": {"window_seconds": 60, "max_hits": 30}
+                },
+                "count": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 300},
+                    "per_connection": {"window_seconds": 60, "max_hits": 60},
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 120},
+                    "per_group": {"window_seconds": 60, "max_hits": 120},
+                    "per_kind": {"window_seconds": 60, "max_hits": 240},
+                    "broad": {"window_seconds": 60, "max_hits": 20}
                 }
             }
         }"#;

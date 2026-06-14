@@ -44,6 +44,19 @@ pub enum TangleRateLimitKey {
         group_id: GroupId,
         pubkey: PublicKeyHex,
     },
+    Connection {
+        scope: TangleRateLimitScope,
+        connection_id: u64,
+    },
+    QueryClass {
+        scope: TangleRateLimitScope,
+        class: TangleRateLimitQueryClass,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TangleRateLimitQueryClass {
+    Broad,
 }
 
 impl TangleRateLimitKey {
@@ -70,6 +83,17 @@ impl TangleRateLimitKey {
     pub fn join_flow(group_id: GroupId, pubkey: PublicKeyHex) -> Self {
         Self::JoinFlow { group_id, pubkey }
     }
+
+    pub fn connection(scope: TangleRateLimitScope, connection_id: u64) -> Self {
+        Self::Connection {
+            scope,
+            connection_id,
+        }
+    }
+
+    pub fn query_class(scope: TangleRateLimitScope, class: TangleRateLimitQueryClass) -> Self {
+        Self::QueryClass { scope, class }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +101,8 @@ pub struct TangleRateLimitConfig {
     auth: TangleAuthRateLimitConfig,
     event: TangleEventRateLimitConfig,
     group: TangleGroupRateLimitConfig,
+    req: TangleQueryRateLimitConfig,
+    count: TangleQueryRateLimitConfig,
 }
 
 impl TangleRateLimitConfig {
@@ -84,8 +110,16 @@ impl TangleRateLimitConfig {
         auth: TangleAuthRateLimitConfig,
         event: TangleEventRateLimitConfig,
         group: TangleGroupRateLimitConfig,
+        req: TangleQueryRateLimitConfig,
+        count: TangleQueryRateLimitConfig,
     ) -> Self {
-        Self { auth, event, group }
+        Self {
+            auth,
+            event,
+            group,
+            req,
+            count,
+        }
     }
 
     pub fn auth(self) -> TangleAuthRateLimitConfig {
@@ -98,6 +132,14 @@ impl TangleRateLimitConfig {
 
     pub fn group(self) -> TangleGroupRateLimitConfig {
         self.group
+    }
+
+    pub fn req(self) -> TangleQueryRateLimitConfig {
+        self.req
+    }
+
+    pub fn count(self) -> TangleQueryRateLimitConfig {
+        self.count
     }
 }
 
@@ -184,6 +226,60 @@ impl TangleGroupRateLimitConfig {
 
     pub fn join_flow(self) -> TangleRateLimitRule {
         self.join_flow
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TangleQueryRateLimitConfig {
+    per_ip: TangleRateLimitRule,
+    per_connection: TangleRateLimitRule,
+    per_pubkey: TangleRateLimitRule,
+    per_group: TangleRateLimitRule,
+    per_kind: TangleRateLimitRule,
+    broad: TangleRateLimitRule,
+}
+
+impl TangleQueryRateLimitConfig {
+    pub fn new(
+        per_ip: TangleRateLimitRule,
+        per_connection: TangleRateLimitRule,
+        per_pubkey: TangleRateLimitRule,
+        per_group: TangleRateLimitRule,
+        per_kind: TangleRateLimitRule,
+        broad: TangleRateLimitRule,
+    ) -> Self {
+        Self {
+            per_ip,
+            per_connection,
+            per_pubkey,
+            per_group,
+            per_kind,
+            broad,
+        }
+    }
+
+    pub fn per_ip(self) -> TangleRateLimitRule {
+        self.per_ip
+    }
+
+    pub fn per_connection(self) -> TangleRateLimitRule {
+        self.per_connection
+    }
+
+    pub fn per_pubkey(self) -> TangleRateLimitRule {
+        self.per_pubkey
+    }
+
+    pub fn per_group(self) -> TangleRateLimitRule {
+        self.per_group
+    }
+
+    pub fn per_kind(self) -> TangleRateLimitRule {
+        self.per_kind
+    }
+
+    pub fn broad(self) -> TangleRateLimitRule {
+        self.broad
     }
 }
 
@@ -339,8 +435,9 @@ fn reset_at(rule: TangleRateLimitRule, now: UnixTimestamp) -> UnixTimestamp {
 mod tests {
     use super::{
         TangleAuthRateLimitConfig, TangleEventRateLimitConfig, TangleGroupRateLimitConfig,
-        TangleRateLimitConfig, TangleRateLimitDecision, TangleRateLimitKey, TangleRateLimitRule,
-        TangleRateLimitScope, TangleRateLimiter,
+        TangleQueryRateLimitConfig, TangleRateLimitConfig, TangleRateLimitDecision,
+        TangleRateLimitKey, TangleRateLimitQueryClass, TangleRateLimitRule, TangleRateLimitScope,
+        TangleRateLimiter,
     };
     use std::net::{IpAddr, Ipv4Addr};
     use tangle_groups::GroupId;
@@ -377,6 +474,11 @@ mod tests {
             TangleRateLimitKey::kind(TangleRateLimitScope::Event, kind),
             TangleRateLimitKey::auth_failure(Some(ip), Some(pubkey.clone())),
             TangleRateLimitKey::join_flow(group_id, pubkey),
+            TangleRateLimitKey::connection(TangleRateLimitScope::Req, 42),
+            TangleRateLimitKey::query_class(
+                TangleRateLimitScope::Count,
+                TangleRateLimitQueryClass::Broad,
+            ),
         ];
 
         for key in keys {
@@ -393,7 +495,7 @@ mod tests {
             );
             assert_eq!(limiter.hits(&key), 1);
         }
-        assert_eq!(limiter.tracked_key_count(), 6);
+        assert_eq!(limiter.tracked_key_count(), 8);
     }
 
     #[test]
@@ -505,10 +607,38 @@ mod tests {
         let group_write = TangleRateLimitRule::new(60, 7).expect("group write");
         let group_kind = TangleRateLimitRule::new(60, 8).expect("group kind");
         let group_join = TangleRateLimitRule::new(300, 9).expect("group join");
+        let req_ip = TangleRateLimitRule::new(60, 10).expect("req ip");
+        let req_connection = TangleRateLimitRule::new(60, 11).expect("req connection");
+        let req_pubkey = TangleRateLimitRule::new(60, 12).expect("req pubkey");
+        let req_group = TangleRateLimitRule::new(60, 13).expect("req group");
+        let req_kind = TangleRateLimitRule::new(60, 14).expect("req kind");
+        let req_broad = TangleRateLimitRule::new(60, 15).expect("req broad");
+        let count_ip = TangleRateLimitRule::new(60, 16).expect("count ip");
+        let count_connection = TangleRateLimitRule::new(60, 17).expect("count connection");
+        let count_pubkey = TangleRateLimitRule::new(60, 18).expect("count pubkey");
+        let count_group = TangleRateLimitRule::new(60, 19).expect("count group");
+        let count_kind = TangleRateLimitRule::new(60, 20).expect("count kind");
+        let count_broad = TangleRateLimitRule::new(60, 21).expect("count broad");
         let config = TangleRateLimitConfig::new(
             TangleAuthRateLimitConfig::new(auth_pubkey, auth_failures),
             TangleEventRateLimitConfig::new(event_pubkey, event_kind),
             TangleGroupRateLimitConfig::new(group_pubkey, group_write, group_kind, group_join),
+            TangleQueryRateLimitConfig::new(
+                req_ip,
+                req_connection,
+                req_pubkey,
+                req_group,
+                req_kind,
+                req_broad,
+            ),
+            TangleQueryRateLimitConfig::new(
+                count_ip,
+                count_connection,
+                count_pubkey,
+                count_group,
+                count_kind,
+                count_broad,
+            ),
         );
 
         assert_eq!(config.auth().per_pubkey(), auth_pubkey);
@@ -519,5 +649,17 @@ mod tests {
         assert_eq!(config.group().write_per_group(), group_write);
         assert_eq!(config.group().write_per_kind(), group_kind);
         assert_eq!(config.group().join_flow(), group_join);
+        assert_eq!(config.req().per_ip(), req_ip);
+        assert_eq!(config.req().per_connection(), req_connection);
+        assert_eq!(config.req().per_pubkey(), req_pubkey);
+        assert_eq!(config.req().per_group(), req_group);
+        assert_eq!(config.req().per_kind(), req_kind);
+        assert_eq!(config.req().broad(), req_broad);
+        assert_eq!(config.count().per_ip(), count_ip);
+        assert_eq!(config.count().per_connection(), count_connection);
+        assert_eq!(config.count().per_pubkey(), count_pubkey);
+        assert_eq!(config.count().per_group(), count_group);
+        assert_eq!(config.count().per_kind(), count_kind);
+        assert_eq!(config.count().broad(), count_broad);
     }
 }

@@ -10,7 +10,7 @@ use crate::{
 use axum::{
     Router,
     extract::{
-        State,
+        ConnectInfo, State,
         ws::{WebSocketUpgrade, rejection::WebSocketUpgradeRejection},
     },
     response::{IntoResponse, Response},
@@ -73,19 +73,22 @@ pub async fn serve_listener_until_shutdown(
         runtime.clone(),
     );
     let mut shutdown = shutdown_signal.subscribe();
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            loop {
-                if *shutdown.borrow() {
-                    break;
-                }
-                if shutdown.changed().await.is_err() {
-                    break;
-                }
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        loop {
+            if *shutdown.borrow() {
+                break;
             }
-        })
-        .await
-        .map_err(|error| BaseRelayError::error(error.to_string()))?;
+            if shutdown.changed().await.is_err() {
+                break;
+            }
+        }
+    })
+    .await
+    .map_err(|error| BaseRelayError::error(error.to_string()))?;
     let shutdown = runtime.shutdown().await?;
     Ok(TangleServeReport::new(
         listen_addr,
@@ -121,18 +124,20 @@ struct TangleHttpState {
 
 async fn tangle_root(
     State(state): State<TangleHttpState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     websocket: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
     headers: HeaderMap,
 ) -> Response {
     match websocket {
         Ok(websocket) => {
             let session = match state.runtime.auth_state().await {
-                Ok(auth) => TangleWebSocketSession::new(
+                Ok(auth) => TangleWebSocketSession::new_with_peer(
                     state.limits,
                     state.shutdown.subscribe(),
                     state.runtime.clone(),
                     auth,
                     state.runtime.subscribe_events().await,
+                    Some(peer_addr.ip()),
                 ),
                 Err(error) => Err(error),
             };
@@ -161,11 +166,12 @@ mod tests {
         ops::BaseRelayReadinessState,
         runtime::{TangleRuntime, TangleRuntimeHandle, TangleShutdownSignal},
     };
-    use axum::body::to_bytes;
+    use axum::{body::to_bytes, extract::ConnectInfo};
     use futures_util::{SinkExt, StreamExt};
     use http::{Request, header};
     use serde_json::json;
     use std::{
+        net::SocketAddr,
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -395,6 +401,7 @@ mod tests {
                 Request::builder()
                     .uri("/")
                     .header(header::ACCEPT, "application/nostr+json")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 39_000))))
                     .body(axum::body::Body::empty())
                     .expect("request"),
             )
@@ -405,6 +412,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 39_001))))
                     .body(axum::body::Body::empty())
                     .expect("request"),
             )
@@ -506,6 +514,22 @@ mod tests {
                     "write_per_group": {"window_seconds": 60, "max_hits": 90},
                     "write_per_kind": {"window_seconds": 60, "max_hits": 300},
                     "join_flow": {"window_seconds": 300, "max_hits": 10}
+                },
+                "req": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 600},
+                    "per_connection": {"window_seconds": 60, "max_hits": 120},
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 240},
+                    "per_group": {"window_seconds": 60, "max_hits": 240},
+                    "per_kind": {"window_seconds": 60, "max_hits": 500},
+                    "broad": {"window_seconds": 60, "max_hits": 30}
+                },
+                "count": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 300},
+                    "per_connection": {"window_seconds": 60, "max_hits": 60},
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 120},
+                    "per_group": {"window_seconds": 60, "max_hits": 120},
+                    "per_kind": {"window_seconds": 60, "max_hits": 240},
+                    "broad": {"window_seconds": 60, "max_hits": 20}
                 }
             }
         })

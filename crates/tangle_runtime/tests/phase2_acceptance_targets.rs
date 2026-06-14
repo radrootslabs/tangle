@@ -584,6 +584,22 @@ fn runtime_config(root: &Path, listen_addr: SocketAddr) -> BaseRelayRuntimeConfi
                 "write_per_group": {"window_seconds": 60, "max_hits": 90},
                 "write_per_kind": {"window_seconds": 60, "max_hits": 300},
                 "join_flow": {"window_seconds": 300, "max_hits": 10}
+            },
+            "req": {
+                "per_ip": {"window_seconds": 60, "max_hits": 600},
+                "per_connection": {"window_seconds": 60, "max_hits": 120},
+                "per_pubkey": {"window_seconds": 60, "max_hits": 240},
+                "per_group": {"window_seconds": 60, "max_hits": 240},
+                "per_kind": {"window_seconds": 60, "max_hits": 500},
+                "broad": {"window_seconds": 60, "max_hits": 30}
+            },
+            "count": {
+                "per_ip": {"window_seconds": 60, "max_hits": 300},
+                "per_connection": {"window_seconds": 60, "max_hits": 60},
+                "per_pubkey": {"window_seconds": 60, "max_hits": 120},
+                "per_group": {"window_seconds": 60, "max_hits": 120},
+                "per_kind": {"window_seconds": 60, "max_hits": 240},
+                "broad": {"window_seconds": 60, "max_hits": 20}
             }
         }
     })

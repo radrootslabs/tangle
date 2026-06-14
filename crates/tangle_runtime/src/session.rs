@@ -7,10 +7,14 @@ use crate::{
         auth::{BaseAuthState, generate_auth_challenge},
         live::LiveSubscriptionSet,
     },
-    runtime::{TangleRuntimeHandle, TangleRuntimeLimits},
+    runtime::{TangleQueryRateLimitContext, TangleRuntimeHandle, TangleRuntimeLimits},
 };
 use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::{
+    net::IpAddr,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 use tangle_groups::GroupAuthContext;
 use tangle_protocol::{
     ClientMessage, Filter, RelayMessage, SubscriptionId, UnixTimestamp, parse_client_message,
@@ -19,6 +23,8 @@ use tokio::sync::{mpsc, watch};
 
 #[derive(Debug)]
 pub struct TangleWebSocketSession {
+    connection_id: u64,
+    peer_ip: Option<IpAddr>,
     connected_at: Instant,
     outbound: TangleOutboundSender,
     outbound_receiver: mpsc::Receiver<Message>,
@@ -30,6 +36,8 @@ pub struct TangleWebSocketSession {
     events: TangleEventReceiver,
 }
 
+static NEXT_TANGLE_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+
 impl TangleWebSocketSession {
     pub fn new(
         limits: TangleRuntimeLimits,
@@ -38,6 +46,17 @@ impl TangleWebSocketSession {
         auth: BaseAuthState,
         events: TangleEventReceiver,
     ) -> Result<Self, BaseRelayError> {
+        Self::new_with_peer(limits, shutdown, runtime, auth, events, None)
+    }
+
+    pub fn new_with_peer(
+        limits: TangleRuntimeLimits,
+        shutdown: watch::Receiver<bool>,
+        runtime: TangleRuntimeHandle,
+        auth: BaseAuthState,
+        events: TangleEventReceiver,
+        peer_ip: Option<IpAddr>,
+    ) -> Result<Self, BaseRelayError> {
         let outbound_queue_capacity = limits.outbound_queue_capacity();
         let (sender, receiver) = mpsc::channel(outbound_queue_capacity);
         let subscriptions = LiveSubscriptionSet::new(
@@ -45,6 +64,8 @@ impl TangleWebSocketSession {
             limits.base_relay_limits().max_subscriptions(),
         )?;
         Ok(Self {
+            connection_id: NEXT_TANGLE_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
+            peer_ip,
             connected_at: Instant::now(),
             outbound: TangleOutboundSender {
                 sender,
@@ -219,6 +240,23 @@ impl TangleWebSocketSession {
                 subscription_id,
                 filters,
             } => self.handle_req(subscription_id, filters).await,
+            ClientMessage::Count {
+                subscription_id,
+                filters,
+            } => {
+                let context = self.query_rate_limit_context();
+                self.runtime
+                    .handle_client_message_with_query_context(
+                        ClientMessage::Count {
+                            subscription_id,
+                            filters,
+                        },
+                        &mut self.auth,
+                        context,
+                        current_unix_timestamp(),
+                    )
+                    .await
+            }
             ClientMessage::Close(subscription_id) => {
                 self.limits
                     .base_relay_limits()
@@ -243,6 +281,19 @@ impl TangleWebSocketSession {
             .base_relay_limits()
             .validate_subscription_id(&subscription_id)?;
         self.limits.base_relay_limits().validate_filters(&filters)?;
+        if let Some(message) = self
+            .runtime
+            .rate_limit_req(
+                &subscription_id,
+                &filters,
+                &self.auth,
+                self.query_rate_limit_context(),
+                current_unix_timestamp(),
+            )
+            .await
+        {
+            return Ok(vec![message]);
+        }
         self.subscriptions.subscribe(
             subscription_id.clone(),
             filters.clone(),
@@ -259,6 +310,10 @@ impl TangleWebSocketSession {
                 Err(error)
             }
         }
+    }
+
+    fn query_rate_limit_context(&self) -> TangleQueryRateLimitContext {
+        TangleQueryRateLimitContext::new(self.peer_ip, Some(self.connection_id))
     }
 
     fn send_relay_message(&self, message: RelayMessage) -> Result<(), TangleOutboundQueueError> {
@@ -325,12 +380,13 @@ fn current_unix_timestamp() -> UnixTimestamp {
 mod tests {
     use super::{
         TangleOutboundQueueError, TangleSessionControl, TangleWebSocketSession,
-        event_stream_lag_close_message,
+        current_unix_timestamp, event_stream_lag_close_message,
     };
     use crate::{
         config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
         errors::BaseRelayError,
         event_bus::TangleEventReceiver,
+        rate_limits::{TangleRateLimitKey, TangleRateLimitScope},
         relay::core::{BaseRelayLimitSettings, BaseRelayLimits},
         runtime::{TangleRuntime, TangleRuntimeHandle, TangleRuntimeLimits, TangleShutdownSignal},
     };
@@ -338,7 +394,7 @@ mod tests {
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use tangle_groups::StoreOffset;
-    use tangle_protocol::{ClientMessage, Filter, RelayMessage, SubscriptionId};
+    use tangle_protocol::{ClientMessage, Filter, RelayMessage, SubscriptionId, filter_from_value};
 
     #[test]
     fn websocket_session_records_connection_time() {
@@ -485,6 +541,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_session_rate_limited_req_does_not_subscribe() {
+        let shutdown = TangleShutdownSignal::new();
+        let root = temp_root("rate-limited-req");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntime::open(runtime_config(&root)).expect("runtime");
+        let rule = runtime.config().rate_limits().req().per_connection();
+        let runtime = TangleRuntimeHandle::new(runtime);
+        let auth = runtime.auth_state().await.expect("auth");
+        let events = runtime.subscribe_events().await;
+        let now = current_unix_timestamp();
+        let mut session = TangleWebSocketSession::new(
+            session_limits(8),
+            shutdown.subscribe(),
+            runtime.clone(),
+            auth,
+            events,
+        )
+        .expect("session");
+        let key = TangleRateLimitKey::connection(TangleRateLimitScope::Req, session.connection_id);
+        let limiter = runtime.rate_limiter().await;
+        for _ in 0..rule.max_hits() {
+            limiter.record(key.clone(), rule, now);
+        }
+        let subscription_id = SubscriptionId::new("limited").expect("subscription");
+
+        assert_eq!(
+            session
+                .handle_client_message(ClientMessage::Req {
+                    subscription_id: subscription_id.clone(),
+                    filters: vec![
+                        filter_from_value(&json!({"kinds": [1], "limit": 1})).expect("filter")
+                    ]
+                })
+                .await
+                .expect("req"),
+            vec![RelayMessage::Closed {
+                subscription_id,
+                message: format!(
+                    "rate-limited: req connection rate limit exceeded until {}",
+                    now.as_u64() + 60
+                )
+            }]
+        );
+        assert_eq!(session.active_subscription_count(), 0);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn websocket_session_closes_when_event_receiver_lags() {
         let shutdown = TangleShutdownSignal::new();
         let root = temp_root("event-receiver-lag");
@@ -614,6 +719,22 @@ mod tests {
                     "write_per_group": {"window_seconds": 60, "max_hits": 90},
                     "write_per_kind": {"window_seconds": 60, "max_hits": 300},
                     "join_flow": {"window_seconds": 300, "max_hits": 10}
+                },
+                "req": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 600},
+                    "per_connection": {"window_seconds": 60, "max_hits": 120},
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 240},
+                    "per_group": {"window_seconds": 60, "max_hits": 240},
+                    "per_kind": {"window_seconds": 60, "max_hits": 500},
+                    "broad": {"window_seconds": 60, "max_hits": 30}
+                },
+                "count": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 300},
+                    "per_connection": {"window_seconds": 60, "max_hits": 60},
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 120},
+                    "per_group": {"window_seconds": 60, "max_hits": 120},
+                    "per_kind": {"window_seconds": 60, "max_hits": 240},
+                    "broad": {"window_seconds": 60, "max_hits": 20}
                 }
             }
         })
