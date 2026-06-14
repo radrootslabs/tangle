@@ -12,9 +12,10 @@ use std::{
 use tangle_groups::{
     GroupAuthContext, GroupAuthority, GroupErrorKind, GroupEventClass, GroupId, GroupMetadata,
     GroupMetadataFlags, GroupMetadataText, GroupPolicyConfig, GroupProjection, GroupReadDecision,
-    GroupReadGate, GroupState, GroupWritePolicy, KIND_GROUP_ADMINS, KIND_GROUP_JOIN_REQUEST,
-    KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA, MemberState, MemberStatus,
-    ProjectionOrderTuple, StoreOffset, SupportedKinds,
+    GroupReadGate, GroupState, GroupWriteDecision, GroupWritePolicy, KIND_GROUP_ADMINS,
+    KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA,
+    MemberState, MemberStatus, ProjectionOrderTuple, StoreOffset, SupportedKinds,
+    parse_group_runtime_config_json,
 };
 use tangle_protocol::{
     Event, EventId, Kind, PublicKeyHex, RelayMessage, SignatureHex, Tag, UnixTimestamp,
@@ -403,6 +404,61 @@ fn duplicate_join_and_leave_use_duplicate_prefix() {
     assert_eq!(
         duplicate_leave.prefixed_message(),
         "duplicate: group member does not exist"
+    );
+}
+
+#[test]
+fn closed_groups_use_strict_nip29_semantics_without_compatibility_flag() {
+    let owner = phase2_pubkey("1");
+    let outsider = phase2_pubkey("2");
+    let projection = phase2_projection_with_group(
+        "Closed",
+        phase2_metadata(false, false, false, true),
+        owner.clone(),
+    );
+    let authority = GroupAuthority::new([owner], Vec::<PublicKeyHex>::new());
+    let policy = GroupWritePolicy::new(
+        &projection,
+        &authority,
+        GroupPolicyConfig::new(true, false).expect("policy"),
+    );
+
+    let join_error = policy
+        .check_event(
+            &phase2_group_event(KIND_GROUP_JOIN_REQUEST, "Closed", outsider.clone()),
+            &GroupEventClass::Normal {
+                group_id: GroupId::new("Closed").expect("group"),
+            },
+            &GroupAuthContext::new([outsider.clone()]),
+        )
+        .expect_err("closed join");
+    assert_eq!(join_error.kind(), GroupErrorKind::GroupUnavailable);
+    assert_eq!(
+        join_error.prefixed_message(),
+        "restricted: group is unavailable"
+    );
+
+    assert_eq!(
+        policy
+            .check_event(
+                &phase2_group_event(1, "Closed", outsider.clone()),
+                &GroupEventClass::Normal {
+                    group_id: GroupId::new("Closed").expect("group"),
+                },
+                &GroupAuthContext::new([outsider]),
+            )
+            .expect("normal write"),
+        GroupWriteDecision::Accept
+    );
+
+    let error = parse_group_runtime_config_json(
+        r#"{"enabled": false, "policy": {"compat_zooid_closed_means_restricted": true}}"#,
+    )
+    .expect_err("compat");
+    assert!(
+        error
+            .message()
+            .contains("unknown field `compat_zooid_closed_means_restricted`")
     );
 }
 
