@@ -18,8 +18,8 @@ use tangle_groups::{
     parse_group_runtime_config_json,
 };
 use tangle_protocol::{
-    Event, EventId, Kind, PublicKeyHex, RelayMessage, SignatureHex, Tag, UnixTimestamp,
-    UnsignedEvent, event_to_value,
+    Event, EventId, Filter, Kind, PublicKeyHex, RelayMessage, SignatureHex, SubscriptionId, Tag,
+    UnixTimestamp, UnsignedEvent, event_to_value, filter_from_value,
 };
 use tangle_runtime::{
     config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
@@ -27,6 +27,10 @@ use tangle_runtime::{
     relay::auth::BaseAuthState,
     runtime::TangleRuntime,
     server::serve_listener_until_shutdown,
+};
+use tangle_store_pocket::{
+    PocketStoreConfig, PocketStoreHandle, TANGLE_GROUP_CHECKPOINT_TABLE, TANGLE_GROUP_OUTBOX_TABLE,
+    TANGLE_GROUP_PROJECTION_TABLE,
 };
 use tangle_test_support::{
     FixtureKey, TANGLE_V2_RELAY_SECRET_HEX, TANGLE_V2_RELAY_URL, tangle_v2_auth_event,
@@ -1329,9 +1333,151 @@ fn runtime_hot_path_does_not_stringify_and_reparse_events() {
 }
 
 #[test]
-#[ignore = "phase2 target: canonical recovery"]
 fn projection_and_outbox_recover_from_canonical_pocket_events() {
-    pending("projection and outbox recovery must rebuild from canonical Pocket events");
+    let root = temp_root("acceptance-recovery");
+    let _ = std::fs::remove_dir_all(&root);
+    let config = runtime_config(&root, "127.0.0.1:0".parse().expect("listen addr"));
+    let mut auth = config.auth_state().expect("auth");
+    auth.issue_challenge("recovery-challenge", UnixTimestamp::new(1_714_124_470))
+        .expect("challenge");
+    let owner_auth = tangle_v2_auth_event(FixtureKey::Owner, "recovery-challenge", 1_714_124_470)
+        .expect("owner auth");
+    let member_auth = tangle_v2_auth_event(FixtureKey::Member, "recovery-challenge", 1_714_124_471)
+        .expect("member auth");
+    auth.authenticate(&owner_auth, UnixTimestamp::new(1_714_124_470))
+        .expect("owner");
+    auth.authenticate(&member_auth, UnixTimestamp::new(1_714_124_471))
+        .expect("member");
+    let create =
+        tangle_v2_group_create_event(FixtureKey::Owner, "RecoverSocket", 1_714_124_472, &[])
+            .expect("create");
+    let put_member = tangle_v2_put_user_event(
+        FixtureKey::Owner,
+        "RecoverSocket",
+        FixtureKey::Member,
+        1_714_124_473,
+    )
+    .expect("put member");
+    let note = tangle_v2_group_event(
+        FixtureKey::Member,
+        "RecoverSocket",
+        1_714_124_474,
+        1,
+        "recover harvest",
+    )
+    .expect("note");
+
+    {
+        let mut runtime = TangleRuntime::open(config.clone()).expect("runtime");
+        assert_relay_ok(
+            runtime
+                .relay_mut()
+                .handle_event_with_auth(create.clone(), &auth)
+                .expect("create"),
+            &create,
+            true,
+            "",
+        );
+        assert_relay_ok(
+            runtime
+                .relay_mut()
+                .handle_event_with_auth(put_member.clone(), &auth)
+                .expect("put member"),
+            &put_member,
+            true,
+            "",
+        );
+        assert_relay_ok(
+            runtime
+                .relay_mut()
+                .handle_event_with_auth(note.clone(), &auth)
+                .expect("note"),
+            &note,
+            true,
+            "",
+        );
+        assert_relay_count(
+            runtime
+                .relay()
+                .handle_count(
+                    subscription_id("pre-recovery-members"),
+                    vec![relay_filter(
+                        json!({"kinds":[KIND_GROUP_MEMBERS], "#d":["RecoverSocket"]}),
+                    )],
+                )
+                .expect("members count"),
+            "pre-recovery-members",
+            1,
+        );
+        runtime.shutdown().expect("shutdown");
+    }
+
+    delete_group_extra_records(config.pocket_config());
+
+    let recovered = TangleRuntime::open(config.clone()).expect("recovered");
+    let readiness = recovered.readiness_state().response();
+    assert_eq!(readiness.checks.group_projection, "ready");
+    assert_eq!(readiness.checks.group_outbox_replay, "ready");
+    assert!(
+        recovered
+            .relay()
+            .group_projection()
+            .expect("projection")
+            .group(&GroupId::new("RecoverSocket").expect("group"))
+            .is_some()
+    );
+    assert_relay_count(
+        recovered
+            .relay()
+            .handle_count(
+                subscription_id("recovered-metadata"),
+                vec![relay_filter(
+                    json!({"kinds":[KIND_GROUP_METADATA], "#d":["RecoverSocket"]}),
+                )],
+            )
+            .expect("metadata count"),
+        "recovered-metadata",
+        1,
+    );
+    assert_relay_count(
+        recovered
+            .relay()
+            .handle_count(
+                subscription_id("recovered-admins"),
+                vec![relay_filter(
+                    json!({"kinds":[KIND_GROUP_ADMINS], "#d":["RecoverSocket"]}),
+                )],
+            )
+            .expect("admins count"),
+        "recovered-admins",
+        1,
+    );
+    assert_relay_count(
+        recovered
+            .relay()
+            .handle_count(
+                subscription_id("recovered-members"),
+                vec![relay_filter(
+                    json!({"kinds":[KIND_GROUP_MEMBERS], "#d":["RecoverSocket"]}),
+                )],
+            )
+            .expect("members count"),
+        "recovered-members",
+        1,
+    );
+    assert_relay_count(
+        recovered
+            .relay()
+            .handle_count(
+                subscription_id("recovered-note"),
+                vec![relay_filter(json!({"kinds":[1], "#h":["RecoverSocket"]}))],
+            )
+            .expect("note count"),
+        "recovered-note",
+        1,
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -1442,10 +1588,6 @@ async fn relay_generated_events_are_stored_projected_and_broadcast_to_websocket_
     assert_eq!(report.listen_addr(), address);
 
     let _ = std::fs::remove_dir_all(root);
-}
-
-fn pending(target: &str) {
-    panic!("{target}");
 }
 
 fn runtime_config(root: &Path, listen_addr: SocketAddr) -> BaseRelayRuntimeConfig {
@@ -1694,6 +1836,49 @@ async fn assert_req_event_then_eose(
         read_relay_value(socket).await,
         json!(["EOSE", subscription_id])
     );
+}
+
+fn assert_relay_ok(message: RelayMessage, event: &Event, accepted: bool, reason: &str) {
+    assert_eq!(
+        message,
+        RelayMessage::Ok {
+            event_id: event.id().clone(),
+            accepted,
+            message: reason.to_owned()
+        }
+    );
+}
+
+fn assert_relay_count(message: RelayMessage, subscription_id: &str, count: u64) {
+    assert_eq!(
+        message,
+        RelayMessage::Count {
+            subscription_id: SubscriptionId::new(subscription_id).expect("subscription"),
+            count
+        }
+    );
+}
+
+fn relay_filter(value: Value) -> Filter {
+    filter_from_value(&value).expect("filter")
+}
+
+fn subscription_id(value: &str) -> SubscriptionId {
+    SubscriptionId::new(value).expect("subscription")
+}
+
+fn delete_group_extra_records(config: &PocketStoreConfig) {
+    let store = PocketStoreHandle::open(config).expect("store");
+    for table in [
+        TANGLE_GROUP_PROJECTION_TABLE,
+        TANGLE_GROUP_OUTBOX_TABLE,
+        TANGLE_GROUP_CHECKPOINT_TABLE,
+    ] {
+        for (key, _) in store.scan_extra_records(table).expect("scan") {
+            store.delete_extra_record(table, &key).expect("delete");
+        }
+    }
+    store.sync().expect("sync");
 }
 
 fn assert_notice_prefix(value: Value, prefix: &str) {
