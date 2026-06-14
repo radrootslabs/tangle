@@ -165,7 +165,7 @@ impl GroupService {
             self.persist_group_projection(store, group_id)?;
         }
         for record in self.plan_outbox_records(event, class)? {
-            let inserted = self.outbox.insert_idempotent(record.clone())?;
+            let inserted = self.outbox.merge_idempotent(record.clone())?;
             if inserted {
                 persist_outbox_record(store, &record)?;
             }
@@ -209,7 +209,7 @@ impl GroupService {
                 &self.authority,
                 self.member_snapshot_cap,
             )? {
-                let inserted = self.outbox.insert_idempotent(record.clone())?;
+                let inserted = self.outbox.merge_idempotent(record.clone())?;
                 if inserted {
                     persist_outbox_record(store, &record)?;
                 }
