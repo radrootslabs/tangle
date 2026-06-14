@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-pub mod base_relay;
 pub mod chorus_pocket;
 pub mod config;
 pub mod errors;

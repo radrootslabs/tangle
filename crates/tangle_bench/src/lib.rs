@@ -11,7 +11,7 @@ use tangle_groups::{KIND_GROUP_ADMINS, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA, 
 use tangle_protocol::{
     Event, Filter, RelayMessage, SubscriptionId, event_to_value, filter_from_value,
 };
-use tangle_runtime::{base_relay::BaseRelay, relay::auth::BaseAuthState};
+use tangle_runtime::relay::{auth::BaseAuthState, core::BaseRelay};
 use tangle_store_pocket::{PocketStoreConfig, PocketSyncPolicy};
 use tangle_test_support::{
     FixtureKey, TANGLE_V2_RELAY_URL, tangle_v2_auth_event, tangle_v2_event, tangle_v2_group_config,
