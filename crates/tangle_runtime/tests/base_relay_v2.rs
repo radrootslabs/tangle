@@ -10,8 +10,9 @@ use tangle_protocol::{
     Event, Filter, RawEventJson, RelayMessage, SubscriptionId, Tag, UnixTimestamp,
     filter_from_value, parse_client_message, parse_event_json,
 };
-use tangle_runtime::base_relay::{
-    BASE_RELAY_SUPPORTED_NIPS, BaseAuthState, BaseRelay, BaseRelayInfoConfig, CloseResult,
+use tangle_runtime::{
+    base_relay::{BaseAuthState, BaseRelay, CloseResult},
+    nip11::{BASE_RELAY_SUPPORTED_NIPS, BaseRelayInfoConfig},
 };
 use tangle_store_pocket::{PocketStoreConfig, PocketSyncPolicy};
 use tangle_test_support::{
