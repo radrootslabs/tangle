@@ -480,9 +480,23 @@ fn closed_groups_use_strict_nip29_semantics_without_compatibility_flag() {
 }
 
 #[test]
-#[ignore = "phase2 target: central read gate"]
 fn req_count_and_live_fanout_share_one_group_read_gate() {
-    pending("REQ COUNT and live fanout must use one central group read gate");
+    let relay_core = include_str!("../src/relay/core.rs");
+
+    assert_eq!(
+        relay_core
+            .matches("fn group_read_gate_visible_to_auth")
+            .count(),
+        1
+    );
+    assert_eq!(
+        relay_core
+            .matches("Self::group_read_gate_visible_to_auth")
+            .count(),
+        4
+    );
+    assert!(!relay_core.contains("fn event_visible_to_auth("));
+    assert!(!relay_core.contains("fn pocket_event_visible_to_auth("));
 }
 
 #[test]

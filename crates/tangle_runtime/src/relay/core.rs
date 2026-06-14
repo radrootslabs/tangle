@@ -11,11 +11,11 @@ use crate::relay::{
 use std::{cell::RefCell, collections::BTreeSet};
 use tangle_crypto::verify_event_signature;
 use tangle_groups::{
-    GroupAuthContext, GroupEventClass, GroupProjection, GroupRuntimeConfig, StoreOffset,
-    validate_client_group_event_structure,
+    GroupAuthContext, GroupEventClass, GroupEventView, GroupProjection, GroupRuntimeConfig,
+    StoreOffset, validate_client_group_event_structure,
 };
 use tangle_protocol::{ClientMessage, Event, Filter, RelayMessage, SubscriptionId, UnixTimestamp};
-use tangle_store_pocket::{PocketEvent, PocketScreenResult, PocketStoreConfig, PocketStoreHandle};
+use tangle_store_pocket::{PocketScreenResult, PocketStoreConfig, PocketStoreHandle};
 
 pub struct BaseRelay {
     store: PocketStoreHandle,
@@ -160,7 +160,8 @@ impl BaseRelay {
         auth: &BaseAuthState,
     ) -> Result<Option<Event>, BaseRelayError> {
         let event = self.event_by_offset(offset)?;
-        if self.event_visible_to_auth(
+        if Self::group_read_gate_visible_to_auth(
+            self.groups.as_ref(),
             &event,
             &GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned()),
         )? {
@@ -415,9 +416,7 @@ impl BaseRelay {
     pub fn fanout(&mut self, event: &Event) -> Vec<RelayMessage> {
         let groups = self.groups.as_ref();
         self.subscriptions.fanout(event, |event, auth| {
-            groups
-                .map(|groups| groups.event_visible_to_auth(event, auth).unwrap_or(false))
-                .unwrap_or(true)
+            Self::group_read_gate_visible_to_auth(groups, event, auth).unwrap_or(false)
         })
     }
 
@@ -479,7 +478,11 @@ impl BaseRelay {
                 }
                 match pocket_filter.event_matches(pocket_event) {
                     Ok(false) => PocketScreenResult::Mismatch,
-                    Ok(true) => match self.pocket_event_visible_to_auth(pocket_event, auth) {
+                    Ok(true) => match Self::group_read_gate_visible_to_auth(
+                        self.groups.as_ref(),
+                        pocket_event,
+                        auth,
+                    ) {
                         Ok(true) => PocketScreenResult::Match,
                         Ok(false) => PocketScreenResult::Redacted,
                         Err(error) => {
@@ -519,25 +522,12 @@ impl BaseRelay {
             .collect()
     }
 
-    fn event_visible_to_auth(
-        &self,
-        event: &Event,
+    fn group_read_gate_visible_to_auth(
+        groups: Option<&GroupService>,
+        event: &(impl GroupEventView + ?Sized),
         auth: &GroupAuthContext,
     ) -> Result<bool, BaseRelayError> {
-        self.groups
-            .as_ref()
-            .map(|groups| groups.event_visible_to_auth(event, auth))
-            .unwrap_or(Ok(true))
-            .map_err(BaseRelayError::from)
-    }
-
-    fn pocket_event_visible_to_auth(
-        &self,
-        event: &PocketEvent,
-        auth: &GroupAuthContext,
-    ) -> Result<bool, BaseRelayError> {
-        self.groups
-            .as_ref()
+        groups
             .map(|groups| groups.event_visible_to_auth(event, auth))
             .unwrap_or(Ok(true))
             .map_err(BaseRelayError::from)
@@ -551,9 +541,7 @@ impl BaseRelay {
         let event = self.event_by_offset(offset)?;
         let groups = self.groups.as_ref();
         Ok(subscriptions.fanout(&event, |event, auth| {
-            groups
-                .map(|groups| groups.event_visible_to_auth(event, auth).unwrap_or(false))
-                .unwrap_or(true)
+            Self::group_read_gate_visible_to_auth(groups, event, auth).unwrap_or(false)
         }))
     }
 }
