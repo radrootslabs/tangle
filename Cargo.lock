@@ -1267,6 +1267,7 @@ dependencies = [
  "tangle_store_pocket",
  "tangle_test_support",
  "tokio",
+ "tokio-tungstenite",
  "tower",
  "tracing",
 ]

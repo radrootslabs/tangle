@@ -2,11 +2,21 @@
 
 use crate::{
     errors::BaseRelayError,
-    nip11::{BaseRelayInfoConfig, BaseRelayInfoDocument, base_relay_info_router},
+    nip11::{BaseRelayInfoConfig, BaseRelayInfoDocument, base_relay_info_response},
     ops::{BaseRelayReadinessState, base_relay_ops_router},
     runtime::TangleRuntime,
+    session::TangleWebSocketSession,
 };
-use axum::Router;
+use axum::{
+    Router,
+    extract::{
+        State,
+        ws::{WebSocketUpgrade, rejection::WebSocketUpgradeRejection},
+    },
+    response::{IntoResponse, Response},
+    routing::get,
+};
+use http::HeaderMap;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 
@@ -77,7 +87,29 @@ pub fn tangle_http_router(
     readiness: BaseRelayReadinessState,
     info: BaseRelayInfoDocument,
 ) -> Router {
-    base_relay_info_router(info).merge(base_relay_ops_router(readiness))
+    Router::new()
+        .route("/", get(tangle_root))
+        .with_state(TangleHttpState { info })
+        .merge(base_relay_ops_router(readiness))
+}
+
+#[derive(Debug, Clone)]
+struct TangleHttpState {
+    info: BaseRelayInfoDocument,
+}
+
+async fn tangle_root(
+    State(state): State<TangleHttpState>,
+    websocket: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+    headers: HeaderMap,
+) -> Response {
+    match websocket {
+        Ok(websocket) => websocket
+            .protocols(["nostr"])
+            .on_upgrade(|socket| TangleWebSocketSession::new().run(socket))
+            .into_response(),
+        Err(_) => base_relay_info_response(state.info, headers),
+    }
 }
 
 #[cfg(test)]
@@ -93,6 +125,8 @@ mod tests {
     use http::{Request, header};
     use serde_json::json;
     use std::path::{Path, PathBuf};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tower::ServiceExt;
 
     #[tokio::test]
@@ -111,6 +145,42 @@ mod tests {
         assert_ne!(report.listen_addr().port(), 0);
         assert_eq!(report.closed_subscriptions(), 0);
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn serve_until_shutdown_accepts_websocket_upgrade() {
+        let root = temp_root("websocket-upgrade");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntime::open(runtime_config(&root)).expect("runtime");
+        let shutdown = runtime.shutdown_signal().clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("address");
+        let task = tokio::spawn(super::serve_listener_until_shutdown(runtime, listener));
+        let mut request = format!("ws://{address}/")
+            .into_client_request()
+            .expect("request");
+        request.headers_mut().insert(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            http::HeaderValue::from_static("nostr"),
+        );
+
+        let (_socket, response) = tokio_tungstenite::connect_async(request)
+            .await
+            .expect("websocket");
+
+        assert_eq!(response.status(), http::StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::SEC_WEBSOCKET_PROTOCOL)
+                .expect("protocol"),
+            "nostr"
+        );
+
+        shutdown.request_shutdown();
+        let report = task.await.expect("task").expect("serve");
+        assert_eq!(report.listen_addr(), address);
         let _ = std::fs::remove_dir_all(root);
     }
 

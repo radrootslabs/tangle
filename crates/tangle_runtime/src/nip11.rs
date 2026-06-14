@@ -128,6 +128,10 @@ async fn base_relay_info(
     State(document): State<BaseRelayInfoDocument>,
     headers: HeaderMap,
 ) -> Response {
+    base_relay_info_response(document, headers)
+}
+
+pub fn base_relay_info_response(document: BaseRelayInfoDocument, headers: HeaderMap) -> Response {
     if !accepts_nostr_json(headers.get(header::ACCEPT)) {
         return (
             StatusCode::NOT_FOUND,

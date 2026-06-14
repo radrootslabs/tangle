@@ -22,6 +22,7 @@ tracing = "0.1"
 [dev-dependencies]
 tangle_test_support = { path = "../tangle_test_support" }
 tokio = { version = "1", features = ["macros", "rt", "time"] }
+tokio-tungstenite = "0.29"
 tower = { version = "0.5", features = ["util"] }
 
 [lints]
