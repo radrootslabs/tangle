@@ -742,6 +742,51 @@ mod tests {
     }
 
     #[test]
+    fn pocket_store_handle_syncs_written_events_and_extra_records() {
+        let root = temp_root("tangle-pocket-sync");
+        let config = PocketStoreConfig::new(
+            root.join("pocket"),
+            1024 * 1024 * 1024,
+            128,
+            PocketSyncPolicy::FlushOnShutdown,
+        )
+        .expect("config");
+        let handle = PocketStoreHandle::open(&config).expect("open");
+        let event =
+            parse_pocket_event_json(event_json_with("d", "4", "synced").as_bytes()).expect("event");
+
+        let offset = handle.store_event(&event).expect("store");
+        handle
+            .put_extra_record(
+                TANGLE_GROUP_CHECKPOINT_TABLE,
+                b"checkpoint\0sync",
+                b"synced",
+            )
+            .expect("checkpoint");
+        handle.sync().expect("sync");
+        drop(handle);
+
+        let reopened = PocketStoreHandle::open(&config).expect("reopen");
+        let by_id = reopened
+            .event_by_id(event.id())
+            .expect("lookup")
+            .expect("event");
+        let by_offset = reopened.event_by_offset(offset).expect("offset");
+
+        assert_eq!(by_id.id(), event.id());
+        assert_eq!(by_offset.id(), event.id());
+        assert_eq!(
+            reopened
+                .get_extra_record(TANGLE_GROUP_CHECKPOINT_TABLE, b"checkpoint\0sync")
+                .expect("checkpoint"),
+            Some(b"synced".to_vec())
+        );
+
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn pocket_store_config_preserves_explicit_storage_boundary() {
         let config = PocketStoreConfig::new(
             "runtime/radroots/tangle/pocket",
