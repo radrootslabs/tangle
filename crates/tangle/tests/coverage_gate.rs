@@ -4,39 +4,51 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[test]
-fn coverage_script_requires_workspace_full_line_coverage() {
-    let script = read("scripts/coverage.sh");
-
-    assert!(script.contains("cargo llvm-cov --version"));
-    assert!(script.contains("LLVM_COV=\"$(command -v llvm-cov)\""));
-    assert!(script.contains("LLVM_PROFDATA=\"$(command -v llvm-profdata)\""));
-    assert!(script.contains("cargo llvm-cov clean --workspace"));
-    assert!(script.contains("cargo llvm-cov --workspace --all-targets"));
-    assert!(script.contains("--show-missing-lines"));
-    assert!(script.contains("--fail-under-lines 100"));
-    assert!(script.contains("--fail-uncovered-lines 0"));
-}
-
-#[test]
-fn release_and_ci_keep_coverage_diagnostic_outside_required_gates() {
-    let release = read("scripts/release_acceptance.sh");
-    let ci = read("scripts/ci.sh");
-    let validation = read("ci/workspace-validation.toml");
-    assert!(!release.contains("scripts/coverage.sh"));
-    assert!(!ci.contains("scripts/coverage.sh"));
-    assert!(!validation.contains("id = \"coverage\""));
-}
-
-#[test]
-fn nix_coverage_app_provisions_coverage_tools_and_environment() {
+fn flake_coverage_app_requires_workspace_full_line_coverage() {
     let flake = read("flake.nix");
 
     assert!(flake.contains("pkgs.cargo-llvm-cov"));
     assert!(flake.contains("pkgs.llvmPackages.llvm"));
+    assert!(flake.contains("cargo llvm-cov --version"));
     assert!(flake.contains("LLVM_COV=\"$(command -v llvm-cov)\""));
     assert!(flake.contains("LLVM_PROFDATA=\"$(command -v llvm-profdata)\""));
     assert!(flake.contains("coverage = mkScript"));
-    assert!(flake.contains("scripts/coverage.sh"));
+    assert!(flake.contains("cargo llvm-cov clean --workspace"));
+    assert!(flake.contains("cargo llvm-cov --workspace --all-targets"));
+    assert!(flake.contains("--show-missing-lines"));
+    assert!(flake.contains("--fail-under-lines 100"));
+    assert!(flake.contains("--fail-uncovered-lines 0"));
+}
+
+#[test]
+fn flake_validation_surface_does_not_depend_on_removed_dirs() {
+    let root = workspace_root();
+    let flake = read("flake.nix");
+
+    assert!(!root.join("scripts").exists());
+    assert!(!root.join("ci").exists());
+    assert!(!flake.contains("scripts/"));
+    assert!(!flake.contains("ci/"));
+    assert!(!flake.contains("ops/"));
+}
+
+#[test]
+fn release_and_ci_keep_coverage_diagnostic_outside_required_gates() {
+    let flake = read("flake.nix");
+
+    let ci_start = flake.find("ci = mkScript").expect("ci app");
+    let release_start = flake
+        .find("releaseAcceptance = mkScript")
+        .expect("release app");
+    let apps_start = release_start
+        + flake[release_start..]
+            .find("in\n        {")
+            .expect("apps body");
+    let ci = &flake[ci_start..release_start];
+    let release = &flake[release_start..apps_start];
+
+    assert!(!ci.contains("cargo llvm-cov"));
+    assert!(!release.contains("cargo llvm-cov"));
 }
 
 fn read(path: &str) -> String {

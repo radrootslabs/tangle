@@ -4,35 +4,42 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[test]
-fn release_acceptance_script_covers_release_candidate_validation_ladder() {
-    let script_path = workspace_root().join("scripts/release_acceptance.sh");
-    let script = fs::read_to_string(&script_path).expect("release acceptance script");
+fn release_acceptance_app_covers_release_candidate_validation_ladder() {
+    let flake = read("flake.nix");
+    let release_start = flake
+        .find("releaseAcceptance = mkScript")
+        .expect("release app");
+    let apps_start = release_start
+        + flake[release_start..]
+            .find("in\n        {")
+            .expect("apps body");
+    let release = &flake[release_start..apps_start];
 
     for required in [
-        "#!/usr/bin/env bash",
-        "set -euo pipefail",
-        "scripts/check.sh",
-        "scripts/test.sh",
+        "cargo fmt --all -- --check",
+        "cargo test -p tangle --test source_comments",
+        "cargo test -p tangle --test unsafe_code",
+        "cargo check --workspace --all-targets",
+        "cargo clippy --workspace --all-targets -- -D warnings",
+        "cargo test --workspace",
         "cargo test -p tangle_runtime --test base_relay_v2",
         "cargo test -p tangle_groups",
         "cargo test -p tangle_store_pocket",
         "cargo test -p tangle_bench",
-        "scripts/benchmark_report.sh",
-        "cargo test -p tangle --test source_comments",
-        "cargo test -p tangle --test unsafe_code",
+        "cargo run -p tangle_bench --bin tangle-benchmark-report",
     ] {
         assert!(
-            script.contains(required),
-            "release acceptance script is missing `{required}`"
+            release.contains(required),
+            "release acceptance app is missing `{required}`"
         );
     }
 
     assert!(
-        !script.contains("scripts/coverage.sh"),
+        !release.contains("cargo llvm-cov"),
         "release acceptance must not depend on strict line coverage"
     );
     assert!(
-        !script.contains("cargo nextest run --workspace"),
+        !release.contains("cargo nextest run --workspace"),
         "release acceptance must not require a host-local nextest install"
     );
     for removed in [
@@ -46,23 +53,8 @@ fn release_acceptance_script_covers_release_candidate_validation_ladder() {
         "runtime_restore_command_imports_backup_and_rebuilds_projection_state",
     ] {
         assert!(
-            !script.contains(removed),
+            !release.contains(removed),
             "release acceptance still references `{removed}`"
-        );
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mode = fs::metadata(&script_path)
-            .expect("script metadata")
-            .permissions()
-            .mode();
-        assert_ne!(
-            mode & 0o111,
-            0,
-            "release acceptance script must be executable"
         );
     }
 }
@@ -73,7 +65,6 @@ fn nix_exposes_release_acceptance_entrypoint() {
 
     for required in [
         "releaseAcceptance = mkScript pkgs \"tangle-release-acceptance\"",
-        "scripts/release_acceptance.sh",
         "\"release-acceptance\"",
         "program = \"${releaseAcceptance}/bin/tangle-release-acceptance\"",
     ] {

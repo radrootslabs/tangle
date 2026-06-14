@@ -16,12 +16,6 @@
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
       mkPkgs = system: import nixpkgs { inherit system; };
-      coverageEnvironment = ''
-        LLVM_COV="$(command -v llvm-cov)"
-        LLVM_PROFDATA="$(command -v llvm-profdata)"
-        export LLVM_COV
-        export LLVM_PROFDATA
-      '';
       mkScript =
         pkgs: name: text:
         pkgs.writeShellApplication {
@@ -55,22 +49,48 @@
         let
           pkgs = mkPkgs system;
           check = mkScript pkgs "tangle-check" ''
-            scripts/check.sh
+            cargo fmt --all -- --check
+            cargo test -p tangle --test source_comments
+            cargo test -p tangle --test unsafe_code
+            cargo check --workspace --all-targets
+            cargo clippy --workspace --all-targets -- -D warnings
           '';
           test = mkScript pkgs "tangle-test" ''
-            scripts/test.sh
+            cargo test --workspace
             cargo nextest run --workspace
           '';
           coverage = mkScript pkgs "tangle-coverage" ''
-            ${coverageEnvironment}
-            scripts/coverage.sh
+            if ! cargo llvm-cov --version >/dev/null 2>&1; then
+              printf '%s\n' 'cargo llvm-cov is required'
+              exit 1
+            fi
+            LLVM_COV="$(command -v llvm-cov)"
+            LLVM_PROFDATA="$(command -v llvm-profdata)"
+            export LLVM_COV
+            export LLVM_PROFDATA
+            cargo llvm-cov clean --workspace
+            cargo llvm-cov --workspace --all-targets --show-missing-lines --fail-under-lines 100 --fail-uncovered-lines 0
           '';
           ci = mkScript pkgs "tangle-ci" ''
-            ${coverageEnvironment}
-            scripts/ci.sh
+            cargo fmt --all -- --check
+            cargo test -p tangle --test source_comments
+            cargo test -p tangle --test unsafe_code
+            cargo check --workspace --all-targets
+            cargo clippy --workspace --all-targets -- -D warnings
+            cargo test --workspace
           '';
           releaseAcceptance = mkScript pkgs "tangle-release-acceptance" ''
-            scripts/release_acceptance.sh
+            cargo fmt --all -- --check
+            cargo test -p tangle --test source_comments
+            cargo test -p tangle --test unsafe_code
+            cargo check --workspace --all-targets
+            cargo clippy --workspace --all-targets -- -D warnings
+            cargo test --workspace
+            cargo test -p tangle_runtime --test base_relay_v2
+            cargo test -p tangle_groups
+            cargo test -p tangle_store_pocket
+            cargo test -p tangle_bench
+            cargo run -p tangle_bench --bin tangle-benchmark-report
           '';
         in
         {
