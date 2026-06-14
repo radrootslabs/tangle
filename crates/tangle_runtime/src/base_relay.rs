@@ -1,7 +1,10 @@
 use crate::errors::{BaseRelayError, ok_accepted, ok_rejected};
 use crate::ops::BaseRelayReadinessState;
-use crate::relay::auth::BaseAuthState;
-use std::{collections::BTreeMap, collections::BTreeSet, str};
+use crate::relay::{
+    auth::BaseAuthState,
+    live::{CloseResult, LiveSubscriptionSet},
+};
+use std::{collections::BTreeSet, str};
 use tangle_crypto::{RelaySigner, verify_event_signature};
 use tangle_groups::{
     GroupAuthContext, GroupAuthority, GroupError, GroupErrorKind, GroupEventClass,
@@ -302,7 +305,12 @@ impl BaseRelay {
     }
 
     pub fn fanout(&mut self, event: &Event) -> Vec<RelayMessage> {
-        self.subscriptions.fanout(event, self.groups.as_ref())
+        let groups = self.groups.as_ref();
+        self.subscriptions.fanout(event, |event, auth| {
+            groups
+                .map(|groups| groups.event_visible_to_auth(event, auth).unwrap_or(false))
+                .unwrap_or(true)
+        })
     }
 
     pub fn mark_delivered(&mut self, subscription_id: &SubscriptionId) {
@@ -816,129 +824,6 @@ fn delete_target_event_id(event: &Event) -> Result<EventId, GroupError> {
     ))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LiveSubscriptionSet {
-    subscriptions: BTreeMap<SubscriptionId, LiveSubscription>,
-    pending: BTreeMap<SubscriptionId, usize>,
-    max_pending_events: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LiveSubscription {
-    filters: Vec<Filter>,
-    auth: GroupAuthContext,
-}
-
-impl LiveSubscriptionSet {
-    pub fn new(max_pending_events: usize) -> Result<Self, BaseRelayError> {
-        if max_pending_events == 0 {
-            return Err(BaseRelayError::invalid(
-                "live subscription pending event limit must be greater than zero",
-            ));
-        }
-        Ok(Self {
-            subscriptions: BTreeMap::new(),
-            pending: BTreeMap::new(),
-            max_pending_events,
-        })
-    }
-
-    pub fn subscribe(
-        &mut self,
-        subscription_id: SubscriptionId,
-        filters: Vec<Filter>,
-        auth: GroupAuthContext,
-    ) -> Result<(), BaseRelayError> {
-        if filters.is_empty() {
-            return Err(BaseRelayError::invalid(
-                "subscription must include at least one filter",
-            ));
-        }
-        self.subscriptions
-            .insert(subscription_id.clone(), LiveSubscription { filters, auth });
-        self.pending.insert(subscription_id, 0);
-        Ok(())
-    }
-
-    pub fn close(&mut self, subscription_id: &SubscriptionId) -> CloseResult {
-        self.pending.remove(subscription_id);
-        if self.subscriptions.remove(subscription_id).is_some() {
-            CloseResult::Closed
-        } else {
-            CloseResult::NotFound
-        }
-    }
-
-    pub fn close_all(&mut self) -> usize {
-        let closed = self.subscriptions.len();
-        self.subscriptions.clear();
-        self.pending.clear();
-        closed
-    }
-
-    fn fanout(&mut self, event: &Event, groups: Option<&GroupService>) -> Vec<RelayMessage> {
-        let matched = self
-            .subscriptions
-            .iter()
-            .filter_map(|(subscription_id, subscription)| {
-                if !subscription
-                    .filters
-                    .iter()
-                    .any(|filter| filter.matches(event))
-                {
-                    return None;
-                }
-                if groups
-                    .map(|groups| {
-                        groups
-                            .event_visible_to_auth(event, &subscription.auth)
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(true)
-                {
-                    Some(subscription_id.clone())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        let mut messages = Vec::new();
-        for subscription_id in matched {
-            let pending = self.pending.entry(subscription_id.clone()).or_insert(0);
-            *pending += 1;
-            if *pending > self.max_pending_events {
-                self.close(&subscription_id);
-                messages.push(RelayMessage::Closed {
-                    subscription_id,
-                    message: "error: subscription lagged; resync required".to_owned(),
-                });
-            } else {
-                messages.push(RelayMessage::Event {
-                    subscription_id,
-                    event: event.clone(),
-                });
-            }
-        }
-        messages
-    }
-
-    pub fn mark_delivered(&mut self, subscription_id: &SubscriptionId) {
-        if let Some(pending) = self.pending.get_mut(subscription_id) {
-            *pending = 0;
-        }
-    }
-
-    pub fn active_count(&self) -> usize {
-        self.subscriptions.len()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CloseResult {
-    Closed,
-    NotFound,
-}
-
 fn tangle_event_to_pocket(event: &Event) -> Result<PocketOwnedEvent, BaseRelayError> {
     let raw = event_to_value(event).to_string();
     parse_pocket_event_json(raw.as_bytes()).map_err(BaseRelayError::from)
@@ -966,8 +851,9 @@ fn pocket_event_id(event_id: &EventId) -> Result<PocketEventId, BaseRelayError> 
 
 #[cfg(test)]
 mod tests {
-    use super::{BaseRelay, CloseResult};
+    use super::BaseRelay;
     use crate::relay::auth::BaseAuthState;
+    use crate::relay::live::CloseResult;
     use tangle_crypto::RelaySigner;
     use tangle_groups::{
         GroupId, KIND_GROUP_ADMINS, KIND_GROUP_CREATE_GROUP, KIND_GROUP_CREATE_INVITE,
