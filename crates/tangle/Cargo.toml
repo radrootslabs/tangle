@@ -10,6 +10,7 @@ readme = "../../README"
 
 [dependencies]
 tangle_runtime = { path = "../tangle_runtime" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [dev-dependencies]
 serde_json = "1"

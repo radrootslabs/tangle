@@ -1210,6 +1210,7 @@ dependencies = [
  "tangle_protocol",
  "tangle_runtime",
  "tangle_test_support",
+ "tokio",
 ]
 
 [[package]]

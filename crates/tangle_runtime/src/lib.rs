@@ -10,6 +10,7 @@ pub mod ops;
 pub(crate) mod pocket_conversion;
 pub mod relay;
 pub mod runtime;
+pub mod server;
 
 use std::{fmt, fs, path::Path, path::PathBuf};
 

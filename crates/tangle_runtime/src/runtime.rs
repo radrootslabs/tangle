@@ -226,7 +226,7 @@ impl TangleShutdownSignal {
     }
 
     pub fn request_shutdown(&self) {
-        let _ = self.sender.send(true);
+        self.sender.send_replace(true);
     }
 
     pub fn requested(&self) -> bool {
