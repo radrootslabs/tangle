@@ -4358,6 +4358,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tangle_crypto",
  "tangle_protocol",
 ]
 

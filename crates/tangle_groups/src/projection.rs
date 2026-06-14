@@ -560,6 +560,17 @@ impl GroupProjection {
         }
     }
 
+    pub fn put_tombstone(&mut self, tombstone: GroupTombstone) {
+        if self
+            .tombstones
+            .get(tombstone.group_id())
+            .is_none_or(|current| tombstone.last_tuple() >= current.last_tuple())
+        {
+            self.tombstones
+                .insert(tombstone.group_id().clone(), tombstone);
+        }
+    }
+
     pub fn apply_canonical_event(
         &mut self,
         event: &Event,

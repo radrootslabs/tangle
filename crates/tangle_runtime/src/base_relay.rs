@@ -10,7 +10,14 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, collections::BTreeSet, str};
 use tangle_crypto::{RelaySigner, verify_event_signature};
 use tangle_groups::{
-    GroupEventClass, GroupLimitsConfig, GroupRuntimeConfig, validate_client_group_event_structure,
+    GroupAuthContext, GroupAuthority, GroupError, GroupEventClass, GroupGeneratedEventBuilder,
+    GroupId, GroupLimitsConfig, GroupOutbox, GroupOutboxEffect, GroupOutboxKey, GroupOutboxPayload,
+    GroupOutboxRecord, GroupProjection, GroupRuntimeConfig, GroupState, GroupTombstone,
+    KIND_GROUP_CREATE_GROUP, KIND_GROUP_EDIT_METADATA, KIND_GROUP_JOIN_REQUEST,
+    KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_PUT_USER, KIND_GROUP_REMOVE_USER,
+    MemberState, ProjectedRoleDefinition, ProjectionCheckpoint, StoreOffset, group_current_key,
+    member_current_key, projection_checkpoint_key, role_current_key, tombstone_key,
+    validate_client_group_event_structure,
 };
 use tangle_nips::parse_relay_auth_event;
 use tangle_protocol::{
@@ -19,7 +26,8 @@ use tangle_protocol::{
 };
 use tangle_store_pocket::{
     PocketEvent, PocketEventId, PocketOwnedEvent, PocketOwnedFilter, PocketStoreConfig,
-    PocketStoreHandle, parse_pocket_event_json, parse_pocket_filter_json,
+    PocketStoreHandle, TANGLE_GROUP_CHECKPOINT_TABLE, TANGLE_GROUP_OUTBOX_TABLE,
+    TANGLE_GROUP_PROJECTION_TABLE, parse_pocket_event_json, parse_pocket_filter_json,
 };
 
 pub const BASE_RELAY_SUPPORTED_NIPS: [u16; 5] = [1, 11, 42, 45, 70];
@@ -248,6 +256,7 @@ struct BaseAuthChallenge {
 pub struct BaseRelay {
     store: PocketStoreHandle,
     subscriptions: LiveSubscriptionSet,
+    groups: Option<GroupService>,
 }
 
 impl BaseRelay {
@@ -259,13 +268,32 @@ impl BaseRelay {
         Self::new(store, max_pending_events)
     }
 
+    pub fn open_with_groups(
+        config: &PocketStoreConfig,
+        max_pending_events: usize,
+        groups: &GroupRuntimeConfig,
+    ) -> Result<Self, BaseRelayError> {
+        let store = PocketStoreHandle::open(config).map_err(BaseRelayError::from)?;
+        Self::new_with_groups(store, max_pending_events, groups)
+    }
+
     pub fn new(
         store: PocketStoreHandle,
         max_pending_events: usize,
     ) -> Result<Self, BaseRelayError> {
+        Self::new_with_groups(store, max_pending_events, &GroupRuntimeConfig::disabled())
+    }
+
+    pub fn new_with_groups(
+        store: PocketStoreHandle,
+        max_pending_events: usize,
+        groups: &GroupRuntimeConfig,
+    ) -> Result<Self, BaseRelayError> {
+        let groups = GroupService::from_config(&store, groups)?;
         Ok(Self {
             store,
             subscriptions: LiveSubscriptionSet::new(max_pending_events)?,
+            groups,
         })
     }
 
@@ -276,7 +304,9 @@ impl BaseRelay {
         now: UnixTimestamp,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
         match message {
-            ClientMessage::Event(event) => self.handle_event(event).map(|message| vec![message]),
+            ClientMessage::Event(event) => self
+                .handle_event_with_auth(event, auth)
+                .map(|message| vec![message]),
             ClientMessage::Req {
                 subscription_id,
                 filters,
@@ -310,20 +340,57 @@ impl BaseRelay {
         }
     }
 
-    pub fn handle_event(&self, event: Event) -> Result<RelayMessage, BaseRelayError> {
+    pub fn handle_event(&mut self, event: Event) -> Result<RelayMessage, BaseRelayError> {
+        self.handle_event_with_group_auth(event, &GroupAuthContext::unauthenticated())
+    }
+
+    pub fn handle_event_with_auth(
+        &mut self,
+        event: Event,
+        auth: &BaseAuthState,
+    ) -> Result<RelayMessage, BaseRelayError> {
+        self.handle_event_with_group_auth(
+            event,
+            &GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned()),
+        )
+    }
+
+    pub fn groups_enabled(&self) -> bool {
+        self.groups.is_some()
+    }
+
+    pub fn group_projection(&self) -> Option<&GroupProjection> {
+        self.groups.as_ref().map(|groups| groups.projection())
+    }
+
+    fn handle_event_with_group_auth(
+        &mut self,
+        event: Event,
+        auth: &GroupAuthContext,
+    ) -> Result<RelayMessage, BaseRelayError> {
         let event_id = event.id().clone();
         if let Err(error) = verify_event_signature(&event) {
             return Ok(ok_rejected(event_id, format!("invalid: {error}")));
         }
-        match validate_client_group_event_structure(&event, GroupLimitsConfig::default()) {
-            Ok(GroupEventClass::NonGroup) => {}
-            Ok(_) => {
+        let group_limits = self
+            .groups
+            .as_ref()
+            .map(GroupService::limits)
+            .unwrap_or_default();
+        let class = match validate_client_group_event_structure(&event, group_limits) {
+            Ok(class) => class,
+            Err(error) => return Ok(ok_rejected(event_id, error.prefixed_message())),
+        };
+        if !matches!(class, GroupEventClass::NonGroup) {
+            let Some(groups) = self.groups.as_ref() else {
                 return Ok(ok_rejected(
                     event_id,
                     "blocked: NIP-29 group events are not accepted before group service".to_owned(),
                 ));
+            };
+            if let Err(error) = groups.check_event(&event, &class, auth) {
+                return Ok(ok_rejected(event_id, error.prefixed_message()));
             }
-            Err(error) => return Ok(ok_rejected(event_id, error.prefixed_message())),
         }
         if event.unsigned().kind().is_ephemeral() {
             return Ok(ok_accepted(event_id, String::new()));
@@ -339,7 +406,12 @@ impl BaseRelay {
             ));
         }
         let pocket_event = tangle_event_to_pocket(&event)?;
-        self.store.store_event(&pocket_event)?;
+        let store_offset = StoreOffset::new(self.store.store_event(&pocket_event)?);
+        if !matches!(class, GroupEventClass::NonGroup)
+            && let Some(groups) = self.groups.as_mut()
+        {
+            groups.after_source_event_stored(&self.store, &event, &class, store_offset)?;
+        }
         self.store.sync()?;
         Ok(ok_accepted(event_id, String::new()))
     }
@@ -403,6 +475,372 @@ impl BaseRelay {
             }
         }
         Ok(output)
+    }
+}
+
+struct GroupService {
+    builder: GroupGeneratedEventBuilder,
+    authority: GroupAuthority,
+    projection: GroupProjection,
+    outbox: GroupOutbox,
+    limits: GroupLimitsConfig,
+    member_snapshot_cap: u32,
+}
+
+impl GroupService {
+    fn from_config(
+        store: &PocketStoreHandle,
+        config: &GroupRuntimeConfig,
+    ) -> Result<Option<Self>, BaseRelayError> {
+        if !config.enabled() {
+            return Ok(None);
+        }
+        let relay_secret = config
+            .relay_secret()
+            .ok_or_else(|| BaseRelayError::invalid("groups.relay_secret is required"))?;
+        let signer = RelaySigner::from_secret_hex(relay_secret.expose_for_signing())
+            .map_err(BaseRelayError::invalid)?;
+        Ok(Some(Self {
+            builder: GroupGeneratedEventBuilder::new(signer),
+            authority: GroupAuthority::new(
+                config.owner_pubkeys().iter().cloned(),
+                config.admin_pubkeys().iter().cloned(),
+            ),
+            projection: load_group_projection(store)?,
+            outbox: load_group_outbox(store)?,
+            limits: config.limits(),
+            member_snapshot_cap: config.limits().max_member_list_pubkeys(),
+        }))
+    }
+
+    fn projection(&self) -> &GroupProjection {
+        &self.projection
+    }
+
+    fn limits(&self) -> GroupLimitsConfig {
+        self.limits
+    }
+
+    fn check_event(
+        &self,
+        event: &Event,
+        class: &GroupEventClass,
+        auth: &GroupAuthContext,
+    ) -> Result<(), GroupError> {
+        tangle_groups::GroupWritePolicy::new(&self.projection, &self.authority)
+            .check_event(event, class, auth)
+            .map(|_| ())
+    }
+
+    fn after_source_event_stored(
+        &mut self,
+        store: &PocketStoreHandle,
+        event: &Event,
+        class: &GroupEventClass,
+        store_offset: StoreOffset,
+    ) -> Result<(), BaseRelayError> {
+        self.projection
+            .apply_canonical_event(event, store_offset, self.limits)?;
+        if let Some(group_id) = class_group_id(class) {
+            self.persist_group_projection(store, group_id)?;
+        }
+        for record in self.plan_outbox_records(event, class)? {
+            let inserted = self.outbox.insert_idempotent(record.clone())?;
+            if inserted {
+                persist_outbox_record(store, &record)?;
+            }
+        }
+        self.materialize_outbox(store)
+    }
+
+    fn plan_outbox_records(
+        &self,
+        event: &Event,
+        class: &GroupEventClass,
+    ) -> Result<Vec<GroupOutboxRecord>, GroupError> {
+        let created_at = event.unsigned().created_at();
+        match class {
+            GroupEventClass::Moderation { kind, group_id } => match kind.as_u32() {
+                KIND_GROUP_CREATE_GROUP => {
+                    let group = self.require_group(group_id)?;
+                    Ok(vec![
+                        self.pending_record(
+                            event,
+                            GroupOutboxEffect::MetadataSnapshot,
+                            group_id,
+                            None,
+                            GroupGeneratedEventBuilder::metadata_snapshot_payload(
+                                group, created_at,
+                            )?,
+                        ),
+                        self.pending_record(
+                            event,
+                            GroupOutboxEffect::AdminListSnapshot,
+                            group_id,
+                            None,
+                            GroupGeneratedEventBuilder::admin_list_snapshot_payload(
+                                group_id,
+                                &self.projection,
+                                &self.authority,
+                                created_at,
+                            )?,
+                        ),
+                    ])
+                }
+                KIND_GROUP_EDIT_METADATA => {
+                    let group = self.require_group(group_id)?;
+                    Ok(vec![self.pending_record(
+                        event,
+                        GroupOutboxEffect::MetadataSnapshot,
+                        group_id,
+                        None,
+                        GroupGeneratedEventBuilder::metadata_snapshot_payload(group, created_at)?,
+                    )])
+                }
+                KIND_GROUP_PUT_USER | KIND_GROUP_REMOVE_USER => {
+                    Ok(self.member_snapshot_record(event, group_id, created_at)?)
+                }
+                _ => Ok(Vec::new()),
+            },
+            GroupEventClass::Normal { group_id } => match event.unsigned().kind().as_u32() {
+                KIND_GROUP_JOIN_REQUEST => Ok(vec![self.pending_record(
+                    event,
+                    GroupOutboxEffect::JoinAccepted,
+                    group_id,
+                    Some(event.unsigned().pubkey().clone()),
+                    GroupGeneratedEventBuilder::join_accepted_payload(
+                        group_id,
+                        event.unsigned().pubkey(),
+                        created_at,
+                    ),
+                )]),
+                KIND_GROUP_LEAVE_REQUEST => Ok(vec![self.pending_record(
+                    event,
+                    GroupOutboxEffect::LeaveAccepted,
+                    group_id,
+                    Some(event.unsigned().pubkey().clone()),
+                    GroupGeneratedEventBuilder::leave_accepted_payload(
+                        group_id,
+                        event.unsigned().pubkey(),
+                        created_at,
+                    ),
+                )]),
+                _ => Ok(Vec::new()),
+            },
+            GroupEventClass::NonGroup | GroupEventClass::RelayGeneratedSnapshot { .. } => {
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    fn member_snapshot_record(
+        &self,
+        event: &Event,
+        group_id: &GroupId,
+        created_at: UnixTimestamp,
+    ) -> Result<Vec<GroupOutboxRecord>, GroupError> {
+        let key = GroupOutboxKey::new(
+            event.id().clone(),
+            GroupOutboxEffect::MemberListSnapshot,
+            group_id.clone(),
+            None,
+        );
+        let payload = GroupGeneratedEventBuilder::member_list_snapshot_payload(
+            group_id,
+            &self.projection,
+            created_at,
+            self.member_snapshot_cap,
+        )?;
+        Ok(vec![match payload {
+            Some(payload) => GroupOutboxRecord::pending(key, payload),
+            None => {
+                let mut record = GroupOutboxRecord::pending(
+                    key,
+                    GroupOutboxPayload::new(
+                        KIND_GROUP_MEMBERS,
+                        created_at,
+                        vec![vec!["d".to_owned(), group_id.as_str().to_owned()]],
+                        "",
+                    ),
+                );
+                record.mark_skipped("member snapshot exceeds configured cap");
+                record
+            }
+        }])
+    }
+
+    fn pending_record(
+        &self,
+        event: &Event,
+        effect: GroupOutboxEffect,
+        group_id: &GroupId,
+        target_pubkey: Option<PublicKeyHex>,
+        payload: GroupOutboxPayload,
+    ) -> GroupOutboxRecord {
+        GroupOutboxRecord::pending(
+            GroupOutboxKey::new(event.id().clone(), effect, group_id.clone(), target_pubkey),
+            payload,
+        )
+    }
+
+    fn materialize_outbox(&mut self, store: &PocketStoreHandle) -> Result<(), BaseRelayError> {
+        let records = self.outbox.replay_plan().records().to_vec();
+        for record in records {
+            self.materialize_record(store, record)?;
+        }
+        Ok(())
+    }
+
+    fn materialize_record(
+        &mut self,
+        store: &PocketStoreHandle,
+        mut record: GroupOutboxRecord,
+    ) -> Result<(), BaseRelayError> {
+        if matches!(
+            record.key().effect(),
+            GroupOutboxEffect::RoleListSnapshot | GroupOutboxEffect::State39004Snapshot
+        ) {
+            record.mark_skipped("generated group effect is not supported");
+            self.outbox.update(record.clone());
+            persist_outbox_record(store, &record)?;
+            return Ok(());
+        }
+        match self.store_generated_event(store, &record) {
+            Ok(generated_event_id) => {
+                record.mark_stored(generated_event_id);
+                self.outbox.update(record.clone());
+                persist_outbox_record(store, &record)?;
+                Ok(())
+            }
+            Err(error) => {
+                record.mark_failed(true, error.prefixed_message());
+                self.outbox.update(record.clone());
+                persist_outbox_record(store, &record)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn store_generated_event(
+        &mut self,
+        store: &PocketStoreHandle,
+        record: &GroupOutboxRecord,
+    ) -> Result<EventId, BaseRelayError> {
+        let event = self.builder.sign_payload(record.payload())?;
+        if store.event_by_id(pocket_event_id(event.id())?)?.is_some() {
+            return Ok(event.id().clone());
+        }
+        let pocket_event = tangle_event_to_pocket(&event)?;
+        let offset = StoreOffset::new(store.store_event(&pocket_event)?);
+        self.projection
+            .apply_canonical_event(&event, offset, self.limits)?;
+        self.persist_group_projection(store, record.key().group_id())?;
+        Ok(event.id().clone())
+    }
+
+    fn persist_group_projection(
+        &self,
+        store: &PocketStoreHandle,
+        group_id: &GroupId,
+    ) -> Result<(), BaseRelayError> {
+        if let Some(group) = self.projection.group(group_id) {
+            store.put_extra_record(
+                TANGLE_GROUP_PROJECTION_TABLE,
+                &group_current_key(group_id),
+                &group.to_json_bytes()?,
+            )?;
+        }
+        for ((candidate_group, pubkey), member) in self.projection.members() {
+            if candidate_group == group_id {
+                store.put_extra_record(
+                    TANGLE_GROUP_PROJECTION_TABLE,
+                    &member_current_key(group_id, pubkey),
+                    &member.to_json_bytes()?,
+                )?;
+            }
+        }
+        for ((candidate_group, role_name), role) in self.projection.roles() {
+            if candidate_group == group_id {
+                store.put_extra_record(
+                    TANGLE_GROUP_PROJECTION_TABLE,
+                    &role_current_key(group_id, role_name),
+                    &role.to_json_bytes()?,
+                )?;
+            }
+        }
+        if let Some(tombstone) = self.projection.tombstone(group_id) {
+            store.put_extra_record(
+                TANGLE_GROUP_PROJECTION_TABLE,
+                &tombstone_key(group_id),
+                &tombstone.to_json_bytes()?,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn require_group(&self, group_id: &GroupId) -> Result<&GroupState, GroupError> {
+        self.projection
+            .group(group_id)
+            .ok_or_else(|| GroupError::internal("group projection is missing after accepted write"))
+    }
+}
+
+fn load_group_projection(store: &PocketStoreHandle) -> Result<GroupProjection, BaseRelayError> {
+    let mut projection = GroupProjection::new();
+    for (key, value) in store.scan_extra_records(TANGLE_GROUP_PROJECTION_TABLE)? {
+        match projection_key_parts(&key)?.as_slice() {
+            ["group", _] => projection.put_group(GroupState::from_json_bytes(&value)?),
+            ["member", group_id, _] => projection.put_member(
+                GroupId::new(group_id)?,
+                MemberState::from_json_bytes(&value)?,
+            ),
+            ["role", group_id, _] => projection.put_role(
+                GroupId::new(group_id)?,
+                ProjectedRoleDefinition::from_json_bytes(&value)?,
+            ),
+            ["tombstone", _] => projection.put_tombstone(GroupTombstone::from_json_bytes(&value)?),
+            _ => {}
+        }
+    }
+    if let Some(raw) =
+        store.get_extra_record(TANGLE_GROUP_CHECKPOINT_TABLE, &projection_checkpoint_key())?
+    {
+        projection.set_checkpoint(ProjectionCheckpoint::from_json_bytes(&raw)?);
+    }
+    Ok(projection)
+}
+
+fn load_group_outbox(store: &PocketStoreHandle) -> Result<GroupOutbox, BaseRelayError> {
+    let mut outbox = GroupOutbox::new();
+    for (_, value) in store.scan_extra_records(TANGLE_GROUP_OUTBOX_TABLE)? {
+        outbox.update(GroupOutboxRecord::from_json_bytes(&value)?);
+    }
+    Ok(outbox)
+}
+
+fn projection_key_parts(key: &[u8]) -> Result<Vec<&str>, BaseRelayError> {
+    let key = str::from_utf8(key).map_err(|error| BaseRelayError::error(error.to_string()))?;
+    Ok(key.split('\0').collect())
+}
+
+fn persist_outbox_record(
+    store: &PocketStoreHandle,
+    record: &GroupOutboxRecord,
+) -> Result<(), BaseRelayError> {
+    store.put_extra_record(
+        TANGLE_GROUP_OUTBOX_TABLE,
+        &record.key().storage_key(),
+        &record.to_json_bytes()?,
+    )?;
+    Ok(())
+}
+
+fn class_group_id(class: &GroupEventClass) -> Option<&GroupId> {
+    match class {
+        GroupEventClass::Moderation { group_id, .. }
+        | GroupEventClass::Normal { group_id }
+        | GroupEventClass::RelayGeneratedSnapshot { group_id, .. } => Some(group_id),
+        GroupEventClass::NonGroup => None,
     }
 }
 
@@ -550,6 +988,12 @@ impl From<tangle_store_pocket::PocketStoreError> for BaseRelayError {
     }
 }
 
+impl From<GroupError> for BaseRelayError {
+    fn from(error: GroupError) -> Self {
+        Self::error(error.prefixed_message())
+    }
+}
+
 fn relay_self_from_groups(
     groups: &GroupRuntimeConfig,
 ) -> Result<Option<PublicKeyHex>, BaseRelayError> {
@@ -621,10 +1065,13 @@ mod tests {
     use axum::body::to_bytes;
     use http::{Request, StatusCode, header};
     use tangle_crypto::RelaySigner;
-    use tangle_groups::parse_group_runtime_config_json;
+    use tangle_groups::{
+        GroupId, KIND_GROUP_ADMINS, KIND_GROUP_CREATE_GROUP, KIND_GROUP_JOIN_REQUEST,
+        KIND_GROUP_METADATA, KIND_GROUP_PUT_USER, MemberStatus, parse_group_runtime_config_json,
+    };
     use tangle_protocol::{
-        ClientMessage, Event, Filter, Kind, RelayMessage, SubscriptionId, Tag, UnixTimestamp,
-        UnsignedEvent, filter_from_value,
+        ClientMessage, Event, Filter, Kind, PublicKeyHex, RelayMessage, SubscriptionId, Tag,
+        UnixTimestamp, UnsignedEvent, filter_from_value,
     };
     use tangle_store_pocket::{PocketStoreConfig, PocketSyncPolicy};
     use tower::ServiceExt;
@@ -777,7 +1224,7 @@ mod tests {
 
     #[test]
     fn base_relay_rejects_group_marked_events_before_group_service() {
-        let relay = test_relay("base-relay-group-reject", 4);
+        let mut relay = test_relay("base-relay-group-reject", 4);
         let event = signed_public_event(
             7,
             1,
@@ -798,7 +1245,7 @@ mod tests {
 
     #[test]
     fn base_relay_rejects_client_submitted_relay_generated_group_state() {
-        let relay = test_relay("base-relay-generated-group-reject", 4);
+        let mut relay = test_relay("base-relay-generated-group-reject", 4);
         let event = signed_public_event(
             7,
             39_000,
@@ -815,6 +1262,138 @@ mod tests {
                     "blocked: relay-generated group state events cannot be submitted by clients"
                         .to_owned()
             }
+        );
+    }
+
+    #[test]
+    fn base_relay_initializes_group_service_from_config() {
+        let owner = signer(7).public_key().clone();
+        let relay = test_relay_with_groups(
+            "base-relay-groups-enabled",
+            4,
+            &enabled_groups_for_owner(&owner),
+        );
+        let disabled = test_relay_with_groups("base-relay-groups-disabled", 4, &disabled_groups());
+
+        assert!(relay.groups_enabled());
+        assert!(
+            relay
+                .group_projection()
+                .expect("projection")
+                .groups()
+                .is_empty()
+        );
+        assert!(!disabled.groups_enabled());
+        assert!(disabled.group_projection().is_none());
+    }
+
+    #[test]
+    fn group_event_write_requires_auth_before_storage() {
+        let owner = signer(7).public_key().clone();
+        let mut relay = test_relay_with_groups(
+            "base-relay-group-auth-required",
+            4,
+            &enabled_groups_for_owner(&owner),
+        );
+        let auth = BaseAuthState::new("wss://relay.radroots.test", 60).expect("auth");
+        let event = signed_group_create_event(7, "Farm");
+
+        assert_eq!(
+            relay
+                .handle_event_with_auth(event.clone(), &auth)
+                .expect("event"),
+            RelayMessage::Ok {
+                event_id: event.id().clone(),
+                accepted: false,
+                message: "auth-required: group event author must authenticate with AUTH".to_owned()
+            }
+        );
+        assert!(
+            relay
+                .group_projection()
+                .expect("projection")
+                .group(&GroupId::new("Farm").expect("group"))
+                .is_none()
+        );
+        assert_eq!(count_kind(&relay, KIND_GROUP_CREATE_GROUP), 0);
+    }
+
+    #[test]
+    fn group_create_updates_projection_and_stores_generated_snapshots() {
+        let owner = signer(7).public_key().clone();
+        let mut relay = test_relay_with_groups(
+            "base-relay-group-create",
+            4,
+            &enabled_groups_for_owner(&owner),
+        );
+        let auth = authenticated_state(7);
+        let event = signed_group_create_event(7, "Farm");
+
+        assert_eq!(
+            relay
+                .handle_event_with_auth(event.clone(), &auth)
+                .expect("event"),
+            RelayMessage::Ok {
+                event_id: event.id().clone(),
+                accepted: true,
+                message: String::new()
+            }
+        );
+
+        let group_id = GroupId::new("Farm").expect("group");
+        assert!(
+            relay
+                .group_projection()
+                .expect("projection")
+                .group(&group_id)
+                .is_some()
+        );
+        assert_eq!(count_kind(&relay, KIND_GROUP_CREATE_GROUP), 1);
+        assert_eq!(count_kind(&relay, KIND_GROUP_METADATA), 1);
+        assert_eq!(count_kind(&relay, KIND_GROUP_ADMINS), 1);
+    }
+
+    #[test]
+    fn group_join_materializes_relay_membership_event() {
+        let owner = signer(7).public_key().clone();
+        let joiner = signer(8).public_key().clone();
+        let mut relay = test_relay_with_groups(
+            "base-relay-group-join",
+            4,
+            &enabled_groups_for_owner(&owner),
+        );
+        let create = signed_group_create_event(7, "Farm");
+        relay
+            .handle_event_with_auth(create, &authenticated_state(7))
+            .expect("create");
+        let join = signed_event_at(
+            8,
+            KIND_GROUP_JOIN_REQUEST.into(),
+            vec![Tag::from_parts("h", &["Farm"]).expect("h")],
+            "",
+            1_714_124_434,
+        );
+
+        assert_eq!(
+            relay
+                .handle_event_with_auth(join.clone(), &authenticated_state(8))
+                .expect("join"),
+            RelayMessage::Ok {
+                event_id: join.id().clone(),
+                accepted: true,
+                message: String::new()
+            }
+        );
+
+        assert_eq!(count_kind(&relay, KIND_GROUP_PUT_USER), 1);
+        assert_eq!(
+            relay
+                .group_projection()
+                .expect("projection")
+                .member(&GroupId::new("Farm").expect("group"), &joiner)
+                .expect("member")
+                .status(),
+            MemberStatus::Member
         );
     }
 
@@ -885,26 +1464,46 @@ mod tests {
     }
 
     fn test_relay(name: &str, max_pending_events: usize) -> BaseRelay {
+        let config = test_store_config(name);
+        BaseRelay::open(&config, max_pending_events).expect("relay")
+    }
+
+    fn test_relay_with_groups(
+        name: &str,
+        max_pending_events: usize,
+        groups: &tangle_groups::GroupRuntimeConfig,
+    ) -> BaseRelay {
+        let config = test_store_config(name);
+        BaseRelay::open_with_groups(&config, max_pending_events, groups).expect("relay")
+    }
+
+    fn test_store_config(name: &str) -> PocketStoreConfig {
         let root = std::env::temp_dir().join(format!("tangle-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let config = PocketStoreConfig::new(
+        PocketStoreConfig::new(
             root.join("pocket"),
             1024 * 1024 * 1024,
             128,
             PocketSyncPolicy::FlushOnShutdown,
         )
-        .expect("config");
-        BaseRelay::open(&config, max_pending_events).expect("relay")
+        .expect("config")
     }
 
     fn enabled_groups() -> tangle_groups::GroupRuntimeConfig {
+        let owner = signer(7).public_key().clone();
+        enabled_groups_for_owner(&owner)
+    }
+
+    fn enabled_groups_for_owner(owner: &PublicKeyHex) -> tangle_groups::GroupRuntimeConfig {
         parse_group_runtime_config_json(&format!(
             r#"{{
                 "enabled": true,
                 "canonical_relay_url": "wss://relay.radroots.test",
-                "relay_secret": "{}"
+                "relay_secret": "{}",
+                "owner_pubkeys": ["{}"]
             }}"#,
-            "7".repeat(64)
+            "7".repeat(64),
+            owner.as_str()
         ))
         .expect("groups")
     }
@@ -930,6 +1529,19 @@ mod tests {
         signed_event_at(secret_byte, kind, tags, content, 1_714_124_433)
     }
 
+    fn signed_group_create_event(secret_byte: u8, group_id: &str) -> Event {
+        signed_event_at(
+            secret_byte,
+            KIND_GROUP_CREATE_GROUP.into(),
+            vec![
+                Tag::from_parts("h", &[group_id]).expect("h"),
+                Tag::from_parts("name", &[group_id]).expect("name"),
+            ],
+            "",
+            1_714_124_433,
+        )
+    }
+
     fn signed_event_at(
         secret_byte: u8,
         kind: u64,
@@ -947,5 +1559,31 @@ mod tests {
             content,
         );
         signer.sign_unsigned_event(unsigned)
+    }
+
+    fn authenticated_state(secret_byte: u8) -> BaseAuthState {
+        let mut auth = BaseAuthState::new("wss://relay.radroots.test", 60).expect("auth state");
+        auth.issue_challenge("challenge-a", UnixTimestamp::new(100))
+            .expect("challenge");
+        let event = signed_auth_event(secret_byte, "challenge-a", 120);
+        auth.authenticate(&event, UnixTimestamp::new(120))
+            .expect("authenticate");
+        auth
+    }
+
+    fn count_kind(relay: &BaseRelay, kind: u32) -> u64 {
+        let subscription_id = SubscriptionId::new(&format!("count-{kind}")).expect("sub");
+        let filter = filter_from_value(&serde_json::json!({"kinds":[kind]})).expect("filter");
+        match relay
+            .handle_count(subscription_id, vec![filter])
+            .expect("count")
+        {
+            RelayMessage::Count { count, .. } => count,
+            _ => panic!("count response expected"),
+        }
+    }
+
+    fn signer(secret_byte: u8) -> RelaySigner {
+        RelaySigner::from_secret_hex(&format!("{:02x}", secret_byte).repeat(32)).expect("signer")
     }
 }

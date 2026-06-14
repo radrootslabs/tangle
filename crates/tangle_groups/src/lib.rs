@@ -51,6 +51,7 @@ pub use roles::{
     Capability, CapabilitySet, PERMANENT_RELAY_OVERRIDE_ROLE, RoleDefinition, RoleName,
     resolve_capabilities,
 };
+pub use signing::GroupGeneratedEventBuilder;
 pub use tags::{GroupTag, GroupTagName, extract_group_tag, has_group_identity_tag};
 pub use write_gate::{
     GroupAuthContext, require_group_auth_as_author, validate_client_group_event_structure,

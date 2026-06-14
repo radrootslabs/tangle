@@ -35,6 +35,14 @@ impl GroupAuthority {
         self.owner_pubkeys.contains(pubkey)
     }
 
+    pub fn owner_pubkeys(&self) -> &BTreeSet<PublicKeyHex> {
+        &self.owner_pubkeys
+    }
+
+    pub fn admin_pubkeys(&self) -> &BTreeSet<PublicKeyHex> {
+        &self.admin_pubkeys
+    }
+
     pub fn is_admin(&self, pubkey: &PublicKeyHex) -> bool {
         self.admin_pubkeys.contains(pubkey) || self.is_owner(pubkey)
     }

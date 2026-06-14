@@ -10,6 +10,7 @@ description = "Group state and authorization model for Tangle"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tangle_crypto = { path = "../tangle_crypto" }
 tangle_protocol = { path = "../tangle_protocol" }
 
 [lints]
