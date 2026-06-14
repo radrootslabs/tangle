@@ -1,7 +1,5 @@
 use crate::errors::{BaseRelayError, ok_accepted, ok_rejected};
-use axum::{Json, Router, extract::State, routing::get};
-use http::StatusCode;
-use serde::{Deserialize, Serialize};
+use crate::ops::BaseRelayReadinessState;
 use std::{collections::BTreeMap, collections::BTreeSet, str};
 use tangle_crypto::{RelaySigner, verify_event_signature};
 use tangle_groups::{
@@ -25,135 +23,6 @@ use tangle_store_pocket::{
     PocketStoreHandle, TANGLE_GROUP_CHECKPOINT_TABLE, TANGLE_GROUP_OUTBOX_TABLE,
     TANGLE_GROUP_PROJECTION_TABLE, parse_pocket_event_json, parse_pocket_filter_json,
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BaseRelayReadinessCheckStatus {
-    Ready,
-    NotReady,
-}
-
-impl BaseRelayReadinessCheckStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Ready => "ready",
-            Self::NotReady => "not_ready",
-        }
-    }
-
-    pub fn is_ready(self) -> bool {
-        self == Self::Ready
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BaseRelayReadinessState {
-    config: BaseRelayReadinessCheckStatus,
-    relay_identity: BaseRelayReadinessCheckStatus,
-    pocket_storage: BaseRelayReadinessCheckStatus,
-    group_projection: BaseRelayReadinessCheckStatus,
-    group_outbox_replay: BaseRelayReadinessCheckStatus,
-}
-
-impl BaseRelayReadinessState {
-    pub fn new(
-        config: BaseRelayReadinessCheckStatus,
-        relay_identity: BaseRelayReadinessCheckStatus,
-        pocket_storage: BaseRelayReadinessCheckStatus,
-        group_projection: BaseRelayReadinessCheckStatus,
-        group_outbox_replay: BaseRelayReadinessCheckStatus,
-    ) -> Self {
-        Self {
-            config,
-            relay_identity,
-            pocket_storage,
-            group_projection,
-            group_outbox_replay,
-        }
-    }
-
-    pub fn ready() -> Self {
-        Self::new(
-            BaseRelayReadinessCheckStatus::Ready,
-            BaseRelayReadinessCheckStatus::Ready,
-            BaseRelayReadinessCheckStatus::Ready,
-            BaseRelayReadinessCheckStatus::Ready,
-            BaseRelayReadinessCheckStatus::Ready,
-        )
-    }
-
-    pub fn is_ready(&self) -> bool {
-        [
-            self.config,
-            self.relay_identity,
-            self.pocket_storage,
-            self.group_projection,
-            self.group_outbox_replay,
-        ]
-        .into_iter()
-        .all(BaseRelayReadinessCheckStatus::is_ready)
-    }
-
-    pub fn response(&self) -> BaseRelayReadinessDocument {
-        BaseRelayReadinessDocument {
-            status: if self.is_ready() {
-                "ready".to_owned()
-            } else {
-                "not_ready".to_owned()
-            },
-            checks: BaseRelayReadinessChecksDocument {
-                config: self.config.as_str().to_owned(),
-                relay_identity: self.relay_identity.as_str().to_owned(),
-                pocket_storage: self.pocket_storage.as_str().to_owned(),
-                group_projection: self.group_projection.as_str().to_owned(),
-                group_outbox_replay: self.group_outbox_replay.as_str().to_owned(),
-            },
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BaseRelayHealthDocument {
-    pub status: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BaseRelayReadinessDocument {
-    pub status: String,
-    pub checks: BaseRelayReadinessChecksDocument,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BaseRelayReadinessChecksDocument {
-    pub config: String,
-    pub relay_identity: String,
-    pub pocket_storage: String,
-    pub group_projection: String,
-    pub group_outbox_replay: String,
-}
-
-pub fn base_relay_ops_router(readiness: BaseRelayReadinessState) -> Router {
-    Router::new()
-        .route("/healthz", get(base_relay_healthz))
-        .route("/readyz", get(base_relay_readyz))
-        .with_state(readiness)
-}
-
-async fn base_relay_healthz() -> Json<BaseRelayHealthDocument> {
-    Json(BaseRelayHealthDocument {
-        status: "ok".to_owned(),
-    })
-}
-
-async fn base_relay_readyz(
-    State(readiness): State<BaseRelayReadinessState>,
-) -> (StatusCode, Json<BaseRelayReadinessDocument>) {
-    let status = if readiness.is_ready() {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-    (status, Json(readiness.response()))
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaseAuthState {
@@ -1244,12 +1113,7 @@ fn pocket_event_id(event_id: &EventId) -> Result<PocketEventId, BaseRelayError> 
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BaseAuthState, BaseRelay, BaseRelayReadinessCheckStatus, BaseRelayReadinessState,
-        CloseResult, base_relay_ops_router,
-    };
-    use axum::body::to_bytes;
-    use http::{Request, StatusCode};
+    use super::{BaseAuthState, BaseRelay, CloseResult};
     use tangle_crypto::RelaySigner;
     use tangle_groups::{
         GroupId, KIND_GROUP_ADMINS, KIND_GROUP_CREATE_GROUP, KIND_GROUP_CREATE_INVITE,
@@ -1262,70 +1126,6 @@ mod tests {
         Tag, UnixTimestamp, UnsignedEvent, filter_from_value,
     };
     use tangle_store_pocket::{PocketStoreConfig, PocketSyncPolicy};
-    use tower::ServiceExt;
-
-    #[tokio::test]
-    async fn base_relay_ops_router_reports_health_and_readiness() {
-        let health = base_relay_ops_router(BaseRelayReadinessState::ready())
-            .oneshot(
-                Request::builder()
-                    .uri("/healthz")
-                    .body(axum::body::Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("health");
-
-        assert_eq!(health.status(), StatusCode::OK);
-        let health_body = to_bytes(health.into_body(), usize::MAX)
-            .await
-            .expect("body");
-        let health_value = serde_json::from_slice::<serde_json::Value>(&health_body).expect("json");
-        assert_eq!(health_value["status"], "ok");
-
-        let ready = base_relay_ops_router(BaseRelayReadinessState::ready())
-            .oneshot(
-                Request::builder()
-                    .uri("/readyz")
-                    .body(axum::body::Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("ready");
-
-        assert_eq!(ready.status(), StatusCode::OK);
-        let ready_body = to_bytes(ready.into_body(), usize::MAX).await.expect("body");
-        let ready_value = serde_json::from_slice::<serde_json::Value>(&ready_body).expect("json");
-        assert_eq!(ready_value["status"], "ready");
-        assert_eq!(ready_value["checks"]["group_outbox_replay"], "ready");
-
-        let not_ready = BaseRelayReadinessState::new(
-            BaseRelayReadinessCheckStatus::Ready,
-            BaseRelayReadinessCheckStatus::Ready,
-            BaseRelayReadinessCheckStatus::Ready,
-            BaseRelayReadinessCheckStatus::NotReady,
-            BaseRelayReadinessCheckStatus::Ready,
-        );
-        let rejected = base_relay_ops_router(not_ready)
-            .oneshot(
-                Request::builder()
-                    .uri("/readyz")
-                    .body(axum::body::Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("not ready");
-
-        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let rejected_body = to_bytes(rejected.into_body(), usize::MAX)
-            .await
-            .expect("body");
-        let rejected_value =
-            serde_json::from_slice::<serde_json::Value>(&rejected_body).expect("json");
-        assert_eq!(rejected_value["status"], "not_ready");
-        assert_eq!(rejected_value["checks"]["group_projection"], "not_ready");
-    }
-
     #[test]
     fn auth_state_issues_challenges_and_accepts_multiple_pubkeys() {
         let mut auth = BaseAuthState::new("wss://relay.radroots.test", 60).expect("auth state");

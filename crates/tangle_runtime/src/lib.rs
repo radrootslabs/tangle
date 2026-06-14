@@ -5,12 +5,13 @@ pub mod chorus_pocket;
 pub mod config;
 pub mod errors;
 pub mod nip11;
+pub mod ops;
 
 use std::{fmt, fs, path::Path, path::PathBuf};
 
-use base_relay::BaseRelayReadinessState;
 use config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json};
 use errors::BaseRelayError;
+use ops::BaseRelayReadinessState;
 
 pub const TANGLE_SUPPORTED_NIPS: [u16; 6] = [1, 11, 29, 42, 45, 70];
 pub const TANGLE_RELAY_SOFTWARE: &str = "https://github.com/radrootslabs/tangle";
