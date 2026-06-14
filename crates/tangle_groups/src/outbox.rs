@@ -257,10 +257,21 @@ impl GroupOutbox {
     }
 
     pub fn replay_plan(&self) -> OutboxReplayPlan {
+        self.replay_plan_matching(|_| true)
+    }
+
+    pub fn replay_plan_for_group(&self, group_id: &GroupId) -> OutboxReplayPlan {
+        self.replay_plan_matching(|record| record.key().group_id() == group_id)
+    }
+
+    fn replay_plan_matching(
+        &self,
+        include: impl Fn(&GroupOutboxRecord) -> bool,
+    ) -> OutboxReplayPlan {
         let mut records = self
             .records
             .values()
-            .filter(|record| record.is_retryable())
+            .filter(|record| record.is_retryable() && include(record))
             .cloned()
             .collect::<Vec<_>>();
         records.sort_by(|left, right| {
@@ -587,6 +598,36 @@ mod tests {
                 farm_early.key().source_event_id(),
                 farm_late.key().source_event_id(),
                 market_early.key().source_event_id()
+            ]
+        );
+    }
+
+    #[test]
+    fn outbox_replay_plan_can_scope_retryable_records_to_one_group() {
+        let mut outbox = GroupOutbox::new();
+        let farm_early = replay_record(&"f".repeat(64), "Farm", 1);
+        let farm_late = replay_record(&"0".repeat(64), "Farm", 2);
+        let market_early = replay_record(&"1".repeat(64), "Market", 1);
+
+        outbox
+            .merge_idempotent(market_early.clone())
+            .expect("market");
+        outbox
+            .merge_idempotent(farm_late.clone())
+            .expect("farm late");
+        outbox
+            .merge_idempotent(farm_early.clone())
+            .expect("farm early");
+        let plan = outbox.replay_plan_for_group(&GroupId::new("Farm").expect("group"));
+
+        assert_eq!(
+            plan.records()
+                .iter()
+                .map(|record| record.key().source_event_id())
+                .collect::<Vec<_>>(),
+            vec![
+                farm_early.key().source_event_id(),
+                farm_late.key().source_event_id()
             ]
         );
     }

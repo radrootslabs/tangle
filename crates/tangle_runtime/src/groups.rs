@@ -170,7 +170,10 @@ impl GroupService {
                 persist_outbox_record(store, &record)?;
             }
         }
-        self.materialize_outbox(store)
+        if let Some(group_id) = class_group_id(class) {
+            return self.materialize_outbox_for_group(store, group_id);
+        }
+        Ok(Vec::new())
     }
 
     fn plan_outbox_records(
@@ -222,8 +225,29 @@ impl GroupService {
         &mut self,
         store: &PocketStoreHandle,
     ) -> Result<Vec<StoreOffset>, BaseRelayError> {
-        let mut stored_offsets = Vec::new();
         let records = self.outbox.replay_plan().records().to_vec();
+        self.materialize_records(store, records)
+    }
+
+    fn materialize_outbox_for_group(
+        &mut self,
+        store: &PocketStoreHandle,
+        group_id: &GroupId,
+    ) -> Result<Vec<StoreOffset>, BaseRelayError> {
+        let records = self
+            .outbox
+            .replay_plan_for_group(group_id)
+            .records()
+            .to_vec();
+        self.materialize_records(store, records)
+    }
+
+    fn materialize_records(
+        &mut self,
+        store: &PocketStoreHandle,
+        records: Vec<GroupOutboxRecord>,
+    ) -> Result<Vec<StoreOffset>, BaseRelayError> {
+        let mut stored_offsets = Vec::new();
         for record in records {
             if let Some(offset) = self.materialize_record(store, record)? {
                 stored_offsets.push(offset);
