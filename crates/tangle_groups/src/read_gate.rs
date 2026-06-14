@@ -1,6 +1,6 @@
 use crate::{
     GroupAuthority, GroupError, GroupEventClass, GroupId, GroupLimitsConfig, GroupProjection,
-    MemberStatus, classify_group_event, non_enumerating_group_error,
+    KIND_GROUP_DELETE_GROUP, MemberStatus, classify_group_event, non_enumerating_group_error,
 };
 use tangle_protocol::{Event, PublicKeyHex};
 
@@ -30,11 +30,18 @@ impl<'a> GroupReadGate<'a> {
         reader: Option<&PublicKeyHex>,
         limits: GroupLimitsConfig,
     ) -> Result<GroupReadDecision, GroupError> {
+        if self.projection.event_deletion(event.id()).is_some() {
+            return Ok(GroupReadDecision::Hidden);
+        }
         match classify_group_event(event, limits)? {
             GroupEventClass::NonGroup => Ok(GroupReadDecision::Visible),
             GroupEventClass::Normal { group_id } => self.screen_normal_event(&group_id, reader),
             GroupEventClass::Moderation { group_id, .. } => {
-                self.screen_normal_event(&group_id, reader)
+                if event.unsigned().kind().as_u32() == KIND_GROUP_DELETE_GROUP {
+                    self.screen_delete_group_marker(event, &group_id, reader)
+                } else {
+                    self.screen_normal_event(&group_id, reader)
+                }
             }
             GroupEventClass::RelayGeneratedSnapshot { kind, group_id } => {
                 self.screen_snapshot_event(kind.as_u32(), &group_id, reader)
@@ -70,6 +77,30 @@ impl<'a> GroupReadGate<'a> {
             return Ok(GroupReadDecision::Hidden);
         }
         if group.metadata().private() && !self.can_read_group(group_id, reader) {
+            return Ok(GroupReadDecision::Hidden);
+        }
+        Ok(GroupReadDecision::Visible)
+    }
+
+    fn screen_delete_group_marker(
+        &self,
+        event: &Event,
+        group_id: &GroupId,
+        reader: Option<&PublicKeyHex>,
+    ) -> Result<GroupReadDecision, GroupError> {
+        let Some(group) = self.projection.group(group_id) else {
+            return Ok(GroupReadDecision::Hidden);
+        };
+        if !self
+            .projection
+            .tombstone(group_id)
+            .is_some_and(|tombstone| tombstone.delete_event_id() == event.id())
+        {
+            return self.screen_normal_event(group_id, reader);
+        }
+        if (group.metadata().hidden() || group.metadata().private())
+            && !self.can_read_group(group_id, reader)
+        {
             return Ok(GroupReadDecision::Hidden);
         }
         Ok(GroupReadDecision::Visible)
@@ -111,8 +142,9 @@ impl<'a> GroupReadGate<'a> {
 mod tests {
     use super::{GroupReadDecision, GroupReadGate};
     use crate::{
-        GroupAuthority, GroupId, GroupMetadata, GroupProjection, GroupState, KIND_GROUP_METADATA,
-        MemberState, MemberStatus, ProjectionOrderTuple, StoreOffset, SupportedKinds,
+        GroupAuthority, GroupEventDeletion, GroupId, GroupMetadata, GroupProjection, GroupState,
+        GroupTombstone, KIND_GROUP_DELETE_GROUP, KIND_GROUP_METADATA, MemberState, MemberStatus,
+        ProjectionOrderTuple, StoreOffset, SupportedKinds,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -263,6 +295,82 @@ mod tests {
                 .expect_err("hidden")
                 .message(),
             "group is unavailable"
+        );
+    }
+
+    #[test]
+    fn read_gate_hides_deleted_target_events() {
+        let owner = pubkey("1");
+        let mut projection = projection_with_group(
+            "Farm",
+            GroupMetadata::new(
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                false,
+                SupportedKinds::UnspecifiedAll,
+            ),
+            owner,
+        );
+        let target = event(1, vec![h("Farm")]);
+        projection.put_event_deletion(GroupEventDeletion::new(
+            GroupId::new("Farm").expect("group"),
+            target.id().clone(),
+            event_id("20"),
+            UnixTimestamp::new(20),
+            pubkey("2"),
+            tuple(20, "20", 2),
+        ));
+        let authority = GroupAuthority::empty();
+        let gate = GroupReadGate::new(&projection, &authority);
+
+        assert_eq!(
+            gate.screen_event(&target, None, Default::default())
+                .expect("deleted"),
+            GroupReadDecision::Hidden
+        );
+    }
+
+    #[test]
+    fn read_gate_keeps_group_delete_marker_under_group_visibility_policy() {
+        let owner = pubkey("1");
+        let mut projection = projection_with_group(
+            "Farm",
+            GroupMetadata::new(
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                false,
+                SupportedKinds::UnspecifiedAll,
+            ),
+            owner,
+        );
+        let marker = event(KIND_GROUP_DELETE_GROUP, vec![h("Farm")]);
+        projection.put_tombstone(GroupTombstone::new(
+            GroupId::new("Farm").expect("group"),
+            marker.id().clone(),
+            marker.unsigned().created_at(),
+            marker.unsigned().pubkey().clone(),
+            tuple(30, "01", 3),
+        ));
+        let authority = GroupAuthority::empty();
+        let gate = GroupReadGate::new(&projection, &authority);
+
+        assert_eq!(
+            gate.screen_event(&marker, None, Default::default())
+                .expect("marker"),
+            GroupReadDecision::Visible
+        );
+        assert_eq!(
+            gate.screen_event(&event(1, vec![h("Farm")]), None, Default::default())
+                .expect("normal"),
+            GroupReadDecision::Hidden
         );
     }
 

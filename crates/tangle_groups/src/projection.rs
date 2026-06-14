@@ -409,6 +409,74 @@ impl GroupTombstone {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupEventDeletion {
+    group_id: GroupId,
+    target_event_id: EventId,
+    delete_event_id: EventId,
+    deleted_at: UnixTimestamp,
+    deleted_by: PublicKeyHex,
+    last_tuple: ProjectionOrderTuple,
+}
+
+impl GroupEventDeletion {
+    pub fn new(
+        group_id: GroupId,
+        target_event_id: EventId,
+        delete_event_id: EventId,
+        deleted_at: UnixTimestamp,
+        deleted_by: PublicKeyHex,
+        last_tuple: ProjectionOrderTuple,
+    ) -> Self {
+        Self {
+            group_id,
+            target_event_id,
+            delete_event_id,
+            deleted_at,
+            deleted_by,
+            last_tuple,
+        }
+    }
+
+    pub fn group_id(&self) -> &GroupId {
+        &self.group_id
+    }
+
+    pub fn target_event_id(&self) -> &EventId {
+        &self.target_event_id
+    }
+
+    pub fn delete_event_id(&self) -> &EventId {
+        &self.delete_event_id
+    }
+
+    pub fn deleted_at(&self) -> UnixTimestamp {
+        self.deleted_at
+    }
+
+    pub fn deleted_by(&self) -> &PublicKeyHex {
+        &self.deleted_by
+    }
+
+    pub fn last_tuple(&self) -> &ProjectionOrderTuple {
+        &self.last_tuple
+    }
+
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, GroupError> {
+        serde_json::to_vec(&GroupEventDeletionDocument::from_deletion(self)).map_err(|error| {
+            GroupError::internal(format!("event deletion JSON encode failed: {error}"))
+        })
+    }
+
+    pub fn from_json_bytes(raw: &[u8]) -> Result<Self, GroupError> {
+        let document =
+            serde_json::from_slice::<GroupEventDeletionDocument>(raw).map_err(|error| {
+                GroupError::internal(format!("event deletion JSON decode failed: {error}"))
+            })?;
+        document.into_deletion()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionCheckpoint {
     projection_version: u32,
     policy_version: u32,
@@ -482,6 +550,7 @@ pub struct GroupProjection {
     members: BTreeMap<(GroupId, PublicKeyHex), MemberState>,
     roles: BTreeMap<(GroupId, RoleName), ProjectedRoleDefinition>,
     tombstones: BTreeMap<GroupId, GroupTombstone>,
+    event_deletions: BTreeMap<EventId, GroupEventDeletion>,
     checkpoint: Option<ProjectionCheckpoint>,
 }
 
@@ -510,6 +579,10 @@ impl GroupProjection {
         self.tombstones.get(group_id)
     }
 
+    pub fn event_deletion(&self, event_id: &EventId) -> Option<&GroupEventDeletion> {
+        self.event_deletions.get(event_id)
+    }
+
     pub fn groups(&self) -> &BTreeMap<GroupId, GroupState> {
         &self.groups
     }
@@ -524,6 +597,10 @@ impl GroupProjection {
 
     pub fn tombstones(&self) -> &BTreeMap<GroupId, GroupTombstone> {
         &self.tombstones
+    }
+
+    pub fn event_deletions(&self) -> &BTreeMap<EventId, GroupEventDeletion> {
+        &self.event_deletions
     }
 
     pub fn checkpoint(&self) -> Option<&ProjectionCheckpoint> {
@@ -568,6 +645,17 @@ impl GroupProjection {
         {
             self.tombstones
                 .insert(tombstone.group_id().clone(), tombstone);
+        }
+    }
+
+    pub fn put_event_deletion(&mut self, deletion: GroupEventDeletion) {
+        if self
+            .event_deletions
+            .get(deletion.target_event_id())
+            .is_none_or(|current| deletion.last_tuple() >= current.last_tuple())
+        {
+            self.event_deletions
+                .insert(deletion.target_event_id().clone(), deletion);
         }
     }
 
@@ -632,6 +720,25 @@ impl GroupProjection {
             }
             crate::KIND_GROUP_REMOVE_USER => {
                 self.apply_member_status(group_id, event, tuple, MemberStatus::Removed)
+            }
+            crate::KIND_GROUP_DELETE_EVENT => {
+                let target_event_id = EventId::new(first_tag_value(event.unsigned().tags(), "e")?)
+                    .map_err(|reason| {
+                        GroupError::invalid(
+                            GroupErrorKind::MalformedTargetTag,
+                            format!("malformed e target tag: {reason}"),
+                        )
+                    })?;
+                let deletion = GroupEventDeletion::new(
+                    group_id,
+                    target_event_id,
+                    event.id().clone(),
+                    event.unsigned().created_at(),
+                    event.unsigned().pubkey().clone(),
+                    tuple,
+                );
+                self.put_event_deletion(deletion);
+                Ok(ProjectionApplyOutcome::Applied)
             }
             crate::KIND_GROUP_DELETE_GROUP => {
                 let tombstone = GroupTombstone::new(
@@ -844,6 +951,10 @@ pub fn role_current_key(group_id: &GroupId, role_name: &RoleName) -> Vec<u8> {
 
 pub fn tombstone_key(group_id: &GroupId) -> Vec<u8> {
     prefixed_key("tombstone", group_id.as_str(), None)
+}
+
+pub fn event_deletion_key(event_id: &EventId) -> Vec<u8> {
+    prefixed_key("event_deletion", event_id.as_str(), None)
 }
 
 pub fn projection_checkpoint_key() -> Vec<u8> {
@@ -1193,6 +1304,40 @@ impl GroupTombstoneDocument {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct GroupEventDeletionDocument {
+    group_id: String,
+    target_event_id: String,
+    delete_event_id: String,
+    deleted_at: u64,
+    deleted_by: String,
+    last_tuple: TupleDocument,
+}
+
+impl GroupEventDeletionDocument {
+    fn from_deletion(deletion: &GroupEventDeletion) -> Self {
+        Self {
+            group_id: deletion.group_id().as_str().to_owned(),
+            target_event_id: deletion.target_event_id().as_str().to_owned(),
+            delete_event_id: deletion.delete_event_id().as_str().to_owned(),
+            deleted_at: deletion.deleted_at().as_u64(),
+            deleted_by: deletion.deleted_by().as_str().to_owned(),
+            last_tuple: TupleDocument::from_tuple(deletion.last_tuple()),
+        }
+    }
+
+    fn into_deletion(self) -> Result<GroupEventDeletion, GroupError> {
+        Ok(GroupEventDeletion::new(
+            GroupId::new(&self.group_id)?,
+            EventId::new(&self.target_event_id).map_err(GroupError::internal)?,
+            EventId::new(&self.delete_event_id).map_err(GroupError::internal)?,
+            UnixTimestamp::new(self.deleted_at),
+            PublicKeyHex::new(&self.deleted_by).map_err(GroupError::internal)?,
+            self.last_tuple.into_tuple()?,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProjectionCheckpointDocument {
     projection_version: u32,
     policy_version: u32,
@@ -1267,15 +1412,16 @@ fn parse_optional_event_id(value: Option<String>) -> Result<Option<EventId>, Gro
 #[cfg(test)]
 mod tests {
     use super::{
-        CanonicalGroupEvent, GroupLifecycleState, GroupProjection, GroupTombstone, MemberStatus,
-        ProjectedRoleDefinition, ProjectionCheckpoint, ProjectionOrderTuple, StoreOffset,
-        group_current_key, member_current_key, projection_checkpoint_key, rebuild_group_projection,
-        role_current_key, tombstone_key,
+        CanonicalGroupEvent, GroupEventDeletion, GroupLifecycleState, GroupProjection,
+        GroupTombstone, MemberStatus, ProjectedRoleDefinition, ProjectionCheckpoint,
+        ProjectionOrderTuple, StoreOffset, event_deletion_key, group_current_key,
+        member_current_key, projection_checkpoint_key, rebuild_group_projection, role_current_key,
+        tombstone_key,
     };
     use crate::{
         Capability, CapabilitySet, GroupId, GroupLimitsConfig, KIND_GROUP_CREATE_GROUP,
-        KIND_GROUP_DELETE_GROUP, KIND_GROUP_EDIT_METADATA, KIND_GROUP_METADATA,
-        KIND_GROUP_PUT_USER, RoleDefinition, RoleName, SupportedKinds,
+        KIND_GROUP_DELETE_EVENT, KIND_GROUP_DELETE_GROUP, KIND_GROUP_EDIT_METADATA,
+        KIND_GROUP_METADATA, KIND_GROUP_PUT_USER, RoleDefinition, RoleName, SupportedKinds,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -1365,12 +1511,27 @@ mod tests {
         projection
             .apply_canonical_event(
                 &event(
+                    KIND_GROUP_DELETE_EVENT,
+                    "45",
+                    45,
+                    vec![
+                        Tag::from_parts("h", &["Farm"]).expect("h"),
+                        Tag::from_parts("e", &[id("30")]).expect("e"),
+                    ],
+                ),
+                StoreOffset::new(5),
+                GroupLimitsConfig::default(),
+            )
+            .expect("event deletion");
+        projection
+            .apply_canonical_event(
+                &event(
                     KIND_GROUP_DELETE_GROUP,
                     "50",
                     50,
                     vec![Tag::from_parts("h", &["Farm"]).expect("h")],
                 ),
-                StoreOffset::new(5),
+                StoreOffset::new(6),
                 GroupLimitsConfig::default(),
             )
             .expect("delete");
@@ -1399,6 +1560,11 @@ mod tests {
         assert!(
             projection
                 .tombstone(&GroupId::new("Farm").expect("group"))
+                .is_some()
+        );
+        assert!(
+            projection
+                .event_deletion(&EventId::new(id("30")).expect("event"))
                 .is_some()
         );
     }
@@ -1507,6 +1673,14 @@ mod tests {
             PublicKeyHex::new(&"3".repeat(64)).expect("pubkey"),
             tuple(40, "40", 4),
         );
+        let deletion = GroupEventDeletion::new(
+            GroupId::new("Farm").expect("group"),
+            EventId::new(id("30")).expect("target"),
+            EventId::new(id("45")).expect("delete"),
+            UnixTimestamp::new(45),
+            PublicKeyHex::new(&"3".repeat(64)).expect("pubkey"),
+            tuple(45, "45", 5),
+        );
         let checkpoint =
             ProjectionCheckpoint::current(Some(StoreOffset::new(25)), UnixTimestamp::new(99));
 
@@ -1531,6 +1705,11 @@ mod tests {
             tombstone
         );
         assert_eq!(
+            GroupEventDeletion::from_json_bytes(&deletion.to_json_bytes().expect("bytes"))
+                .expect("deletion"),
+            deletion
+        );
+        assert_eq!(
             ProjectionCheckpoint::from_json_bytes(&checkpoint.to_json_bytes().expect("bytes"))
                 .expect("checkpoint"),
             checkpoint
@@ -1552,6 +1731,10 @@ mod tests {
             b"role\0Farm\0moderator".to_vec()
         );
         assert_eq!(tombstone_key(&group), b"tombstone\0Farm".to_vec());
+        assert_eq!(
+            event_deletion_key(&EventId::new(id("30")).expect("event")),
+            format!("event_deletion\0{}", id("30")).into_bytes()
+        );
         assert_eq!(projection_checkpoint_key(), b"checkpoint\0groups".to_vec());
     }
 
@@ -1583,6 +1766,7 @@ mod tests {
             "20" => "0000000000000000000000000000000000000000000000000000000000000020",
             "30" => "0000000000000000000000000000000000000000000000000000000000000030",
             "40" => "0000000000000000000000000000000000000000000000000000000000000040",
+            "45" => "0000000000000000000000000000000000000000000000000000000000000045",
             "50" => "0000000000000000000000000000000000000000000000000000000000000050",
             "a" => "000000000000000000000000000000000000000000000000000000000000000a",
             "b" => "000000000000000000000000000000000000000000000000000000000000000b",

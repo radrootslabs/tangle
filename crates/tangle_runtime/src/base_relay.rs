@@ -10,14 +10,16 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, collections::BTreeSet, str};
 use tangle_crypto::{RelaySigner, verify_event_signature};
 use tangle_groups::{
-    GroupAuthContext, GroupAuthority, GroupError, GroupEventClass, GroupGeneratedEventBuilder,
-    GroupId, GroupLimitsConfig, GroupOutbox, GroupOutboxEffect, GroupOutboxKey, GroupOutboxPayload,
-    GroupOutboxRecord, GroupProjection, GroupReadDecision, GroupReadGate, GroupRuntimeConfig,
-    GroupState, GroupTombstone, KIND_GROUP_CREATE_GROUP, KIND_GROUP_EDIT_METADATA,
+    GroupAuthContext, GroupAuthority, GroupError, GroupErrorKind, GroupEventClass,
+    GroupEventDeletion, GroupGeneratedEventBuilder, GroupId, GroupLimitsConfig, GroupOutbox,
+    GroupOutboxEffect, GroupOutboxKey, GroupOutboxPayload, GroupOutboxRecord, GroupProjection,
+    GroupReadDecision, GroupReadGate, GroupRuntimeConfig, GroupState, GroupTombstone,
+    KIND_GROUP_CREATE_GROUP, KIND_GROUP_DELETE_EVENT, KIND_GROUP_EDIT_METADATA,
     KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_PUT_USER,
     KIND_GROUP_REMOVE_USER, MemberState, ProjectedRoleDefinition, ProjectionCheckpoint,
-    StoreOffset, group_current_key, member_current_key, projection_checkpoint_key,
-    role_current_key, tombstone_key, validate_client_group_event_structure,
+    StoreOffset, event_deletion_key, group_current_key, member_current_key,
+    projection_checkpoint_key, role_current_key, tombstone_key,
+    validate_client_group_event_structure,
 };
 use tangle_nips::parse_relay_auth_event;
 use tangle_protocol::{
@@ -388,7 +390,7 @@ impl BaseRelay {
                     "blocked: NIP-29 group events are not accepted before group service".to_owned(),
                 ));
             };
-            if let Err(error) = groups.check_event(&event, &class, auth) {
+            if let Err(error) = groups.check_event(&self.store, &event, &class, auth) {
                 return Ok(ok_rejected(event_id, error.prefixed_message()));
             }
         }
@@ -591,13 +593,60 @@ impl GroupService {
 
     fn check_event(
         &self,
+        store: &PocketStoreHandle,
         event: &Event,
         class: &GroupEventClass,
         auth: &GroupAuthContext,
     ) -> Result<(), GroupError> {
         tangle_groups::GroupWritePolicy::new(&self.projection, &self.authority)
             .check_event(event, class, auth)
-            .map(|_| ())
+            .map(|_| ())?;
+        self.check_runtime_write_constraints(store, event, class)
+    }
+
+    fn check_runtime_write_constraints(
+        &self,
+        store: &PocketStoreHandle,
+        event: &Event,
+        class: &GroupEventClass,
+    ) -> Result<(), GroupError> {
+        if let GroupEventClass::Moderation { kind, group_id } = class
+            && kind.as_u32() == KIND_GROUP_DELETE_EVENT
+        {
+            self.check_delete_event_target(store, event, group_id)?;
+        }
+        Ok(())
+    }
+
+    fn check_delete_event_target(
+        &self,
+        store: &PocketStoreHandle,
+        event: &Event,
+        group_id: &GroupId,
+    ) -> Result<(), GroupError> {
+        let target_id = delete_target_event_id(event)?;
+        let Some(target) = store
+            .event_by_id(
+                pocket_event_id(&target_id)
+                    .map_err(|error| GroupError::internal(error.prefixed_message()))?,
+            )
+            .map_err(|error| GroupError::internal(error.to_string()))?
+        else {
+            return Err(GroupError::invalid(
+                GroupErrorKind::MalformedTargetTag,
+                "delete target event is unavailable",
+            ));
+        };
+        let target = pocket_event_to_tangle(&target)
+            .map_err(|error| GroupError::internal(error.prefixed_message()))?;
+        let target_class = tangle_groups::classify_group_event(&target, self.limits)?;
+        if target_class.group_id() != Some(group_id) {
+            return Err(GroupError::invalid(
+                GroupErrorKind::MalformedTargetTag,
+                "delete target event is not in group",
+            ));
+        }
+        Ok(())
     }
 
     fn event_visible_to_auth(
@@ -862,6 +911,15 @@ impl GroupService {
                 &tombstone.to_json_bytes()?,
             )?;
         }
+        for (target_event_id, deletion) in self.projection.event_deletions() {
+            if deletion.group_id() == group_id {
+                store.put_extra_record(
+                    TANGLE_GROUP_PROJECTION_TABLE,
+                    &event_deletion_key(target_event_id),
+                    &deletion.to_json_bytes()?,
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -886,6 +944,9 @@ fn load_group_projection(store: &PocketStoreHandle) -> Result<GroupProjection, B
                 ProjectedRoleDefinition::from_json_bytes(&value)?,
             ),
             ["tombstone", _] => projection.put_tombstone(GroupTombstone::from_json_bytes(&value)?),
+            ["event_deletion", _] => {
+                projection.put_event_deletion(GroupEventDeletion::from_json_bytes(&value)?)
+            }
             _ => {}
         }
     }
@@ -929,6 +990,30 @@ fn class_group_id(class: &GroupEventClass) -> Option<&GroupId> {
         | GroupEventClass::RelayGeneratedSnapshot { group_id, .. } => Some(group_id),
         GroupEventClass::NonGroup => None,
     }
+}
+
+fn delete_target_event_id(event: &Event) -> Result<EventId, GroupError> {
+    for tag in event.unsigned().tags() {
+        if !tag.values().first().is_some_and(|name| name == "e") {
+            continue;
+        }
+        let Some((_, value)) = tag.indexed_pair() else {
+            return Err(GroupError::invalid(
+                GroupErrorKind::MalformedTargetTag,
+                "malformed e target tag",
+            ));
+        };
+        return EventId::new(value).map_err(|reason| {
+            GroupError::invalid(
+                GroupErrorKind::MalformedTargetTag,
+                format!("malformed e target tag: {reason}"),
+            )
+        });
+    }
+    Err(GroupError::invalid(
+        GroupErrorKind::MissingTargetTag,
+        "missing e target tag",
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1176,12 +1261,14 @@ mod tests {
     use http::{Request, StatusCode, header};
     use tangle_crypto::RelaySigner;
     use tangle_groups::{
-        GroupId, KIND_GROUP_ADMINS, KIND_GROUP_CREATE_GROUP, KIND_GROUP_JOIN_REQUEST,
-        KIND_GROUP_METADATA, KIND_GROUP_PUT_USER, MemberStatus, parse_group_runtime_config_json,
+        GroupId, KIND_GROUP_ADMINS, KIND_GROUP_CREATE_GROUP, KIND_GROUP_CREATE_INVITE,
+        KIND_GROUP_DELETE_EVENT, KIND_GROUP_DELETE_GROUP, KIND_GROUP_EDIT_METADATA,
+        KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA,
+        KIND_GROUP_PUT_USER, KIND_GROUP_REMOVE_USER, MemberStatus, parse_group_runtime_config_json,
     };
     use tangle_protocol::{
-        ClientMessage, Event, Filter, Kind, PublicKeyHex, RelayMessage, SubscriptionId, Tag,
-        UnixTimestamp, UnsignedEvent, filter_from_value,
+        ClientMessage, Event, EventId, Filter, Kind, PublicKeyHex, RelayMessage, SubscriptionId,
+        Tag, UnixTimestamp, UnsignedEvent, filter_from_value,
     };
     use tangle_store_pocket::{PocketStoreConfig, PocketSyncPolicy};
     use tower::ServiceExt;
@@ -1508,6 +1595,423 @@ mod tests {
     }
 
     #[test]
+    fn group_metadata_edit_replaces_generated_metadata_snapshot() {
+        let owner = signer(7).public_key().clone();
+        let mut relay = test_relay_with_groups(
+            "base-relay-group-metadata-edit",
+            4,
+            &enabled_groups_for_owner(&owner),
+        );
+        let auth = authenticated_state(7);
+        let create = signed_group_create_event(7, "Farm");
+        assert_accepted(
+            relay
+                .handle_event_with_auth(create.clone(), &auth)
+                .expect("create"),
+            &create,
+        );
+        let edit = signed_event_at(
+            7,
+            KIND_GROUP_EDIT_METADATA.into(),
+            vec![h("Farm"), name("Market")],
+            "",
+            1_714_124_436,
+        );
+        assert_accepted(
+            relay
+                .handle_event_with_auth(edit.clone(), &auth)
+                .expect("edit"),
+            &edit,
+        );
+
+        let group_id = GroupId::new("Farm").expect("group");
+        let group = relay
+            .group_projection()
+            .expect("projection")
+            .group(&group_id)
+            .expect("group");
+        assert_eq!(group.metadata().name(), Some("Market"));
+        let metadata = query_filter(
+            &mut relay,
+            "metadata-edit",
+            filter_group_tag(KIND_GROUP_METADATA, "d", "Farm"),
+        );
+        assert_eq!(metadata.len(), 1);
+        assert!(has_tag(&metadata[0], "d", &["Farm"]));
+        assert!(has_tag(&metadata[0], "name", &["Market"]));
+        assert_eq!(count_kind(&relay, KIND_GROUP_METADATA), 1);
+    }
+
+    #[test]
+    fn group_member_moderation_join_leave_and_snapshots_flow() {
+        let owner = signer(7).public_key().clone();
+        let member = signer(8).public_key().clone();
+        let target = signer(9).public_key().clone();
+        let mut relay = test_relay_with_groups(
+            "base-relay-group-member-flow",
+            4,
+            &enabled_groups_for_owner(&owner),
+        );
+        let owner_auth = authenticated_state(7);
+        let member_auth = authenticated_state(8);
+        let target_auth = authenticated_state(9);
+        relay
+            .handle_event_with_auth(signed_group_create_event(7, "Farm"), &owner_auth)
+            .expect("create");
+        let rejected_add = signed_event_at(
+            9,
+            KIND_GROUP_PUT_USER.into(),
+            vec![h("Farm"), p(&target)],
+            "",
+            1_714_124_434,
+        );
+        assert_eq!(
+            rejected_message(
+                relay
+                    .handle_event_with_auth(rejected_add.clone(), &target_auth)
+                    .expect("rejected add")
+            ),
+            "restricted: missing group capability manage_members"
+        );
+        let add = signed_event_at(
+            7,
+            KIND_GROUP_PUT_USER.into(),
+            vec![h("Farm"), p(&member)],
+            "",
+            1_714_124_435,
+        );
+        assert_accepted(
+            relay
+                .handle_event_with_auth(add.clone(), &owner_auth)
+                .expect("add"),
+            &add,
+        );
+        assert_member_status(&relay, "Farm", &member, MemberStatus::Member);
+        assert_eq!(count_kind(&relay, KIND_GROUP_MEMBERS), 1);
+
+        let remove = signed_event_at(
+            7,
+            KIND_GROUP_REMOVE_USER.into(),
+            vec![h("Farm"), p(&member)],
+            "",
+            1_714_124_436,
+        );
+        assert_accepted(
+            relay
+                .handle_event_with_auth(remove.clone(), &owner_auth)
+                .expect("remove"),
+            &remove,
+        );
+        assert_member_status(&relay, "Farm", &member, MemberStatus::Removed);
+        assert_eq!(count_kind(&relay, KIND_GROUP_MEMBERS), 1);
+
+        let join = signed_event_at(
+            8,
+            KIND_GROUP_JOIN_REQUEST.into(),
+            vec![h("Farm")],
+            "",
+            1_714_124_437,
+        );
+        assert_accepted(
+            relay
+                .handle_event_with_auth(join.clone(), &member_auth)
+                .expect("join"),
+            &join,
+        );
+        assert_member_status(&relay, "Farm", &member, MemberStatus::Member);
+        let duplicate_join = signed_event_at(
+            8,
+            KIND_GROUP_JOIN_REQUEST.into(),
+            vec![h("Farm")],
+            "",
+            1_714_124_438,
+        );
+        assert_eq!(
+            rejected_message(
+                relay
+                    .handle_event_with_auth(duplicate_join, &member_auth)
+                    .expect("duplicate join")
+            ),
+            "invalid: group member already exists"
+        );
+
+        let leave = signed_event_at(
+            8,
+            KIND_GROUP_LEAVE_REQUEST.into(),
+            vec![h("Farm")],
+            "",
+            1_714_124_439,
+        );
+        assert_accepted(
+            relay
+                .handle_event_with_auth(leave.clone(), &member_auth)
+                .expect("leave"),
+            &leave,
+        );
+        assert_member_status(&relay, "Farm", &member, MemberStatus::Removed);
+        assert_eq!(count_kind(&relay, KIND_GROUP_REMOVE_USER), 2);
+        let duplicate_leave = signed_event_at(
+            8,
+            KIND_GROUP_LEAVE_REQUEST.into(),
+            vec![h("Farm")],
+            "",
+            1_714_124_440,
+        );
+        assert_eq!(
+            rejected_message(
+                relay
+                    .handle_event_with_auth(duplicate_leave, &member_auth)
+                    .expect("duplicate leave")
+            ),
+            "invalid: group member does not exist"
+        );
+    }
+
+    #[test]
+    fn group_delete_event_moderation_hides_target_and_validates_group() {
+        let owner = signer(7).public_key().clone();
+        let outsider_auth = authenticated_state(8);
+        let owner_auth = authenticated_state(7);
+        let mut relay = test_relay_with_groups(
+            "base-relay-group-delete-event",
+            4,
+            &enabled_groups_for_owner(&owner),
+        );
+        relay
+            .handle_event_with_auth(signed_group_create_event(7, "Farm"), &owner_auth)
+            .expect("create farm");
+        relay
+            .handle_event_with_auth(signed_group_create_event(7, "Other"), &owner_auth)
+            .expect("create other");
+        let target = signed_event_at(7, 1, vec![h("Farm")], "harvest", 1_714_124_434);
+        let other = signed_event_at(7, 1, vec![h("Other")], "other", 1_714_124_435);
+        relay
+            .handle_event_with_auth(target.clone(), &owner_auth)
+            .expect("target");
+        relay
+            .handle_event_with_auth(other.clone(), &owner_auth)
+            .expect("other");
+
+        let wrong_group = signed_event_at(
+            7,
+            KIND_GROUP_DELETE_EVENT.into(),
+            vec![h("Farm"), e(other.id())],
+            "",
+            1_714_124_436,
+        );
+        assert_eq!(
+            rejected_message(
+                relay
+                    .handle_event_with_auth(wrong_group, &owner_auth)
+                    .expect("wrong group")
+            ),
+            "invalid: delete target event is not in group"
+        );
+        let unauthorized = signed_event_at(
+            8,
+            KIND_GROUP_DELETE_EVENT.into(),
+            vec![h("Farm"), e(target.id())],
+            "",
+            1_714_124_437,
+        );
+        assert_eq!(
+            rejected_message(
+                relay
+                    .handle_event_with_auth(unauthorized, &outsider_auth)
+                    .expect("unauthorized")
+            ),
+            "restricted: missing group capability delete_events"
+        );
+        assert_eq!(
+            count_filter(
+                &relay,
+                "target-before-delete",
+                filter_group_tag(1, "h", "Farm")
+            ),
+            1
+        );
+
+        let delete = signed_event_at(
+            7,
+            KIND_GROUP_DELETE_EVENT.into(),
+            vec![h("Farm"), e(target.id())],
+            "",
+            1_714_124_438,
+        );
+        assert_accepted(
+            relay
+                .handle_event_with_auth(delete.clone(), &owner_auth)
+                .expect("delete"),
+            &delete,
+        );
+
+        assert_eq!(
+            count_filter(
+                &relay,
+                "target-after-delete",
+                filter_group_tag(1, "h", "Farm")
+            ),
+            0
+        );
+        assert_eq!(
+            count_filter(
+                &relay,
+                "delete-event-marker",
+                filter_group_tag(KIND_GROUP_DELETE_EVENT, "h", "Farm")
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn group_delete_tombstone_hides_events_and_rejects_future_writes() {
+        let owner = signer(7).public_key().clone();
+        let auth = authenticated_state(7);
+        let mut relay = test_relay_with_groups(
+            "base-relay-group-delete-tombstone",
+            4,
+            &enabled_groups_for_owner(&owner),
+        );
+        relay
+            .handle_event_with_auth(signed_group_create_event(7, "Farm"), &auth)
+            .expect("create");
+        let normal = signed_event_at(7, 1, vec![h("Farm")], "harvest", 1_714_124_434);
+        relay.handle_event_with_auth(normal, &auth).expect("normal");
+        let delete_group = signed_event_at(
+            7,
+            KIND_GROUP_DELETE_GROUP.into(),
+            vec![h("Farm")],
+            "",
+            1_714_124_435,
+        );
+        assert_accepted(
+            relay
+                .handle_event_with_auth(delete_group.clone(), &auth)
+                .expect("delete group"),
+            &delete_group,
+        );
+
+        let future = signed_event_at(7, 1, vec![h("Farm")], "future", 1_714_124_436);
+        assert_eq!(
+            rejected_message(relay.handle_event_with_auth(future, &auth).expect("future")),
+            "blocked: group is deleted"
+        );
+        assert_eq!(
+            count_filter(
+                &relay,
+                "deleted-group-normal",
+                filter_group_tag(1, "h", "Farm")
+            ),
+            0
+        );
+        assert_eq!(
+            count_filter(
+                &relay,
+                "deleted-group-marker",
+                filter_group_tag(KIND_GROUP_DELETE_GROUP, "h", "Farm")
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn strict_closed_restricted_hidden_and_disabled_invite_flows() {
+        let owner = signer(7).public_key().clone();
+        let outsider_auth = authenticated_state(8);
+        let owner_auth = authenticated_state(7);
+        let mut relay = test_relay_with_groups(
+            "base-relay-group-strict-policy-flow",
+            4,
+            &enabled_groups_for_owner(&owner),
+        );
+        relay
+            .handle_event_with_auth(
+                signed_group_create_event_with_tags(7, "Restricted", vec![restricted()], 1),
+                &owner_auth,
+            )
+            .expect("restricted create");
+        let restricted_write =
+            signed_event_at(8, 1, vec![h("Restricted")], "restricted", 1_714_124_434);
+        assert_eq!(
+            rejected_message(
+                relay
+                    .handle_event_with_auth(restricted_write, &outsider_auth)
+                    .expect("restricted write")
+            ),
+            "restricted: group is unavailable"
+        );
+
+        relay
+            .handle_event_with_auth(
+                signed_group_create_event_with_tags(7, "Closed", vec![closed()], 2),
+                &owner_auth,
+            )
+            .expect("closed create");
+        let closed_join = signed_event_at(
+            8,
+            KIND_GROUP_JOIN_REQUEST.into(),
+            vec![h("Closed")],
+            "",
+            1_714_124_435,
+        );
+        assert_eq!(
+            rejected_message(
+                relay
+                    .handle_event_with_auth(closed_join, &outsider_auth)
+                    .expect("closed join")
+            ),
+            "restricted: group is unavailable"
+        );
+        let closed_normal = signed_event_at(8, 1, vec![h("Closed")], "open", 1_714_124_436);
+        assert_accepted(
+            relay
+                .handle_event_with_auth(closed_normal.clone(), &outsider_auth)
+                .expect("closed normal"),
+            &closed_normal,
+        );
+
+        relay
+            .handle_event_with_auth(
+                signed_group_create_event_with_tags(7, "Hidden", vec![hidden()], 3),
+                &owner_auth,
+            )
+            .expect("hidden create");
+        assert_eq!(
+            count_filter(
+                &relay,
+                "hidden-unauth",
+                filter_group_tag(KIND_GROUP_METADATA, "d", "Hidden")
+            ),
+            0
+        );
+        assert_eq!(
+            count_filter_with_auth(
+                &relay,
+                "hidden-owner",
+                filter_group_tag(KIND_GROUP_METADATA, "d", "Hidden"),
+                &owner_auth
+            ),
+            1
+        );
+
+        let invite = signed_event_at(
+            7,
+            KIND_GROUP_CREATE_INVITE.into(),
+            vec![h("Closed")],
+            "",
+            1_714_124_437,
+        );
+        assert_eq!(
+            rejected_message(
+                relay
+                    .handle_event_with_auth(invite, &owner_auth)
+                    .expect("invite")
+            ),
+            "restricted: invites not enabled"
+        );
+    }
+
+    #[test]
     fn private_group_req_and_count_use_reader_auth() {
         let owner = signer(7).public_key().clone();
         let auth = authenticated_state(7);
@@ -1723,15 +2227,23 @@ mod tests {
     }
 
     fn signed_group_create_event(secret_byte: u8, group_id: &str) -> Event {
+        signed_group_create_event_with_tags(secret_byte, group_id, Vec::new(), 1_714_124_433)
+    }
+
+    fn signed_group_create_event_with_tags(
+        secret_byte: u8,
+        group_id: &str,
+        mut extra_tags: Vec<Tag>,
+        created_at: u64,
+    ) -> Event {
+        let mut tags = vec![h(group_id), name(group_id)];
+        tags.append(&mut extra_tags);
         signed_event_at(
             secret_byte,
             KIND_GROUP_CREATE_GROUP.into(),
-            vec![
-                Tag::from_parts("h", &[group_id]).expect("h"),
-                Tag::from_parts("name", &[group_id]).expect("name"),
-            ],
+            tags,
             "",
-            1_714_124_433,
+            created_at,
         )
     }
 
@@ -1739,11 +2251,7 @@ mod tests {
         signed_event_at(
             secret_byte,
             KIND_GROUP_CREATE_GROUP.into(),
-            vec![
-                Tag::from_parts("h", &[group_id]).expect("h"),
-                Tag::from_parts("name", &[group_id]).expect("name"),
-                Tag::from_parts("private", &[]).expect("private"),
-            ],
+            vec![h(group_id), name(group_id), private()],
             "",
             1_714_124_433,
         )
@@ -1801,8 +2309,147 @@ mod tests {
         }
     }
 
+    fn count_filter(relay: &BaseRelay, subscription_id: &str, filter: Filter) -> u64 {
+        match relay
+            .handle_count(
+                SubscriptionId::new(subscription_id).expect("sub"),
+                vec![filter],
+            )
+            .expect("count")
+        {
+            RelayMessage::Count { count, .. } => count,
+            _ => panic!("count response expected"),
+        }
+    }
+
+    fn count_filter_with_auth(
+        relay: &BaseRelay,
+        subscription_id: &str,
+        filter: Filter,
+        auth: &BaseAuthState,
+    ) -> u64 {
+        match relay
+            .handle_count_with_auth(
+                SubscriptionId::new(subscription_id).expect("sub"),
+                vec![filter],
+                auth,
+            )
+            .expect("count")
+        {
+            RelayMessage::Count { count, .. } => count,
+            _ => panic!("count response expected"),
+        }
+    }
+
+    fn query_filter(relay: &mut BaseRelay, subscription_id: &str, filter: Filter) -> Vec<Event> {
+        relay
+            .handle_req(
+                SubscriptionId::new(subscription_id).expect("sub"),
+                vec![filter],
+            )
+            .expect("query")
+            .into_iter()
+            .filter_map(|message| match message {
+                RelayMessage::Event { event, .. } => Some(event),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn filter_kind(kind: u32) -> Filter {
         filter_from_value(&serde_json::json!({"kinds":[kind]})).expect("filter")
+    }
+
+    fn filter_group_tag(kind: u32, tag: &str, group_id: &str) -> Filter {
+        let mut value = serde_json::json!({"kinds":[kind]});
+        value
+            .as_object_mut()
+            .expect("object")
+            .insert(format!("#{tag}"), serde_json::json!([group_id]));
+        filter_from_value(&value).expect("filter")
+    }
+
+    fn assert_accepted(message: RelayMessage, event: &Event) {
+        assert_eq!(
+            message,
+            RelayMessage::Ok {
+                event_id: event.id().clone(),
+                accepted: true,
+                message: String::new()
+            }
+        );
+    }
+
+    fn rejected_message(message: RelayMessage) -> String {
+        match message {
+            RelayMessage::Ok {
+                accepted: false,
+                message,
+                ..
+            } => message,
+            _ => panic!("rejected OK expected"),
+        }
+    }
+
+    fn assert_member_status(
+        relay: &BaseRelay,
+        group_id: &str,
+        pubkey: &PublicKeyHex,
+        status: MemberStatus,
+    ) {
+        assert_eq!(
+            relay
+                .group_projection()
+                .expect("projection")
+                .member(&GroupId::new(group_id).expect("group"), pubkey)
+                .expect("member")
+                .status(),
+            status
+        );
+    }
+
+    fn has_tag(event: &Event, name: &str, values: &[&str]) -> bool {
+        event.unsigned().tags().iter().any(|tag| {
+            tag.values().first().is_some_and(|value| value == name)
+                && tag.values().len() == values.len() + 1
+                && values.iter().enumerate().all(|(index, expected)| {
+                    tag.values()
+                        .get(index + 1)
+                        .is_some_and(|value| value == expected)
+                })
+        })
+    }
+
+    fn h(group_id: &str) -> Tag {
+        Tag::from_parts("h", &[group_id]).expect("h")
+    }
+
+    fn p(pubkey: &PublicKeyHex) -> Tag {
+        Tag::from_parts("p", &[pubkey.as_str()]).expect("p")
+    }
+
+    fn e(event_id: &EventId) -> Tag {
+        Tag::from_parts("e", &[event_id.as_str()]).expect("e")
+    }
+
+    fn name(value: &str) -> Tag {
+        Tag::from_parts("name", &[value]).expect("name")
+    }
+
+    fn private() -> Tag {
+        Tag::from_parts("private", &[]).expect("private")
+    }
+
+    fn restricted() -> Tag {
+        Tag::from_parts("restricted", &[]).expect("restricted")
+    }
+
+    fn hidden() -> Tag {
+        Tag::from_parts("hidden", &[]).expect("hidden")
+    }
+
+    fn closed() -> Tag {
+        Tag::from_parts("closed", &[]).expect("closed")
     }
 
     fn signer(secret_byte: u8) -> RelaySigner {

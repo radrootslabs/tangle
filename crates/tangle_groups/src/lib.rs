@@ -39,12 +39,12 @@ pub use policy::{
     GroupAuthority, GroupWriteDecision, GroupWritePolicy, non_enumerating_group_error,
 };
 pub use projection::{
-    CanonicalGroupEvent, GROUP_POLICY_VERSION, GROUP_PROJECTION_SCHEMA_VERSION,
+    CanonicalGroupEvent, GROUP_POLICY_VERSION, GROUP_PROJECTION_SCHEMA_VERSION, GroupEventDeletion,
     GroupLifecycleState, GroupProjection, GroupRecoveryReadiness, GroupSnapshotIds, GroupState,
     GroupTombstone, MemberState, MemberStatus, ProjectedRoleDefinition, ProjectionApplyOutcome,
     ProjectionCheckpoint, ProjectionOrderTuple, ProjectionRebuildReport, StoreOffset,
-    group_current_key, member_current_key, projection_checkpoint_key, rebuild_group_projection,
-    role_current_key, tombstone_key,
+    event_deletion_key, group_current_key, member_current_key, projection_checkpoint_key,
+    rebuild_group_projection, role_current_key, tombstone_key,
 };
 pub use read_gate::{GroupReadDecision, GroupReadGate};
 pub use roles::{

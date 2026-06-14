@@ -123,6 +123,12 @@ impl<'a> GroupWritePolicy<'a> {
             return self.check_create_group(event, group_id);
         }
         let group = self.require_active_group(group_id)?;
+        if kind == KIND_GROUP_CREATE_INVITE {
+            return Err(GroupError::restricted(
+                GroupErrorKind::MissingCapability,
+                "invites not enabled",
+            ));
+        }
         let required = required_capability(kind, event.unsigned().tags())?;
         if let Some(required) = required {
             self.require_capability(group_id, event.unsigned().pubkey(), required)?;
@@ -369,9 +375,10 @@ mod tests {
     use crate::{
         Capability, CapabilitySet, GroupAuthContext, GroupErrorKind, GroupEventClass, GroupId,
         GroupMetadata, GroupProjection, GroupState, KIND_GROUP_CREATE_GROUP,
-        KIND_GROUP_DELETE_GROUP, KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST,
-        KIND_GROUP_REMOVE_USER, MemberState, MemberStatus, ProjectedRoleDefinition,
-        ProjectionOrderTuple, RoleDefinition, RoleName, StoreOffset, SupportedKinds,
+        KIND_GROUP_CREATE_INVITE, KIND_GROUP_DELETE_GROUP, KIND_GROUP_JOIN_REQUEST,
+        KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_REMOVE_USER, MemberState, MemberStatus,
+        ProjectedRoleDefinition, ProjectionOrderTuple, RoleDefinition, RoleName, StoreOffset,
+        SupportedKinds,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -654,6 +661,33 @@ mod tests {
                 .kind(),
             GroupErrorKind::GroupUnavailable
         );
+    }
+
+    #[test]
+    fn invite_creation_is_rejected_while_invites_are_disabled() {
+        let owner = pubkey("1");
+        let projection = projection_with_group(
+            "Farm",
+            metadata(false, false, false, false, SupportedKinds::UnspecifiedAll),
+            owner.clone(),
+        );
+        let authority = GroupAuthority::new([owner.clone()], Vec::<PublicKeyHex>::new());
+        let policy = GroupWritePolicy::new(&projection, &authority);
+        let invite = event(KIND_GROUP_CREATE_INVITE, owner.clone(), vec![h("Farm")]);
+
+        let error = policy
+            .check_event(
+                &invite,
+                &GroupEventClass::Moderation {
+                    kind: kind(KIND_GROUP_CREATE_INVITE),
+                    group_id: group("Farm"),
+                },
+                &GroupAuthContext::new([owner]),
+            )
+            .expect_err("invite");
+
+        assert_eq!(error.kind(), GroupErrorKind::MissingCapability);
+        assert_eq!(error.prefixed_message(), "restricted: invites not enabled");
     }
 
     fn projection_with_group(
