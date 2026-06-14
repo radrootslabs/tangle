@@ -102,23 +102,44 @@ impl BaseRelay {
                 self.handle_close(&subscription_id);
                 Ok(Vec::new())
             }
-            ClientMessage::Auth(event) => auth
-                .authenticate(&event, now)
-                .map(|_| {
-                    vec![RelayMessage::Ok {
-                        event_id: event.id().clone(),
-                        accepted: true,
-                        message: String::new(),
-                    }]
-                })
-                .or_else(|error| {
-                    Ok(vec![RelayMessage::Ok {
-                        event_id: event.id().clone(),
-                        accepted: false,
-                        message: error.prefixed_message(),
-                    }])
-                }),
+            ClientMessage::Auth(event) => Ok(self.handle_auth_message(event, auth, now)),
         }
+    }
+
+    pub(crate) fn query_req_with_auth(
+        &self,
+        subscription_id: SubscriptionId,
+        filters: Vec<Filter>,
+        auth: &BaseAuthState,
+    ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+        self.query_req_with_group_auth(
+            subscription_id,
+            filters,
+            &GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned()),
+        )
+    }
+
+    fn handle_auth_message(
+        &self,
+        event: Event,
+        auth: &mut BaseAuthState,
+        now: UnixTimestamp,
+    ) -> Vec<RelayMessage> {
+        auth.authenticate(&event, now)
+            .map(|_| {
+                vec![RelayMessage::Ok {
+                    event_id: event.id().clone(),
+                    accepted: true,
+                    message: String::new(),
+                }]
+            })
+            .unwrap_or_else(|error| {
+                vec![RelayMessage::Ok {
+                    event_id: event.id().clone(),
+                    accepted: false,
+                    message: error.prefixed_message(),
+                }]
+            })
     }
 
     pub fn handle_event(&mut self, event: Event) -> Result<RelayMessage, BaseRelayError> {
@@ -240,6 +261,15 @@ impl BaseRelay {
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
         self.subscriptions
             .subscribe(subscription_id.clone(), filters.clone(), auth.clone())?;
+        self.query_req_with_group_auth(subscription_id, filters, auth)
+    }
+
+    fn query_req_with_group_auth(
+        &self,
+        subscription_id: SubscriptionId,
+        filters: Vec<Filter>,
+        auth: &GroupAuthContext,
+    ) -> Result<Vec<RelayMessage>, BaseRelayError> {
         let mut messages = self
             .query_events(&filters, auth)?
             .into_iter()

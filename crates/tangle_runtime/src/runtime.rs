@@ -18,7 +18,7 @@ use std::{
     },
     time::Instant,
 };
-use tangle_protocol::{ClientMessage, RelayMessage, UnixTimestamp};
+use tangle_protocol::{ClientMessage, Filter, RelayMessage, SubscriptionId, UnixTimestamp};
 use tokio::sync::{Mutex, watch};
 
 pub struct TangleRuntime {
@@ -116,6 +116,19 @@ impl TangleRuntimeHandle {
             .await
             .relay_mut()
             .handle_client_message(message, auth, now)
+    }
+
+    pub(crate) async fn query_req_with_auth(
+        &self,
+        subscription_id: SubscriptionId,
+        filters: Vec<Filter>,
+        auth: &BaseAuthState,
+    ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+        self.inner
+            .lock()
+            .await
+            .relay()
+            .query_req_with_auth(subscription_id, filters, auth)
     }
 
     pub async fn shutdown(&self) -> Result<BaseRelayShutdownReport, BaseRelayError> {
