@@ -23,6 +23,7 @@ use tangle_protocol::{
 };
 use tangle_runtime::{
     config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
+    nip11::BaseRelayInfoConfig,
     relay::auth::BaseAuthState,
     runtime::TangleRuntime,
     server::serve_listener_until_shutdown,
@@ -286,9 +287,54 @@ fn auth_rejects_events_outside_created_at_skew() {
 }
 
 #[test]
-#[ignore = "phase2 target: nip70 enforcement"]
 fn protected_events_require_author_auth_before_nip70_is_advertised() {
-    pending("events with a dash tag require AUTH as event author before NIP-70 advertisement");
+    let root = temp_root("acceptance-nip70");
+    let _ = std::fs::remove_dir_all(&root);
+    let config = runtime_config(&root, SocketAddr::from(([127, 0, 0, 1], 0)));
+    let document = BaseRelayInfoConfig::new("tangle", config.groups().clone())
+        .expect("info config")
+        .build_document()
+        .expect("document");
+    let mut relay = config.open_relay().expect("relay");
+    let protected = tangle_v2_event(
+        FixtureKey::Member,
+        1_714_124_433,
+        1,
+        vec![Tag::from_parts("-", &[]).expect("protected")],
+        "protected",
+    )
+    .expect("protected event");
+    let mut auth = BaseAuthState::new(TANGLE_V2_RELAY_URL, 300, 10).expect("auth");
+    auth.issue_challenge("challenge-a", UnixTimestamp::new(1_714_124_433))
+        .expect("challenge");
+    auth.authenticate(
+        &tangle_v2_auth_event(FixtureKey::Member, "challenge-a", 1_714_124_433).expect("auth"),
+        UnixTimestamp::new(1_714_124_433),
+    )
+    .expect("author auth");
+
+    assert!(document.supported_nips.contains(&70));
+    assert_eq!(
+        relay.handle_event(protected.clone()).expect("unauth"),
+        RelayMessage::Ok {
+            event_id: protected.id().clone(),
+            accepted: false,
+            message: "auth-required: protected event requires authenticated event author"
+                .to_owned()
+        }
+    );
+    assert_eq!(
+        relay
+            .handle_event_with_auth(protected.clone(), &auth)
+            .expect("author write"),
+        RelayMessage::Ok {
+            event_id: protected.id().clone(),
+            accepted: true,
+            message: String::new()
+        }
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

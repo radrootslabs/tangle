@@ -55,6 +55,14 @@ impl BaseRelayEventWrite {
     }
 }
 
+fn is_nip70_protected_event(event: &Event) -> bool {
+    event
+        .unsigned()
+        .tags()
+        .iter()
+        .any(|tag| tag.name().as_str() == "-")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BaseRelayShutdownReport {
     closed_subscriptions: usize,
@@ -527,6 +535,15 @@ impl BaseRelay {
             return Ok(BaseRelayEventWrite::unstored(ok_rejected(
                 event_id,
                 format!("invalid: {error}"),
+            )));
+        }
+        if is_nip70_protected_event(&event) && !auth.contains(event.unsigned().pubkey()) {
+            return Ok(BaseRelayEventWrite::unstored(ok_rejected(
+                event_id,
+                BaseRelayError::auth_required(
+                    "protected event requires authenticated event author",
+                )
+                .prefixed_message(),
             )));
         }
         let group_limits = self
@@ -1221,6 +1238,39 @@ mod tests {
             &ephemeral,
         );
         assert_eq!(count_kind(&relay, 20_001), 0);
+    }
+
+    #[test]
+    fn base_relay_enforces_nip70_protected_event_author_auth() {
+        let mut relay = test_relay("base-relay-nip70-protected", 8);
+        let protected = signed_public_event(
+            7,
+            1,
+            vec![Tag::from_parts("-", &[]).expect("protected")],
+            "protected",
+        );
+
+        assert_eq!(
+            rejected_message(relay.handle_event(protected.clone()).expect("unauth")),
+            "auth-required: protected event requires authenticated event author"
+        );
+        assert_eq!(count_kind(&relay, 1), 0);
+        assert_eq!(
+            rejected_message(
+                relay
+                    .handle_event_with_auth(protected.clone(), &authenticated_state(8))
+                    .expect("wrong auth")
+            ),
+            "auth-required: protected event requires authenticated event author"
+        );
+        assert_eq!(count_kind(&relay, 1), 0);
+        assert_accepted(
+            relay
+                .handle_event_with_auth(protected.clone(), &authenticated_state(7))
+                .expect("author auth"),
+            &protected,
+        );
+        assert_eq!(count_kind(&relay, 1), 1);
     }
 
     #[test]

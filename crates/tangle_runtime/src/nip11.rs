@@ -210,6 +210,7 @@ mod tests {
 
         assert!(document.supported_nips.contains(&29));
         assert!(document.supported_nips.contains(&45));
+        assert!(document.supported_nips.contains(&70));
         assert!(document.relay_self().is_some());
         assert_eq!(document.description.as_deref(), Some("Tangle v2 relay"));
         assert!(!disabled.supported_nips.contains(&29));
