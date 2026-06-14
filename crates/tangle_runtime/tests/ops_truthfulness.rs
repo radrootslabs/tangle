@@ -36,6 +36,8 @@ fn operations_surfaces_match_enforced_runtime_contracts() {
     assert_eq!(document.limitation.max_query_complexity, 2_048);
     assert_eq!(document.limitation.default_limit, 100);
     assert!(document.limitation.restricted_writes);
+    assert!(!document.retention.physical_erasure);
+    assert!(!document.retention.compaction_guarantee);
 
     let redactor = TangleLogRedactor::from_runtime_config(&config);
     assert_eq!(

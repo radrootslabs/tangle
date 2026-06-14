@@ -111,6 +111,7 @@ impl BaseRelayInfoConfig {
                 restricted_writes: self.restricted_writes,
                 default_limit: self.limits.default_limit(),
             },
+            retention: BaseRelayInfoRetentionDocument::tangle_default(),
         })
     }
 }
@@ -130,6 +131,7 @@ pub struct BaseRelayInfoDocument {
     pub software: String,
     pub version: String,
     pub limitation: BaseRelayInfoLimitationDocument,
+    pub retention: BaseRelayInfoRetentionDocument,
 }
 
 impl BaseRelayInfoDocument {
@@ -152,6 +154,27 @@ pub struct BaseRelayInfoLimitationDocument {
     pub payment_required: bool,
     pub restricted_writes: bool,
     pub default_limit: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaseRelayInfoRetentionDocument {
+    pub accepted_events: String,
+    pub relay_generated_events: String,
+    pub group_visibility: String,
+    pub physical_erasure: bool,
+    pub compaction_guarantee: bool,
+}
+
+impl BaseRelayInfoRetentionDocument {
+    fn tangle_default() -> Self {
+        Self {
+            accepted_events: "accepted events are retained in canonical storage without a time-based expiration policy".to_owned(),
+            relay_generated_events: "relay-generated group state events are retained with their source events".to_owned(),
+            group_visibility: "private and hidden group policy gates visibility without implying physical deletion".to_owned(),
+            physical_erasure: false,
+            compaction_guarantee: false,
+        }
+    }
 }
 
 pub fn base_relay_info_router(document: BaseRelayInfoDocument) -> Router {
@@ -261,6 +284,16 @@ mod tests {
         assert!(!document.limitation.payment_required);
         assert!(document.limitation.restricted_writes);
         assert_eq!(document.limitation.default_limit, 100);
+        assert_eq!(
+            document.retention.accepted_events,
+            "accepted events are retained in canonical storage without a time-based expiration policy"
+        );
+        assert_eq!(
+            document.retention.group_visibility,
+            "private and hidden group policy gates visibility without implying physical deletion"
+        );
+        assert!(!document.retention.physical_erasure);
+        assert!(!document.retention.compaction_guarantee);
         assert_eq!(disabled.supported_nips, vec![1, 11, 42, 45, 70]);
         assert!(disabled.relay_self().is_none());
     }
@@ -315,6 +348,12 @@ mod tests {
         let value = serde_json::from_slice::<serde_json::Value>(&body).expect("json");
         assert_eq!(value["name"], document.name);
         assert!(value["self"].as_str().is_some());
+        assert_eq!(value["retention"]["physical_erasure"], false);
+        assert_eq!(value["retention"]["compaction_guarantee"], false);
+        assert_eq!(
+            value["retention"]["group_visibility"],
+            "private and hidden group policy gates visibility without implying physical deletion"
+        );
 
         let rejected = base_relay_info_router(document)
             .oneshot(

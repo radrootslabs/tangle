@@ -482,6 +482,8 @@ mod tests {
         assert_eq!(nip11_value["limitation"]["payment_required"], false);
         assert_eq!(nip11_value["limitation"]["restricted_writes"], true);
         assert_eq!(nip11_value["limitation"]["default_limit"], 100);
+        assert_eq!(nip11_value["retention"]["physical_erasure"], false);
+        assert_eq!(nip11_value["retention"]["compaction_guarantee"], false);
         assert!(
             nip11_value["supported_nips"]
                 .as_array()

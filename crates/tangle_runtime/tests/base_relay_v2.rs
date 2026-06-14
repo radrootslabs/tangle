@@ -104,6 +104,12 @@ fn nip11_integration_reports_group_contracts() {
     assert!(!document.limitation.payment_required);
     assert!(document.limitation.restricted_writes);
     assert_eq!(document.limitation.default_limit, 100);
+    assert!(!document.retention.physical_erasure);
+    assert!(!document.retention.compaction_guarantee);
+    assert_eq!(
+        document.retention.group_visibility,
+        "private and hidden group policy gates visibility without implying physical deletion"
+    );
     assert_eq!(disabled.supported_nips, vec![1, 11, 42, 45, 70]);
     assert!(disabled.relay_self().is_none());
 }
