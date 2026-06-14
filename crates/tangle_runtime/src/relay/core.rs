@@ -606,8 +606,16 @@ impl BaseRelay {
         self.groups.is_some()
     }
 
+    pub(crate) fn store_handle(&self) -> PocketStoreHandle {
+        self.store.clone()
+    }
+
     pub fn group_projection(&self) -> Option<&GroupProjection> {
         self.groups.as_ref().map(|groups| groups.projection())
+    }
+
+    pub(crate) fn group_service(&self) -> Option<&GroupService> {
+        self.groups.as_ref()
     }
 
     pub(crate) fn group_outbox_pending_events(&self) -> usize {
@@ -1019,7 +1027,7 @@ impl BaseRelay {
             .collect()
     }
 
-    fn group_read_gate_visible_to_auth(
+    pub(crate) fn group_read_gate_visible_to_auth(
         groups: Option<&GroupService>,
         event: &(impl GroupEventView + ?Sized),
         auth: &GroupAuthContext,

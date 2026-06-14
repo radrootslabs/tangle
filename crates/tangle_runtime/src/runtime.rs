@@ -6,6 +6,7 @@ use crate::{
     event_bus::{TangleEventBus, TangleEventReceiver},
     logging,
     ops::{BaseRelayReadinessHandle, BaseRelayReadinessState},
+    pocket_conversion::pocket_event_to_tangle,
     rate_limits::{
         TangleQueryRateLimitConfig, TangleRateLimitDecision, TangleRateLimitKey,
         TangleRateLimitQueryClass, TangleRateLimitRule, TangleRateLimitScope, TangleRateLimiter,
@@ -29,12 +30,13 @@ use std::{
     time::Instant,
 };
 use tangle_groups::{
-    GroupEventClass, GroupId, KIND_GROUP_JOIN_REQUEST, StoreOffset,
+    GroupAuthContext, GroupEventClass, GroupId, KIND_GROUP_JOIN_REQUEST, StoreOffset,
     validate_client_group_event_structure,
 };
 use tangle_protocol::{
     ClientMessage, Event, Filter, Kind, RelayMessage, SubscriptionId, UnixTimestamp,
 };
+use tangle_store_pocket::PocketStoreHandle;
 use tokio::sync::{Mutex, watch};
 
 pub struct TangleRuntime {
@@ -152,6 +154,7 @@ impl TangleRuntime {
 
 struct TangleRuntimeShared {
     config: Arc<BaseRelayRuntimeConfig>,
+    store: PocketStoreHandle,
     relay: Mutex<BaseRelay>,
     readiness: BaseRelayReadinessHandle,
     limits: TangleRuntimeLimits,
@@ -173,8 +176,10 @@ impl TangleRuntimeShared {
             metrics,
             shutdown,
         } = runtime;
+        let store = relay.store_handle();
         Self {
             config: Arc::new(config),
+            store,
             relay: Mutex::new(relay),
             readiness,
             limits,
@@ -815,16 +820,18 @@ impl TangleRuntimeHandle {
         offset: StoreOffset,
         auth: &BaseAuthState,
     ) -> Result<Option<Event>, BaseRelayError> {
-        let event = self
-            .inner
-            .relay
-            .lock()
-            .await
-            .event_by_offset_with_auth(offset, auth)?;
-        if event.is_none() {
+        let pocket_event = self.inner.store.event_by_offset(offset.as_u64())?;
+        let event = pocket_event_to_tangle(&pocket_event)?;
+        let group_auth = GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned());
+        let visible = {
+            let relay = self.inner.relay.lock().await;
+            BaseRelay::group_read_gate_visible_to_auth(relay.group_service(), &event, &group_auth)?
+        };
+        if !visible {
             self.inner.metrics.record_group_read_denial();
+            return Ok(None);
         }
-        Ok(event)
+        Ok(Some(event))
     }
 
     pub(crate) async fn fanout_event_offset(

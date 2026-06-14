@@ -11,6 +11,7 @@ use pocket_types::{
 use std::{
     io,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 pub const POCKET_SOURCE_REPOSITORY: &str = "https://github.com/triesap/pocket";
@@ -154,8 +155,9 @@ impl PocketDependencyBoundary {
     }
 }
 
+#[derive(Clone)]
 pub struct PocketStoreHandle {
-    store: PocketStore,
+    store: Arc<PocketStore>,
     sync_policy: PocketSyncPolicy,
 }
 
@@ -166,7 +168,7 @@ impl PocketStoreHandle {
         let store = PocketStore::new(config.data_directory(), TANGLE_POCKET_EXTRA_TABLES.to_vec())
             .map_err(PocketStoreError::from_pocket)?;
         Ok(Self {
-            store,
+            store: Arc::new(store),
             sync_policy: config.sync_policy(),
         })
     }
@@ -353,10 +355,6 @@ impl PocketStoreHandle {
             records.push((key.to_vec(), value.to_vec()));
         }
         Ok(records)
-    }
-
-    pub fn into_inner(self) -> PocketStore {
-        self.store
     }
 
     fn extra_table(&self, table: &'static str) -> Result<Database<Bytes, Bytes>, PocketStoreError> {
@@ -597,6 +595,29 @@ mod tests {
             ["group_projection", "group_outbox", "group_checkpoint"]
         );
         handle.sync().expect("sync");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pocket_store_handle_clones_share_one_store_boundary() {
+        let root = temp_root("tangle-pocket-shared");
+        let config = PocketStoreConfig::new(root.join("pocket"), PocketSyncPolicy::FlushOnShutdown)
+            .expect("config");
+        let writer = PocketStoreHandle::open(&config).expect("open");
+        let reader = writer.clone();
+        let event = parse_pocket_event_json(event_json().as_bytes()).expect("event");
+        let filter = parse_pocket_filter_json(filter_json().as_bytes()).expect("filter");
+
+        let offset = writer.store_event(&event).expect("store");
+        let stored = reader.event_by_offset(offset).expect("offset");
+        let found = reader
+            .find_events(&filter, PocketQueryConfig::default())
+            .expect("find");
+
+        assert_eq!(stored.id(), event.id());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id(), event.id());
 
         let _ = std::fs::remove_dir_all(root);
     }
