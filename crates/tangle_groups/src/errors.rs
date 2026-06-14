@@ -47,6 +47,10 @@ pub enum GroupErrorKind {
     InvalidRole,
     MissingCapability,
     AuthenticationRequired,
+    GroupUnavailable,
+    GroupDeleted,
+    GroupAlreadyExists,
+    DuplicateMember,
     Internal,
 }
 

@@ -518,6 +518,14 @@ impl GroupProjection {
         &self.members
     }
 
+    pub fn roles(&self) -> &BTreeMap<(GroupId, RoleName), ProjectedRoleDefinition> {
+        &self.roles
+    }
+
+    pub fn tombstones(&self) -> &BTreeMap<GroupId, GroupTombstone> {
+        &self.tombstones
+    }
+
     pub fn checkpoint(&self) -> Option<&ProjectionCheckpoint> {
         self.checkpoint.as_ref()
     }

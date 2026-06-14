@@ -35,6 +35,9 @@ pub use outbox::{
     GroupOutboxPayload, GroupOutboxRecord, GroupOutboxStatus, OutboxRecoveryReadiness,
     OutboxReplayPlan,
 };
+pub use policy::{
+    GroupAuthority, GroupWriteDecision, GroupWritePolicy, non_enumerating_group_error,
+};
 pub use projection::{
     CanonicalGroupEvent, GROUP_POLICY_VERSION, GROUP_PROJECTION_SCHEMA_VERSION,
     GroupLifecycleState, GroupProjection, GroupRecoveryReadiness, GroupSnapshotIds, GroupState,
@@ -43,12 +46,15 @@ pub use projection::{
     group_current_key, member_current_key, projection_checkpoint_key, rebuild_group_projection,
     role_current_key, tombstone_key,
 };
+pub use read_gate::{GroupReadDecision, GroupReadGate};
 pub use roles::{
     Capability, CapabilitySet, PERMANENT_RELAY_OVERRIDE_ROLE, RoleDefinition, RoleName,
     resolve_capabilities,
 };
 pub use tags::{GroupTag, GroupTagName, extract_group_tag, has_group_identity_tag};
-pub use write_gate::validate_client_group_event_structure;
+pub use write_gate::{
+    GroupAuthContext, require_group_auth_as_author, validate_client_group_event_structure,
+};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct RelaySecret(String);
