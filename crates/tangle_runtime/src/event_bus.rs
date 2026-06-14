@@ -46,6 +46,10 @@ pub struct TangleEventReceiver {
 }
 
 impl TangleEventReceiver {
+    pub async fn recv(&mut self) -> Result<StoreOffset, TangleEventReceiveError> {
+        self.receiver.recv().await.map_err(Into::into)
+    }
+
     pub fn try_recv(&mut self) -> Result<StoreOffset, TangleEventReceiveError> {
         self.receiver.try_recv().map_err(Into::into)
     }
@@ -64,6 +68,15 @@ impl From<broadcast::error::TryRecvError> for TangleEventReceiveError {
             broadcast::error::TryRecvError::Empty => Self::Empty,
             broadcast::error::TryRecvError::Closed => Self::Closed,
             broadcast::error::TryRecvError::Lagged(skipped) => Self::Lagged(skipped),
+        }
+    }
+}
+
+impl From<broadcast::error::RecvError> for TangleEventReceiveError {
+    fn from(error: broadcast::error::RecvError) -> Self {
+        match error {
+            broadcast::error::RecvError::Closed => Self::Closed,
+            broadcast::error::RecvError::Lagged(skipped) => Self::Lagged(skipped),
         }
     }
 }

@@ -125,24 +125,29 @@ async fn tangle_root(
     headers: HeaderMap,
 ) -> Response {
     match websocket {
-        Ok(websocket) => match state.runtime.auth_state().await.and_then(|auth| {
-            TangleWebSocketSession::new(
-                state.outbound_queue_capacity,
-                state.shutdown.subscribe(),
-                state.runtime.clone(),
-                auth,
-            )
-        }) {
-            Ok(session) => websocket
-                .protocols(["nostr"])
-                .on_upgrade(move |socket| session.run(socket))
-                .into_response(),
-            Err(error) => (
-                http::StatusCode::INTERNAL_SERVER_ERROR,
-                error.prefixed_message(),
-            )
-                .into_response(),
-        },
+        Ok(websocket) => {
+            let session = match state.runtime.auth_state().await {
+                Ok(auth) => TangleWebSocketSession::new(
+                    state.outbound_queue_capacity,
+                    state.shutdown.subscribe(),
+                    state.runtime.clone(),
+                    auth,
+                    state.runtime.subscribe_events().await,
+                ),
+                Err(error) => Err(error),
+            };
+            match session {
+                Ok(session) => websocket
+                    .protocols(["nostr"])
+                    .on_upgrade(move |socket| session.run(socket))
+                    .into_response(),
+                Err(error) => (
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    error.prefixed_message(),
+                )
+                    .into_response(),
+            }
+        }
         Err(_) => base_relay_info_response(state.info, headers),
     }
 }

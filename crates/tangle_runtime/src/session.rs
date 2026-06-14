@@ -2,6 +2,7 @@
 
 use crate::{
     errors::BaseRelayError,
+    event_bus::{TangleEventReceiveError, TangleEventReceiver},
     relay::{
         auth::{BaseAuthState, generate_auth_challenge},
         live::LiveSubscriptionSet,
@@ -25,6 +26,7 @@ pub struct TangleWebSocketSession {
     runtime: TangleRuntimeHandle,
     auth: BaseAuthState,
     subscriptions: LiveSubscriptionSet,
+    events: TangleEventReceiver,
 }
 
 impl TangleWebSocketSession {
@@ -33,6 +35,7 @@ impl TangleWebSocketSession {
         shutdown: watch::Receiver<bool>,
         runtime: TangleRuntimeHandle,
         auth: BaseAuthState,
+        events: TangleEventReceiver,
     ) -> Result<Self, BaseRelayError> {
         if outbound_queue_capacity == 0 {
             return Err(BaseRelayError::invalid(
@@ -52,6 +55,7 @@ impl TangleWebSocketSession {
             runtime,
             auth,
             subscriptions,
+            events,
         })
     }
 
@@ -67,7 +71,6 @@ impl TangleWebSocketSession {
         *self.shutdown.borrow()
     }
 
-    #[cfg(test)]
     #[cfg(test)]
     fn active_subscription_count(&self) -> usize {
         self.subscriptions.active_count()
@@ -101,6 +104,17 @@ impl TangleWebSocketSession {
                         break;
                     }
                 }
+                event_offset = self.events.recv() => {
+                    match event_offset {
+                        Ok(offset) => {
+                            if !self.handle_event_offset(offset).await {
+                                break;
+                            }
+                        }
+                        Err(TangleEventReceiveError::Closed | TangleEventReceiveError::Lagged(_)) => break,
+                        Err(TangleEventReceiveError::Empty) => {}
+                    }
+                }
                 changed = self.shutdown.changed() => {
                     if changed.is_err() || self.shutdown_requested() {
                         let _ = socket.send(Message::Close(None)).await;
@@ -110,6 +124,23 @@ impl TangleWebSocketSession {
             }
         }
         self.subscriptions.close_all();
+    }
+
+    async fn handle_event_offset(&mut self, offset: tangle_groups::StoreOffset) -> bool {
+        let runtime = self.runtime.clone();
+        let replies = match runtime
+            .fanout_event_offset(offset, &mut self.subscriptions)
+            .await
+        {
+            Ok(replies) => replies,
+            Err(error) => vec![RelayMessage::Notice(error.prefixed_message())],
+        };
+        for reply in replies {
+            if self.send_relay_message(reply).is_err() {
+                return false;
+            }
+        }
+        true
     }
 
     async fn handle_incoming_message(&mut self, message: Message) -> bool {
@@ -246,6 +277,7 @@ mod tests {
     use super::{TangleOutboundQueueError, TangleWebSocketSession};
     use crate::{
         config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
+        event_bus::TangleEventReceiver,
         runtime::{TangleRuntime, TangleRuntimeHandle, TangleShutdownSignal},
     };
     use axum::extract::ws::Message;
@@ -257,9 +289,9 @@ mod tests {
     fn websocket_session_records_connection_time() {
         let before = std::time::Instant::now();
         let shutdown = TangleShutdownSignal::new();
-        let (runtime, auth) = session_runtime("records-connection-time");
-        let session =
-            TangleWebSocketSession::new(8, shutdown.subscribe(), runtime, auth).expect("session");
+        let (runtime, auth, events) = session_runtime("records-connection-time");
+        let session = TangleWebSocketSession::new(8, shutdown.subscribe(), runtime, auth, events)
+            .expect("session");
 
         assert!(session.connected_at() >= before);
     }
@@ -267,17 +299,19 @@ mod tests {
     #[test]
     fn websocket_session_rejects_zero_outbound_capacity() {
         let shutdown = TangleShutdownSignal::new();
-        let (runtime, auth) = session_runtime("zero-outbound-capacity");
+        let (runtime, auth, events) = session_runtime("zero-outbound-capacity");
 
-        assert!(TangleWebSocketSession::new(0, shutdown.subscribe(), runtime, auth).is_err());
+        assert!(
+            TangleWebSocketSession::new(0, shutdown.subscribe(), runtime, auth, events).is_err()
+        );
     }
 
     #[test]
     fn websocket_session_observes_shutdown_request() {
         let shutdown = TangleShutdownSignal::new();
-        let (runtime, auth) = session_runtime("observes-shutdown");
-        let session =
-            TangleWebSocketSession::new(8, shutdown.subscribe(), runtime, auth).expect("session");
+        let (runtime, auth, events) = session_runtime("observes-shutdown");
+        let session = TangleWebSocketSession::new(8, shutdown.subscribe(), runtime, auth, events)
+            .expect("session");
 
         assert!(!session.shutdown_requested());
 
@@ -295,11 +329,14 @@ mod tests {
             TangleRuntimeHandle::new(TangleRuntime::open(runtime_config(&root)).expect("runtime"));
         let auth_a = runtime.auth_state().await.expect("auth a");
         let auth_b = runtime.auth_state().await.expect("auth b");
+        let events_a = runtime.subscribe_events().await;
+        let events_b = runtime.subscribe_events().await;
         let mut first =
-            TangleWebSocketSession::new(8, shutdown.subscribe(), runtime.clone(), auth_a)
+            TangleWebSocketSession::new(8, shutdown.subscribe(), runtime.clone(), auth_a, events_a)
                 .expect("first");
         let mut second =
-            TangleWebSocketSession::new(8, shutdown.subscribe(), runtime, auth_b).expect("second");
+            TangleWebSocketSession::new(8, shutdown.subscribe(), runtime, auth_b, events_b)
+                .expect("second");
         let subscription_id = SubscriptionId::new("shared").expect("subscription");
 
         assert_eq!(
@@ -354,9 +391,9 @@ mod tests {
     #[test]
     fn outbound_queue_is_bounded() {
         let shutdown = TangleShutdownSignal::new();
-        let (runtime, auth) = session_runtime("outbound-queue");
-        let session =
-            TangleWebSocketSession::new(1, shutdown.subscribe(), runtime, auth).expect("session");
+        let (runtime, auth, events) = session_runtime("outbound-queue");
+        let session = TangleWebSocketSession::new(1, shutdown.subscribe(), runtime, auth, events)
+            .expect("session");
         let outbound = session.outbound();
 
         assert_eq!(outbound.capacity(), 1);
@@ -371,12 +408,19 @@ mod tests {
         );
     }
 
-    fn session_runtime(name: &str) -> (TangleRuntimeHandle, crate::relay::auth::BaseAuthState) {
+    fn session_runtime(
+        name: &str,
+    ) -> (
+        TangleRuntimeHandle,
+        crate::relay::auth::BaseAuthState,
+        TangleEventReceiver,
+    ) {
         let root = temp_root(name);
         let _ = std::fs::remove_dir_all(&root);
         let runtime = TangleRuntime::open(runtime_config(&root)).expect("runtime");
         let auth = runtime.auth_state().expect("auth");
-        (TangleRuntimeHandle::new(runtime), auth)
+        let events = runtime.event_bus().subscribe();
+        (TangleRuntimeHandle::new(runtime), auth, events)
     }
 
     fn req(subscription_id: SubscriptionId) -> ClientMessage {

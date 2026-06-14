@@ -23,6 +23,36 @@ pub struct BaseRelay {
     groups: Option<GroupService>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BaseRelayEventWrite {
+    message: RelayMessage,
+    stored_offset: Option<StoreOffset>,
+}
+
+impl BaseRelayEventWrite {
+    fn stored(message: RelayMessage, stored_offset: StoreOffset) -> Self {
+        Self {
+            message,
+            stored_offset: Some(stored_offset),
+        }
+    }
+
+    fn unstored(message: RelayMessage) -> Self {
+        Self {
+            message,
+            stored_offset: None,
+        }
+    }
+
+    pub(crate) fn stored_offset(&self) -> Option<StoreOffset> {
+        self.stored_offset
+    }
+
+    pub(crate) fn into_message(self) -> RelayMessage {
+        self.message
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BaseRelayShutdownReport {
     closed_subscriptions: usize,
@@ -176,6 +206,7 @@ impl BaseRelay {
 
     pub fn handle_event(&mut self, event: Event) -> Result<RelayMessage, BaseRelayError> {
         self.handle_event_with_group_auth(event, &GroupAuthContext::unauthenticated())
+            .map(BaseRelayEventWrite::into_message)
     }
 
     pub fn handle_event_with_auth(
@@ -183,6 +214,15 @@ impl BaseRelay {
         event: Event,
         auth: &BaseAuthState,
     ) -> Result<RelayMessage, BaseRelayError> {
+        self.handle_event_with_auth_report(event, auth)
+            .map(BaseRelayEventWrite::into_message)
+    }
+
+    pub(crate) fn handle_event_with_auth_report(
+        &mut self,
+        event: Event,
+        auth: &BaseAuthState,
+    ) -> Result<BaseRelayEventWrite, BaseRelayError> {
         self.handle_event_with_group_auth(
             event,
             &GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned()),
@@ -211,10 +251,13 @@ impl BaseRelay {
         &mut self,
         event: Event,
         auth: &GroupAuthContext,
-    ) -> Result<RelayMessage, BaseRelayError> {
+    ) -> Result<BaseRelayEventWrite, BaseRelayError> {
         let event_id = event.id().clone();
         if let Err(error) = verify_event_signature(&event) {
-            return Ok(ok_rejected(event_id, format!("invalid: {error}")));
+            return Ok(BaseRelayEventWrite::unstored(ok_rejected(
+                event_id,
+                format!("invalid: {error}"),
+            )));
         }
         let group_limits = self
             .groups
@@ -223,31 +266,42 @@ impl BaseRelay {
             .unwrap_or_default();
         let class = match validate_client_group_event_structure(&event, group_limits) {
             Ok(class) => class,
-            Err(error) => return Ok(ok_rejected(event_id, error.prefixed_message())),
+            Err(error) => {
+                return Ok(BaseRelayEventWrite::unstored(ok_rejected(
+                    event_id,
+                    error.prefixed_message(),
+                )));
+            }
         };
         if !matches!(class, GroupEventClass::NonGroup) {
             let Some(groups) = self.groups.as_ref() else {
-                return Ok(ok_rejected(
+                return Ok(BaseRelayEventWrite::unstored(ok_rejected(
                     event_id,
                     "blocked: NIP-29 group events are not accepted before group service".to_owned(),
-                ));
+                )));
             };
             if let Err(error) = groups.check_event(&self.store, &event, &class, auth) {
-                return Ok(ok_rejected(event_id, error.prefixed_message()));
+                return Ok(BaseRelayEventWrite::unstored(ok_rejected(
+                    event_id,
+                    error.prefixed_message(),
+                )));
             }
         }
         if event.unsigned().kind().is_ephemeral() {
-            return Ok(ok_accepted(event_id, String::new()));
+            return Ok(BaseRelayEventWrite::unstored(ok_accepted(
+                event_id,
+                String::new(),
+            )));
         }
         if self
             .store
             .event_by_id(pocket_event_id(&event_id)?)?
             .is_some()
         {
-            return Ok(ok_accepted(
+            return Ok(BaseRelayEventWrite::unstored(ok_accepted(
                 event_id,
                 "duplicate: already have this event".to_owned(),
-            ));
+            )));
         }
         let pocket_event = tangle_event_to_pocket(&event)?;
         let store_offset = StoreOffset::new(self.store.store_event(&pocket_event)?);
@@ -257,7 +311,10 @@ impl BaseRelay {
             groups.after_source_event_stored(&self.store, &event, &class, store_offset)?;
         }
         self.store.sync()?;
-        Ok(ok_accepted(event_id, String::new()))
+        Ok(BaseRelayEventWrite::stored(
+            ok_accepted(event_id, String::new()),
+            store_offset,
+        ))
     }
 
     pub fn handle_req(
@@ -472,6 +529,20 @@ impl BaseRelay {
             .map(|groups| groups.event_visible_to_auth(event, auth))
             .unwrap_or(Ok(true))
             .map_err(BaseRelayError::from)
+    }
+
+    pub(crate) fn fanout_offset(
+        &self,
+        offset: StoreOffset,
+        subscriptions: &mut LiveSubscriptionSet,
+    ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+        let event = self.event_by_offset(offset)?;
+        let groups = self.groups.as_ref();
+        Ok(subscriptions.fanout(&event, |event, auth| {
+            groups
+                .map(|groups| groups.event_visible_to_auth(event, auth).unwrap_or(false))
+                .unwrap_or(true)
+        }))
     }
 }
 

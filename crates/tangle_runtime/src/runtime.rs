@@ -3,11 +3,12 @@
 use crate::{
     config::BaseRelayRuntimeConfig,
     errors::BaseRelayError,
-    event_bus::TangleEventBus,
+    event_bus::{TangleEventBus, TangleEventReceiver},
     ops::BaseRelayReadinessState,
     relay::{
         auth::BaseAuthState,
         core::{BaseRelay, BaseRelayShutdownReport},
+        live::LiveSubscriptionSet,
     },
 };
 use std::{
@@ -112,11 +113,26 @@ impl TangleRuntimeHandle {
         auth: &mut BaseAuthState,
         now: UnixTimestamp,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
-        self.inner
-            .lock()
-            .await
-            .relay_mut()
-            .handle_client_message(message, auth, now)
+        let mut runtime = self.inner.lock().await;
+        match message {
+            ClientMessage::Event(event) => {
+                let result = runtime
+                    .relay_mut()
+                    .handle_event_with_auth_report(event, auth)?;
+                if let Some(offset) = result.stored_offset() {
+                    runtime.metrics().record_stored_event_offset();
+                    runtime.event_bus().publish(offset);
+                }
+                Ok(vec![result.into_message()])
+            }
+            message => runtime
+                .relay_mut()
+                .handle_client_message(message, auth, now),
+        }
+    }
+
+    pub async fn subscribe_events(&self) -> TangleEventReceiver {
+        self.inner.lock().await.event_bus().subscribe()
     }
 
     pub(crate) async fn query_req_with_auth(
@@ -142,6 +158,18 @@ impl TangleRuntimeHandle {
             .await
             .relay()
             .event_by_offset_with_auth(offset, auth)
+    }
+
+    pub(crate) async fn fanout_event_offset(
+        &self,
+        offset: StoreOffset,
+        subscriptions: &mut LiveSubscriptionSet,
+    ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+        self.inner
+            .lock()
+            .await
+            .relay()
+            .fanout_offset(offset, subscriptions)
     }
 
     pub async fn shutdown(&self) -> Result<BaseRelayShutdownReport, BaseRelayError> {
@@ -300,12 +328,17 @@ impl Default for TangleShutdownSignal {
 
 #[cfg(test)]
 mod tests {
-    use super::{TangleRuntime, TangleRuntimeLimits};
+    use super::{TangleRuntime, TangleRuntimeHandle, TangleRuntimeLimits};
     use crate::config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json};
-    use crate::event_bus::TangleEventBus;
+    use crate::event_bus::{TangleEventBus, TangleEventReceiveError};
+    use crate::relay::live::LiveSubscriptionSet;
     use serde_json::json;
     use std::path::{Path, PathBuf};
-    use tangle_groups::StoreOffset;
+    use tangle_groups::{GroupAuthContext, StoreOffset};
+    use tangle_protocol::{
+        ClientMessage, RelayMessage, SubscriptionId, UnixTimestamp, filter_from_value,
+    };
+    use tangle_test_support::{FixtureKey, tangle_v2_event};
 
     #[test]
     fn tangle_runtime_opens_owned_process_shell_from_config() {
@@ -367,6 +400,78 @@ mod tests {
         assert!(TangleRuntimeLimits::new(1, 0, 1).is_err());
         assert!(TangleRuntimeLimits::new(1, 1, 0).is_err());
         assert!(TangleEventBus::new(0).is_err());
+    }
+
+    #[tokio::test]
+    async fn runtime_publishes_stored_event_offsets_for_live_fanout() {
+        let root = temp_root("runtime-offset-fanout");
+        let _ = std::fs::remove_dir_all(&root);
+        let handle = TangleRuntimeHandle::new(
+            TangleRuntime::open(runtime_config(&root, 8)).expect("runtime"),
+        );
+        let mut offsets = handle.subscribe_events().await;
+        let mut auth = handle.auth_state().await.expect("auth");
+        let mut subscriptions = LiveSubscriptionSet::new(8).expect("subscriptions");
+        let subscription_id = SubscriptionId::new("live-offset").expect("subscription");
+        subscriptions
+            .subscribe(
+                subscription_id.clone(),
+                vec![filter_from_value(&json!({"kinds":[1]})).expect("filter")],
+                GroupAuthContext::unauthenticated(),
+            )
+            .expect("subscribe");
+        let event = tangle_v2_event(FixtureKey::Member, 1_714_124_433, 1, Vec::new(), "live")
+            .expect("event");
+
+        assert_eq!(
+            handle
+                .handle_client_message(
+                    ClientMessage::Event(event.clone()),
+                    &mut auth,
+                    UnixTimestamp::new(1_714_124_433)
+                )
+                .await
+                .expect("event"),
+            vec![RelayMessage::Ok {
+                event_id: event.id().clone(),
+                accepted: true,
+                message: String::new()
+            }]
+        );
+        let offset = offsets.try_recv().expect("offset");
+        assert!(matches!(
+            handle
+                .fanout_event_offset(offset, &mut subscriptions)
+                .await
+                .expect("fanout")
+                .as_slice(),
+            [RelayMessage::Event {
+                subscription_id: delivered,
+                event: found
+            }] if delivered == &subscription_id && found.id() == event.id()
+        ));
+
+        assert_eq!(
+            handle
+                .handle_client_message(
+                    ClientMessage::Event(event.clone()),
+                    &mut auth,
+                    UnixTimestamp::new(1_714_124_434)
+                )
+                .await
+                .expect("duplicate"),
+            vec![RelayMessage::Ok {
+                event_id: event.id().clone(),
+                accepted: true,
+                message: "duplicate: already have this event".to_owned()
+            }]
+        );
+        assert_eq!(
+            offsets.try_recv().expect_err("no duplicate offset"),
+            TangleEventReceiveError::Empty
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn runtime_config(root: &Path, max_pending_events: usize) -> BaseRelayRuntimeConfig {
