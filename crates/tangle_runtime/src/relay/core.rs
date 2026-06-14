@@ -21,6 +21,7 @@ pub struct BaseRelay {
     store: PocketStoreHandle,
     subscriptions: LiveSubscriptionSet,
     groups: Option<GroupService>,
+    readiness: BaseRelayReadinessState,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -101,10 +102,13 @@ impl BaseRelay {
         groups: &GroupRuntimeConfig,
     ) -> Result<Self, BaseRelayError> {
         let groups = GroupService::from_config(&store, groups)?;
+        let subscriptions = LiveSubscriptionSet::new(max_pending_events)?;
+        let readiness = BaseRelayReadinessState::ready();
         Ok(Self {
             store,
-            subscriptions: LiveSubscriptionSet::new(max_pending_events)?,
+            subscriptions,
             groups,
+            readiness,
         })
     }
 
@@ -239,7 +243,7 @@ impl BaseRelay {
     }
 
     pub fn readiness_state(&self) -> BaseRelayReadinessState {
-        BaseRelayReadinessState::ready()
+        self.readiness.clone()
     }
 
     pub fn shutdown(&mut self) -> Result<BaseRelayShutdownReport, BaseRelayError> {
@@ -841,6 +845,14 @@ mod tests {
         let disabled = test_relay_with_groups("base-relay-groups-disabled", 4, &disabled_groups());
 
         assert!(relay.groups_enabled());
+        assert_eq!(
+            relay
+                .readiness_state()
+                .response()
+                .checks
+                .group_outbox_replay,
+            "ready"
+        );
         assert!(
             relay
                 .group_projection()
@@ -849,6 +861,14 @@ mod tests {
                 .is_empty()
         );
         assert!(!disabled.groups_enabled());
+        assert_eq!(
+            disabled
+                .readiness_state()
+                .response()
+                .checks
+                .group_outbox_replay,
+            "ready"
+        );
         assert!(disabled.group_projection().is_none());
     }
 

@@ -3,10 +3,11 @@
 use std::{fs, panic, path::PathBuf};
 use tangle_crypto::{event_id_matches, verify_event_signature};
 use tangle_groups::{
-    GroupId, GroupRuntimeConfig, KIND_GROUP_ADMINS, KIND_GROUP_DELETE_GROUP,
-    KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA,
-    KIND_GROUP_PUT_USER, MemberStatus, NIP29_RELAY_GENERATED_KIND_VALUES, ProjectionCheckpoint,
-    StoreOffset, member_current_key, parse_group_runtime_config_json, projection_checkpoint_key,
+    GroupId, GroupOutboxRecord, GroupOutboxStatus, GroupRuntimeConfig, KIND_GROUP_ADMINS,
+    KIND_GROUP_DELETE_GROUP, KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS,
+    KIND_GROUP_METADATA, KIND_GROUP_PUT_USER, MemberStatus, NIP29_RELAY_GENERATED_KIND_VALUES,
+    ProjectionCheckpoint, StoreOffset, member_current_key, parse_group_runtime_config_json,
+    projection_checkpoint_key,
 };
 use tangle_protocol::{
     Event, Filter, RawEventJson, RelayMessage, SubscriptionId, Tag, UnixTimestamp,
@@ -955,6 +956,14 @@ fn projection_rebuild_after_restart_matches_live_state_and_outbox_is_idempotent(
     delete_group_extra_records(&config);
 
     let relay = BaseRelay::open_with_groups(&config, 8, &group_config()).expect("reopen");
+    assert_eq!(
+        relay
+            .readiness_state()
+            .response()
+            .checks
+            .group_outbox_replay,
+        "ready"
+    );
     assert!(
         relay
             .group_projection()
@@ -1041,6 +1050,36 @@ fn projection_applies_canonical_events_after_checkpoint_on_restart() {
                 .last_offset()
                 .is_some_and(|offset| offset.as_u64() > create_offset)
     ));
+}
+
+#[test]
+fn pending_and_retryable_group_outbox_records_materialize_on_restart() {
+    let config = test_store_config("outbox-retryable-restart");
+    let owner_auth = authenticated(FixtureKey::Owner);
+    {
+        let mut relay = BaseRelay::open_with_groups(&config, 8, &group_config()).expect("relay");
+        accept_group_create(&mut relay, "OutboxFarm", &[], 1, &owner_auth);
+        relay.shutdown().expect("shutdown");
+    }
+    regress_outbox_records_to_retryable(&config);
+    assert_eq!(outbox_status_counts(&config).pending, 1);
+    assert_eq!(outbox_status_counts(&config).retryable, 1);
+
+    let relay = BaseRelay::open_with_groups(&config, 8, &group_config()).expect("reopen");
+    assert_eq!(
+        relay
+            .readiness_state()
+            .response()
+            .checks
+            .group_outbox_replay,
+        "ready"
+    );
+    assert_eq!(count_kind(&relay, KIND_GROUP_METADATA), 1);
+    assert_eq!(count_kind(&relay, KIND_GROUP_ADMINS), 1);
+    let counts = outbox_status_counts(&config);
+    assert_eq!(counts.pending, 0);
+    assert_eq!(counts.retryable, 0);
+    assert!(counts.stored >= 2);
 }
 
 #[test]
@@ -1225,6 +1264,60 @@ fn regress_member_projection_to_checkpoint(
         )
         .expect("delete member");
     store.sync().expect("sync");
+}
+
+fn regress_outbox_records_to_retryable(config: &PocketStoreConfig) {
+    let store = PocketStoreHandle::open(config).expect("store");
+    let records = store
+        .scan_extra_records(TANGLE_GROUP_OUTBOX_TABLE)
+        .expect("outbox records");
+    assert!(records.len() >= 2);
+    let mut first = GroupOutboxRecord::from_json_bytes(&records[0].1).expect("first outbox record");
+    let second = GroupOutboxRecord::from_json_bytes(&records[1].1).expect("second outbox record");
+    first.mark_failed(true, "retry on restart");
+    let pending = GroupOutboxRecord::pending(second.key().clone(), second.payload().clone());
+    store
+        .put_extra_record(
+            TANGLE_GROUP_OUTBOX_TABLE,
+            &first.key().storage_key(),
+            &first.to_json_bytes().expect("failed bytes"),
+        )
+        .expect("put failed");
+    store
+        .put_extra_record(
+            TANGLE_GROUP_OUTBOX_TABLE,
+            &pending.key().storage_key(),
+            &pending.to_json_bytes().expect("pending bytes"),
+        )
+        .expect("put pending");
+    store.sync().expect("sync");
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct OutboxStatusCounts {
+    pending: usize,
+    retryable: usize,
+    stored: usize,
+}
+
+fn outbox_status_counts(config: &PocketStoreConfig) -> OutboxStatusCounts {
+    let store = PocketStoreHandle::open(config).expect("store");
+    let mut counts = OutboxStatusCounts::default();
+    for (_, value) in store
+        .scan_extra_records(TANGLE_GROUP_OUTBOX_TABLE)
+        .expect("outbox records")
+    {
+        match GroupOutboxRecord::from_json_bytes(&value)
+            .expect("outbox record")
+            .status()
+        {
+            GroupOutboxStatus::Pending => counts.pending += 1,
+            GroupOutboxStatus::Failed { retryable: true } => counts.retryable += 1,
+            GroupOutboxStatus::Stored { .. } => counts.stored += 1,
+            GroupOutboxStatus::Skipped { .. } | GroupOutboxStatus::Failed { retryable: false } => {}
+        }
+    }
+    counts
 }
 
 fn temp_root(name: &str) -> PathBuf {
