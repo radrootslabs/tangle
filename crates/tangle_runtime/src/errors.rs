@@ -25,6 +25,13 @@ impl BaseRelayError {
         }
     }
 
+    pub fn rate_limited(message: impl Into<String>) -> Self {
+        Self {
+            prefix: "rate-limited",
+            message: message.into(),
+        }
+    }
+
     pub fn error(message: impl Into<String>) -> Self {
         Self {
             prefix: "error",
@@ -90,6 +97,10 @@ mod tests {
         assert_eq!(
             BaseRelayError::auth_required("login").prefixed_message(),
             "auth-required: login"
+        );
+        assert_eq!(
+            BaseRelayError::rate_limited("slow down").prefixed_message(),
+            "rate-limited: slow down"
         );
         assert_eq!(
             BaseRelayError::error("store").prefixed_message(),

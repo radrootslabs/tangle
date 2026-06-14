@@ -9,12 +9,33 @@ use std::{
 use tangle_groups::GroupId;
 use tangle_protocol::{Kind, PublicKeyHex, UnixTimestamp};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TangleRateLimitScope {
+    Auth,
+    Event,
+    GroupWrite,
+    Req,
+    Count,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TangleRateLimitKey {
-    Ip(IpAddr),
-    Pubkey(PublicKeyHex),
-    Group(GroupId),
-    Kind(Kind),
+    Ip {
+        scope: TangleRateLimitScope,
+        ip: IpAddr,
+    },
+    Pubkey {
+        scope: TangleRateLimitScope,
+        pubkey: PublicKeyHex,
+    },
+    Group {
+        scope: TangleRateLimitScope,
+        group_id: GroupId,
+    },
+    Kind {
+        scope: TangleRateLimitScope,
+        kind: Kind,
+    },
     AuthFailure {
         ip: Option<IpAddr>,
         pubkey: Option<PublicKeyHex>,
@@ -26,20 +47,20 @@ pub enum TangleRateLimitKey {
 }
 
 impl TangleRateLimitKey {
-    pub fn ip(ip: IpAddr) -> Self {
-        Self::Ip(ip)
+    pub fn ip(scope: TangleRateLimitScope, ip: IpAddr) -> Self {
+        Self::Ip { scope, ip }
     }
 
-    pub fn pubkey(pubkey: PublicKeyHex) -> Self {
-        Self::Pubkey(pubkey)
+    pub fn pubkey(scope: TangleRateLimitScope, pubkey: PublicKeyHex) -> Self {
+        Self::Pubkey { scope, pubkey }
     }
 
-    pub fn group(group_id: GroupId) -> Self {
-        Self::Group(group_id)
+    pub fn group(scope: TangleRateLimitScope, group_id: GroupId) -> Self {
+        Self::Group { scope, group_id }
     }
 
-    pub fn kind(kind: Kind) -> Self {
-        Self::Kind(kind)
+    pub fn kind(scope: TangleRateLimitScope, kind: Kind) -> Self {
+        Self::Kind { scope, kind }
     }
 
     pub fn auth_failure(ip: Option<IpAddr>, pubkey: Option<PublicKeyHex>) -> Self {
@@ -48,6 +69,72 @@ impl TangleRateLimitKey {
 
     pub fn join_flow(group_id: GroupId, pubkey: PublicKeyHex) -> Self {
         Self::JoinFlow { group_id, pubkey }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TangleRateLimitConfig {
+    auth: TangleAuthRateLimitConfig,
+    event: TangleEventRateLimitConfig,
+}
+
+impl TangleRateLimitConfig {
+    pub fn new(auth: TangleAuthRateLimitConfig, event: TangleEventRateLimitConfig) -> Self {
+        Self { auth, event }
+    }
+
+    pub fn auth(self) -> TangleAuthRateLimitConfig {
+        self.auth
+    }
+
+    pub fn event(self) -> TangleEventRateLimitConfig {
+        self.event
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TangleAuthRateLimitConfig {
+    per_pubkey: TangleRateLimitRule,
+    failures: TangleRateLimitRule,
+}
+
+impl TangleAuthRateLimitConfig {
+    pub fn new(per_pubkey: TangleRateLimitRule, failures: TangleRateLimitRule) -> Self {
+        Self {
+            per_pubkey,
+            failures,
+        }
+    }
+
+    pub fn per_pubkey(self) -> TangleRateLimitRule {
+        self.per_pubkey
+    }
+
+    pub fn failures(self) -> TangleRateLimitRule {
+        self.failures
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TangleEventRateLimitConfig {
+    per_pubkey: TangleRateLimitRule,
+    per_kind: TangleRateLimitRule,
+}
+
+impl TangleEventRateLimitConfig {
+    pub fn new(per_pubkey: TangleRateLimitRule, per_kind: TangleRateLimitRule) -> Self {
+        Self {
+            per_pubkey,
+            per_kind,
+        }
+    }
+
+    pub fn per_pubkey(self) -> TangleRateLimitRule {
+        self.per_pubkey
+    }
+
+    pub fn per_kind(self) -> TangleRateLimitRule {
+        self.per_kind
     }
 }
 
@@ -202,7 +289,9 @@ fn reset_at(rule: TangleRateLimitRule, now: UnixTimestamp) -> UnixTimestamp {
 #[cfg(test)]
 mod tests {
     use super::{
-        TangleRateLimitDecision, TangleRateLimitKey, TangleRateLimitRule, TangleRateLimiter,
+        TangleAuthRateLimitConfig, TangleEventRateLimitConfig, TangleRateLimitConfig,
+        TangleRateLimitDecision, TangleRateLimitKey, TangleRateLimitRule, TangleRateLimitScope,
+        TangleRateLimiter,
     };
     use std::net::{IpAddr, Ipv4Addr};
     use tangle_groups::GroupId;
@@ -233,10 +322,10 @@ mod tests {
         let group_id = GroupId::new("farm").expect("group");
         let kind = Kind::new(1).expect("kind");
         let keys = [
-            TangleRateLimitKey::ip(ip),
-            TangleRateLimitKey::pubkey(pubkey.clone()),
-            TangleRateLimitKey::group(group_id.clone()),
-            TangleRateLimitKey::kind(kind),
+            TangleRateLimitKey::ip(TangleRateLimitScope::Event, ip),
+            TangleRateLimitKey::pubkey(TangleRateLimitScope::Event, pubkey.clone()),
+            TangleRateLimitKey::group(TangleRateLimitScope::GroupWrite, group_id.clone()),
+            TangleRateLimitKey::kind(TangleRateLimitScope::Event, kind),
             TangleRateLimitKey::auth_failure(Some(ip), Some(pubkey.clone())),
             TangleRateLimitKey::join_flow(group_id, pubkey),
         ];
@@ -262,7 +351,10 @@ mod tests {
     fn rate_limiter_counts_per_key_and_resets_after_window() {
         let limiter = TangleRateLimiter::new();
         let rule = TangleRateLimitRule::new(10, 2).expect("rule");
-        let key = TangleRateLimitKey::ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        let key = TangleRateLimitKey::ip(
+            TangleRateLimitScope::Event,
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        );
 
         let first = limiter.record(key.clone(), rule, UnixTimestamp::from(100));
         let second = limiter.record(key.clone(), rule, UnixTimestamp::from(101));
@@ -303,12 +395,18 @@ mod tests {
         let limiter = TangleRateLimiter::new();
         let rule = TangleRateLimitRule::new(5, 1).expect("rule");
         limiter.record(
-            TangleRateLimitKey::ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+            TangleRateLimitKey::ip(
+                TangleRateLimitScope::Event,
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            ),
             rule,
             UnixTimestamp::from(1),
         );
         limiter.record(
-            TangleRateLimitKey::ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))),
+            TangleRateLimitKey::ip(
+                TangleRateLimitScope::Event,
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+            ),
             rule,
             UnixTimestamp::from(5),
         );
@@ -316,5 +414,52 @@ mod tests {
         limiter.retain_active(UnixTimestamp::from(6));
 
         assert_eq!(limiter.tracked_key_count(), 1);
+    }
+
+    #[test]
+    fn scoped_pubkey_keys_do_not_share_buckets() {
+        let limiter = TangleRateLimiter::new();
+        let rule = TangleRateLimitRule::new(60, 1).expect("rule");
+        let pubkey = PublicKeyHex::new(&"1".repeat(64)).expect("pubkey");
+        let auth_key = TangleRateLimitKey::pubkey(TangleRateLimitScope::Auth, pubkey.clone());
+        let event_key = TangleRateLimitKey::pubkey(TangleRateLimitScope::Event, pubkey);
+
+        assert!(
+            limiter
+                .record(auth_key.clone(), rule, UnixTimestamp::from(1))
+                .is_allowed()
+        );
+        assert!(
+            limiter
+                .record(event_key.clone(), rule, UnixTimestamp::from(1))
+                .is_allowed()
+        );
+        assert!(
+            !limiter
+                .record(auth_key, rule, UnixTimestamp::from(2))
+                .is_allowed()
+        );
+        assert!(
+            !limiter
+                .record(event_key, rule, UnixTimestamp::from(2))
+                .is_allowed()
+        );
+    }
+
+    #[test]
+    fn rate_limit_config_exposes_auth_and_event_rules() {
+        let auth_pubkey = TangleRateLimitRule::new(60, 2).expect("auth pubkey");
+        let auth_failures = TangleRateLimitRule::new(300, 3).expect("auth failures");
+        let event_pubkey = TangleRateLimitRule::new(60, 4).expect("event pubkey");
+        let event_kind = TangleRateLimitRule::new(60, 5).expect("event kind");
+        let config = TangleRateLimitConfig::new(
+            TangleAuthRateLimitConfig::new(auth_pubkey, auth_failures),
+            TangleEventRateLimitConfig::new(event_pubkey, event_kind),
+        );
+
+        assert_eq!(config.auth().per_pubkey(), auth_pubkey);
+        assert_eq!(config.auth().failures(), auth_failures);
+        assert_eq!(config.event().per_pubkey(), event_pubkey);
+        assert_eq!(config.event().per_kind(), event_kind);
     }
 }

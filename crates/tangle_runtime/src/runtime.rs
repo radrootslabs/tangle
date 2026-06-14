@@ -5,7 +5,10 @@ use crate::{
     errors::BaseRelayError,
     event_bus::{TangleEventBus, TangleEventReceiver},
     ops::BaseRelayReadinessState,
-    rate_limits::TangleRateLimiter,
+    rate_limits::{
+        TangleRateLimitDecision, TangleRateLimitKey, TangleRateLimitRule, TangleRateLimitScope,
+        TangleRateLimiter,
+    },
     relay::{
         auth::BaseAuthState,
         core::{BaseRelay, BaseRelayLimits, BaseRelayShutdownReport},
@@ -97,6 +100,75 @@ impl TangleRuntime {
         self.shutdown.request_shutdown();
         self.relay.shutdown()
     }
+
+    fn rate_limit_event(&self, event: &Event, now: UnixTimestamp) -> Option<RelayMessage> {
+        let rules = self.config.rate_limits().event();
+        self.rate_limit_ok(
+            event,
+            TangleRateLimitKey::pubkey(
+                TangleRateLimitScope::Event,
+                event.unsigned().pubkey().clone(),
+            ),
+            rules.per_pubkey(),
+            "event pubkey",
+            now,
+        )
+        .or_else(|| {
+            self.rate_limit_ok(
+                event,
+                TangleRateLimitKey::kind(TangleRateLimitScope::Event, event.unsigned().kind()),
+                rules.per_kind(),
+                "event kind",
+                now,
+            )
+        })
+    }
+
+    fn rate_limit_auth_attempt(&self, event: &Event, now: UnixTimestamp) -> Option<RelayMessage> {
+        let rules = self.config.rate_limits().auth();
+        self.rate_limit_ok(
+            event,
+            TangleRateLimitKey::pubkey(
+                TangleRateLimitScope::Auth,
+                event.unsigned().pubkey().clone(),
+            ),
+            rules.per_pubkey(),
+            "auth pubkey",
+            now,
+        )
+    }
+
+    fn rate_limit_auth_failure(&self, event: &Event, now: UnixTimestamp) -> Option<RelayMessage> {
+        let rules = self.config.rate_limits().auth();
+        self.rate_limit_ok(
+            event,
+            TangleRateLimitKey::auth_failure(None, Some(event.unsigned().pubkey().clone())),
+            rules.failures(),
+            "auth failure",
+            now,
+        )
+    }
+
+    fn rate_limit_ok(
+        &self,
+        event: &Event,
+        key: TangleRateLimitKey,
+        rule: TangleRateLimitRule,
+        label: &'static str,
+        now: UnixTimestamp,
+    ) -> Option<RelayMessage> {
+        match self.rate_limiter.record(key, rule, now) {
+            TangleRateLimitDecision::Allowed { .. } => None,
+            TangleRateLimitDecision::Rejected { reset_at } => Some(RelayMessage::Ok {
+                event_id: event.id().clone(),
+                accepted: false,
+                message: BaseRelayError::rate_limited(format!(
+                    "{label} rate limit exceeded until {reset_at}"
+                ))
+                .prefixed_message(),
+            }),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -124,6 +196,9 @@ impl TangleRuntimeHandle {
         let mut runtime = self.inner.lock().await;
         match message {
             ClientMessage::Event(event) => {
+                if let Some(message) = runtime.rate_limit_event(&event, now) {
+                    return Ok(vec![message]);
+                }
                 let result = runtime
                     .relay_mut()
                     .handle_event_with_auth_report(event, auth)?;
@@ -141,9 +216,21 @@ impl TangleRuntimeHandle {
                         message: error.prefixed_message(),
                     }]);
                 }
-                runtime
-                    .relay_mut()
-                    .handle_client_message(ClientMessage::Auth(event), auth, now)
+                if let Some(message) = runtime.rate_limit_auth_attempt(&event, now) {
+                    return Ok(vec![message]);
+                }
+                let event_for_failure = event.clone();
+                let replies = runtime.relay_mut().handle_client_message(
+                    ClientMessage::Auth(event),
+                    auth,
+                    now,
+                )?;
+                if auth_response_failed(&replies)
+                    && let Some(message) = runtime.rate_limit_auth_failure(&event_for_failure, now)
+                {
+                    return Ok(vec![message]);
+                }
+                Ok(replies)
             }
             message => runtime
                 .relay_mut()
@@ -199,6 +286,18 @@ impl TangleRuntimeHandle {
     pub async fn shutdown(&self) -> Result<BaseRelayShutdownReport, BaseRelayError> {
         self.inner.lock().await.shutdown()
     }
+}
+
+fn auth_response_failed(replies: &[RelayMessage]) -> bool {
+    replies.iter().any(|reply| {
+        matches!(
+            reply,
+            RelayMessage::Ok {
+                accepted: false,
+                ..
+            }
+        )
+    })
 }
 
 impl fmt::Debug for TangleRuntimeHandle {
@@ -368,6 +467,7 @@ mod tests {
     use super::{TangleRuntime, TangleRuntimeHandle, TangleRuntimeLimits};
     use crate::config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json};
     use crate::event_bus::{TangleEventBus, TangleEventReceiveError};
+    use crate::rate_limits::{TangleRateLimitKey, TangleRateLimitScope};
     use crate::relay::core::{BaseRelayLimitSettings, BaseRelayLimits};
     use crate::relay::live::LiveSubscriptionSet;
     use serde_json::json;
@@ -517,6 +617,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_rate_limits_event_pubkeys_before_storage() {
+        let root = temp_root("runtime-event-rate-limit");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let event = tangle_v2_event(FixtureKey::Member, 1_714_124_433, 1, Vec::new(), "limited")
+            .expect("event");
+        let rule = runtime.config().rate_limits().event().per_pubkey();
+        let key = TangleRateLimitKey::pubkey(
+            TangleRateLimitScope::Event,
+            event.unsigned().pubkey().clone(),
+        );
+        for _ in 0..rule.max_hits() {
+            runtime
+                .rate_limiter()
+                .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
+        }
+        let handle = TangleRuntimeHandle::new(runtime);
+        let mut auth = handle.auth_state().await.expect("auth");
+
+        assert_eq!(
+            handle
+                .handle_client_message(
+                    ClientMessage::Event(event.clone()),
+                    &mut auth,
+                    UnixTimestamp::new(1_714_124_433)
+                )
+                .await
+                .expect("event"),
+            vec![RelayMessage::Ok {
+                event_id: event.id().clone(),
+                accepted: false,
+                message: "rate-limited: event pubkey rate limit exceeded until 1714124493"
+                    .to_owned()
+            }]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_rate_limits_event_kinds_before_storage() {
+        let root = temp_root("runtime-event-kind-rate-limit");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let event = tangle_v2_event(FixtureKey::Admin, 1_714_124_433, 1, Vec::new(), "limited")
+            .expect("event");
+        let rule = runtime.config().rate_limits().event().per_kind();
+        let key = TangleRateLimitKey::kind(TangleRateLimitScope::Event, event.unsigned().kind());
+        for _ in 0..rule.max_hits() {
+            runtime
+                .rate_limiter()
+                .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
+        }
+        let handle = TangleRuntimeHandle::new(runtime);
+        let mut auth = handle.auth_state().await.expect("auth");
+
+        assert_eq!(
+            handle
+                .handle_client_message(
+                    ClientMessage::Event(event.clone()),
+                    &mut auth,
+                    UnixTimestamp::new(1_714_124_433)
+                )
+                .await
+                .expect("event"),
+            vec![RelayMessage::Ok {
+                event_id: event.id().clone(),
+                accepted: false,
+                message: "rate-limited: event kind rate limit exceeded until 1714124493".to_owned()
+            }]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_rate_limits_auth_pubkeys_before_authentication() {
+        let root = temp_root("runtime-auth-pubkey-rate-limit");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let auth_event =
+            tangle_v2_auth_event(FixtureKey::Member, "challenge-a", 120).expect("auth event");
+        let rule = runtime.config().rate_limits().auth().per_pubkey();
+        let key = TangleRateLimitKey::pubkey(
+            TangleRateLimitScope::Auth,
+            auth_event.unsigned().pubkey().clone(),
+        );
+        for _ in 0..rule.max_hits() {
+            runtime
+                .rate_limiter()
+                .record(key.clone(), rule, UnixTimestamp::new(120));
+        }
+        let handle = TangleRuntimeHandle::new(runtime);
+        let mut auth = handle.auth_state().await.expect("auth");
+        auth.issue_challenge("challenge-a", UnixTimestamp::new(100))
+            .expect("challenge");
+
+        assert_eq!(
+            handle
+                .handle_client_message(
+                    ClientMessage::Auth(auth_event.clone()),
+                    &mut auth,
+                    UnixTimestamp::new(120)
+                )
+                .await
+                .expect("auth"),
+            vec![RelayMessage::Ok {
+                event_id: auth_event.id().clone(),
+                accepted: false,
+                message: "rate-limited: auth pubkey rate limit exceeded until 180".to_owned()
+            }]
+        );
+        assert!(auth.authenticated_pubkeys().is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_rate_limits_auth_failures() {
+        let root = temp_root("runtime-auth-failure-rate-limit");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let auth_event = tangle_v2_event(FixtureKey::Member, 1_714_124_433, 22_242, Vec::new(), "")
+            .expect("auth event");
+        let key =
+            TangleRateLimitKey::auth_failure(None, Some(auth_event.unsigned().pubkey().clone()));
+        let rule = runtime.config().rate_limits().auth().failures();
+        for _ in 0..rule.max_hits() {
+            runtime
+                .rate_limiter()
+                .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
+        }
+        let handle = TangleRuntimeHandle::new(runtime);
+        let mut auth = handle.auth_state().await.expect("auth");
+
+        assert_eq!(
+            handle
+                .handle_client_message(
+                    ClientMessage::Auth(auth_event.clone()),
+                    &mut auth,
+                    UnixTimestamp::new(1_714_124_433)
+                )
+                .await
+                .expect("auth"),
+            vec![RelayMessage::Ok {
+                event_id: auth_event.id().clone(),
+                accepted: false,
+                message: "rate-limited: auth failure rate limit exceeded until 1714124733"
+                    .to_owned()
+            }]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn runtime_publishes_generated_group_event_offsets_for_live_fanout() {
         let root = temp_root("runtime-generated-offset-fanout");
         let _ = std::fs::remove_dir_all(&root);
@@ -638,6 +894,16 @@ mod tests {
                 "max_content_length": 65536,
                 "broadcast_channel_capacity": 16,
                 "per_connection_outbound_queue": per_connection_outbound_queue
+            },
+            "rate_limits": {
+                "auth": {
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 30},
+                    "failures": {"window_seconds": 300, "max_hits": 5}
+                },
+                "event": {
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 120},
+                    "per_kind": {"window_seconds": 60, "max_hits": 1000}
+                }
             }
         })
         .to_string();

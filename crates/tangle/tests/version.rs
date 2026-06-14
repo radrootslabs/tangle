@@ -136,6 +136,16 @@ fn tangle_run_starts_server_and_stays_alive_until_shutdown() {
                 "max_content_length": 65536,
                 "broadcast_channel_capacity": 4096,
                 "per_connection_outbound_queue": 256
+            },
+            "rate_limits": {
+                "auth": {
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 30},
+                    "failures": {"window_seconds": 300, "max_hits": 5}
+                },
+                "event": {
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 120},
+                    "per_kind": {"window_seconds": 60, "max_hits": 1000}
+                }
             }
         })
         .to_string(),

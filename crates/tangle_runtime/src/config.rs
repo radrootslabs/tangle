@@ -2,6 +2,10 @@
 
 use crate::{
     errors::BaseRelayError,
+    rate_limits::{
+        TangleAuthRateLimitConfig, TangleEventRateLimitConfig, TangleRateLimitConfig,
+        TangleRateLimitRule,
+    },
     relay::{
         auth::BaseAuthState,
         core::{BaseRelay, BaseRelayLimitSettings, BaseRelayLimits},
@@ -22,6 +26,7 @@ pub struct BaseRelayRuntimeConfig {
     auth_ttl_seconds: u64,
     auth_created_at_skew_seconds: u64,
     limits: BaseRelayRuntimeLimitsConfig,
+    rate_limits: TangleRateLimitConfig,
     tracing: BaseRelayTracingConfig,
 }
 
@@ -52,6 +57,10 @@ impl BaseRelayRuntimeConfig {
 
     pub fn limits(&self) -> BaseRelayRuntimeLimitsConfig {
         self.limits
+    }
+
+    pub fn rate_limits(&self) -> TangleRateLimitConfig {
+        self.rate_limits
     }
 
     pub fn tracing(&self) -> &BaseRelayTracingConfig {
@@ -280,6 +289,7 @@ struct BaseRelayRuntimeConfigDocument {
     groups: serde_json::Value,
     auth: BaseRelayAuthConfigDocument,
     limits: BaseRelayRuntimeLimitsDocument,
+    rate_limits: BaseRelayRateLimitsDocument,
     #[serde(default)]
     observability: BaseRelayObservabilityConfigDocument,
 }
@@ -328,6 +338,34 @@ struct BaseRelayRuntimeLimitsDocument {
     max_content_length: usize,
     broadcast_channel_capacity: usize,
     per_connection_outbound_queue: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BaseRelayRateLimitsDocument {
+    auth: BaseRelayAuthRateLimitsDocument,
+    event: BaseRelayEventRateLimitsDocument,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BaseRelayAuthRateLimitsDocument {
+    per_pubkey: BaseRelayRateLimitRuleDocument,
+    failures: BaseRelayRateLimitRuleDocument,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BaseRelayEventRateLimitsDocument {
+    per_pubkey: BaseRelayRateLimitRuleDocument,
+    per_kind: BaseRelayRateLimitRuleDocument,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BaseRelayRateLimitRuleDocument {
+    window_seconds: u64,
+    max_hits: u64,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -384,6 +422,7 @@ pub fn parse_base_relay_runtime_config_json(
     let groups = tangle_groups::parse_group_runtime_config_json(&groups_raw)
         .map_err(|error| BaseRelayError::invalid(error.to_string()))?;
     let limits = BaseRelayRuntimeLimitsConfig::from_document(document.limits)?;
+    let rate_limits = base_relay_rate_limits_from_document(document.rate_limits)?;
     if document.auth.created_at_skew_seconds == 0 {
         return Err(BaseRelayError::invalid(
             "auth.created_at_skew_seconds must be greater than zero",
@@ -398,6 +437,7 @@ pub fn parse_base_relay_runtime_config_json(
         auth_ttl_seconds: document.auth.challenge_ttl_seconds,
         auth_created_at_skew_seconds: document.auth.created_at_skew_seconds,
         limits,
+        rate_limits,
         tracing,
     })
 }
@@ -418,6 +458,42 @@ fn require_positive_u64(field: &str, value: u64) -> Result<(), BaseRelayError> {
         )));
     }
     Ok(())
+}
+
+fn base_relay_rate_limits_from_document(
+    document: BaseRelayRateLimitsDocument,
+) -> Result<TangleRateLimitConfig, BaseRelayError> {
+    Ok(TangleRateLimitConfig::new(
+        TangleAuthRateLimitConfig::new(
+            base_relay_rate_limit_rule_from_document(
+                "rate_limits.auth.per_pubkey",
+                document.auth.per_pubkey,
+            )?,
+            base_relay_rate_limit_rule_from_document(
+                "rate_limits.auth.failures",
+                document.auth.failures,
+            )?,
+        ),
+        TangleEventRateLimitConfig::new(
+            base_relay_rate_limit_rule_from_document(
+                "rate_limits.event.per_pubkey",
+                document.event.per_pubkey,
+            )?,
+            base_relay_rate_limit_rule_from_document(
+                "rate_limits.event.per_kind",
+                document.event.per_kind,
+            )?,
+        ),
+    ))
+}
+
+fn base_relay_rate_limit_rule_from_document(
+    field: &str,
+    document: BaseRelayRateLimitRuleDocument,
+) -> Result<TangleRateLimitRule, BaseRelayError> {
+    require_positive_u64(&format!("{field}.window_seconds"), document.window_seconds)?;
+    require_positive_u64(&format!("{field}.max_hits"), document.max_hits)?;
+    TangleRateLimitRule::new(document.window_seconds, document.max_hits)
 }
 
 fn base_relay_tracing_config_from_document(
@@ -478,6 +554,10 @@ mod tests {
         assert_eq!(config.limits().max_content_length(), 65_536);
         assert_eq!(config.limits().broadcast_channel_capacity(), 4_096);
         assert_eq!(config.limits().per_connection_outbound_queue(), 256);
+        assert_eq!(config.rate_limits().auth().per_pubkey().max_hits(), 30);
+        assert_eq!(config.rate_limits().auth().failures().max_hits(), 5);
+        assert_eq!(config.rate_limits().event().per_pubkey().max_hits(), 120);
+        assert_eq!(config.rate_limits().event().per_kind().max_hits(), 1_000);
         assert!(config.tracing().enabled());
         assert_eq!(config.tracing().format(), BaseRelayTracingFormat::Json);
         config.auth_state().expect("auth");
@@ -515,6 +595,16 @@ mod tests {
                 "max_content_length": 65536,
                 "broadcast_channel_capacity": 4096,
                 "per_connection_outbound_queue": 256
+            },
+            "rate_limits": {
+                "auth": {
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 30},
+                    "failures": {"window_seconds": 300, "max_hits": 5}
+                },
+                "event": {
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 120},
+                    "per_kind": {"window_seconds": 60, "max_hits": 1000}
+                }
             }
         }"#;
 
@@ -559,6 +649,16 @@ mod tests {
                 "broadcast_channel_capacity": 4096,
                 "per_connection_outbound_queue": 256
             },
+            "rate_limits": {
+                "auth": {
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 30},
+                    "failures": {"window_seconds": 300, "max_hits": 5}
+                },
+                "event": {
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 120},
+                    "per_kind": {"window_seconds": 60, "max_hits": 1000}
+                }
+            },
             "ignored": true
         }"#;
         assert!(
@@ -599,6 +699,16 @@ mod tests {
                 "broadcast_channel_capacity": 4096,
                 "per_connection_outbound_queue": 256,
                 "max_unimplemented_limit": 99
+            },
+            "rate_limits": {
+                "auth": {
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 30},
+                    "failures": {"window_seconds": 300, "max_hits": 5}
+                },
+                "event": {
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 120},
+                    "per_kind": {"window_seconds": 60, "max_hits": 1000}
+                }
             }
         }"#;
         assert!(

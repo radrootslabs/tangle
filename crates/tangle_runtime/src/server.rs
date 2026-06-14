@@ -491,6 +491,16 @@ mod tests {
                 "max_content_length": 65536,
                 "broadcast_channel_capacity": 8,
                 "per_connection_outbound_queue": 8
+            },
+            "rate_limits": {
+                "auth": {
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 30},
+                    "failures": {"window_seconds": 300, "max_hits": 5}
+                },
+                "event": {
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 120},
+                    "per_kind": {"window_seconds": 60, "max_hits": 1000}
+                }
             }
         })
         .to_string();
