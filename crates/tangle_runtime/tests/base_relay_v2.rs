@@ -11,8 +11,9 @@ use tangle_protocol::{
     filter_from_value, parse_client_message, parse_event_json,
 };
 use tangle_runtime::{
-    base_relay::{BaseAuthState, BaseRelay, CloseResult},
+    base_relay::{BaseRelay, CloseResult},
     nip11::{BASE_RELAY_SUPPORTED_NIPS, BaseRelayInfoConfig},
+    relay::auth::BaseAuthState,
 };
 use tangle_store_pocket::{PocketStoreConfig, PocketSyncPolicy};
 use tangle_test_support::{

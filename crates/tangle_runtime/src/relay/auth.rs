@@ -1,0 +1,210 @@
+#![forbid(unsafe_code)]
+
+use crate::errors::BaseRelayError;
+use std::collections::BTreeSet;
+use tangle_crypto::verify_event_signature;
+use tangle_protocol::{Event, PublicKeyHex, RelayMessage, UnixTimestamp};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseAuthState {
+    relay_url: String,
+    ttl_seconds: u64,
+    challenge: Option<BaseAuthChallenge>,
+    authenticated_pubkeys: BTreeSet<PublicKeyHex>,
+}
+
+impl BaseAuthState {
+    pub fn new(relay_url: impl Into<String>, ttl_seconds: u64) -> Result<Self, BaseRelayError> {
+        let relay_url = relay_url.into();
+        if relay_url.trim().is_empty() {
+            return Err(BaseRelayError::invalid("auth relay URL must not be empty"));
+        }
+        if ttl_seconds == 0 {
+            return Err(BaseRelayError::invalid(
+                "auth challenge ttl must be greater than zero",
+            ));
+        }
+        Ok(Self {
+            relay_url,
+            ttl_seconds,
+            challenge: None,
+            authenticated_pubkeys: BTreeSet::new(),
+        })
+    }
+
+    pub fn issue_challenge(
+        &mut self,
+        challenge: impl Into<String>,
+        issued_at: UnixTimestamp,
+    ) -> Result<RelayMessage, BaseRelayError> {
+        let challenge = challenge.into();
+        if challenge.is_empty() {
+            return Err(BaseRelayError::invalid("auth challenge must not be empty"));
+        }
+        self.challenge = Some(BaseAuthChallenge {
+            value: challenge.clone(),
+            issued_at,
+        });
+        Ok(RelayMessage::Auth(challenge))
+    }
+
+    pub fn authenticate(
+        &mut self,
+        event: &Event,
+        now: UnixTimestamp,
+    ) -> Result<PublicKeyHex, BaseRelayError> {
+        verify_event_signature(event).map_err(BaseRelayError::invalid)?;
+        let auth = parse_base_relay_auth_event(event)
+            .map_err(BaseRelayError::invalid)?
+            .ok_or_else(|| BaseRelayError::invalid("AUTH message must contain kind 22242"))?;
+        let challenge = self
+            .challenge
+            .as_ref()
+            .ok_or_else(|| BaseRelayError::auth_required("auth challenge is missing"))?;
+        if auth.relay() != self.relay_url {
+            return Err(BaseRelayError::auth_required(
+                "auth relay does not match canonical relay URL",
+            ));
+        }
+        if auth.challenge() != challenge.value {
+            return Err(BaseRelayError::auth_required(
+                "auth challenge does not match",
+            ));
+        }
+        if now.as_u64()
+            > challenge
+                .issued_at
+                .as_u64()
+                .saturating_add(self.ttl_seconds)
+        {
+            return Err(BaseRelayError::auth_required("auth challenge expired"));
+        }
+        let pubkey = auth.pubkey().clone();
+        self.authenticated_pubkeys.insert(pubkey.clone());
+        Ok(pubkey)
+    }
+
+    pub fn authenticated_pubkeys(&self) -> &BTreeSet<PublicKeyHex> {
+        &self.authenticated_pubkeys
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BaseAuthChallenge {
+    value: String,
+    issued_at: UnixTimestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BaseRelayAuthEvent {
+    pubkey: PublicKeyHex,
+    relay: String,
+    challenge: String,
+}
+
+impl BaseRelayAuthEvent {
+    fn pubkey(&self) -> &PublicKeyHex {
+        &self.pubkey
+    }
+
+    fn relay(&self) -> &str {
+        &self.relay
+    }
+
+    fn challenge(&self) -> &str {
+        &self.challenge
+    }
+}
+
+fn parse_base_relay_auth_event(event: &Event) -> Result<Option<BaseRelayAuthEvent>, String> {
+    if event.unsigned().kind().as_u32() != 22_242 {
+        return Ok(None);
+    }
+    let relay = required_single_tag_value(event, "relay")?;
+    let challenge = required_single_tag_value(event, "challenge")?;
+    if relay.is_empty() {
+        return Err("relay auth relay tag must not be empty".to_owned());
+    }
+    if challenge.is_empty() {
+        return Err("relay auth challenge tag must not be empty".to_owned());
+    }
+    Ok(Some(BaseRelayAuthEvent {
+        pubkey: event.unsigned().pubkey().clone(),
+        relay,
+        challenge,
+    }))
+}
+
+fn required_single_tag_value(event: &Event, name: &str) -> Result<String, String> {
+    let mut matches = event
+        .unsigned()
+        .tags()
+        .iter()
+        .filter(|tag| tag.name().as_str() == name);
+    let tag = matches
+        .next()
+        .ok_or_else(|| format!("tag `{name}` is required"))?;
+    if matches.next().is_some() {
+        return Err(format!("tag `{name}` must not be repeated"));
+    }
+    tag.values()
+        .get(1)
+        .cloned()
+        .ok_or_else(|| format!("tag `{name}` must include a value"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BaseAuthState;
+    use tangle_crypto::RelaySigner;
+    use tangle_protocol::{Event, Kind, RelayMessage, Tag, UnixTimestamp, UnsignedEvent};
+
+    #[test]
+    fn auth_state_issues_challenges_and_accepts_multiple_pubkeys() {
+        let mut auth = BaseAuthState::new("wss://relay.radroots.test", 60).expect("auth state");
+        let issued = UnixTimestamp::new(100);
+
+        assert_eq!(
+            auth.issue_challenge("challenge-a", issued)
+                .expect("challenge"),
+            RelayMessage::Auth("challenge-a".to_owned())
+        );
+
+        let first = signed_auth_event(7, "challenge-a", 120);
+        let second = signed_auth_event(8, "challenge-a", 130);
+
+        let first_pubkey = auth
+            .authenticate(&first, UnixTimestamp::new(120))
+            .expect("first");
+        let second_pubkey = auth
+            .authenticate(&second, UnixTimestamp::new(130))
+            .expect("second");
+
+        assert_ne!(first_pubkey, second_pubkey);
+        assert!(auth.authenticated_pubkeys().contains(&first_pubkey));
+        assert!(auth.authenticated_pubkeys().contains(&second_pubkey));
+        assert_eq!(auth.authenticated_pubkeys().len(), 2);
+        assert_eq!(
+            auth.authenticate(&signed_auth_event(9, "wrong", 130), UnixTimestamp::new(130))
+                .expect_err("wrong")
+                .prefixed_message(),
+            "auth-required: auth challenge does not match"
+        );
+    }
+
+    fn signed_auth_event(secret_byte: u8, challenge: &str, created_at: u64) -> Event {
+        let secret = format!("{:02x}", secret_byte).repeat(32);
+        let signer = RelaySigner::from_secret_hex(&secret).expect("signer");
+        let unsigned = UnsignedEvent::new(
+            signer.public_key().clone(),
+            UnixTimestamp::new(created_at),
+            Kind::new(22_242).expect("kind"),
+            vec![
+                Tag::from_parts("relay", &["wss://relay.radroots.test"]).expect("relay"),
+                Tag::from_parts("challenge", &[challenge]).expect("challenge"),
+            ],
+            "",
+        );
+        signer.sign_unsigned_event(unsigned)
+    }
+}

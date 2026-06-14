@@ -6,6 +6,7 @@ pub mod config;
 pub mod errors;
 pub mod nip11;
 pub mod ops;
+pub mod relay;
 
 use std::{fmt, fs, path::Path, path::PathBuf};
 
