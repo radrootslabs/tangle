@@ -61,7 +61,11 @@ pub async fn serve_listener_until_shutdown(
         .map_err(|error| BaseRelayError::error(error.to_string()))?;
     let info =
         BaseRelayInfoConfig::new("tangle", runtime.config().groups().clone())?.build_document()?;
-    let router = tangle_http_router(runtime.readiness_state().clone(), info);
+    let router = tangle_http_router(
+        runtime.readiness_state().clone(),
+        info,
+        runtime.limits().outbound_queue_capacity(),
+    );
     let mut shutdown = runtime.shutdown_signal().subscribe();
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
@@ -86,16 +90,21 @@ pub async fn serve_listener_until_shutdown(
 pub fn tangle_http_router(
     readiness: BaseRelayReadinessState,
     info: BaseRelayInfoDocument,
+    outbound_queue_capacity: usize,
 ) -> Router {
     Router::new()
         .route("/", get(tangle_root))
-        .with_state(TangleHttpState { info })
+        .with_state(TangleHttpState {
+            info,
+            outbound_queue_capacity,
+        })
         .merge(base_relay_ops_router(readiness))
 }
 
 #[derive(Debug, Clone)]
 struct TangleHttpState {
     info: BaseRelayInfoDocument,
+    outbound_queue_capacity: usize,
 }
 
 async fn tangle_root(
@@ -104,10 +113,17 @@ async fn tangle_root(
     headers: HeaderMap,
 ) -> Response {
     match websocket {
-        Ok(websocket) => websocket
-            .protocols(["nostr"])
-            .on_upgrade(|socket| TangleWebSocketSession::new().run(socket))
-            .into_response(),
+        Ok(websocket) => match TangleWebSocketSession::new(state.outbound_queue_capacity) {
+            Ok(session) => websocket
+                .protocols(["nostr"])
+                .on_upgrade(move |socket| session.run(socket))
+                .into_response(),
+            Err(error) => (
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                error.prefixed_message(),
+            )
+                .into_response(),
+        },
         Err(_) => base_relay_info_response(state.info, headers),
     }
 }
@@ -192,7 +208,7 @@ mod tests {
             .expect("info config")
             .build_document()
             .expect("info");
-        let router = tangle_http_router(BaseRelayReadinessState::ready(), info);
+        let router = tangle_http_router(BaseRelayReadinessState::ready(), info, 8);
         let nip11 = router
             .clone()
             .oneshot(
