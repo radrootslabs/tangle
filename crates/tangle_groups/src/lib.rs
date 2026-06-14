@@ -1,8 +1,41 @@
 #![forbid(unsafe_code)]
 
+pub mod classification;
+pub mod errors;
+pub mod ids;
+pub mod kinds;
+pub mod metadata;
+pub mod outbox;
+pub mod policy;
+pub mod projection;
+pub mod read_gate;
+pub mod roles;
+pub mod signing;
+pub mod tags;
+pub mod write_gate;
+
 use core::fmt;
 use serde::Deserialize;
 use tangle_protocol::PublicKeyHex;
+
+pub use classification::{GroupEventClass, classify_group_event};
+pub use errors::{GroupError, GroupErrorKind, GroupReplyPrefix};
+pub use ids::GroupId;
+pub use kinds::{
+    KIND_GROUP_ADMINS, KIND_GROUP_CREATE_GROUP, KIND_GROUP_CREATE_INVITE, KIND_GROUP_DELETE_EVENT,
+    KIND_GROUP_DELETE_GROUP, KIND_GROUP_EDIT_METADATA, KIND_GROUP_JOIN_REQUEST,
+    KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA, KIND_GROUP_PUT_USER,
+    KIND_GROUP_REMOVE_USER, KIND_GROUP_ROLES, KIND_GROUP_STATE_39004, NIP29_GROUP_KIND_VALUES,
+    NIP29_MODERATION_KIND_VALUES, NIP29_RELAY_GENERATED_KIND_VALUES,
+    NIP29_USER_REQUEST_KIND_VALUES,
+};
+pub use metadata::{GroupMetadata, SupportedKinds, parse_group_metadata};
+pub use roles::{
+    Capability, CapabilitySet, PERMANENT_RELAY_OVERRIDE_ROLE, RoleDefinition, RoleName,
+    resolve_capabilities,
+};
+pub use tags::{GroupTag, GroupTagName, extract_group_tag, has_group_identity_tag};
+pub use write_gate::validate_client_group_event_structure;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct RelaySecret(String);

@@ -9,7 +9,9 @@ use http::{HeaderMap, HeaderValue, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, collections::BTreeSet, str};
 use tangle_crypto::{RelaySigner, verify_event_signature};
-use tangle_groups::GroupRuntimeConfig;
+use tangle_groups::{
+    GroupEventClass, GroupLimitsConfig, GroupRuntimeConfig, validate_client_group_event_structure,
+};
 use tangle_nips::parse_relay_auth_event;
 use tangle_protocol::{
     ClientMessage, Event, EventId, Filter, PublicKeyHex, RelayMessage, SubscriptionId,
@@ -313,11 +315,15 @@ impl BaseRelay {
         if let Err(error) = verify_event_signature(&event) {
             return Ok(ok_rejected(event_id, format!("invalid: {error}")));
         }
-        if is_nip29_group_event(&event) {
-            return Ok(ok_rejected(
-                event_id,
-                "blocked: NIP-29 group events are not accepted before group service".to_owned(),
-            ));
+        match validate_client_group_event_structure(&event, GroupLimitsConfig::default()) {
+            Ok(GroupEventClass::NonGroup) => {}
+            Ok(_) => {
+                return Ok(ok_rejected(
+                    event_id,
+                    "blocked: NIP-29 group events are not accepted before group service".to_owned(),
+                ));
+            }
+            Err(error) => return Ok(ok_rejected(event_id, error.prefixed_message())),
         }
         if event.unsigned().kind().is_ephemeral() {
             return Ok(ok_accepted(event_id, String::new()));
@@ -582,15 +588,6 @@ fn ok_rejected(event_id: EventId, message: String) -> RelayMessage {
     }
 }
 
-fn is_nip29_group_event(event: &Event) -> bool {
-    matches!(event.unsigned().kind().as_u32(), 39_000..=39_004)
-        || event
-            .unsigned()
-            .tags()
-            .iter()
-            .any(|tag| tag.indexed_pair().is_some_and(|(name, _)| name == "h"))
-}
-
 fn tangle_event_to_pocket(event: &Event) -> Result<PocketOwnedEvent, BaseRelayError> {
     let raw = event_to_value(event).to_string();
     parse_pocket_event_json(raw.as_bytes()).map_err(BaseRelayError::from)
@@ -795,6 +792,28 @@ mod tests {
                 accepted: false,
                 message: "blocked: NIP-29 group events are not accepted before group service"
                     .to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn base_relay_rejects_client_submitted_relay_generated_group_state() {
+        let relay = test_relay("base-relay-generated-group-reject", 4);
+        let event = signed_public_event(
+            7,
+            39_000,
+            vec![Tag::from_parts("d", &["public-group"]).expect("group")],
+            "",
+        );
+
+        assert_eq!(
+            relay.handle_event(event.clone()).expect("event"),
+            RelayMessage::Ok {
+                event_id: event.id().clone(),
+                accepted: false,
+                message:
+                    "blocked: relay-generated group state events cannot be submitted by clients"
+                        .to_owned()
             }
         );
     }
