@@ -2132,7 +2132,7 @@ mod tests {
 
     #[test]
     fn base_relay_enforces_event_and_filter_runtime_limits() {
-        let config = test_store_config("base-relay-runtime-limits");
+        let config = test_store_config("base-relay-event-filter-runtime-limits");
         let mut relay = BaseRelay::open(&config, strict_relay_limits()).expect("relay");
         let first = signed_public_event(7, 1, Vec::new(), "a");
         let second = signed_event_at(8, 1, Vec::new(), "b", 1_714_124_434);

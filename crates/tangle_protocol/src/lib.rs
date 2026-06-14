@@ -1675,6 +1675,92 @@ mod tests {
     }
 
     #[test]
+    fn protocol_conformance_fixtures_cover_dense_envelopes_and_parser_stress() {
+        let event_payload = event_json(
+            "a",
+            "b",
+            30_023,
+            r#"[["e","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","wss://relay.example","root"],["e","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],["p","2222222222222222222222222222222222222222222222222222222222222222"],["h","Farm"],["emoji","🌱"]]"#,
+        );
+        let parsed_event =
+            parse_client_message(&format!("[\"EVENT\",{event_payload}]")).expect("event envelope");
+        let ClientMessage::Event(event) = parsed_event else {
+            panic!("expected event")
+        };
+        assert_eq!(event.unsigned().kind().as_u32(), 30_023);
+        assert_eq!(event.unsigned().tags().len(), 5);
+
+        let req = serde_json::json!([
+            "REQ",
+            "sub-dense",
+            {
+                "ids": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+                "authors": ["1111111111111111111111111111111111111111111111111111111111111111"],
+                "kinds": [1, 30023],
+                "#e": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+                "#p": ["2222222222222222222222222222222222222222222222222222222222222222"],
+                "#h": ["Farm"],
+                "since": 0,
+                "until": 4102444800_u64,
+                "limit": 500,
+                "search": "radroots"
+            },
+            {
+                "#t": ["radroots", "market", "farm"],
+                "limit": 1
+            }
+        ])
+        .to_string();
+        let ClientMessage::Req {
+            subscription_id,
+            filters,
+        } = parse_client_message(&req).expect("req")
+        else {
+            panic!("expected req")
+        };
+        assert_eq!(subscription_id.as_str(), "sub-dense");
+        assert_eq!(filters.len(), 2);
+        assert_eq!(filters[0].kinds().len(), 2);
+        assert_eq!(filters[0].tag_filters().len(), 3);
+        assert_eq!(filters[1].limit(), Some(1));
+
+        let count = serde_json::json!([
+            "COUNT",
+            "sub-count",
+            {"#h": ["Farm"], "kinds": [1], "limit": 1}
+        ])
+        .to_string();
+        let ClientMessage::Count {
+            subscription_id,
+            filters,
+        } = parse_client_message(&count).expect("count")
+        else {
+            panic!("expected count")
+        };
+        assert_eq!(subscription_id.as_str(), "sub-count");
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].limit(), Some(1));
+
+        for raw in [
+            "",
+            "[",
+            "[\"REQ\",\"sub\",{}",
+            "[\"REQ\",\"sub\",{\"#h\":[{}]}]",
+            "[\"REQ\",\"sub\",{\"ids\":[\"short\"]}]",
+            "[\"COUNT\",\"sub\",{\"kinds\":[4294967296]}]",
+            "[\"COUNT\",1,{}]",
+            "[\"EVENT\",{\"tags\":[[1]]}]",
+            "[\"AUTH\",{\"kind\":\"bad\"}]",
+            "[\"CLOSE\",\"\"]",
+        ] {
+            std::panic::catch_unwind(|| {
+                assert!(parse_client_message(raw).is_err());
+            })
+            .expect("parser must not panic");
+        }
+    }
+
+    #[test]
     fn parse_client_message_rejects_malformed_envelopes() {
         assert!(
             parse_client_message("{")
