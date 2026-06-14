@@ -1,7 +1,7 @@
 use crate::{
     GroupAuthority, GroupError, GroupEventClass, GroupId, GroupLimitsConfig, GroupProjection,
-    KIND_GROUP_DELETE_GROUP, MemberStatus, classify_group_event, event_view::GroupEventView,
-    non_enumerating_group_error,
+    KIND_GROUP_ADMINS, KIND_GROUP_DELETE_GROUP, KIND_GROUP_METADATA, MemberStatus,
+    classify_group_event, event_view::GroupEventView, non_enumerating_group_error,
 };
 use tangle_protocol::{EventId, PublicKeyHex};
 
@@ -65,7 +65,7 @@ impl<'a> GroupReadGate<'a> {
 
     fn screen_snapshot_event(
         &self,
-        _kind: u32,
+        kind: u32,
         group_id: &GroupId,
         reader: Option<&PublicKeyHex>,
     ) -> Result<GroupReadDecision, GroupError> {
@@ -78,7 +78,10 @@ impl<'a> GroupReadGate<'a> {
         if group.metadata().hidden() && !self.can_read_group(group_id, reader) {
             return Ok(GroupReadDecision::Hidden);
         }
-        if group.metadata().private() && !self.can_read_group(group_id, reader) {
+        if group.metadata().private()
+            && !is_public_when_private_snapshot(kind)
+            && !self.can_read_group(group_id, reader)
+        {
             return Ok(GroupReadDecision::Hidden);
         }
         Ok(GroupReadDecision::Visible)
@@ -140,14 +143,18 @@ impl<'a> GroupReadGate<'a> {
     }
 }
 
+fn is_public_when_private_snapshot(kind: u32) -> bool {
+    matches!(kind, KIND_GROUP_METADATA | KIND_GROUP_ADMINS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{GroupReadDecision, GroupReadGate};
     use crate::{
         GroupAuthority, GroupEventDeletion, GroupId, GroupMetadata, GroupMetadataFlags,
-        GroupMetadataText, GroupProjection, GroupState, GroupTombstone, KIND_GROUP_DELETE_GROUP,
-        KIND_GROUP_METADATA, MemberState, MemberStatus, ProjectionOrderTuple, StoreOffset,
-        SupportedKinds,
+        GroupMetadataText, GroupProjection, GroupState, GroupTombstone, KIND_GROUP_ADMINS,
+        KIND_GROUP_DELETE_GROUP, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA, MemberState,
+        MemberStatus, ProjectionOrderTuple, StoreOffset, SupportedKinds,
     };
     use pocket_types::Event as PocketEvent;
     use tangle_protocol::{
@@ -227,10 +234,10 @@ mod tests {
     }
 
     #[test]
-    fn read_gate_hides_hidden_and_private_snapshots_from_non_members() {
+    fn read_gate_splits_private_and_hidden_snapshot_visibility() {
         let owner = pubkey("1");
         let projection =
-            projection_with_group("Farm", metadata(true, false, true, false), owner.clone());
+            projection_with_group("Farm", metadata(true, false, false, false), owner.clone());
         let authority = GroupAuthority::new([owner.clone()], Vec::<PublicKeyHex>::new());
         let gate = GroupReadGate::new(&projection, &authority);
 
@@ -240,17 +247,49 @@ mod tests {
                 None,
                 Default::default()
             )
-            .expect("hidden"),
+            .expect("private metadata"),
+            GroupReadDecision::Visible
+        );
+        assert_eq!(
+            gate.screen_event(
+                &event(KIND_GROUP_ADMINS, vec![d("Farm")]),
+                None,
+                Default::default()
+            )
+            .expect("private admins"),
+            GroupReadDecision::Visible
+        );
+        assert_eq!(
+            gate.screen_event(
+                &event(KIND_GROUP_MEMBERS, vec![d("Farm")]),
+                None,
+                Default::default()
+            )
+            .expect("private members"),
             GroupReadDecision::Hidden
         );
         assert_eq!(
             gate.screen_event(
-                &event(KIND_GROUP_METADATA, vec![d("Farm")]),
+                &event(KIND_GROUP_MEMBERS, vec![d("Farm")]),
                 Some(&owner),
                 Default::default()
             )
-            .expect("owner"),
+            .expect("owner members"),
             GroupReadDecision::Visible
+        );
+
+        let hidden_projection =
+            projection_with_group("Hidden", metadata(false, false, true, false), owner.clone());
+        let hidden_gate = GroupReadGate::new(&hidden_projection, &authority);
+        assert_eq!(
+            hidden_gate
+                .screen_event(
+                    &event(KIND_GROUP_METADATA, vec![d("Hidden")]),
+                    None,
+                    Default::default()
+                )
+                .expect("hidden metadata"),
+            GroupReadDecision::Hidden
         );
     }
 

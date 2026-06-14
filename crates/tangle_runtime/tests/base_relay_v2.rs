@@ -302,6 +302,27 @@ fn metadata_flags_and_read_privacy_cover_req_count_and_fanout() {
         ),
         0,
     );
+    assert_count(
+        relay.handle_count(
+            subscription("private-metadata-unauth"),
+            vec![filter_group_tag(KIND_GROUP_METADATA, "d", "PrivateFarm")],
+        ),
+        1,
+    );
+    assert_count(
+        relay.handle_count(
+            subscription("private-admins-unauth"),
+            vec![filter_group_tag(KIND_GROUP_ADMINS, "d", "PrivateFarm")],
+        ),
+        1,
+    );
+    assert_count(
+        relay.handle_count(
+            subscription("private-members-unauth"),
+            vec![filter_kind(KIND_GROUP_MEMBERS)],
+        ),
+        0,
+    );
     let owner_query_id = subscription("private-owner");
     assert_event_query(
         relay

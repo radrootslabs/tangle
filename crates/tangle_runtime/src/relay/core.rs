@@ -1430,8 +1430,11 @@ mod tests {
         ));
         assert_eq!(count_kind(&relay, 1), 0);
         assert_eq!(count_kind_with_auth(&relay, 1, &auth), 1);
-        assert_eq!(count_kind(&relay, KIND_GROUP_METADATA), 0);
+        assert_eq!(count_kind(&relay, KIND_GROUP_METADATA), 1);
+        assert_eq!(count_kind(&relay, KIND_GROUP_ADMINS), 1);
+        assert_eq!(count_kind(&relay, KIND_GROUP_MEMBERS), 0);
         assert_eq!(count_kind_with_auth(&relay, KIND_GROUP_METADATA, &auth), 1);
+        assert_eq!(count_kind_with_auth(&relay, KIND_GROUP_ADMINS, &auth), 1);
     }
 
     #[test]

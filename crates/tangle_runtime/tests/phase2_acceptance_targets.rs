@@ -9,7 +9,15 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tangle_protocol::{Event, RelayMessage, UnixTimestamp, event_to_value};
+use tangle_groups::{
+    GroupAuthority, GroupMetadata, GroupMetadataFlags, GroupMetadataText, GroupProjection,
+    GroupReadDecision, GroupReadGate, GroupState, KIND_GROUP_ADMINS, KIND_GROUP_MEMBERS,
+    KIND_GROUP_METADATA, ProjectionOrderTuple, StoreOffset, SupportedKinds,
+};
+use tangle_protocol::{
+    Event, EventId, Kind, PublicKeyHex, RelayMessage, SignatureHex, Tag, UnixTimestamp,
+    UnsignedEvent, event_to_value,
+};
 use tangle_runtime::{
     config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
     relay::auth::BaseAuthState,
@@ -261,9 +269,57 @@ fn protected_events_require_author_auth_before_nip70_is_advertised() {
 }
 
 #[test]
-#[ignore = "phase2 target: private hidden semantics"]
 fn private_but_not_hidden_group_metadata_remains_visible() {
-    pending("private-but-not-hidden group metadata and admins must remain visible to non-members");
+    let owner = phase2_pubkey("1");
+    let projection = phase2_projection_with_group(
+        "Farm",
+        phase2_metadata(true, false, false, false),
+        owner.clone(),
+    );
+    let authority = GroupAuthority::new([owner.clone()], Vec::<PublicKeyHex>::new());
+    let gate = GroupReadGate::new(&projection, &authority);
+
+    assert_eq!(
+        gate.screen_event(
+            &phase2_snapshot_event(KIND_GROUP_METADATA, "Farm"),
+            None,
+            Default::default()
+        )
+        .expect("metadata"),
+        GroupReadDecision::Visible
+    );
+    assert_eq!(
+        gate.screen_event(
+            &phase2_snapshot_event(KIND_GROUP_ADMINS, "Farm"),
+            None,
+            Default::default()
+        )
+        .expect("admins"),
+        GroupReadDecision::Visible
+    );
+    assert_eq!(
+        gate.screen_event(
+            &phase2_snapshot_event(KIND_GROUP_MEMBERS, "Farm"),
+            None,
+            Default::default()
+        )
+        .expect("members"),
+        GroupReadDecision::Hidden
+    );
+
+    let hidden_projection =
+        phase2_projection_with_group("Hidden", phase2_metadata(false, false, true, false), owner);
+    let hidden_gate = GroupReadGate::new(&hidden_projection, &authority);
+    assert_eq!(
+        hidden_gate
+            .screen_event(
+                &phase2_snapshot_event(KIND_GROUP_METADATA, "Hidden"),
+                None,
+                Default::default()
+            )
+            .expect("hidden metadata"),
+        GroupReadDecision::Hidden
+    );
 }
 
 #[test]
@@ -488,6 +544,58 @@ fn assert_live_event(value: Value, subscription_id: &str, event: &Event) {
     assert_eq!(value[0], "EVENT");
     assert_eq!(value[1], subscription_id);
     assert_eq!(value[2]["id"], event.id().as_str());
+}
+
+fn phase2_projection_with_group(
+    group_id: &str,
+    metadata: GroupMetadata,
+    author: PublicKeyHex,
+) -> GroupProjection {
+    let mut projection = GroupProjection::new();
+    projection.put_group(GroupState::new(
+        tangle_groups::GroupId::new(group_id).expect("group"),
+        metadata,
+        author,
+        phase2_event_id("10"),
+        ProjectionOrderTuple::new(
+            UnixTimestamp::new(10),
+            phase2_event_id("10"),
+            StoreOffset::new(1),
+        ),
+    ));
+    projection
+}
+
+fn phase2_metadata(private: bool, restricted: bool, hidden: bool, closed: bool) -> GroupMetadata {
+    GroupMetadata::from_parts(
+        GroupMetadataText::empty(),
+        GroupMetadataFlags::new(private, restricted, hidden, closed),
+        SupportedKinds::UnspecifiedAll,
+    )
+}
+
+fn phase2_snapshot_event(kind: u32, group_id: &str) -> Event {
+    Event::new(
+        phase2_event_id("01"),
+        UnsignedEvent::new(
+            phase2_pubkey("9"),
+            UnixTimestamp::new(1),
+            Kind::new(kind.into()).expect("kind"),
+            vec![Tag::from_parts("d", &[group_id]).expect("d")],
+            "",
+        ),
+        SignatureHex::new(&"2".repeat(128)).expect("sig"),
+    )
+}
+
+fn phase2_pubkey(suffix: &str) -> PublicKeyHex {
+    PublicKeyHex::new(&suffix.repeat(64)).expect("pubkey")
+}
+
+fn phase2_event_id(suffix: &str) -> EventId {
+    let mut value = "0".repeat(64 - suffix.len());
+    value.push_str(suffix);
+    EventId::new(&value).expect("id")
 }
 
 fn current_unix_timestamp() -> u64 {
