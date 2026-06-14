@@ -429,6 +429,8 @@ fn load_group_storage(
         let scan = scan_canonical_group_events(store, limits)?;
         let report =
             rebuild_group_projection(scan.into_events(), limits, projection_rebuilt_at()?)?;
+        persist_group_projection_snapshot(store, report.projection())?;
+        validate_rebuilt_group_projection(store)?;
         return Ok(GroupStorageState {
             projection: report.into_projection(),
             outbox: load_group_outbox(outbox_records)?,
@@ -482,6 +484,74 @@ fn load_group_outbox(records: Vec<(Vec<u8>, Vec<u8>)>) -> Result<GroupOutbox, Ba
         outbox.update(GroupOutboxRecord::from_json_bytes(&value)?);
     }
     Ok(outbox)
+}
+
+fn persist_group_projection_snapshot(
+    store: &PocketStoreHandle,
+    projection: &GroupProjection,
+) -> Result<(), BaseRelayError> {
+    clear_extra_table(store, TANGLE_GROUP_PROJECTION_TABLE)?;
+    for (group_id, group) in projection.groups() {
+        store.put_extra_record(
+            TANGLE_GROUP_PROJECTION_TABLE,
+            &group_current_key(group_id),
+            &group.to_json_bytes()?,
+        )?;
+    }
+    for ((group_id, pubkey), member) in projection.members() {
+        store.put_extra_record(
+            TANGLE_GROUP_PROJECTION_TABLE,
+            &member_current_key(group_id, pubkey),
+            &member.to_json_bytes()?,
+        )?;
+    }
+    for ((group_id, role_name), role) in projection.roles() {
+        store.put_extra_record(
+            TANGLE_GROUP_PROJECTION_TABLE,
+            &role_current_key(group_id, role_name),
+            &role.to_json_bytes()?,
+        )?;
+    }
+    for (group_id, tombstone) in projection.tombstones() {
+        store.put_extra_record(
+            TANGLE_GROUP_PROJECTION_TABLE,
+            &tombstone_key(group_id),
+            &tombstone.to_json_bytes()?,
+        )?;
+    }
+    for (target_event_id, deletion) in projection.event_deletions() {
+        store.put_extra_record(
+            TANGLE_GROUP_PROJECTION_TABLE,
+            &event_deletion_key(target_event_id),
+            &deletion.to_json_bytes()?,
+        )?;
+    }
+    let checkpoint = projection
+        .checkpoint()
+        .ok_or_else(|| BaseRelayError::error("group projection rebuild checkpoint is missing"))?;
+    store.put_extra_record(
+        TANGLE_GROUP_CHECKPOINT_TABLE,
+        &projection_checkpoint_key(),
+        &checkpoint.to_json_bytes()?,
+    )?;
+    Ok(())
+}
+
+fn clear_extra_table(store: &PocketStoreHandle, table: &'static str) -> Result<(), BaseRelayError> {
+    for (key, _) in store.scan_extra_records(table)? {
+        store.delete_extra_record(table, &key)?;
+    }
+    Ok(())
+}
+
+fn validate_rebuilt_group_projection(store: &PocketStoreHandle) -> Result<(), BaseRelayError> {
+    let validation = validate_group_extra_tables(store)?;
+    if validation.checkpoint_status().requires_rebuild() {
+        return Err(BaseRelayError::error(
+            "group projection checkpoint is not current after rebuild",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -723,12 +793,12 @@ fn delete_target_event_id(event: &Event) -> Result<EventId, GroupError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GroupCheckpointStatus, GroupService, load_group_storage, scan_canonical_group_events,
+        GroupCheckpointStatus, GroupService, scan_canonical_group_events,
         scan_canonical_group_events_after, validate_group_extra_tables,
     };
     use crate::pocket_conversion::tangle_event_to_pocket;
     use tangle_groups::{
-        GroupId, GroupRuntimeConfig, KIND_GROUP_METADATA, ProjectionCheckpoint, StoreOffset,
+        GroupRuntimeConfig, KIND_GROUP_METADATA, ProjectionCheckpoint, StoreOffset,
         projection_checkpoint_key,
     };
     use tangle_protocol::{Tag, UnixTimestamp};

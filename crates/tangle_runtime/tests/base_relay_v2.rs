@@ -13,6 +13,7 @@ use tangle_protocol::{
     filter_from_value, parse_client_message, parse_event_json,
 };
 use tangle_runtime::{
+    groups::{GroupCheckpointStatus, validate_group_extra_tables},
     nip11::{BASE_RELAY_SUPPORTED_NIPS, BaseRelayInfoConfig},
     relay::{auth::BaseAuthState, core::BaseRelay, live::CloseResult},
 };
@@ -980,6 +981,12 @@ fn projection_rebuild_after_restart_matches_live_state_and_outbox_is_idempotent(
     assert_eq!(count_kind(&relay, KIND_GROUP_METADATA), 1);
     assert_eq!(count_kind(&relay, KIND_GROUP_ADMINS), 1);
     assert_eq!(count_kind(&relay, KIND_GROUP_MEMBERS), 1);
+    let validation = group_extra_table_validation(&config);
+    assert!(validation.projection_records() > 0);
+    assert!(matches!(
+        validation.checkpoint_status(),
+        &GroupCheckpointStatus::Current { .. }
+    ));
 
     let relay = BaseRelay::open_with_groups(&config, 8, &group_config()).expect("second reopen");
     assert_eq!(count_kind(&relay, KIND_GROUP_METADATA), 1);
@@ -1124,6 +1131,13 @@ fn delete_group_extra_records(config: &PocketStoreConfig) {
         }
     }
     store.sync().expect("sync");
+}
+
+fn group_extra_table_validation(
+    config: &PocketStoreConfig,
+) -> tangle_runtime::groups::GroupExtraTableValidation {
+    let store = PocketStoreHandle::open(config).expect("store");
+    validate_group_extra_tables(&store).expect("validation")
 }
 
 fn temp_root(name: &str) -> PathBuf {
