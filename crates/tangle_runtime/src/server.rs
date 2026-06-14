@@ -5,7 +5,10 @@ use crate::{
     logging,
     nip11::{BaseRelayInfoConfig, BaseRelayInfoDocument, base_relay_info_response},
     ops::{BaseRelayReadinessState, base_relay_ops_router},
-    runtime::{TangleRuntime, TangleRuntimeHandle, TangleRuntimeLimits, TangleShutdownSignal},
+    runtime::{
+        TangleRuntime, TangleRuntimeHandle, TangleRuntimeLimits, TangleRuntimeMetrics,
+        TangleShutdownSignal,
+    },
     session::TangleWebSocketSession,
 };
 use axum::{
@@ -65,12 +68,14 @@ pub async fn serve_listener_until_shutdown(
         BaseRelayInfoConfig::new("tangle", runtime.config().groups().clone())?.build_document()?;
     let readiness = runtime.readiness_state().clone();
     let limits = runtime.limits();
+    let metrics = runtime.metrics().clone();
     let shutdown_signal = runtime.shutdown_signal().clone();
     let runtime = TangleRuntimeHandle::new(runtime);
     let router = tangle_http_router(
         readiness,
         info,
         limits,
+        metrics,
         shutdown_signal.clone(),
         runtime.clone(),
     );
@@ -104,6 +109,7 @@ pub fn tangle_http_router(
     readiness: BaseRelayReadinessState,
     info: BaseRelayInfoDocument,
     limits: TangleRuntimeLimits,
+    metrics: TangleRuntimeMetrics,
     shutdown: TangleShutdownSignal,
     runtime: TangleRuntimeHandle,
 ) -> Router {
@@ -115,7 +121,7 @@ pub fn tangle_http_router(
             shutdown,
             runtime,
         })
-        .merge(base_relay_ops_router(readiness))
+        .merge(base_relay_ops_router(readiness, metrics))
 }
 
 #[derive(Debug, Clone)]
@@ -392,10 +398,12 @@ mod tests {
             .expect("info");
         let runtime = TangleRuntime::open(config).expect("runtime");
         let limits = runtime.limits();
+        let metrics = runtime.metrics().clone();
         let router = tangle_http_router(
             BaseRelayReadinessState::ready(),
             info,
             limits,
+            metrics,
             TangleShutdownSignal::new(),
             TangleRuntimeHandle::new(runtime),
         );
@@ -433,6 +441,7 @@ mod tests {
             .await
             .expect("health");
         let ready = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/readyz")
@@ -441,6 +450,15 @@ mod tests {
             )
             .await
             .expect("ready");
+        let metrics = router
+            .oneshot(
+                Request::builder()
+                    .uri("/metricsz")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("metrics");
 
         assert_eq!(nip11.status(), http::StatusCode::OK);
         assert_eq!(
@@ -459,6 +477,14 @@ mod tests {
         assert_eq!(root_without_accept.status(), http::StatusCode::NOT_FOUND);
         assert_eq!(health.status(), http::StatusCode::OK);
         assert_eq!(ready.status(), http::StatusCode::OK);
+        assert_eq!(metrics.status(), http::StatusCode::OK);
+        let metrics_body = to_bytes(metrics.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let metrics_value =
+            serde_json::from_slice::<serde_json::Value>(&metrics_body).expect("json");
+        assert_eq!(metrics_value["active_sessions"], 0);
+        assert_eq!(metrics_value["stored_event_offsets"], 0);
         let root_body = to_bytes(root_without_accept.into_body(), usize::MAX)
             .await
             .expect("body");

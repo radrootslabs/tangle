@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use crate::runtime::{TangleRuntimeMetrics, TangleRuntimeMetricsSnapshot};
 use axum::{Json, Router, extract::State, routing::get};
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -109,11 +110,21 @@ pub struct BaseRelayReadinessChecksDocument {
     pub group_outbox_replay: String,
 }
 
-pub fn base_relay_ops_router(readiness: BaseRelayReadinessState) -> Router {
+#[derive(Debug, Clone)]
+struct BaseRelayOpsState {
+    readiness: BaseRelayReadinessState,
+    metrics: TangleRuntimeMetrics,
+}
+
+pub fn base_relay_ops_router(
+    readiness: BaseRelayReadinessState,
+    metrics: TangleRuntimeMetrics,
+) -> Router {
     Router::new()
         .route("/healthz", get(base_relay_healthz))
         .route("/readyz", get(base_relay_readyz))
-        .with_state(readiness)
+        .route("/metricsz", get(base_relay_metricsz))
+        .with_state(BaseRelayOpsState { readiness, metrics })
 }
 
 async fn base_relay_healthz() -> Json<BaseRelayHealthDocument> {
@@ -123,26 +134,34 @@ async fn base_relay_healthz() -> Json<BaseRelayHealthDocument> {
 }
 
 async fn base_relay_readyz(
-    State(readiness): State<BaseRelayReadinessState>,
+    State(state): State<BaseRelayOpsState>,
 ) -> (StatusCode, Json<BaseRelayReadinessDocument>) {
-    let status = if readiness.is_ready() {
+    let status = if state.readiness.is_ready() {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (status, Json(readiness.response()))
+    (status, Json(state.readiness.response()))
+}
+
+async fn base_relay_metricsz(
+    State(state): State<BaseRelayOpsState>,
+) -> Json<TangleRuntimeMetricsSnapshot> {
+    Json(state.metrics.snapshot())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{BaseRelayReadinessCheckStatus, BaseRelayReadinessState, base_relay_ops_router};
+    use crate::runtime::TangleRuntimeMetrics;
     use axum::body::to_bytes;
     use http::{Request, StatusCode};
     use tower::ServiceExt;
 
     #[tokio::test]
     async fn base_relay_ops_router_reports_health_and_readiness() {
-        let health = base_relay_ops_router(BaseRelayReadinessState::ready())
+        let metrics = TangleRuntimeMetrics::new();
+        let health = base_relay_ops_router(BaseRelayReadinessState::ready(), metrics.clone())
             .oneshot(
                 Request::builder()
                     .uri("/healthz")
@@ -159,7 +178,10 @@ mod tests {
         let health_value = serde_json::from_slice::<serde_json::Value>(&health_body).expect("json");
         assert_eq!(health_value["status"], "ok");
 
-        let ready = base_relay_ops_router(BaseRelayReadinessState::ready())
+        metrics.record_session_opened();
+        metrics.record_client_message(crate::runtime::TangleClientMessageMetricKind::Req);
+        metrics.record_subscription_opened();
+        let ready = base_relay_ops_router(BaseRelayReadinessState::ready(), metrics.clone())
             .oneshot(
                 Request::builder()
                     .uri("/readyz")
@@ -174,6 +196,27 @@ mod tests {
         let ready_value = serde_json::from_slice::<serde_json::Value>(&ready_body).expect("json");
         assert_eq!(ready_value["status"], "ready");
         assert_eq!(ready_value["checks"]["group_outbox_replay"], "ready");
+        let metrics_response = base_relay_ops_router(BaseRelayReadinessState::ready(), metrics)
+            .oneshot(
+                Request::builder()
+                    .uri("/metricsz")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("metrics");
+
+        assert_eq!(metrics_response.status(), StatusCode::OK);
+        let metrics_body = to_bytes(metrics_response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let metrics_value =
+            serde_json::from_slice::<serde_json::Value>(&metrics_body).expect("json");
+        assert_eq!(metrics_value["active_sessions"], 1);
+        assert_eq!(metrics_value["total_sessions"], 1);
+        assert_eq!(metrics_value["client_messages"], 1);
+        assert_eq!(metrics_value["req_messages"], 1);
+        assert_eq!(metrics_value["opened_subscriptions"], 1);
 
         let not_ready = BaseRelayReadinessState::new(
             BaseRelayReadinessCheckStatus::Ready,
@@ -182,7 +225,7 @@ mod tests {
             BaseRelayReadinessCheckStatus::NotReady,
             BaseRelayReadinessCheckStatus::Ready,
         );
-        let rejected = base_relay_ops_router(not_ready)
+        let rejected = base_relay_ops_router(not_ready, TangleRuntimeMetrics::new())
             .oneshot(
                 Request::builder()
                     .uri("/readyz")

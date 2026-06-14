@@ -46,10 +46,13 @@ async fn tangle_run_serves_until_shutdown() {
 
     let health = wait_for_http_ok(address, "/healthz", None).await;
     let ready = wait_for_http_ok(address, "/readyz", None).await;
+    let metrics = wait_for_http_ok(address, "/metricsz", None).await;
     let nip11 = wait_for_http_ok(address, "/", Some("application/nostr+json")).await;
 
     assert!(health.contains(r#""status":"ok""#));
     assert!(ready.contains(r#""status":"ready""#));
+    assert!(metrics.contains(r#""active_sessions":0"#));
+    assert!(metrics.contains(r#""stored_event_offsets":0"#));
     assert!(nip11.contains(r#""name":"tangle""#));
     assert!(
         nip11

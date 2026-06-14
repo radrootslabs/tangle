@@ -6,9 +6,12 @@ use crate::{
     logging,
     relay::{
         auth::{BaseAuthState, generate_auth_challenge},
-        live::LiveSubscriptionSet,
+        live::{CloseResult, LiveSubscriptionSet},
     },
-    runtime::{TangleQueryRateLimitContext, TangleRuntimeHandle, TangleRuntimeLimits},
+    runtime::{
+        TangleClientMessageMetricKind, TangleQueryRateLimitContext, TangleRuntimeHandle,
+        TangleRuntimeLimits,
+    },
 };
 use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket};
 use std::{
@@ -100,9 +103,13 @@ impl TangleWebSocketSession {
     }
 
     pub async fn run(mut self, mut socket: WebSocket) {
+        let metrics = self.runtime.metrics();
+        metrics.record_session_opened();
         logging::log_websocket_session_opened(self.connection_id, self.peer_ip);
         if !self.issue_auth_challenge() {
             let closed_subscriptions = self.subscriptions.close_all();
+            metrics.record_subscriptions_closed(closed_subscriptions);
+            metrics.record_session_closed();
             logging::log_websocket_session_closed(
                 self.connection_id,
                 self.peer_ip,
@@ -153,6 +160,8 @@ impl TangleWebSocketSession {
             }
         }
         let closed_subscriptions = self.subscriptions.close_all();
+        metrics.record_subscriptions_closed(closed_subscriptions);
+        metrics.record_session_closed();
         logging::log_websocket_session_closed(
             self.connection_id,
             self.peer_ip,
@@ -271,10 +280,14 @@ impl TangleWebSocketSession {
                     .await
             }
             ClientMessage::Close(subscription_id) => {
+                let metrics = self.runtime.metrics();
+                metrics.record_client_message(TangleClientMessageMetricKind::Close);
                 self.limits
                     .base_relay_limits()
                     .validate_subscription_id(&subscription_id)?;
-                self.subscriptions.close(&subscription_id);
+                if self.subscriptions.close(&subscription_id) == CloseResult::Closed {
+                    metrics.record_subscriptions_closed(1);
+                }
                 Ok(Vec::new())
             }
             message => {
@@ -290,6 +303,8 @@ impl TangleWebSocketSession {
         subscription_id: SubscriptionId,
         filters: Vec<Filter>,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+        let metrics = self.runtime.metrics();
+        metrics.record_client_message(TangleClientMessageMetricKind::Req);
         self.limits
             .base_relay_limits()
             .validate_subscription_id(&subscription_id)?;
@@ -312,6 +327,7 @@ impl TangleWebSocketSession {
             filters.clone(),
             GroupAuthContext::new(self.auth.authenticated_pubkeys().iter().cloned()),
         )?;
+        metrics.record_subscription_opened();
         logging::log_subscription_opened(self.connection_id, &subscription_id);
         match self
             .runtime
@@ -483,6 +499,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let runtime =
             TangleRuntimeHandle::new(TangleRuntime::open(runtime_config(&root)).expect("runtime"));
+        let metrics = runtime.metrics();
         let auth_a = runtime.auth_state().await.expect("auth a");
         let auth_b = runtime.auth_state().await.expect("auth b");
         let events_a = runtime.subscribe_events().await;
@@ -498,7 +515,7 @@ mod tests {
         let mut second = TangleWebSocketSession::new(
             session_limits(8),
             shutdown.subscribe(),
-            runtime,
+            runtime.clone(),
             auth_b,
             events_b,
         )
@@ -550,6 +567,12 @@ mod tests {
             Vec::<RelayMessage>::new()
         );
         assert_eq!(second.active_subscription_count(), 0);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.client_messages(), 5);
+        assert_eq!(snapshot.req_messages(), 3);
+        assert_eq!(snapshot.close_messages(), 2);
+        assert_eq!(snapshot.opened_subscriptions(), 3);
+        assert_eq!(snapshot.closed_subscriptions(), 2);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -599,6 +622,11 @@ mod tests {
             }]
         );
         assert_eq!(session.active_subscription_count(), 0);
+        let snapshot = runtime.metrics().snapshot();
+        assert_eq!(snapshot.client_messages(), 1);
+        assert_eq!(snapshot.req_messages(), 1);
+        assert_eq!(snapshot.opened_subscriptions(), 0);
+        assert_eq!(snapshot.rate_limit_rejections(), 1);
 
         let _ = std::fs::remove_dir_all(root);
     }

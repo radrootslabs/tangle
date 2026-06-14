@@ -16,6 +16,7 @@ use crate::{
         live::LiveSubscriptionSet,
     },
 };
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
     fmt,
@@ -360,6 +361,7 @@ impl TangleRuntime {
         match self.rate_limiter.record(key, rule, now) {
             TangleRateLimitDecision::Allowed { .. } => None,
             TangleRateLimitDecision::Rejected { reset_at } => {
+                self.metrics.record_rate_limit_rejection();
                 logging::log_rate_limit_rejected(label, dimension, reset_at);
                 Some(RelayMessage::Closed {
                     subscription_id: subscription_id.clone(),
@@ -383,6 +385,7 @@ impl TangleRuntime {
         match self.rate_limiter.record(key, rule, now) {
             TangleRateLimitDecision::Allowed { .. } => None,
             TangleRateLimitDecision::Rejected { reset_at } => {
+                self.metrics.record_rate_limit_rejection();
                 logging::log_rate_limit_rejected(label, "event", reset_at);
                 Some(RelayMessage::Ok {
                     event_id: event.id().clone(),
@@ -400,13 +403,20 @@ impl TangleRuntime {
 #[derive(Clone)]
 pub struct TangleRuntimeHandle {
     inner: Arc<Mutex<TangleRuntime>>,
+    metrics: TangleRuntimeMetrics,
 }
 
 impl TangleRuntimeHandle {
     pub fn new(runtime: TangleRuntime) -> Self {
+        let metrics = runtime.metrics().clone();
         Self {
             inner: Arc::new(Mutex::new(runtime)),
+            metrics,
         }
+    }
+
+    pub fn metrics(&self) -> TangleRuntimeMetrics {
+        self.metrics.clone()
     }
 
     pub async fn auth_state(&self) -> Result<BaseAuthState, BaseRelayError> {
@@ -435,6 +445,8 @@ impl TangleRuntimeHandle {
         query_context: TangleQueryRateLimitContext,
         now: UnixTimestamp,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+        self.metrics
+            .record_client_message(client_message_metric_kind(&message));
         let mut runtime = self.inner.lock().await;
         match message {
             ClientMessage::Event(event) => {
@@ -619,6 +631,16 @@ fn auth_response_failed(replies: &[RelayMessage]) -> bool {
     })
 }
 
+fn client_message_metric_kind(message: &ClientMessage) -> TangleClientMessageMetricKind {
+    match message {
+        ClientMessage::Event(_) => TangleClientMessageMetricKind::Event,
+        ClientMessage::Req { .. } => TangleClientMessageMetricKind::Req,
+        ClientMessage::Count { .. } => TangleClientMessageMetricKind::Count,
+        ClientMessage::Auth(_) => TangleClientMessageMetricKind::Auth,
+        ClientMessage::Close(_) => TangleClientMessageMetricKind::Close,
+    }
+}
+
 fn filter_group_ids(filters: &[Filter]) -> Vec<GroupId> {
     filters
         .iter()
@@ -735,7 +757,93 @@ pub struct TangleRuntimeMetrics {
 struct TangleRuntimeMetricsInner {
     started_at: Instant,
     active_sessions: AtomicUsize,
+    total_sessions: AtomicU64,
+    client_messages: AtomicU64,
+    event_messages: AtomicU64,
+    req_messages: AtomicU64,
+    count_messages: AtomicU64,
+    auth_messages: AtomicU64,
+    close_messages: AtomicU64,
+    opened_subscriptions: AtomicU64,
+    closed_subscriptions: AtomicU64,
     stored_event_offsets: AtomicU64,
+    rate_limit_rejections: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TangleClientMessageMetricKind {
+    Event,
+    Req,
+    Count,
+    Auth,
+    Close,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TangleRuntimeMetricsSnapshot {
+    uptime_seconds: u64,
+    active_sessions: usize,
+    total_sessions: u64,
+    client_messages: u64,
+    event_messages: u64,
+    req_messages: u64,
+    count_messages: u64,
+    auth_messages: u64,
+    close_messages: u64,
+    opened_subscriptions: u64,
+    closed_subscriptions: u64,
+    stored_event_offsets: u64,
+    rate_limit_rejections: u64,
+}
+
+impl TangleRuntimeMetricsSnapshot {
+    pub fn active_sessions(&self) -> usize {
+        self.active_sessions
+    }
+
+    pub fn total_sessions(&self) -> u64 {
+        self.total_sessions
+    }
+
+    pub fn client_messages(&self) -> u64 {
+        self.client_messages
+    }
+
+    pub fn event_messages(&self) -> u64 {
+        self.event_messages
+    }
+
+    pub fn req_messages(&self) -> u64 {
+        self.req_messages
+    }
+
+    pub fn count_messages(&self) -> u64 {
+        self.count_messages
+    }
+
+    pub fn auth_messages(&self) -> u64 {
+        self.auth_messages
+    }
+
+    pub fn close_messages(&self) -> u64 {
+        self.close_messages
+    }
+
+    pub fn opened_subscriptions(&self) -> u64 {
+        self.opened_subscriptions
+    }
+
+    pub fn closed_subscriptions(&self) -> u64 {
+        self.closed_subscriptions
+    }
+
+    pub fn stored_event_offsets(&self) -> u64 {
+        self.stored_event_offsets
+    }
+
+    pub fn rate_limit_rejections(&self) -> u64 {
+        self.rate_limit_rejections
+    }
 }
 
 impl TangleRuntimeMetrics {
@@ -744,8 +852,36 @@ impl TangleRuntimeMetrics {
             inner: Arc::new(TangleRuntimeMetricsInner {
                 started_at: Instant::now(),
                 active_sessions: AtomicUsize::new(0),
+                total_sessions: AtomicU64::new(0),
+                client_messages: AtomicU64::new(0),
+                event_messages: AtomicU64::new(0),
+                req_messages: AtomicU64::new(0),
+                count_messages: AtomicU64::new(0),
+                auth_messages: AtomicU64::new(0),
+                close_messages: AtomicU64::new(0),
+                opened_subscriptions: AtomicU64::new(0),
+                closed_subscriptions: AtomicU64::new(0),
                 stored_event_offsets: AtomicU64::new(0),
+                rate_limit_rejections: AtomicU64::new(0),
             }),
+        }
+    }
+
+    pub fn snapshot(&self) -> TangleRuntimeMetricsSnapshot {
+        TangleRuntimeMetricsSnapshot {
+            uptime_seconds: self.started_at().elapsed().as_secs(),
+            active_sessions: self.active_sessions(),
+            total_sessions: self.total_sessions(),
+            client_messages: self.client_messages(),
+            event_messages: self.event_messages(),
+            req_messages: self.req_messages(),
+            count_messages: self.count_messages(),
+            auth_messages: self.auth_messages(),
+            close_messages: self.close_messages(),
+            opened_subscriptions: self.opened_subscriptions(),
+            closed_subscriptions: self.closed_subscriptions(),
+            stored_event_offsets: self.stored_event_offsets(),
+            rate_limit_rejections: self.rate_limit_rejections(),
         }
     }
 
@@ -757,21 +893,119 @@ impl TangleRuntimeMetrics {
         self.inner.active_sessions.load(Ordering::Relaxed)
     }
 
-    pub fn increment_active_sessions(&self) -> usize {
-        self.inner.active_sessions.fetch_add(1, Ordering::Relaxed) + 1
+    pub fn total_sessions(&self) -> u64 {
+        self.inner.total_sessions.load(Ordering::Relaxed)
     }
 
-    pub fn decrement_active_sessions(&self) -> usize {
-        self.inner.active_sessions.fetch_sub(1, Ordering::Relaxed) - 1
+    pub fn client_messages(&self) -> u64 {
+        self.inner.client_messages.load(Ordering::Relaxed)
+    }
+
+    pub fn event_messages(&self) -> u64 {
+        self.inner.event_messages.load(Ordering::Relaxed)
+    }
+
+    pub fn req_messages(&self) -> u64 {
+        self.inner.req_messages.load(Ordering::Relaxed)
+    }
+
+    pub fn count_messages(&self) -> u64 {
+        self.inner.count_messages.load(Ordering::Relaxed)
+    }
+
+    pub fn auth_messages(&self) -> u64 {
+        self.inner.auth_messages.load(Ordering::Relaxed)
+    }
+
+    pub fn close_messages(&self) -> u64 {
+        self.inner.close_messages.load(Ordering::Relaxed)
+    }
+
+    pub fn opened_subscriptions(&self) -> u64 {
+        self.inner.opened_subscriptions.load(Ordering::Relaxed)
+    }
+
+    pub fn closed_subscriptions(&self) -> u64 {
+        self.inner.closed_subscriptions.load(Ordering::Relaxed)
     }
 
     pub fn stored_event_offsets(&self) -> u64 {
         self.inner.stored_event_offsets.load(Ordering::Relaxed)
     }
 
+    pub fn rate_limit_rejections(&self) -> u64 {
+        self.inner.rate_limit_rejections.load(Ordering::Relaxed)
+    }
+
+    pub fn record_session_opened(&self) -> usize {
+        self.inner.total_sessions.fetch_add(1, Ordering::Relaxed);
+        self.inner.active_sessions.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub fn record_session_closed(&self) -> usize {
+        let mut current = self.inner.active_sessions.load(Ordering::Relaxed);
+        loop {
+            if current == 0 {
+                return 0;
+            }
+            match self.inner.active_sessions.compare_exchange(
+                current,
+                current - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return current - 1,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    pub fn record_client_message(&self, kind: TangleClientMessageMetricKind) -> u64 {
+        let total = self.inner.client_messages.fetch_add(1, Ordering::Relaxed) + 1;
+        match kind {
+            TangleClientMessageMetricKind::Event => {
+                self.inner.event_messages.fetch_add(1, Ordering::Relaxed);
+            }
+            TangleClientMessageMetricKind::Req => {
+                self.inner.req_messages.fetch_add(1, Ordering::Relaxed);
+            }
+            TangleClientMessageMetricKind::Count => {
+                self.inner.count_messages.fetch_add(1, Ordering::Relaxed);
+            }
+            TangleClientMessageMetricKind::Auth => {
+                self.inner.auth_messages.fetch_add(1, Ordering::Relaxed);
+            }
+            TangleClientMessageMetricKind::Close => {
+                self.inner.close_messages.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+        total
+    }
+
+    pub fn record_subscription_opened(&self) -> u64 {
+        self.inner
+            .opened_subscriptions
+            .fetch_add(1, Ordering::Relaxed)
+            + 1
+    }
+
+    pub fn record_subscriptions_closed(&self, count: usize) -> u64 {
+        self.inner.closed_subscriptions.fetch_add(
+            u64::try_from(count).expect("subscription count fits in u64"),
+            Ordering::Relaxed,
+        ) + u64::try_from(count).expect("subscription count fits in u64")
+    }
+
     pub fn record_stored_event_offset(&self) -> u64 {
         self.inner
             .stored_event_offsets
+            .fetch_add(1, Ordering::Relaxed)
+            + 1
+    }
+
+    pub fn record_rate_limit_rejection(&self) -> u64 {
+        self.inner
+            .rate_limit_rejections
             .fetch_add(1, Ordering::Relaxed)
             + 1
     }
@@ -879,12 +1113,37 @@ mod tests {
             Path::new(&root).join("pocket")
         );
 
-        assert_eq!(runtime.metrics().increment_active_sessions(), 1);
+        assert_eq!(runtime.metrics().record_session_opened(), 1);
         assert_eq!(runtime.metrics().active_sessions(), 1);
-        assert_eq!(runtime.metrics().decrement_active_sessions(), 0);
+        assert_eq!(runtime.metrics().total_sessions(), 1);
+        assert_eq!(runtime.metrics().record_session_closed(), 0);
         assert_eq!(runtime.metrics().active_sessions(), 0);
+        assert_eq!(runtime.metrics().total_sessions(), 1);
+        assert_eq!(
+            runtime
+                .metrics()
+                .record_client_message(super::TangleClientMessageMetricKind::Req),
+            1
+        );
+        assert_eq!(runtime.metrics().client_messages(), 1);
+        assert_eq!(runtime.metrics().req_messages(), 1);
+        assert_eq!(runtime.metrics().record_subscription_opened(), 1);
+        assert_eq!(runtime.metrics().opened_subscriptions(), 1);
+        assert_eq!(runtime.metrics().record_subscriptions_closed(1), 1);
+        assert_eq!(runtime.metrics().closed_subscriptions(), 1);
         assert_eq!(runtime.metrics().record_stored_event_offset(), 1);
         assert_eq!(runtime.metrics().stored_event_offsets(), 1);
+        assert_eq!(runtime.metrics().record_rate_limit_rejection(), 1);
+        assert_eq!(runtime.metrics().rate_limit_rejections(), 1);
+        let snapshot = runtime.metrics().snapshot();
+        assert_eq!(snapshot.active_sessions(), 0);
+        assert_eq!(snapshot.total_sessions(), 1);
+        assert_eq!(snapshot.client_messages(), 1);
+        assert_eq!(snapshot.req_messages(), 1);
+        assert_eq!(snapshot.opened_subscriptions(), 1);
+        assert_eq!(snapshot.closed_subscriptions(), 1);
+        assert_eq!(snapshot.stored_event_offsets(), 1);
+        assert_eq!(snapshot.rate_limit_rejections(), 1);
 
         let report = runtime.shutdown().expect("shutdown");
 
@@ -971,6 +1230,10 @@ mod tests {
             offsets.try_recv().expect_err("no duplicate offset"),
             TangleEventReceiveError::Empty
         );
+        let snapshot = handle.metrics().snapshot();
+        assert_eq!(snapshot.client_messages(), 2);
+        assert_eq!(snapshot.event_messages(), 2);
+        assert_eq!(snapshot.stored_event_offsets(), 1);
 
         let _ = std::fs::remove_dir_all(root);
     }
