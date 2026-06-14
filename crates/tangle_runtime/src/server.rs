@@ -503,8 +503,9 @@ mod tests {
             .expect("body");
         let metrics_value =
             serde_json::from_slice::<serde_json::Value>(&metrics_body).expect("json");
-        assert_eq!(metrics_value["active_sessions"], 0);
-        assert_eq!(metrics_value["stored_event_offsets"], 0);
+        assert_eq!(metrics_value["tangle_readiness_ready"], true);
+        assert_eq!(metrics_value["tangle_ws_connections_current"], 0);
+        assert_eq!(metrics_value["tangle_stored_event_offsets_total"], 0);
         let root_body = to_bytes(root_without_accept.into_body(), usize::MAX)
             .await
             .expect("body");

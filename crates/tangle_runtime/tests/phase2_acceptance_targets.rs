@@ -58,8 +58,9 @@ async fn tangle_run_serves_until_shutdown() {
     assert!(health.contains(r#""status":"ok""#));
     assert!(ready.contains(r#""status":"ready""#));
     assert!(ready.contains(r#""server_bind":"ready""#));
-    assert!(metrics.contains(r#""active_sessions":0"#));
-    assert!(metrics.contains(r#""stored_event_offsets":0"#));
+    assert!(metrics.contains(r#""tangle_readiness_ready":true"#));
+    assert!(metrics.contains(r#""tangle_ws_connections_current":0"#));
+    assert!(metrics.contains(r#""tangle_stored_event_offsets_total":0"#));
     assert!(nip11.contains(r#""name":"tangle""#));
     assert!(
         nip11

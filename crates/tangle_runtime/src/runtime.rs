@@ -19,8 +19,9 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
-    fmt,
+    fmt, fs,
     net::IpAddr,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -28,7 +29,8 @@ use std::{
     time::Instant,
 };
 use tangle_groups::{
-    GroupId, KIND_GROUP_JOIN_REQUEST, StoreOffset, validate_client_group_event_structure,
+    GroupEventClass, GroupId, KIND_GROUP_JOIN_REQUEST, StoreOffset,
+    validate_client_group_event_structure,
 };
 use tangle_protocol::{
     ClientMessage, Event, Filter, Kind, RelayMessage, SubscriptionId, UnixTimestamp,
@@ -77,15 +79,22 @@ impl TangleRuntime {
         let limits = TangleRuntimeLimits::from_config(&config)?;
         let relay = config.open_relay()?;
         let readiness = BaseRelayReadinessHandle::new(relay.readiness_state());
+        let event_bus = TangleEventBus::new(limits.event_bus_capacity())?;
         let rate_limiter = TangleRateLimiter::new();
+        let metrics = TangleRuntimeMetrics::new();
+        metrics.record_disk_used_bytes(directory_size_bytes(
+            config.pocket_config().data_directory(),
+        ));
+        metrics.record_event_bus_receivers(event_bus.receiver_count());
+        metrics.record_outbox_pending_events(relay.group_outbox_pending_events());
         logging::log_runtime_opened(&config);
         Ok(Self {
             config,
             relay,
             readiness,
-            event_bus: TangleEventBus::new(limits.event_bus_capacity())?,
+            event_bus,
             rate_limiter,
-            metrics: TangleRuntimeMetrics::new(),
+            metrics,
             limits,
             shutdown: TangleShutdownSignal::new(),
         })
@@ -235,6 +244,12 @@ impl TangleRuntime {
             "group kind",
             now,
         )
+    }
+
+    fn is_group_event(&self, event: &Event) -> bool {
+        self.config.groups().enabled()
+            && validate_client_group_event_structure(event, self.config.groups().limits())
+                .is_ok_and(|class| !matches!(class, GroupEventClass::NonGroup))
     }
 
     fn rate_limit_req(
@@ -454,19 +469,32 @@ impl TangleRuntimeHandle {
         let mut runtime = self.inner.lock().await;
         match message {
             ClientMessage::Event(event) => {
+                let started_at = Instant::now();
                 let event_id = event.id().clone();
+                let is_group_event = runtime.is_group_event(&event);
                 if let Some(message) = runtime.rate_limit_event(&event, now) {
+                    record_event_metrics(runtime.metrics(), &message, is_group_event, started_at);
                     return Ok(vec![message]);
                 }
                 if let Some(message) = runtime.rate_limit_group_write(&event, now) {
+                    record_event_metrics(runtime.metrics(), &message, is_group_event, started_at);
                     return Ok(vec![message]);
                 }
                 let result = runtime
                     .relay_mut()
                     .handle_event_with_auth_report(event, auth)?;
+                if is_group_event {
+                    for _ in 0..result.stored_offsets().len().saturating_sub(1) {
+                        runtime.metrics().record_outbox_replayed_event();
+                    }
+                    runtime.metrics().record_outbox_pending_events(
+                        runtime.relay().group_outbox_pending_events(),
+                    );
+                }
                 for offset in result.stored_offsets() {
                     runtime.metrics().record_stored_event_offset();
-                    runtime.event_bus().publish(*offset);
+                    let receivers = runtime.event_bus().publish(*offset);
+                    runtime.metrics().record_event_bus_publish(receivers);
                 }
                 if !result.stored_offsets().is_empty() {
                     logging::log_event_stored(
@@ -475,12 +503,15 @@ impl TangleRuntimeHandle {
                         runtime.metrics().stored_event_offsets(),
                     );
                 }
-                Ok(vec![result.into_message()])
+                let message = result.into_message();
+                record_event_metrics(runtime.metrics(), &message, is_group_event, started_at);
+                Ok(vec![message])
             }
             ClientMessage::Req {
                 subscription_id,
                 filters,
             } => {
+                let started_at = Instant::now();
                 runtime
                     .limits()
                     .base_relay_limits()
@@ -492,21 +523,29 @@ impl TangleRuntimeHandle {
                 if let Some(message) =
                     runtime.rate_limit_req(&subscription_id, &filters, auth, query_context, now)
                 {
+                    runtime
+                        .metrics()
+                        .record_query_latency(elapsed_micros(started_at));
                     return Ok(vec![message]);
                 }
-                runtime.relay_mut().handle_client_message(
-                    ClientMessage::Req {
-                        subscription_id,
-                        filters,
-                    },
+                let report = runtime.relay_mut().query_req_with_auth_report(
+                    subscription_id,
+                    filters,
                     auth,
-                    now,
-                )
+                )?;
+                if report.group_read_denied() {
+                    runtime.metrics().record_group_read_denial();
+                }
+                runtime
+                    .metrics()
+                    .record_query_latency(elapsed_micros(started_at));
+                Ok(report.into_messages())
             }
             ClientMessage::Count {
                 subscription_id,
                 filters,
             } => {
+                let started_at = Instant::now();
                 runtime
                     .limits()
                     .base_relay_limits()
@@ -518,19 +557,27 @@ impl TangleRuntimeHandle {
                 if let Some(message) =
                     runtime.rate_limit_count(&subscription_id, &filters, auth, query_context, now)
                 {
+                    runtime
+                        .metrics()
+                        .record_query_latency(elapsed_micros(started_at));
                     return Ok(vec![message]);
                 }
-                runtime.relay_mut().handle_client_message(
-                    ClientMessage::Count {
-                        subscription_id,
-                        filters,
-                    },
+                let report = runtime.relay_mut().handle_count_with_auth_report(
+                    subscription_id,
+                    filters,
                     auth,
-                    now,
-                )
+                )?;
+                if report.group_read_denied() {
+                    runtime.metrics().record_group_read_denial();
+                }
+                runtime
+                    .metrics()
+                    .record_query_latency(elapsed_micros(started_at));
+                Ok(vec![report.into_message()])
             }
             ClientMessage::Auth(event) => {
                 if let Err(error) = runtime.limits().base_relay_limits().validate_event(&event) {
+                    runtime.metrics().record_auth_failure();
                     return Ok(vec![RelayMessage::Ok {
                         event_id: event.id().clone(),
                         accepted: false,
@@ -538,6 +585,7 @@ impl TangleRuntimeHandle {
                     }]);
                 }
                 if let Some(message) = runtime.rate_limit_auth_attempt(&event, now) {
+                    runtime.metrics().record_auth_failure();
                     return Ok(vec![message]);
                 }
                 let event_for_failure = event.clone();
@@ -546,10 +594,14 @@ impl TangleRuntimeHandle {
                     auth,
                     now,
                 )?;
-                if auth_response_failed(&replies)
-                    && let Some(message) = runtime.rate_limit_auth_failure(&event_for_failure, now)
-                {
-                    return Ok(vec![message]);
+                if auth_response_failed(&replies) {
+                    runtime.metrics().record_auth_failure();
+                    if let Some(message) = runtime.rate_limit_auth_failure(&event_for_failure, now)
+                    {
+                        return Ok(vec![message]);
+                    }
+                } else {
+                    runtime.metrics().record_auth_success();
                 }
                 Ok(replies)
             }
@@ -560,7 +612,12 @@ impl TangleRuntimeHandle {
     }
 
     pub async fn subscribe_events(&self) -> TangleEventReceiver {
-        self.inner.lock().await.event_bus().subscribe()
+        let runtime = self.inner.lock().await;
+        let receiver = runtime.event_bus().subscribe();
+        runtime
+            .metrics()
+            .record_event_bus_receivers(runtime.event_bus().receiver_count());
+        receiver
     }
 
     pub async fn rate_limiter(&self) -> TangleRateLimiter {
@@ -587,11 +644,19 @@ impl TangleRuntimeHandle {
         filters: Vec<Filter>,
         auth: &BaseAuthState,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
-        self.inner
-            .lock()
-            .await
-            .relay()
-            .query_req_with_auth(subscription_id, filters, auth)
+        let started_at = Instant::now();
+        let mut runtime = self.inner.lock().await;
+        let report =
+            runtime
+                .relay_mut()
+                .query_req_with_auth_report(subscription_id, filters, auth)?;
+        if report.group_read_denied() {
+            runtime.metrics().record_group_read_denial();
+        }
+        runtime
+            .metrics()
+            .record_query_latency(elapsed_micros(started_at));
+        Ok(report.into_messages())
     }
 
     pub async fn event_by_offset_with_auth(
@@ -599,11 +664,12 @@ impl TangleRuntimeHandle {
         offset: StoreOffset,
         auth: &BaseAuthState,
     ) -> Result<Option<Event>, BaseRelayError> {
-        self.inner
-            .lock()
-            .await
-            .relay()
-            .event_by_offset_with_auth(offset, auth)
+        let runtime = self.inner.lock().await;
+        let event = runtime.relay().event_by_offset_with_auth(offset, auth)?;
+        if event.is_none() {
+            runtime.metrics().record_group_read_denial();
+        }
+        Ok(event)
     }
 
     pub(crate) async fn fanout_event_offset(
@@ -633,6 +699,48 @@ fn auth_response_failed(replies: &[RelayMessage]) -> bool {
             }
         )
     })
+}
+
+fn record_event_metrics(
+    metrics: &TangleRuntimeMetrics,
+    message: &RelayMessage,
+    is_group_event: bool,
+    started_at: Instant,
+) {
+    metrics.record_event_admission_latency(elapsed_micros(started_at));
+    if let RelayMessage::Ok { accepted, .. } = message {
+        if *accepted {
+            metrics.record_event_admission();
+        } else {
+            metrics.record_event_rejection();
+            if is_group_event {
+                metrics.record_group_write_denial();
+            }
+        }
+    }
+}
+
+fn elapsed_micros(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+fn directory_size_bytes(path: &Path) -> u64 {
+    let Ok(metadata) = fs::metadata(path) else {
+        return 0;
+    };
+    if metadata.is_file() {
+        return metadata.len();
+    }
+    if !metadata.is_dir() {
+        return 0;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| directory_size_bytes(&entry.path()))
+        .sum()
 }
 
 fn client_message_metric_kind(message: &ClientMessage) -> TangleClientMessageMetricKind {
@@ -772,6 +880,23 @@ struct TangleRuntimeMetricsInner {
     closed_subscriptions: AtomicU64,
     stored_event_offsets: AtomicU64,
     rate_limit_rejections: AtomicU64,
+    auth_successes: AtomicU64,
+    auth_failures: AtomicU64,
+    event_admissions: AtomicU64,
+    event_rejections: AtomicU64,
+    group_read_denials: AtomicU64,
+    group_write_denials: AtomicU64,
+    event_bus_receivers_current: AtomicUsize,
+    event_bus_published_offsets: AtomicU64,
+    event_bus_lagged_receivers: AtomicU64,
+    event_bus_lagged_offsets: AtomicU64,
+    outbox_pending_events: AtomicUsize,
+    outbox_replayed_events: AtomicU64,
+    disk_used_bytes: AtomicU64,
+    event_admission_latency_total_micros: AtomicU64,
+    event_admission_latency_count: AtomicU64,
+    query_latency_total_micros: AtomicU64,
+    query_latency_count: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -785,68 +910,86 @@ pub enum TangleClientMessageMetricKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TangleRuntimeMetricsSnapshot {
-    uptime_seconds: u64,
-    active_sessions: usize,
-    total_sessions: u64,
-    client_messages: u64,
-    event_messages: u64,
-    req_messages: u64,
-    count_messages: u64,
-    auth_messages: u64,
-    close_messages: u64,
-    opened_subscriptions: u64,
-    closed_subscriptions: u64,
-    stored_event_offsets: u64,
-    rate_limit_rejections: u64,
+    tangle_runtime_uptime_seconds: u64,
+    tangle_readiness_ready: bool,
+    tangle_ws_connections_current: usize,
+    tangle_ws_connections_total: u64,
+    tangle_client_messages_total: u64,
+    tangle_event_messages_total: u64,
+    tangle_req_messages_total: u64,
+    tangle_count_messages_total: u64,
+    tangle_auth_messages_total: u64,
+    tangle_close_messages_total: u64,
+    tangle_subscriptions_opened_total: u64,
+    tangle_subscriptions_closed_total: u64,
+    tangle_stored_event_offsets_total: u64,
+    tangle_rate_limit_rejections_total: u64,
+    tangle_auth_success_total: u64,
+    tangle_auth_failure_total: u64,
+    tangle_event_admitted_total: u64,
+    tangle_event_rejected_total: u64,
+    tangle_group_read_denied_total: u64,
+    tangle_group_write_denied_total: u64,
+    tangle_event_bus_receivers_current: usize,
+    tangle_event_bus_published_offsets_total: u64,
+    tangle_event_bus_lagged_receivers_total: u64,
+    tangle_event_bus_lagged_offsets_total: u64,
+    tangle_outbox_pending_events: usize,
+    tangle_outbox_replayed_events_total: u64,
+    tangle_disk_used_bytes: u64,
+    tangle_event_admission_latency_total_micros: u64,
+    tangle_event_admission_latency_count: u64,
+    tangle_query_latency_total_micros: u64,
+    tangle_query_latency_count: u64,
 }
 
 impl TangleRuntimeMetricsSnapshot {
     pub fn active_sessions(&self) -> usize {
-        self.active_sessions
+        self.tangle_ws_connections_current
     }
 
     pub fn total_sessions(&self) -> u64 {
-        self.total_sessions
+        self.tangle_ws_connections_total
     }
 
     pub fn client_messages(&self) -> u64 {
-        self.client_messages
+        self.tangle_client_messages_total
     }
 
     pub fn event_messages(&self) -> u64 {
-        self.event_messages
+        self.tangle_event_messages_total
     }
 
     pub fn req_messages(&self) -> u64 {
-        self.req_messages
+        self.tangle_req_messages_total
     }
 
     pub fn count_messages(&self) -> u64 {
-        self.count_messages
+        self.tangle_count_messages_total
     }
 
     pub fn auth_messages(&self) -> u64 {
-        self.auth_messages
+        self.tangle_auth_messages_total
     }
 
     pub fn close_messages(&self) -> u64 {
-        self.close_messages
+        self.tangle_close_messages_total
     }
 
     pub fn opened_subscriptions(&self) -> u64 {
-        self.opened_subscriptions
+        self.tangle_subscriptions_opened_total
     }
 
     pub fn closed_subscriptions(&self) -> u64 {
-        self.closed_subscriptions
+        self.tangle_subscriptions_closed_total
     }
 
     pub fn stored_event_offsets(&self) -> u64 {
-        self.stored_event_offsets
+        self.tangle_stored_event_offsets_total
     }
 
     pub fn rate_limit_rejections(&self) -> u64 {
-        self.rate_limit_rejections
+        self.tangle_rate_limit_rejections_total
     }
 }
 
@@ -867,25 +1010,65 @@ impl TangleRuntimeMetrics {
                 closed_subscriptions: AtomicU64::new(0),
                 stored_event_offsets: AtomicU64::new(0),
                 rate_limit_rejections: AtomicU64::new(0),
+                auth_successes: AtomicU64::new(0),
+                auth_failures: AtomicU64::new(0),
+                event_admissions: AtomicU64::new(0),
+                event_rejections: AtomicU64::new(0),
+                group_read_denials: AtomicU64::new(0),
+                group_write_denials: AtomicU64::new(0),
+                event_bus_receivers_current: AtomicUsize::new(0),
+                event_bus_published_offsets: AtomicU64::new(0),
+                event_bus_lagged_receivers: AtomicU64::new(0),
+                event_bus_lagged_offsets: AtomicU64::new(0),
+                outbox_pending_events: AtomicUsize::new(0),
+                outbox_replayed_events: AtomicU64::new(0),
+                disk_used_bytes: AtomicU64::new(0),
+                event_admission_latency_total_micros: AtomicU64::new(0),
+                event_admission_latency_count: AtomicU64::new(0),
+                query_latency_total_micros: AtomicU64::new(0),
+                query_latency_count: AtomicU64::new(0),
             }),
         }
     }
 
     pub fn snapshot(&self) -> TangleRuntimeMetricsSnapshot {
+        self.snapshot_with_readiness(false)
+    }
+
+    pub fn snapshot_with_readiness(&self, readiness_ready: bool) -> TangleRuntimeMetricsSnapshot {
         TangleRuntimeMetricsSnapshot {
-            uptime_seconds: self.started_at().elapsed().as_secs(),
-            active_sessions: self.active_sessions(),
-            total_sessions: self.total_sessions(),
-            client_messages: self.client_messages(),
-            event_messages: self.event_messages(),
-            req_messages: self.req_messages(),
-            count_messages: self.count_messages(),
-            auth_messages: self.auth_messages(),
-            close_messages: self.close_messages(),
-            opened_subscriptions: self.opened_subscriptions(),
-            closed_subscriptions: self.closed_subscriptions(),
-            stored_event_offsets: self.stored_event_offsets(),
-            rate_limit_rejections: self.rate_limit_rejections(),
+            tangle_runtime_uptime_seconds: self.started_at().elapsed().as_secs(),
+            tangle_readiness_ready: readiness_ready,
+            tangle_ws_connections_current: self.active_sessions(),
+            tangle_ws_connections_total: self.total_sessions(),
+            tangle_client_messages_total: self.client_messages(),
+            tangle_event_messages_total: self.event_messages(),
+            tangle_req_messages_total: self.req_messages(),
+            tangle_count_messages_total: self.count_messages(),
+            tangle_auth_messages_total: self.auth_messages(),
+            tangle_close_messages_total: self.close_messages(),
+            tangle_subscriptions_opened_total: self.opened_subscriptions(),
+            tangle_subscriptions_closed_total: self.closed_subscriptions(),
+            tangle_stored_event_offsets_total: self.stored_event_offsets(),
+            tangle_rate_limit_rejections_total: self.rate_limit_rejections(),
+            tangle_auth_success_total: self.auth_successes(),
+            tangle_auth_failure_total: self.auth_failures(),
+            tangle_event_admitted_total: self.event_admissions(),
+            tangle_event_rejected_total: self.event_rejections(),
+            tangle_group_read_denied_total: self.group_read_denials(),
+            tangle_group_write_denied_total: self.group_write_denials(),
+            tangle_event_bus_receivers_current: self.event_bus_receivers_current(),
+            tangle_event_bus_published_offsets_total: self.event_bus_published_offsets(),
+            tangle_event_bus_lagged_receivers_total: self.event_bus_lagged_receivers(),
+            tangle_event_bus_lagged_offsets_total: self.event_bus_lagged_offsets(),
+            tangle_outbox_pending_events: self.outbox_pending_events(),
+            tangle_outbox_replayed_events_total: self.outbox_replayed_events(),
+            tangle_disk_used_bytes: self.disk_used_bytes(),
+            tangle_event_admission_latency_total_micros: self
+                .event_admission_latency_total_micros(),
+            tangle_event_admission_latency_count: self.event_admission_latency_count(),
+            tangle_query_latency_total_micros: self.query_latency_total_micros(),
+            tangle_query_latency_count: self.query_latency_count(),
         }
     }
 
@@ -939,6 +1122,86 @@ impl TangleRuntimeMetrics {
 
     pub fn rate_limit_rejections(&self) -> u64 {
         self.inner.rate_limit_rejections.load(Ordering::Relaxed)
+    }
+
+    pub fn auth_successes(&self) -> u64 {
+        self.inner.auth_successes.load(Ordering::Relaxed)
+    }
+
+    pub fn auth_failures(&self) -> u64 {
+        self.inner.auth_failures.load(Ordering::Relaxed)
+    }
+
+    pub fn event_admissions(&self) -> u64 {
+        self.inner.event_admissions.load(Ordering::Relaxed)
+    }
+
+    pub fn event_rejections(&self) -> u64 {
+        self.inner.event_rejections.load(Ordering::Relaxed)
+    }
+
+    pub fn group_read_denials(&self) -> u64 {
+        self.inner.group_read_denials.load(Ordering::Relaxed)
+    }
+
+    pub fn group_write_denials(&self) -> u64 {
+        self.inner.group_write_denials.load(Ordering::Relaxed)
+    }
+
+    pub fn event_bus_receivers_current(&self) -> usize {
+        self.inner
+            .event_bus_receivers_current
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn event_bus_published_offsets(&self) -> u64 {
+        self.inner
+            .event_bus_published_offsets
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn event_bus_lagged_receivers(&self) -> u64 {
+        self.inner
+            .event_bus_lagged_receivers
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn event_bus_lagged_offsets(&self) -> u64 {
+        self.inner.event_bus_lagged_offsets.load(Ordering::Relaxed)
+    }
+
+    pub fn outbox_pending_events(&self) -> usize {
+        self.inner.outbox_pending_events.load(Ordering::Relaxed)
+    }
+
+    pub fn outbox_replayed_events(&self) -> u64 {
+        self.inner.outbox_replayed_events.load(Ordering::Relaxed)
+    }
+
+    pub fn disk_used_bytes(&self) -> u64 {
+        self.inner.disk_used_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn event_admission_latency_total_micros(&self) -> u64 {
+        self.inner
+            .event_admission_latency_total_micros
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn event_admission_latency_count(&self) -> u64 {
+        self.inner
+            .event_admission_latency_count
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn query_latency_total_micros(&self) -> u64 {
+        self.inner
+            .query_latency_total_micros
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn query_latency_count(&self) -> u64 {
+        self.inner.query_latency_count.load(Ordering::Relaxed)
     }
 
     pub fn record_session_opened(&self) -> usize {
@@ -1012,6 +1275,94 @@ impl TangleRuntimeMetrics {
             .rate_limit_rejections
             .fetch_add(1, Ordering::Relaxed)
             + 1
+    }
+
+    pub fn record_auth_success(&self) -> u64 {
+        self.inner.auth_successes.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub fn record_auth_failure(&self) -> u64 {
+        self.inner.auth_failures.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub fn record_event_admission(&self) -> u64 {
+        self.inner.event_admissions.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub fn record_event_rejection(&self) -> u64 {
+        self.inner.event_rejections.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub fn record_group_read_denial(&self) -> u64 {
+        self.inner
+            .group_read_denials
+            .fetch_add(1, Ordering::Relaxed)
+            + 1
+    }
+
+    pub fn record_group_write_denial(&self) -> u64 {
+        self.inner
+            .group_write_denials
+            .fetch_add(1, Ordering::Relaxed)
+            + 1
+    }
+
+    pub fn record_event_bus_receivers(&self, count: usize) {
+        self.inner
+            .event_bus_receivers_current
+            .store(count, Ordering::Relaxed);
+    }
+
+    pub fn record_event_bus_publish(&self, receivers: usize) -> u64 {
+        self.record_event_bus_receivers(receivers);
+        self.inner
+            .event_bus_published_offsets
+            .fetch_add(1, Ordering::Relaxed)
+            + 1
+    }
+
+    pub fn record_event_bus_lagged(&self, skipped: u64) {
+        self.inner
+            .event_bus_lagged_receivers
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .event_bus_lagged_offsets
+            .fetch_add(skipped, Ordering::Relaxed);
+    }
+
+    pub fn record_outbox_pending_events(&self, count: usize) {
+        self.inner
+            .outbox_pending_events
+            .store(count, Ordering::Relaxed);
+    }
+
+    pub fn record_outbox_replayed_event(&self) -> u64 {
+        self.inner
+            .outbox_replayed_events
+            .fetch_add(1, Ordering::Relaxed)
+            + 1
+    }
+
+    pub fn record_disk_used_bytes(&self, bytes: u64) {
+        self.inner.disk_used_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_event_admission_latency(&self, micros: u64) {
+        self.inner
+            .event_admission_latency_total_micros
+            .fetch_add(micros, Ordering::Relaxed);
+        self.inner
+            .event_admission_latency_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_query_latency(&self, micros: u64) {
+        self.inner
+            .query_latency_total_micros
+            .fetch_add(micros, Ordering::Relaxed);
+        self.inner
+            .query_latency_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1155,7 +1506,21 @@ mod tests {
         assert_eq!(runtime.metrics().stored_event_offsets(), 1);
         assert_eq!(runtime.metrics().record_rate_limit_rejection(), 1);
         assert_eq!(runtime.metrics().rate_limit_rejections(), 1);
-        let snapshot = runtime.metrics().snapshot();
+        assert_eq!(runtime.metrics().record_auth_success(), 1);
+        assert_eq!(runtime.metrics().record_auth_failure(), 1);
+        assert_eq!(runtime.metrics().record_event_admission(), 1);
+        assert_eq!(runtime.metrics().record_event_rejection(), 1);
+        assert_eq!(runtime.metrics().record_group_read_denial(), 1);
+        assert_eq!(runtime.metrics().record_group_write_denial(), 1);
+        runtime.metrics().record_event_bus_receivers(3);
+        assert_eq!(runtime.metrics().record_event_bus_publish(3), 1);
+        runtime.metrics().record_event_bus_lagged(4);
+        runtime.metrics().record_outbox_pending_events(2);
+        assert_eq!(runtime.metrics().record_outbox_replayed_event(), 1);
+        runtime.metrics().record_disk_used_bytes(5);
+        runtime.metrics().record_event_admission_latency(13);
+        runtime.metrics().record_query_latency(17);
+        let snapshot = runtime.metrics().snapshot_with_readiness(true);
         assert_eq!(snapshot.active_sessions(), 0);
         assert_eq!(snapshot.total_sessions(), 1);
         assert_eq!(snapshot.client_messages(), 1);
@@ -1164,6 +1529,31 @@ mod tests {
         assert_eq!(snapshot.closed_subscriptions(), 1);
         assert_eq!(snapshot.stored_event_offsets(), 1);
         assert_eq!(snapshot.rate_limit_rejections(), 1);
+        let snapshot_value = serde_json::to_value(snapshot).expect("snapshot json");
+        assert_eq!(snapshot_value["tangle_readiness_ready"], true);
+        assert_eq!(snapshot_value["tangle_auth_success_total"], 1);
+        assert_eq!(snapshot_value["tangle_auth_failure_total"], 1);
+        assert_eq!(snapshot_value["tangle_event_admitted_total"], 1);
+        assert_eq!(snapshot_value["tangle_event_rejected_total"], 1);
+        assert_eq!(snapshot_value["tangle_group_read_denied_total"], 1);
+        assert_eq!(snapshot_value["tangle_group_write_denied_total"], 1);
+        assert_eq!(snapshot_value["tangle_event_bus_receivers_current"], 3);
+        assert_eq!(
+            snapshot_value["tangle_event_bus_published_offsets_total"],
+            1
+        );
+        assert_eq!(snapshot_value["tangle_event_bus_lagged_receivers_total"], 1);
+        assert_eq!(snapshot_value["tangle_event_bus_lagged_offsets_total"], 4);
+        assert_eq!(snapshot_value["tangle_outbox_pending_events"], 2);
+        assert_eq!(snapshot_value["tangle_outbox_replayed_events_total"], 1);
+        assert_eq!(snapshot_value["tangle_disk_used_bytes"], 5);
+        assert_eq!(
+            snapshot_value["tangle_event_admission_latency_total_micros"],
+            13
+        );
+        assert_eq!(snapshot_value["tangle_event_admission_latency_count"], 1);
+        assert_eq!(snapshot_value["tangle_query_latency_total_micros"], 17);
+        assert_eq!(snapshot_value["tangle_query_latency_count"], 1);
 
         let report = runtime.shutdown().expect("shutdown");
 
@@ -1172,6 +1562,27 @@ mod tests {
         assert!(*shutdown.borrow());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_metrics_snapshot_serializes_tangle_contract_keys() {
+        let metrics = super::TangleRuntimeMetrics::new();
+        metrics.record_session_opened();
+        metrics.record_auth_success();
+        metrics.record_event_admission();
+        metrics.record_event_bus_publish(1);
+        metrics.record_disk_used_bytes(42);
+        let snapshot = metrics.snapshot_with_readiness(true);
+        let value = serde_json::to_value(snapshot).expect("snapshot");
+
+        assert_eq!(value["tangle_readiness_ready"], true);
+        assert_eq!(value["tangle_ws_connections_current"], 1);
+        assert_eq!(value["tangle_auth_success_total"], 1);
+        assert_eq!(value["tangle_event_admitted_total"], 1);
+        assert_eq!(value["tangle_event_bus_published_offsets_total"], 1);
+        assert_eq!(value["tangle_disk_used_bytes"], 42);
+        assert!(value.get("active_sessions").is_none());
+        assert!(value.get("stored_event_offsets").is_none());
     }
 
     #[test]
@@ -1254,6 +1665,10 @@ mod tests {
         assert_eq!(snapshot.client_messages(), 2);
         assert_eq!(snapshot.event_messages(), 2);
         assert_eq!(snapshot.stored_event_offsets(), 1);
+        assert_eq!(handle.metrics().event_admissions(), 2);
+        assert_eq!(handle.metrics().event_bus_receivers_current(), 1);
+        assert_eq!(handle.metrics().event_bus_published_offsets(), 1);
+        assert_eq!(handle.metrics().event_admission_latency_count(), 2);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1929,6 +2344,9 @@ mod tests {
                         .contains(&event.unsigned().kind().as_u32())
             ));
         }
+        assert_eq!(handle.metrics().outbox_replayed_events(), 2);
+        assert_eq!(handle.metrics().outbox_pending_events(), 0);
+        assert_eq!(handle.metrics().event_bus_published_offsets(), 3);
         assert_eq!(
             offsets.try_recv().expect_err("only source plus generated"),
             TangleEventReceiveError::Empty

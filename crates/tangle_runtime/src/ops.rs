@@ -209,7 +209,8 @@ async fn base_relay_readyz(
 async fn base_relay_metricsz(
     State(state): State<BaseRelayOpsState>,
 ) -> Json<TangleRuntimeMetricsSnapshot> {
-    Json(state.metrics.snapshot())
+    let readiness = state.readiness.snapshot();
+    Json(state.metrics.snapshot_with_readiness(readiness.is_ready()))
 }
 
 #[cfg(test)]
@@ -247,6 +248,20 @@ mod tests {
         metrics.record_session_opened();
         metrics.record_client_message(crate::runtime::TangleClientMessageMetricKind::Req);
         metrics.record_subscription_opened();
+        metrics.record_auth_success();
+        metrics.record_auth_failure();
+        metrics.record_event_admission();
+        metrics.record_event_rejection();
+        metrics.record_group_read_denial();
+        metrics.record_group_write_denial();
+        metrics.record_event_bus_receivers(2);
+        metrics.record_event_bus_publish(2);
+        metrics.record_event_bus_lagged(3);
+        metrics.record_outbox_pending_events(5);
+        metrics.record_outbox_replayed_event();
+        metrics.record_disk_used_bytes(89);
+        metrics.record_event_admission_latency(11);
+        metrics.record_query_latency(17);
         let ready = base_relay_ops_router(readiness.clone(), metrics.clone())
             .oneshot(
                 Request::builder()
@@ -280,11 +295,80 @@ mod tests {
             .expect("body");
         let metrics_value =
             serde_json::from_slice::<serde_json::Value>(&metrics_body).expect("json");
-        assert_eq!(metrics_value["active_sessions"], 1);
-        assert_eq!(metrics_value["total_sessions"], 1);
-        assert_eq!(metrics_value["client_messages"], 1);
-        assert_eq!(metrics_value["req_messages"], 1);
-        assert_eq!(metrics_value["opened_subscriptions"], 1);
+        let keys = metrics_value
+            .as_object()
+            .expect("metrics object")
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            [
+                "tangle_auth_failure_total",
+                "tangle_auth_messages_total",
+                "tangle_auth_success_total",
+                "tangle_client_messages_total",
+                "tangle_close_messages_total",
+                "tangle_count_messages_total",
+                "tangle_disk_used_bytes",
+                "tangle_event_admission_latency_count",
+                "tangle_event_admission_latency_total_micros",
+                "tangle_event_admitted_total",
+                "tangle_event_bus_lagged_offsets_total",
+                "tangle_event_bus_lagged_receivers_total",
+                "tangle_event_bus_published_offsets_total",
+                "tangle_event_bus_receivers_current",
+                "tangle_event_messages_total",
+                "tangle_event_rejected_total",
+                "tangle_group_read_denied_total",
+                "tangle_group_write_denied_total",
+                "tangle_outbox_pending_events",
+                "tangle_outbox_replayed_events_total",
+                "tangle_query_latency_count",
+                "tangle_query_latency_total_micros",
+                "tangle_rate_limit_rejections_total",
+                "tangle_readiness_ready",
+                "tangle_req_messages_total",
+                "tangle_runtime_uptime_seconds",
+                "tangle_stored_event_offsets_total",
+                "tangle_subscriptions_closed_total",
+                "tangle_subscriptions_opened_total",
+                "tangle_ws_connections_current",
+                "tangle_ws_connections_total",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert_eq!(metrics_value["tangle_readiness_ready"], true);
+        assert_eq!(metrics_value["tangle_ws_connections_current"], 1);
+        assert_eq!(metrics_value["tangle_ws_connections_total"], 1);
+        assert_eq!(metrics_value["tangle_client_messages_total"], 1);
+        assert_eq!(metrics_value["tangle_req_messages_total"], 1);
+        assert_eq!(metrics_value["tangle_subscriptions_opened_total"], 1);
+        assert_eq!(metrics_value["tangle_auth_success_total"], 1);
+        assert_eq!(metrics_value["tangle_auth_failure_total"], 1);
+        assert_eq!(metrics_value["tangle_event_admitted_total"], 1);
+        assert_eq!(metrics_value["tangle_event_rejected_total"], 1);
+        assert_eq!(metrics_value["tangle_group_read_denied_total"], 1);
+        assert_eq!(metrics_value["tangle_group_write_denied_total"], 1);
+        assert_eq!(metrics_value["tangle_event_bus_receivers_current"], 2);
+        assert_eq!(metrics_value["tangle_event_bus_published_offsets_total"], 1);
+        assert_eq!(metrics_value["tangle_event_bus_lagged_receivers_total"], 1);
+        assert_eq!(metrics_value["tangle_event_bus_lagged_offsets_total"], 3);
+        assert_eq!(metrics_value["tangle_outbox_pending_events"], 5);
+        assert_eq!(metrics_value["tangle_outbox_replayed_events_total"], 1);
+        assert_eq!(metrics_value["tangle_disk_used_bytes"], 89);
+        assert_eq!(
+            metrics_value["tangle_event_admission_latency_total_micros"],
+            11
+        );
+        assert_eq!(metrics_value["tangle_event_admission_latency_count"], 1);
+        assert_eq!(metrics_value["tangle_query_latency_total_micros"], 17);
+        assert_eq!(metrics_value["tangle_query_latency_count"], 1);
+        let metrics_text = String::from_utf8(metrics_body.to_vec()).expect("utf8");
+        assert!(!metrics_text.contains("relay_secret"));
+        assert!(!metrics_text.contains("invite"));
 
         let not_ready = BaseRelayReadinessState::new(
             BaseRelayReadinessCheckStatus::Ready,

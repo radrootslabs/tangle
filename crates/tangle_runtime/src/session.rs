@@ -110,6 +110,9 @@ impl TangleWebSocketSession {
             let closed_subscriptions = self.subscriptions.close_all();
             metrics.record_subscriptions_closed(closed_subscriptions);
             metrics.record_session_closed();
+            metrics.record_event_bus_receivers(
+                metrics.event_bus_receivers_current().saturating_sub(1),
+            );
             logging::log_websocket_session_closed(
                 self.connection_id,
                 self.peer_ip,
@@ -162,6 +165,7 @@ impl TangleWebSocketSession {
         let closed_subscriptions = self.subscriptions.close_all();
         metrics.record_subscriptions_closed(closed_subscriptions);
         metrics.record_session_closed();
+        metrics.record_event_bus_receivers(metrics.event_bus_receivers_current().saturating_sub(1));
         logging::log_websocket_session_closed(
             self.connection_id,
             self.peer_ip,
@@ -181,7 +185,8 @@ impl TangleWebSocketSession {
                     TangleSessionControl::Stop
                 }
             }
-            Err(TangleEventReceiveError::Lagged(_)) => {
+            Err(TangleEventReceiveError::Lagged(skipped)) => {
+                self.runtime.metrics().record_event_bus_lagged(skipped);
                 TangleSessionControl::Close(event_stream_lag_close_message())
             }
             Err(TangleEventReceiveError::Closed) => TangleSessionControl::Stop,
@@ -642,10 +647,12 @@ mod tests {
         let events = runtime.event_bus().subscribe();
         assert_eq!(runtime.event_bus().publish(StoreOffset::new(1)), 1);
         assert_eq!(runtime.event_bus().publish(StoreOffset::new(2)), 1);
+        let runtime = TangleRuntimeHandle::new(runtime);
+        let metrics = runtime.metrics();
         let mut session = TangleWebSocketSession::new(
             session_limits(1),
             shutdown.subscribe(),
-            TangleRuntimeHandle::new(runtime),
+            runtime,
             auth,
             events,
         )
@@ -656,6 +663,8 @@ mod tests {
             session.handle_event_receive_result(event).await,
             TangleSessionControl::Close(event_stream_lag_close_message())
         );
+        assert_eq!(metrics.event_bus_lagged_receivers(), 1);
+        assert_eq!(metrics.event_bus_lagged_offsets(), 1);
 
         let _ = std::fs::remove_dir_all(root);
     }

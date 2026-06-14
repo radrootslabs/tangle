@@ -55,6 +55,82 @@ impl BaseRelayEventWrite {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BaseRelayQueryReport {
+    messages: Vec<RelayMessage>,
+    group_read_denied: bool,
+}
+
+impl BaseRelayQueryReport {
+    fn new(messages: Vec<RelayMessage>, group_read_denied: bool) -> Self {
+        Self {
+            messages,
+            group_read_denied,
+        }
+    }
+
+    pub(crate) fn group_read_denied(&self) -> bool {
+        self.group_read_denied
+    }
+
+    pub(crate) fn into_messages(self) -> Vec<RelayMessage> {
+        self.messages
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BaseRelayCountReport {
+    message: RelayMessage,
+    group_read_denied: bool,
+}
+
+impl BaseRelayCountReport {
+    fn new(message: RelayMessage, group_read_denied: bool) -> Self {
+        Self {
+            message,
+            group_read_denied,
+        }
+    }
+
+    pub(crate) fn group_read_denied(&self) -> bool {
+        self.group_read_denied
+    }
+
+    pub(crate) fn into_message(self) -> RelayMessage {
+        self.message
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct BaseRelayEventQueryReport {
+    events: Vec<Event>,
+    group_read_denied: bool,
+}
+
+impl BaseRelayEventQueryReport {
+    fn new(events: Vec<Event>, group_read_denied: bool) -> Self {
+        Self {
+            events,
+            group_read_denied,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BaseRelayCountEventsReport {
+    count: u64,
+    group_read_denied: bool,
+}
+
+impl BaseRelayCountEventsReport {
+    fn new(count: u64, group_read_denied: bool) -> Self {
+        Self {
+            count,
+            group_read_denied,
+        }
+    }
+}
+
 fn is_nip70_protected_event(event: &Event) -> bool {
     event
         .unsigned()
@@ -399,13 +475,13 @@ impl BaseRelay {
         }
     }
 
-    pub(crate) fn query_req_with_auth(
+    pub(crate) fn query_req_with_auth_report(
         &self,
         subscription_id: SubscriptionId,
         filters: Vec<Filter>,
         auth: &BaseAuthState,
-    ) -> Result<Vec<RelayMessage>, BaseRelayError> {
-        self.query_req_with_group_auth(
+    ) -> Result<BaseRelayQueryReport, BaseRelayError> {
+        self.query_req_with_group_auth_report(
             subscription_id,
             filters,
             &GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned()),
@@ -507,6 +583,13 @@ impl BaseRelay {
 
     pub fn group_projection(&self) -> Option<&GroupProjection> {
         self.groups.as_ref().map(|groups| groups.projection())
+    }
+
+    pub(crate) fn group_outbox_pending_events(&self) -> usize {
+        self.groups
+            .as_ref()
+            .map(GroupService::outbox_pending_events)
+            .unwrap_or(0)
     }
 
     pub fn readiness_state(&self) -> BaseRelayReadinessState {
@@ -641,23 +724,35 @@ impl BaseRelay {
         filters: Vec<Filter>,
         auth: &GroupAuthContext,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+        self.handle_req_with_group_auth_report(subscription_id, filters, auth)
+            .map(BaseRelayQueryReport::into_messages)
+    }
+
+    fn handle_req_with_group_auth_report(
+        &mut self,
+        subscription_id: SubscriptionId,
+        filters: Vec<Filter>,
+        auth: &GroupAuthContext,
+    ) -> Result<BaseRelayQueryReport, BaseRelayError> {
         self.limits.validate_subscription_id(&subscription_id)?;
         self.limits.validate_filters(&filters)?;
         self.subscriptions
             .subscribe(subscription_id.clone(), filters.clone(), auth.clone())?;
-        self.query_req_with_group_auth(subscription_id, filters, auth)
+        self.query_req_with_group_auth_report(subscription_id, filters, auth)
     }
 
-    fn query_req_with_group_auth(
+    fn query_req_with_group_auth_report(
         &self,
         subscription_id: SubscriptionId,
         filters: Vec<Filter>,
         auth: &GroupAuthContext,
-    ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+    ) -> Result<BaseRelayQueryReport, BaseRelayError> {
         self.limits.validate_subscription_id(&subscription_id)?;
         self.limits.validate_filters(&filters)?;
-        let mut messages = self
-            .query_events(&filters, auth)?
+        let report = self.query_events_report(&filters, auth)?;
+        let group_read_denied = report.group_read_denied;
+        let mut messages = report
+            .events
             .into_iter()
             .map(|event| RelayMessage::Event {
                 subscription_id: subscription_id.clone(),
@@ -665,7 +760,7 @@ impl BaseRelay {
             })
             .collect::<Vec<_>>();
         messages.push(RelayMessage::Eose(subscription_id));
-        Ok(messages)
+        Ok(BaseRelayQueryReport::new(messages, group_read_denied))
     }
 
     pub fn handle_count(
@@ -686,7 +781,17 @@ impl BaseRelay {
         filters: Vec<Filter>,
         auth: &BaseAuthState,
     ) -> Result<RelayMessage, BaseRelayError> {
-        self.handle_count_with_group_auth(
+        self.handle_count_with_auth_report(subscription_id, filters, auth)
+            .map(BaseRelayCountReport::into_message)
+    }
+
+    pub(crate) fn handle_count_with_auth_report(
+        &self,
+        subscription_id: SubscriptionId,
+        filters: Vec<Filter>,
+        auth: &BaseAuthState,
+    ) -> Result<BaseRelayCountReport, BaseRelayError> {
+        self.handle_count_with_group_auth_report(
             subscription_id,
             filters,
             &GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned()),
@@ -699,12 +804,26 @@ impl BaseRelay {
         filters: Vec<Filter>,
         auth: &GroupAuthContext,
     ) -> Result<RelayMessage, BaseRelayError> {
+        self.handle_count_with_group_auth_report(subscription_id, filters, auth)
+            .map(BaseRelayCountReport::into_message)
+    }
+
+    fn handle_count_with_group_auth_report(
+        &self,
+        subscription_id: SubscriptionId,
+        filters: Vec<Filter>,
+        auth: &GroupAuthContext,
+    ) -> Result<BaseRelayCountReport, BaseRelayError> {
         self.limits.validate_subscription_id(&subscription_id)?;
         self.limits.validate_filters(&filters)?;
-        Ok(RelayMessage::Count {
-            subscription_id,
-            count: self.count_events(&filters, auth)?,
-        })
+        let report = self.count_events_report(&filters, auth)?;
+        Ok(BaseRelayCountReport::new(
+            RelayMessage::Count {
+                subscription_id,
+                count: report.count,
+            },
+            report.group_read_denied,
+        ))
     }
 
     pub fn handle_close(&mut self, subscription_id: &SubscriptionId) -> CloseResult {
@@ -731,36 +850,55 @@ impl BaseRelay {
         filters: &[Filter],
         auth: &GroupAuthContext,
     ) -> Result<Vec<Event>, BaseRelayError> {
-        let mut output = Vec::new();
-        for filter in filters {
-            let mut events =
-                Self::sort_and_dedupe_query_events(self.query_filter_events(filter, auth)?);
-            events.truncate(self.limits.effective_filter_limit(filter));
-            output.extend(events);
-        }
-        Ok(Self::sort_and_dedupe_query_events(output))
+        self.query_events_report(filters, auth)
+            .map(|report| report.events)
     }
 
-    fn count_events(
+    fn query_events_report(
         &self,
         filters: &[Filter],
         auth: &GroupAuthContext,
-    ) -> Result<u64, BaseRelayError> {
+    ) -> Result<BaseRelayEventQueryReport, BaseRelayError> {
+        let mut output = Vec::new();
+        let mut group_read_denied = false;
+        for filter in filters {
+            let report = self.query_filter_events_report(filter, auth)?;
+            group_read_denied |= report.group_read_denied;
+            let mut events = Self::sort_and_dedupe_query_events(report.events);
+            events.truncate(self.limits.effective_filter_limit(filter));
+            output.extend(events);
+        }
+        Ok(BaseRelayEventQueryReport::new(
+            Self::sort_and_dedupe_query_events(output),
+            group_read_denied,
+        ))
+    }
+
+    fn count_events_report(
+        &self,
+        filters: &[Filter],
+        auth: &GroupAuthContext,
+    ) -> Result<BaseRelayCountEventsReport, BaseRelayError> {
         let mut seen = BTreeSet::new();
+        let mut group_read_denied = false;
         for filter in filters {
             let filter = filter.without_limit();
-            for event in self.query_filter_events(&filter, auth)? {
+            let report = self.query_filter_events_report(&filter, auth)?;
+            group_read_denied |= report.group_read_denied;
+            for event in report.events {
                 seen.insert(event.id().clone());
             }
         }
-        u64::try_from(seen.len()).map_err(|_| BaseRelayError::error("visible event count overflow"))
+        let count = u64::try_from(seen.len())
+            .map_err(|_| BaseRelayError::error("visible event count overflow"))?;
+        Ok(BaseRelayCountEventsReport::new(count, group_read_denied))
     }
 
-    fn query_filter_events(
+    fn query_filter_events_report(
         &self,
         filter: &Filter,
         auth: &GroupAuthContext,
-    ) -> Result<Vec<Event>, BaseRelayError> {
+    ) -> Result<BaseRelayEventQueryReport, BaseRelayError> {
         let pocket_filter = tangle_filter_to_pocket(filter)?;
         let screen_error = RefCell::new(None);
         let screened = self.store.find_events_with_screen(
@@ -796,11 +934,13 @@ impl BaseRelay {
         if let Some(error) = screen_error.into_inner() {
             return Err(error);
         }
-        screened
+        let group_read_denied = screened.redacted();
+        let events = screened
             .into_events()
             .into_iter()
             .map(|pocket_event| pocket_event_to_tangle(&pocket_event))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(BaseRelayEventQueryReport::new(events, group_read_denied))
     }
 
     fn sort_and_dedupe_query_events(mut events: Vec<Event>) -> Vec<Event> {

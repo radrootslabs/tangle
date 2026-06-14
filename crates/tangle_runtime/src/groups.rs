@@ -79,6 +79,10 @@ impl GroupService {
         self.limits
     }
 
+    pub(crate) fn outbox_pending_events(&self) -> usize {
+        self.outbox.replay_plan().records().len()
+    }
+
     pub(crate) fn check_event(
         &self,
         store: &PocketStoreHandle,
