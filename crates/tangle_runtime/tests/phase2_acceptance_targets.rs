@@ -1379,6 +1379,22 @@ fn runtime_count_handling_does_not_lock_relay_state() {
 }
 
 #[test]
+fn runtime_live_fanout_offset_lookup_does_not_lock_relay_state() {
+    let runtime = include_str!("../src/runtime.rs");
+    let fanout_helper = runtime
+        .split("pub(crate) async fn fanout_event_offset")
+        .nth(1)
+        .expect("fanout helper")
+        .split("pub async fn shutdown")
+        .next()
+        .expect("shutdown helper");
+
+    assert!(!fanout_helper.contains("relay.lock().await"));
+    assert!(fanout_helper.contains("self.inner.store.event_by_offset"));
+    assert!(fanout_helper.contains("BaseRelay::group_read_gate_visible_to_auth"));
+}
+
+#[test]
 fn runtime_hot_path_does_not_stringify_and_reparse_events() {
     let conversion_boundary = include_str!("../src/pocket_conversion.rs");
     for forbidden in [
