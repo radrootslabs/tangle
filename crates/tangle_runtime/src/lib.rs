@@ -8,12 +8,14 @@ pub mod nip11;
 pub mod ops;
 pub(crate) mod pocket_conversion;
 pub mod relay;
+pub mod runtime;
 
 use std::{fmt, fs, path::Path, path::PathBuf};
 
 use config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json};
 use errors::BaseRelayError;
 use ops::BaseRelayReadinessState;
+use runtime::TangleRuntime;
 
 pub const TANGLE_SUPPORTED_NIPS: [u16; 6] = [1, 11, 29, 42, 45, 70];
 pub const TANGLE_RELAY_SOFTWARE: &str = "https://github.com/radrootslabs/tangle";
@@ -90,17 +92,19 @@ pub fn open_base_relay_from_config_path(
     path: impl AsRef<Path>,
 ) -> Result<TangleRuntimeStartupReport, TangleRuntimeLoadError> {
     let config = load_base_relay_runtime_config(path)?;
-    let mut relay = config
-        .open_relay()
-        .map_err(TangleRuntimeLoadError::OpenRelay)?;
-    let readiness = relay.readiness_state();
-    relay
+    let mut runtime = TangleRuntime::open(config).map_err(TangleRuntimeLoadError::OpenRelay)?;
+    let readiness = runtime.readiness().clone();
+    runtime
         .shutdown()
         .map_err(TangleRuntimeLoadError::ShutdownRelay)?;
     Ok(TangleRuntimeStartupReport {
-        relay_url: config.relay_url().to_owned(),
-        data_directory: config.pocket_config().data_directory().to_path_buf(),
-        groups_enabled: config.groups().enabled(),
+        relay_url: runtime.config().relay_url().to_owned(),
+        data_directory: runtime
+            .config()
+            .pocket_config()
+            .data_directory()
+            .to_path_buf(),
+        groups_enabled: runtime.config().groups().enabled(),
         readiness,
     })
 }
