@@ -13,7 +13,8 @@ use tangle_groups::{
     GroupAuthContext, GroupAuthority, GroupErrorKind, GroupEventClass, GroupId, GroupMetadata,
     GroupMetadataFlags, GroupMetadataText, GroupPolicyConfig, GroupProjection, GroupReadDecision,
     GroupReadGate, GroupState, GroupWritePolicy, KIND_GROUP_ADMINS, KIND_GROUP_JOIN_REQUEST,
-    KIND_GROUP_MEMBERS, KIND_GROUP_METADATA, ProjectionOrderTuple, StoreOffset, SupportedKinds,
+    KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA, MemberState, MemberStatus,
+    ProjectionOrderTuple, StoreOffset, SupportedKinds,
 };
 use tangle_protocol::{
     Event, EventId, Kind, PublicKeyHex, RelayMessage, SignatureHex, Tag, UnixTimestamp,
@@ -350,9 +351,59 @@ fn public_join_defaults_false() {
 }
 
 #[test]
-#[ignore = "phase2 target: duplicate membership prefixes"]
 fn duplicate_join_and_leave_use_duplicate_prefix() {
-    pending("duplicate join and leave responses must use the duplicate prefix");
+    let owner = phase2_pubkey("1");
+    let member = phase2_pubkey("2");
+    let outsider = phase2_pubkey("3");
+    let mut projection = phase2_projection_with_group(
+        "Farm",
+        phase2_metadata(false, false, false, false),
+        owner.clone(),
+    );
+    projection.put_member(
+        GroupId::new("Farm").expect("group"),
+        MemberState::new(
+            member.clone(),
+            MemberStatus::Member,
+            Default::default(),
+            phase2_event_id("20"),
+            phase2_order_tuple(20, "20", 2),
+        ),
+    );
+    let authority = GroupAuthority::new([owner], Vec::<PublicKeyHex>::new());
+    let policy = GroupWritePolicy::new(
+        &projection,
+        &authority,
+        GroupPolicyConfig::new(true, false).expect("policy"),
+    );
+
+    let duplicate_join = policy
+        .check_event(
+            &phase2_group_event(KIND_GROUP_JOIN_REQUEST, "Farm", member.clone()),
+            &GroupEventClass::Normal {
+                group_id: GroupId::new("Farm").expect("group"),
+            },
+            &GroupAuthContext::new([member]),
+        )
+        .expect_err("duplicate join");
+    assert_eq!(
+        duplicate_join.prefixed_message(),
+        "duplicate: group member already exists"
+    );
+
+    let duplicate_leave = policy
+        .check_event(
+            &phase2_group_event(KIND_GROUP_LEAVE_REQUEST, "Farm", outsider.clone()),
+            &GroupEventClass::Normal {
+                group_id: GroupId::new("Farm").expect("group"),
+            },
+            &GroupAuthContext::new([outsider]),
+        )
+        .expect_err("duplicate leave");
+    assert_eq!(
+        duplicate_leave.prefixed_message(),
+        "duplicate: group member does not exist"
+    );
 }
 
 #[test]
@@ -576,11 +627,7 @@ fn phase2_projection_with_group(
         metadata,
         author,
         phase2_event_id("10"),
-        ProjectionOrderTuple::new(
-            UnixTimestamp::new(10),
-            phase2_event_id("10"),
-            StoreOffset::new(1),
-        ),
+        phase2_order_tuple(10, "10", 1),
     ));
     projection
 }
@@ -629,6 +676,14 @@ fn phase2_event_id(suffix: &str) -> EventId {
     let mut value = "0".repeat(64 - suffix.len());
     value.push_str(suffix);
     EventId::new(&value).expect("id")
+}
+
+fn phase2_order_tuple(created_at: u64, suffix: &str, offset: u64) -> ProjectionOrderTuple {
+    ProjectionOrderTuple::new(
+        UnixTimestamp::new(created_at),
+        phase2_event_id(suffix),
+        StoreOffset::new(offset),
+    )
 }
 
 fn current_unix_timestamp() -> u64 {

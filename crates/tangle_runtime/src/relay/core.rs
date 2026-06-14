@@ -1144,7 +1144,7 @@ mod tests {
                     .handle_event_with_auth(duplicate_join, &member_auth)
                     .expect("duplicate join")
             ),
-            "invalid: group member already exists"
+            "duplicate: group member already exists"
         );
 
         let leave = signed_event_at(
@@ -1175,7 +1175,7 @@ mod tests {
                     .handle_event_with_auth(duplicate_leave, &member_auth)
                     .expect("duplicate leave")
             ),
-            "invalid: group member does not exist"
+            "duplicate: group member does not exist"
         );
     }
 

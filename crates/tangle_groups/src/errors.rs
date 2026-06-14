@@ -74,6 +74,10 @@ impl GroupError {
         Self::new(kind, GroupReplyPrefix::Invalid, message)
     }
 
+    pub fn duplicate(kind: GroupErrorKind, message: impl Into<String>) -> Self {
+        Self::new(kind, GroupReplyPrefix::Duplicate, message)
+    }
+
     pub fn blocked(kind: GroupErrorKind, message: impl Into<String>) -> Self {
         Self::new(kind, GroupReplyPrefix::Blocked, message)
     }
@@ -149,6 +153,17 @@ mod tests {
         assert_eq!(
             error.prefixed_message(),
             "restricted: missing group capability manage_members"
+        );
+
+        let duplicate = GroupError::duplicate(
+            GroupErrorKind::DuplicateMember,
+            "group member already exists",
+        );
+
+        assert_eq!(duplicate.reply_prefix(), GroupReplyPrefix::Duplicate);
+        assert_eq!(
+            duplicate.prefixed_message(),
+            "duplicate: group member already exists"
         );
     }
 }

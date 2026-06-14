@@ -217,7 +217,7 @@ fn group_auth_lifecycle_membership_and_flag_flows_pass_in_process() {
                 )
                 .expect("duplicate")
         ),
-        "invalid: group member already exists"
+        "duplicate: group member already exists"
     );
 
     let leave = tangle_v2_leave_event(FixtureKey::Outsider, "Farm", 6).expect("leave");
@@ -236,7 +236,7 @@ fn group_auth_lifecycle_membership_and_flag_flows_pass_in_process() {
                 )
                 .expect("admin leave")
         ),
-        "invalid: group member does not exist"
+        "duplicate: group member does not exist"
     );
 
     let protected_remove =

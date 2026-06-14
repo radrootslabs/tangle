@@ -228,7 +228,7 @@ impl<'a> GroupWritePolicy<'a> {
     ) -> Result<GroupWriteDecision, GroupError> {
         let group = self.require_active_group(group_id)?;
         if self.is_current_member(group_id, &event.pubkey()?) {
-            return Err(GroupError::invalid(
+            return Err(GroupError::duplicate(
                 GroupErrorKind::DuplicateMember,
                 "group member already exists",
             ));
@@ -246,7 +246,7 @@ impl<'a> GroupWritePolicy<'a> {
     ) -> Result<GroupWriteDecision, GroupError> {
         self.require_active_group(group_id)?;
         if !self.is_current_member(group_id, &event.pubkey()?) {
-            return Err(GroupError::invalid(
+            return Err(GroupError::duplicate(
                 GroupErrorKind::DuplicateMember,
                 "group member does not exist",
             ));
@@ -650,18 +650,19 @@ mod tests {
                 .expect("public join"),
             GroupWriteDecision::Accept
         );
+        let duplicate_join = strict_policy
+            .check_event(
+                &event(KIND_GROUP_JOIN_REQUEST, member.clone(), vec![h("Farm")]),
+                &GroupEventClass::Normal {
+                    group_id: group("Farm"),
+                },
+                &GroupAuthContext::new([member.clone()]),
+            )
+            .expect_err("duplicate join");
+        assert_eq!(duplicate_join.kind(), GroupErrorKind::DuplicateMember);
         assert_eq!(
-            strict_policy
-                .check_event(
-                    &event(KIND_GROUP_JOIN_REQUEST, member.clone(), vec![h("Farm")]),
-                    &GroupEventClass::Normal {
-                        group_id: group("Farm")
-                    },
-                    &GroupAuthContext::new([member.clone()])
-                )
-                .expect_err("duplicate join")
-                .kind(),
-            GroupErrorKind::DuplicateMember
+            duplicate_join.prefixed_message(),
+            "duplicate: group member already exists"
         );
         assert_eq!(
             strict_policy
