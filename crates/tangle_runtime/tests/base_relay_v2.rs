@@ -1083,6 +1083,39 @@ fn pending_and_retryable_group_outbox_records_materialize_on_restart() {
 }
 
 #[test]
+fn already_stored_generated_events_mark_outbox_stored_without_duplication_on_restart() {
+    let config = test_store_config("outbox-generated-already-stored");
+    let owner_auth = authenticated(FixtureKey::Owner);
+    {
+        let mut relay = BaseRelay::open_with_groups(&config, 8, &group_config()).expect("relay");
+        accept_group_create(&mut relay, "StoredGeneratedFarm", &[], 1, &owner_auth);
+        relay.shutdown().expect("shutdown");
+    }
+    let metadata_before = stored_event_ids_for_kind(&config, KIND_GROUP_METADATA);
+    let admins_before = stored_event_ids_for_kind(&config, KIND_GROUP_ADMINS);
+    assert_eq!(metadata_before.len(), 1);
+    assert_eq!(admins_before.len(), 1);
+
+    regress_outbox_records_to_pending(&config);
+    assert_eq!(outbox_status_counts(&config).pending, 2);
+
+    let relay = BaseRelay::open_with_groups(&config, 8, &group_config()).expect("reopen");
+    assert_eq!(count_kind(&relay, KIND_GROUP_METADATA), 1);
+    assert_eq!(count_kind(&relay, KIND_GROUP_ADMINS), 1);
+    assert_eq!(
+        stored_event_ids_for_kind(&config, KIND_GROUP_METADATA),
+        metadata_before
+    );
+    assert_eq!(
+        stored_event_ids_for_kind(&config, KIND_GROUP_ADMINS),
+        admins_before
+    );
+    let counts = outbox_status_counts(&config);
+    assert_eq!(counts.pending, 0);
+    assert_eq!(counts.stored, 2);
+}
+
+#[test]
 fn same_timestamp_conflicts_are_deterministic_across_ingest_order() {
     let first = tangle_v2_group_metadata_event(FixtureKey::Owner, "ClockFarm", "Alpha", 100, &[])
         .expect("first");
@@ -1291,6 +1324,38 @@ fn regress_outbox_records_to_retryable(config: &PocketStoreConfig) {
         )
         .expect("put pending");
     store.sync().expect("sync");
+}
+
+fn regress_outbox_records_to_pending(config: &PocketStoreConfig) {
+    let store = PocketStoreHandle::open(config).expect("store");
+    for (_, value) in store
+        .scan_extra_records(TANGLE_GROUP_OUTBOX_TABLE)
+        .expect("outbox records")
+    {
+        let record = GroupOutboxRecord::from_json_bytes(&value).expect("outbox record");
+        let pending = GroupOutboxRecord::pending(record.key().clone(), record.payload().clone());
+        store
+            .put_extra_record(
+                TANGLE_GROUP_OUTBOX_TABLE,
+                &pending.key().storage_key(),
+                &pending.to_json_bytes().expect("pending bytes"),
+            )
+            .expect("put pending");
+    }
+    store.sync().expect("sync");
+}
+
+fn stored_event_ids_for_kind(config: &PocketStoreConfig, kind: u32) -> Vec<String> {
+    let store = PocketStoreHandle::open(config).expect("store");
+    let mut ids = store
+        .scan_events()
+        .expect("events")
+        .into_iter()
+        .filter(|stored| u32::from(stored.event().kind().as_u16()) == kind)
+        .map(|stored| stored.event().id().as_hex_string())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
