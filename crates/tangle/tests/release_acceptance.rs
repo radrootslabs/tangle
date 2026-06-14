@@ -13,7 +13,6 @@ fn release_acceptance_script_covers_release_candidate_validation_ladder() {
         "set -euo pipefail",
         "scripts/check.sh",
         "scripts/test.sh",
-        "cargo nextest run --workspace",
         "cargo test -p tangle_runtime --test base_relay_v2",
         "cargo test -p tangle_groups",
         "cargo test -p tangle_store_pocket",
@@ -31,6 +30,10 @@ fn release_acceptance_script_covers_release_candidate_validation_ladder() {
     assert!(
         !script.contains("scripts/coverage.sh"),
         "release acceptance must not depend on strict line coverage"
+    );
+    assert!(
+        !script.contains("cargo nextest run --workspace"),
+        "release acceptance must not require a host-local nextest install"
     );
     for removed in [
         "nip50_conformance",
