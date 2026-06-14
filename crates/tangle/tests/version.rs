@@ -145,6 +145,12 @@ fn tangle_run_starts_server_and_stays_alive_until_shutdown() {
                 "event": {
                     "per_pubkey": {"window_seconds": 60, "max_hits": 120},
                     "per_kind": {"window_seconds": 60, "max_hits": 1000}
+                },
+                "group": {
+                    "write_per_pubkey": {"window_seconds": 60, "max_hits": 60},
+                    "write_per_group": {"window_seconds": 60, "max_hits": 90},
+                    "write_per_kind": {"window_seconds": 60, "max_hits": 300},
+                    "join_flow": {"window_seconds": 300, "max_hits": 10}
                 }
             }
         })

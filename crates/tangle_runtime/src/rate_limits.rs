@@ -76,11 +76,16 @@ impl TangleRateLimitKey {
 pub struct TangleRateLimitConfig {
     auth: TangleAuthRateLimitConfig,
     event: TangleEventRateLimitConfig,
+    group: TangleGroupRateLimitConfig,
 }
 
 impl TangleRateLimitConfig {
-    pub fn new(auth: TangleAuthRateLimitConfig, event: TangleEventRateLimitConfig) -> Self {
-        Self { auth, event }
+    pub fn new(
+        auth: TangleAuthRateLimitConfig,
+        event: TangleEventRateLimitConfig,
+        group: TangleGroupRateLimitConfig,
+    ) -> Self {
+        Self { auth, event, group }
     }
 
     pub fn auth(self) -> TangleAuthRateLimitConfig {
@@ -89,6 +94,10 @@ impl TangleRateLimitConfig {
 
     pub fn event(self) -> TangleEventRateLimitConfig {
         self.event
+    }
+
+    pub fn group(self) -> TangleGroupRateLimitConfig {
+        self.group
     }
 }
 
@@ -135,6 +144,46 @@ impl TangleEventRateLimitConfig {
 
     pub fn per_kind(self) -> TangleRateLimitRule {
         self.per_kind
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TangleGroupRateLimitConfig {
+    write_per_pubkey: TangleRateLimitRule,
+    write_per_group: TangleRateLimitRule,
+    write_per_kind: TangleRateLimitRule,
+    join_flow: TangleRateLimitRule,
+}
+
+impl TangleGroupRateLimitConfig {
+    pub fn new(
+        write_per_pubkey: TangleRateLimitRule,
+        write_per_group: TangleRateLimitRule,
+        write_per_kind: TangleRateLimitRule,
+        join_flow: TangleRateLimitRule,
+    ) -> Self {
+        Self {
+            write_per_pubkey,
+            write_per_group,
+            write_per_kind,
+            join_flow,
+        }
+    }
+
+    pub fn write_per_pubkey(self) -> TangleRateLimitRule {
+        self.write_per_pubkey
+    }
+
+    pub fn write_per_group(self) -> TangleRateLimitRule {
+        self.write_per_group
+    }
+
+    pub fn write_per_kind(self) -> TangleRateLimitRule {
+        self.write_per_kind
+    }
+
+    pub fn join_flow(self) -> TangleRateLimitRule {
+        self.join_flow
     }
 }
 
@@ -289,9 +338,9 @@ fn reset_at(rule: TangleRateLimitRule, now: UnixTimestamp) -> UnixTimestamp {
 #[cfg(test)]
 mod tests {
     use super::{
-        TangleAuthRateLimitConfig, TangleEventRateLimitConfig, TangleRateLimitConfig,
-        TangleRateLimitDecision, TangleRateLimitKey, TangleRateLimitRule, TangleRateLimitScope,
-        TangleRateLimiter,
+        TangleAuthRateLimitConfig, TangleEventRateLimitConfig, TangleGroupRateLimitConfig,
+        TangleRateLimitConfig, TangleRateLimitDecision, TangleRateLimitKey, TangleRateLimitRule,
+        TangleRateLimitScope, TangleRateLimiter,
     };
     use std::net::{IpAddr, Ipv4Addr};
     use tangle_groups::GroupId;
@@ -452,14 +501,23 @@ mod tests {
         let auth_failures = TangleRateLimitRule::new(300, 3).expect("auth failures");
         let event_pubkey = TangleRateLimitRule::new(60, 4).expect("event pubkey");
         let event_kind = TangleRateLimitRule::new(60, 5).expect("event kind");
+        let group_pubkey = TangleRateLimitRule::new(60, 6).expect("group pubkey");
+        let group_write = TangleRateLimitRule::new(60, 7).expect("group write");
+        let group_kind = TangleRateLimitRule::new(60, 8).expect("group kind");
+        let group_join = TangleRateLimitRule::new(300, 9).expect("group join");
         let config = TangleRateLimitConfig::new(
             TangleAuthRateLimitConfig::new(auth_pubkey, auth_failures),
             TangleEventRateLimitConfig::new(event_pubkey, event_kind),
+            TangleGroupRateLimitConfig::new(group_pubkey, group_write, group_kind, group_join),
         );
 
         assert_eq!(config.auth().per_pubkey(), auth_pubkey);
         assert_eq!(config.auth().failures(), auth_failures);
         assert_eq!(config.event().per_pubkey(), event_pubkey);
         assert_eq!(config.event().per_kind(), event_kind);
+        assert_eq!(config.group().write_per_pubkey(), group_pubkey);
+        assert_eq!(config.group().write_per_group(), group_write);
+        assert_eq!(config.group().write_per_kind(), group_kind);
+        assert_eq!(config.group().join_flow(), group_join);
     }
 }

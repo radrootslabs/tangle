@@ -23,7 +23,7 @@ use std::{
     },
     time::Instant,
 };
-use tangle_groups::StoreOffset;
+use tangle_groups::{KIND_GROUP_JOIN_REQUEST, StoreOffset, validate_client_group_event_structure};
 use tangle_protocol::{ClientMessage, Event, Filter, RelayMessage, SubscriptionId, UnixTimestamp};
 use tokio::sync::{Mutex, watch};
 
@@ -149,6 +149,55 @@ impl TangleRuntime {
         )
     }
 
+    fn rate_limit_group_write(&self, event: &Event, now: UnixTimestamp) -> Option<RelayMessage> {
+        if !self.config.groups().enabled() {
+            return None;
+        }
+        let class =
+            validate_client_group_event_structure(event, self.config.groups().limits()).ok()?;
+        let group_id = class.group_id()?.clone();
+        let rules = self.config.rate_limits().group();
+        if event.unsigned().kind().as_u32() == KIND_GROUP_JOIN_REQUEST
+            && let Some(message) = self.rate_limit_ok(
+                event,
+                TangleRateLimitKey::join_flow(group_id.clone(), event.unsigned().pubkey().clone()),
+                rules.join_flow(),
+                "group join",
+                now,
+            )
+        {
+            return Some(message);
+        }
+        if let Some(message) = self.rate_limit_ok(
+            event,
+            TangleRateLimitKey::pubkey(
+                TangleRateLimitScope::GroupWrite,
+                event.unsigned().pubkey().clone(),
+            ),
+            rules.write_per_pubkey(),
+            "group pubkey",
+            now,
+        ) {
+            return Some(message);
+        }
+        if let Some(message) = self.rate_limit_ok(
+            event,
+            TangleRateLimitKey::group(TangleRateLimitScope::GroupWrite, group_id),
+            rules.write_per_group(),
+            "group write",
+            now,
+        ) {
+            return Some(message);
+        }
+        self.rate_limit_ok(
+            event,
+            TangleRateLimitKey::kind(TangleRateLimitScope::GroupWrite, event.unsigned().kind()),
+            rules.write_per_kind(),
+            "group kind",
+            now,
+        )
+    }
+
     fn rate_limit_ok(
         &self,
         event: &Event,
@@ -197,6 +246,9 @@ impl TangleRuntimeHandle {
         match message {
             ClientMessage::Event(event) => {
                 if let Some(message) = runtime.rate_limit_event(&event, now) {
+                    return Ok(vec![message]);
+                }
+                if let Some(message) = runtime.rate_limit_group_write(&event, now) {
                     return Ok(vec![message]);
                 }
                 let result = runtime
@@ -472,9 +524,12 @@ mod tests {
     use crate::relay::live::LiveSubscriptionSet;
     use serde_json::json;
     use std::path::{Path, PathBuf};
-    use tangle_groups::{GroupAuthContext, KIND_GROUP_ADMINS, KIND_GROUP_METADATA, StoreOffset};
+    use tangle_groups::{
+        GroupAuthContext, GroupId, KIND_GROUP_ADMINS, KIND_GROUP_JOIN_REQUEST, KIND_GROUP_METADATA,
+        StoreOffset,
+    };
     use tangle_protocol::{
-        ClientMessage, RelayMessage, SubscriptionId, UnixTimestamp, filter_from_value,
+        ClientMessage, RelayMessage, SubscriptionId, Tag, UnixTimestamp, filter_from_value,
     };
     use tangle_test_support::{
         FixtureKey, tangle_v2_auth_event, tangle_v2_event, tangle_v2_group_create_event,
@@ -773,6 +828,182 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_rate_limits_group_writes_by_pubkey() {
+        let root = temp_root("runtime-group-pubkey-rate-limit");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let event = tangle_v2_event(
+            FixtureKey::Member,
+            1_714_124_433,
+            1,
+            vec![Tag::from_parts("h", &["Farm"]).expect("h")],
+            "limited",
+        )
+        .expect("event");
+        let rule = runtime.config().rate_limits().group().write_per_pubkey();
+        let key = TangleRateLimitKey::pubkey(
+            TangleRateLimitScope::GroupWrite,
+            event.unsigned().pubkey().clone(),
+        );
+        for _ in 0..rule.max_hits() {
+            runtime
+                .rate_limiter()
+                .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
+        }
+        let handle = TangleRuntimeHandle::new(runtime);
+        let mut auth = handle.auth_state().await.expect("auth");
+
+        assert_eq!(
+            handle
+                .handle_client_message(
+                    ClientMessage::Event(event.clone()),
+                    &mut auth,
+                    UnixTimestamp::new(1_714_124_433)
+                )
+                .await
+                .expect("event"),
+            vec![RelayMessage::Ok {
+                event_id: event.id().clone(),
+                accepted: false,
+                message: "rate-limited: group pubkey rate limit exceeded until 1714124493"
+                    .to_owned()
+            }]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_rate_limits_group_writes_by_group_id() {
+        let root = temp_root("runtime-group-write-rate-limit");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let group_id = GroupId::new("Farm").expect("group");
+        let event = tangle_v2_event(
+            FixtureKey::Member,
+            1_714_124_433,
+            1,
+            vec![Tag::from_parts("h", &[group_id.as_str()]).expect("h")],
+            "limited",
+        )
+        .expect("event");
+        let rule = runtime.config().rate_limits().group().write_per_group();
+        let key = TangleRateLimitKey::group(TangleRateLimitScope::GroupWrite, group_id);
+        for _ in 0..rule.max_hits() {
+            runtime
+                .rate_limiter()
+                .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
+        }
+        let handle = TangleRuntimeHandle::new(runtime);
+        let mut auth = handle.auth_state().await.expect("auth");
+
+        assert_eq!(
+            handle
+                .handle_client_message(
+                    ClientMessage::Event(event.clone()),
+                    &mut auth,
+                    UnixTimestamp::new(1_714_124_433)
+                )
+                .await
+                .expect("event"),
+            vec![RelayMessage::Ok {
+                event_id: event.id().clone(),
+                accepted: false,
+                message: "rate-limited: group write rate limit exceeded until 1714124493"
+                    .to_owned()
+            }]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_rate_limits_group_writes_by_kind() {
+        let root = temp_root("runtime-group-kind-rate-limit");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let event = tangle_v2_event(
+            FixtureKey::Member,
+            1_714_124_433,
+            1,
+            vec![Tag::from_parts("h", &["Farm"]).expect("h")],
+            "limited",
+        )
+        .expect("event");
+        let rule = runtime.config().rate_limits().group().write_per_kind();
+        let key =
+            TangleRateLimitKey::kind(TangleRateLimitScope::GroupWrite, event.unsigned().kind());
+        for _ in 0..rule.max_hits() {
+            runtime
+                .rate_limiter()
+                .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
+        }
+        let handle = TangleRuntimeHandle::new(runtime);
+        let mut auth = handle.auth_state().await.expect("auth");
+
+        assert_eq!(
+            handle
+                .handle_client_message(
+                    ClientMessage::Event(event.clone()),
+                    &mut auth,
+                    UnixTimestamp::new(1_714_124_433)
+                )
+                .await
+                .expect("event"),
+            vec![RelayMessage::Ok {
+                event_id: event.id().clone(),
+                accepted: false,
+                message: "rate-limited: group kind rate limit exceeded until 1714124493".to_owned()
+            }]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_rate_limits_group_join_flows() {
+        let root = temp_root("runtime-group-join-rate-limit");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let group_id = GroupId::new("Farm").expect("group");
+        let event = tangle_v2_event(
+            FixtureKey::Member,
+            1_714_124_433,
+            KIND_GROUP_JOIN_REQUEST.into(),
+            vec![Tag::from_parts("h", &[group_id.as_str()]).expect("h")],
+            "",
+        )
+        .expect("event");
+        let rule = runtime.config().rate_limits().group().join_flow();
+        let key = TangleRateLimitKey::join_flow(group_id, event.unsigned().pubkey().clone());
+        for _ in 0..rule.max_hits() {
+            runtime
+                .rate_limiter()
+                .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
+        }
+        let handle = TangleRuntimeHandle::new(runtime);
+        let mut auth = handle.auth_state().await.expect("auth");
+
+        assert_eq!(
+            handle
+                .handle_client_message(
+                    ClientMessage::Event(event.clone()),
+                    &mut auth,
+                    UnixTimestamp::new(1_714_124_433)
+                )
+                .await
+                .expect("event"),
+            vec![RelayMessage::Ok {
+                event_id: event.id().clone(),
+                accepted: false,
+                message: "rate-limited: group join rate limit exceeded until 1714124733".to_owned()
+            }]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn runtime_publishes_generated_group_event_offsets_for_live_fanout() {
         let root = temp_root("runtime-generated-offset-fanout");
         let _ = std::fs::remove_dir_all(&root);
@@ -903,6 +1134,12 @@ mod tests {
                 "event": {
                     "per_pubkey": {"window_seconds": 60, "max_hits": 120},
                     "per_kind": {"window_seconds": 60, "max_hits": 1000}
+                },
+                "group": {
+                    "write_per_pubkey": {"window_seconds": 60, "max_hits": 60},
+                    "write_per_group": {"window_seconds": 60, "max_hits": 90},
+                    "write_per_kind": {"window_seconds": 60, "max_hits": 300},
+                    "join_flow": {"window_seconds": 300, "max_hits": 10}
                 }
             }
         })
