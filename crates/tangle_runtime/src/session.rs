@@ -3,6 +3,7 @@
 use crate::{
     errors::BaseRelayError,
     event_bus::{TangleEventReceiveError, TangleEventReceiver},
+    logging,
     relay::{
         auth::{BaseAuthState, generate_auth_challenge},
         live::LiveSubscriptionSet,
@@ -99,7 +100,14 @@ impl TangleWebSocketSession {
     }
 
     pub async fn run(mut self, mut socket: WebSocket) {
+        logging::log_websocket_session_opened(self.connection_id, self.peer_ip);
         if !self.issue_auth_challenge() {
+            let closed_subscriptions = self.subscriptions.close_all();
+            logging::log_websocket_session_closed(
+                self.connection_id,
+                self.peer_ip,
+                closed_subscriptions,
+            );
             return;
         }
         loop {
@@ -144,7 +152,12 @@ impl TangleWebSocketSession {
                 }
             }
         }
-        self.subscriptions.close_all();
+        let closed_subscriptions = self.subscriptions.close_all();
+        logging::log_websocket_session_closed(
+            self.connection_id,
+            self.peer_ip,
+            closed_subscriptions,
+        );
     }
 
     async fn handle_event_receive_result(
@@ -299,6 +312,7 @@ impl TangleWebSocketSession {
             filters.clone(),
             GroupAuthContext::new(self.auth.authenticated_pubkeys().iter().cloned()),
         )?;
+        logging::log_subscription_opened(self.connection_id, &subscription_id);
         match self
             .runtime
             .query_req_with_auth(subscription_id.clone(), filters, &self.auth)

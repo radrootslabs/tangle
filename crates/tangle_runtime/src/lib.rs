@@ -5,6 +5,7 @@ pub mod config;
 pub mod errors;
 pub mod event_bus;
 pub mod groups;
+pub mod logging;
 pub mod nip11;
 pub mod ops;
 pub(crate) mod pocket_conversion;

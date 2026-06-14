@@ -2,6 +2,7 @@
 
 use crate::{
     errors::BaseRelayError,
+    logging,
     nip11::{BaseRelayInfoConfig, BaseRelayInfoDocument, base_relay_info_response},
     ops::{BaseRelayReadinessState, base_relay_ops_router},
     runtime::{TangleRuntime, TangleRuntimeHandle, TangleRuntimeLimits, TangleShutdownSignal},
@@ -59,6 +60,7 @@ pub async fn serve_listener_until_shutdown(
     let listen_addr = listener
         .local_addr()
         .map_err(|error| BaseRelayError::error(error.to_string()))?;
+    let relay_url = runtime.config().relay_url().to_owned();
     let info =
         BaseRelayInfoConfig::new("tangle", runtime.config().groups().clone())?.build_document()?;
     let readiness = runtime.readiness_state().clone();
@@ -73,6 +75,7 @@ pub async fn serve_listener_until_shutdown(
         runtime.clone(),
     );
     let mut shutdown = shutdown_signal.subscribe();
+    logging::log_server_listening(listen_addr, &relay_url);
     axum::serve(
         listener,
         router.into_make_service_with_connect_info::<SocketAddr>(),
@@ -90,6 +93,7 @@ pub async fn serve_listener_until_shutdown(
     .await
     .map_err(|error| BaseRelayError::error(error.to_string()))?;
     let shutdown = runtime.shutdown().await?;
+    logging::log_server_shutdown(listen_addr, shutdown.closed_subscriptions());
     Ok(TangleServeReport::new(
         listen_addr,
         shutdown.closed_subscriptions(),

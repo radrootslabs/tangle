@@ -4,6 +4,7 @@ use crate::{
     config::BaseRelayRuntimeConfig,
     errors::BaseRelayError,
     event_bus::{TangleEventBus, TangleEventReceiver},
+    logging,
     ops::BaseRelayReadinessState,
     rate_limits::{
         TangleQueryRateLimitConfig, TangleRateLimitDecision, TangleRateLimitKey,
@@ -76,6 +77,7 @@ impl TangleRuntime {
         let relay = config.open_relay()?;
         let readiness = relay.readiness_state();
         let rate_limiter = TangleRateLimiter::new();
+        logging::log_runtime_opened(&config);
         Ok(Self {
             config,
             relay,
@@ -357,13 +359,16 @@ impl TangleRuntime {
     ) -> Option<RelayMessage> {
         match self.rate_limiter.record(key, rule, now) {
             TangleRateLimitDecision::Allowed { .. } => None,
-            TangleRateLimitDecision::Rejected { reset_at } => Some(RelayMessage::Closed {
-                subscription_id: subscription_id.clone(),
-                message: BaseRelayError::rate_limited(format!(
-                    "{label} {dimension} rate limit exceeded until {reset_at}"
-                ))
-                .prefixed_message(),
-            }),
+            TangleRateLimitDecision::Rejected { reset_at } => {
+                logging::log_rate_limit_rejected(label, dimension, reset_at);
+                Some(RelayMessage::Closed {
+                    subscription_id: subscription_id.clone(),
+                    message: BaseRelayError::rate_limited(format!(
+                        "{label} {dimension} rate limit exceeded until {reset_at}"
+                    ))
+                    .prefixed_message(),
+                })
+            }
         }
     }
 
@@ -377,14 +382,17 @@ impl TangleRuntime {
     ) -> Option<RelayMessage> {
         match self.rate_limiter.record(key, rule, now) {
             TangleRateLimitDecision::Allowed { .. } => None,
-            TangleRateLimitDecision::Rejected { reset_at } => Some(RelayMessage::Ok {
-                event_id: event.id().clone(),
-                accepted: false,
-                message: BaseRelayError::rate_limited(format!(
-                    "{label} rate limit exceeded until {reset_at}"
-                ))
-                .prefixed_message(),
-            }),
+            TangleRateLimitDecision::Rejected { reset_at } => {
+                logging::log_rate_limit_rejected(label, "event", reset_at);
+                Some(RelayMessage::Ok {
+                    event_id: event.id().clone(),
+                    accepted: false,
+                    message: BaseRelayError::rate_limited(format!(
+                        "{label} rate limit exceeded until {reset_at}"
+                    ))
+                    .prefixed_message(),
+                })
+            }
         }
     }
 }
@@ -430,6 +438,7 @@ impl TangleRuntimeHandle {
         let mut runtime = self.inner.lock().await;
         match message {
             ClientMessage::Event(event) => {
+                let event_id = event.id().clone();
                 if let Some(message) = runtime.rate_limit_event(&event, now) {
                     return Ok(vec![message]);
                 }
@@ -442,6 +451,13 @@ impl TangleRuntimeHandle {
                 for offset in result.stored_offsets() {
                     runtime.metrics().record_stored_event_offset();
                     runtime.event_bus().publish(*offset);
+                }
+                if !result.stored_offsets().is_empty() {
+                    logging::log_event_stored(
+                        &event_id,
+                        result.stored_offsets().len(),
+                        runtime.metrics().stored_event_offsets(),
+                    );
                 }
                 Ok(vec![result.into_message()])
             }

@@ -148,8 +148,13 @@ pub fn require_config_path(invocation: &TangleInvocation) -> Result<&str, Tangle
 pub async fn run_with_config(
     config_path: &str,
 ) -> Result<tangle_runtime::server::TangleServeReport, String> {
-    let runtime = tangle_runtime::open_tangle_runtime_from_config_path(config_path)
+    let config = tangle_runtime::load_base_relay_runtime_config(config_path)
         .map_err(|error| error.to_string())?;
+    tangle_runtime::logging::init_tangle_tracing(config.tracing())
+        .map_err(|error| error.to_string())?;
+    tangle_runtime::logging::log_runtime_config_loaded(&config);
+    let runtime =
+        tangle_runtime::runtime::TangleRuntime::open(config).map_err(|error| error.to_string())?;
     tangle_runtime::server::serve_until_shutdown(runtime)
         .await
         .map_err(|error| error.to_string())

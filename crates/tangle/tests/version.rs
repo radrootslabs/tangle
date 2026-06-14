@@ -203,7 +203,10 @@ fn tangle_run_starts_server_and_stays_alive_until_shutdown() {
     let output = child.stop().expect("stop child");
 
     assert!(output.stdout.is_empty());
-    assert!(output.stderr.is_empty());
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(stderr.contains(r#""event":"runtime_config_loaded""#));
+    assert!(stderr.contains(r#""relay_secret":"<redacted>""#));
+    assert!(!stderr.contains(TANGLE_V2_RELAY_SECRET_HEX));
 
     std::fs::remove_dir_all(&root).expect("remove runtime root");
 }
