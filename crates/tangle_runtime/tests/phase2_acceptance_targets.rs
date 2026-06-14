@@ -1334,12 +1334,114 @@ fn projection_and_outbox_recover_from_canonical_pocket_events() {
     pending("projection and outbox recovery must rebuild from canonical Pocket events");
 }
 
-#[test]
-#[ignore = "phase2 target: generated broadcast"]
-fn relay_generated_events_are_stored_projected_recovered_and_broadcast() {
-    pending(
-        "relay-generated group events must be stored projected recovered and broadcast by offset",
+#[tokio::test]
+async fn relay_generated_events_are_stored_projected_and_broadcast_to_websocket_clients() {
+    let root = temp_root("acceptance-generated-websocket");
+    let _ = std::fs::remove_dir_all(&root);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let runtime = TangleRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let shutdown = runtime.shutdown_signal().clone();
+    let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
+    let mut owner = connect_nostr_socket(address).await;
+    let mut observer = connect_nostr_socket(address).await;
+    let owner_challenge = read_auth_challenge(&mut owner).await;
+    let _ = read_auth_challenge(&mut observer).await;
+    authenticate_client(
+        &mut owner,
+        FixtureKey::Owner,
+        &owner_challenge,
+        current_unix_timestamp(),
+    )
+    .await;
+
+    send_client_value(
+        &mut observer,
+        json!([
+            "REQ",
+            "generated-state-live",
+            {"kinds":[KIND_GROUP_METADATA, KIND_GROUP_ADMINS, KIND_GROUP_MEMBERS], "#d":["GeneratedSocket"]}
+        ]),
+    )
+    .await;
+    assert_eq!(
+        read_relay_value(&mut observer).await,
+        json!(["EOSE", "generated-state-live"])
     );
+
+    let create =
+        tangle_v2_group_create_event(FixtureKey::Owner, "GeneratedSocket", 1_714_124_460, &[])
+            .expect("create");
+    send_client_value(&mut owner, json!(["EVENT", event_to_value(&create)])).await;
+    assert_ok(read_relay_value(&mut owner).await, &create, true, "");
+    let create_generated_kinds = [
+        relay_event_kind_tag(
+            read_relay_value(&mut observer).await,
+            "generated-state-live",
+            "d",
+            "GeneratedSocket",
+        ),
+        relay_event_kind_tag(
+            read_relay_value(&mut observer).await,
+            "generated-state-live",
+            "d",
+            "GeneratedSocket",
+        ),
+    ];
+    assert!(create_generated_kinds.contains(&KIND_GROUP_METADATA));
+    assert!(create_generated_kinds.contains(&KIND_GROUP_ADMINS));
+    assert_count_message(
+        &mut observer,
+        "generated-metadata-count",
+        json!({"kinds":[KIND_GROUP_METADATA], "#d":["GeneratedSocket"]}),
+        1,
+    )
+    .await;
+    assert_count_message(
+        &mut observer,
+        "generated-admins-count",
+        json!({"kinds":[KIND_GROUP_ADMINS], "#d":["GeneratedSocket"]}),
+        1,
+    )
+    .await;
+
+    let put_member = tangle_v2_put_user_event(
+        FixtureKey::Owner,
+        "GeneratedSocket",
+        FixtureKey::Member,
+        1_714_124_461,
+    )
+    .expect("put member");
+    send_client_value(&mut owner, json!(["EVENT", event_to_value(&put_member)])).await;
+    assert_ok(read_relay_value(&mut owner).await, &put_member, true, "");
+    assert_eq!(
+        relay_event_kind_tag(
+            read_relay_value(&mut observer).await,
+            "generated-state-live",
+            "d",
+            "GeneratedSocket",
+        ),
+        KIND_GROUP_MEMBERS
+    );
+    assert_count_message(
+        &mut observer,
+        "generated-members-count",
+        json!({"kinds":[KIND_GROUP_MEMBERS], "#d":["GeneratedSocket"]}),
+        1,
+    )
+    .await;
+
+    shutdown.request_shutdown();
+    read_websocket_close(&mut owner).await;
+    read_websocket_close(&mut observer).await;
+    let report = timeout(Duration::from_secs(2), task)
+        .await
+        .expect("shutdown timeout")
+        .expect("task")
+        .expect("serve");
+    assert_eq!(report.listen_addr(), address);
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 fn pending(target: &str) {
@@ -1616,9 +1718,20 @@ fn assert_relay_event_kind_tag(
     tag_name: &str,
     tag_value: &str,
 ) {
+    assert_eq!(
+        relay_event_kind_tag(value, subscription_id, tag_name, tag_value),
+        kind
+    );
+}
+
+fn relay_event_kind_tag(
+    value: Value,
+    subscription_id: &str,
+    tag_name: &str,
+    tag_value: &str,
+) -> u32 {
     assert_eq!(value[0], "EVENT");
     assert_eq!(value[1], subscription_id);
-    assert_eq!(value[2]["kind"], json!(kind));
     let tags = value[2]["tags"].as_array().expect("tags");
     assert!(tags.iter().any(|tag| {
         let Some(parts) = tag.as_array() else {
@@ -1627,6 +1740,7 @@ fn assert_relay_event_kind_tag(
         parts.first().and_then(Value::as_str) == Some(tag_name)
             && parts.get(1).and_then(Value::as_str) == Some(tag_value)
     }));
+    u32::try_from(value[2]["kind"].as_u64().expect("event kind")).expect("event kind fits u32")
 }
 
 fn phase2_projection_with_group(
