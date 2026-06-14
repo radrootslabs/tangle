@@ -1053,49 +1053,73 @@ fn validation_summary(
     thresholds: BenchmarkThresholds,
 ) -> Result<BTreeMap<String, String>, String> {
     let mut summary = BTreeMap::new();
-    summary.insert(
-        SCENARIO_POCKET_QUERY_VISIBLE_EVENTS.to_owned(),
-        status(
-            scenario(scenarios, SCENARIO_POCKET_QUERY_VISIBLE_EVENTS)?
-                .pass_latency_gate(thresholds.pocket_query_p95_micros),
-        ),
-    );
-    summary.insert(
-        SCENARIO_GROUP_READ_GATE_OVERHEAD.to_owned(),
-        status(
-            scenario(scenarios, SCENARIO_GROUP_READ_GATE_OVERHEAD)?
-                .pass_latency_gate(thresholds.read_gate_p95_micros),
-        ),
-    );
-    summary.insert(
-        SCENARIO_PROJECTION_REBUILD.to_owned(),
-        status(
-            scenario(scenarios, SCENARIO_PROJECTION_REBUILD)?
-                .pass_elapsed_gate(thresholds.projection_rebuild_elapsed_micros),
-        ),
-    );
-    summary.insert(
-        SCENARIO_OUTBOX_REPLAY.to_owned(),
-        status(
-            scenario(scenarios, SCENARIO_OUTBOX_REPLAY)?
-                .pass_elapsed_gate(thresholds.outbox_replay_elapsed_micros),
-        ),
-    );
-    summary.insert(
-        SCENARIO_BROADCAST_LAG.to_owned(),
-        status(
-            scenario(scenarios, SCENARIO_BROADCAST_LAG)?
-                .pass_latency_gate(thresholds.broadcast_lag_p95_micros),
-        ),
-    );
-    summary.insert(
-        SCENARIO_MEMORY_PROFILE.to_owned(),
-        status(
-            scenario(scenarios, SCENARIO_MEMORY_PROFILE)?
-                .pass_memory_gate(thresholds.memory_profile_max_bytes),
-        ),
-    );
-    Ok(summary)
+    let mut failures = Vec::new();
+    if let Some(failure) = record_threshold_status(
+        &mut summary,
+        SCENARIO_POCKET_QUERY_VISIBLE_EVENTS,
+        scenario(scenarios, SCENARIO_POCKET_QUERY_VISIBLE_EVENTS)?
+            .pass_latency_gate(thresholds.pocket_query_p95_micros),
+    ) {
+        failures.push(failure);
+    }
+    if let Some(failure) = record_threshold_status(
+        &mut summary,
+        SCENARIO_GROUP_READ_GATE_OVERHEAD,
+        scenario(scenarios, SCENARIO_GROUP_READ_GATE_OVERHEAD)?
+            .pass_latency_gate(thresholds.read_gate_p95_micros),
+    ) {
+        failures.push(failure);
+    }
+    if let Some(failure) = record_threshold_status(
+        &mut summary,
+        SCENARIO_PROJECTION_REBUILD,
+        scenario(scenarios, SCENARIO_PROJECTION_REBUILD)?
+            .pass_elapsed_gate(thresholds.projection_rebuild_elapsed_micros),
+    ) {
+        failures.push(failure);
+    }
+    if let Some(failure) = record_threshold_status(
+        &mut summary,
+        SCENARIO_OUTBOX_REPLAY,
+        scenario(scenarios, SCENARIO_OUTBOX_REPLAY)?
+            .pass_elapsed_gate(thresholds.outbox_replay_elapsed_micros),
+    ) {
+        failures.push(failure);
+    }
+    if let Some(failure) = record_threshold_status(
+        &mut summary,
+        SCENARIO_BROADCAST_LAG,
+        scenario(scenarios, SCENARIO_BROADCAST_LAG)?
+            .pass_latency_gate(thresholds.broadcast_lag_p95_micros),
+    ) {
+        failures.push(failure);
+    }
+    if let Some(failure) = record_threshold_status(
+        &mut summary,
+        SCENARIO_MEMORY_PROFILE,
+        scenario(scenarios, SCENARIO_MEMORY_PROFILE)?
+            .pass_memory_gate(thresholds.memory_profile_max_bytes),
+    ) {
+        failures.push(failure);
+    }
+    if failures.is_empty() {
+        Ok(summary)
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+fn record_threshold_status(
+    summary: &mut BTreeMap<String, String>,
+    name: &str,
+    passed: bool,
+) -> Option<String> {
+    summary.insert(name.to_owned(), status(passed));
+    if passed {
+        None
+    } else {
+        Some(format!("scenario `{name}` failed benchmark threshold"))
+    }
 }
 
 fn scenario<'a>(scenarios: &'a [ScenarioReport], name: &str) -> Result<&'a ScenarioReport, String> {
@@ -1249,9 +1273,9 @@ fn lower_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         BenchDataset, BenchDatasetConfig, BenchGroupVisibility, BenchmarkRunReport,
-        SCENARIO_BROADCAST_LAG, SCENARIO_GROUP_READ_GATE_OVERHEAD, SCENARIO_MEMORY_PROFILE,
-        SCENARIO_OUTBOX_REPLAY, SCENARIO_POCKET_QUERY_VISIBLE_EVENTS, SCENARIO_PROJECTION_REBUILD,
-        generated_state_counts, materialize_dataset,
+        BenchmarkThresholds, SCENARIO_BROADCAST_LAG, SCENARIO_GROUP_READ_GATE_OVERHEAD,
+        SCENARIO_MEMORY_PROFILE, SCENARIO_OUTBOX_REPLAY, SCENARIO_POCKET_QUERY_VISIBLE_EVENTS,
+        SCENARIO_PROJECTION_REBUILD, ScenarioReport, generated_state_counts, materialize_dataset,
     };
     use std::collections::BTreeSet;
     use tangle_groups::{GroupId, KIND_GROUP_ADMINS, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA};
@@ -1364,6 +1388,36 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_threshold_validation_rejects_missing_or_failed_scenarios() {
+        let scenarios = vec![
+            passing_scenario(SCENARIO_POCKET_QUERY_VISIBLE_EVENTS),
+            ScenarioReport::new(
+                SCENARIO_GROUP_READ_GATE_OVERHEAD,
+                1,
+                1,
+                0,
+                10,
+                vec![BenchmarkThresholds::smoke().read_gate_p95_micros + 1],
+                128,
+            ),
+            passing_scenario(SCENARIO_PROJECTION_REBUILD),
+            passing_scenario(SCENARIO_OUTBOX_REPLAY),
+            passing_scenario(SCENARIO_BROADCAST_LAG),
+            passing_scenario(SCENARIO_MEMORY_PROFILE),
+        ];
+        let failed =
+            super::validation_summary(&scenarios, BenchmarkThresholds::smoke()).expect_err("fail");
+        assert!(failed.contains(SCENARIO_GROUP_READ_GATE_OVERHEAD));
+
+        let missing = super::validation_summary(
+            &scenarios[..scenarios.len() - 1],
+            BenchmarkThresholds::smoke(),
+        )
+        .expect_err("missing");
+        assert!(missing.contains(SCENARIO_MEMORY_PROFILE));
+    }
+
+    #[test]
     fn benchmark_summary_json_matches_report_template_surface() {
         let report =
             BenchmarkRunReport::run(BenchDatasetConfig::new(3, 1, 1, 1, 1)).expect("report");
@@ -1441,5 +1495,9 @@ mod tests {
         for group in dataset.groups() {
             GroupId::new(group.id()).expect("group id");
         }
+    }
+
+    fn passing_scenario(name: &str) -> ScenarioReport {
+        ScenarioReport::new(name, 1, 1, 0, 10, vec![1], 128)
     }
 }
