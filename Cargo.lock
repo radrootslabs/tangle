@@ -4321,13 +4321,11 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "sha2",
- "tangle_nips",
+ "tangle_groups",
  "tangle_protocol",
  "tangle_runtime",
- "tangle_store",
- "tangle_store_surreal",
+ "tangle_store_pocket",
  "tangle_test_support",
- "tokio",
 ]
 
 [[package]]

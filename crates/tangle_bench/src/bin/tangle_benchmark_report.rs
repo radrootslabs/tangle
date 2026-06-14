@@ -1,151 +1,71 @@
 #![forbid(unsafe_code)]
 
-use serde_json::json;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tangle_bench::{
-    BenchDatasetConfig, capture_query_plans, run_ingest_benchmark, run_listing_query_benchmark,
-    run_rebuild_benchmark, run_restore_drill_smoke, run_search_benchmark,
-};
+use tangle_bench::{BenchDatasetConfig, BenchmarkRunReport};
 use tangle_runtime::TANGLE_SUPPORTED_NIPS;
 
 struct BenchmarkReportArgs {
     output_root: PathBuf,
     run_id: String,
-    listing_count: usize,
-    note_count: usize,
+    config: BenchDatasetConfig,
 }
 
 fn main() {
-    let result = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| error.to_string())
-        .and_then(|runtime| runtime.block_on(run()));
-    if let Err(error) = result {
-        eprintln!("{error}");
-        std::process::exit(1);
+    match run() {
+        Ok(Some(artifact_dir)) => println!("{}", path_string(&artifact_dir)),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
     }
 }
 
-async fn run() -> Result<(), String> {
-    let args = BenchmarkReportArgs::parse(env::args().skip(1))?;
+fn run() -> Result<Option<PathBuf>, String> {
+    let Some(args) = BenchmarkReportArgs::parse(env::args().skip(1))? else {
+        println!("{}", help_text());
+        return Ok(None);
+    };
     let artifact_dir = args.output_root.join(&args.run_id);
     fs::create_dir_all(&artifact_dir).map_err(|error| error.to_string())?;
-    let config = BenchDatasetConfig::new(args.listing_count, args.note_count);
 
-    let ingest = run_ingest_benchmark(config).await?;
-    let listing = run_listing_query_benchmark(config).await?;
-    let search = run_search_benchmark(config).await?;
-    let query_plans = capture_query_plans(config).await?;
-    let rebuild = run_rebuild_benchmark(config).await?;
-    let restore = run_restore_drill_smoke(config).await?;
+    let report = BenchmarkRunReport::run(args.config)?;
+    let dataset_path = artifact_dir.join("dataset-events.jsonl");
+    fs::write(
+        &dataset_path,
+        report
+            .dataset()
+            .source_events_jsonl()
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
 
-    let listing_plan_path = artifact_dir.join("listing-query-plan.txt");
-    let search_plan_path = artifact_dir.join("search-query-plan.txt");
-    fs::write(&listing_plan_path, &query_plans.listing_plan_text)
-        .map_err(|error| error.to_string())?;
-    fs::write(&search_plan_path, &query_plans.search_plan_text)
-        .map_err(|error| error.to_string())?;
-
-    let expected_events = (args.listing_count + args.note_count) as u64;
-    let benchmark_smoke = ingest.attempted == expected_events
-        && ingest.inserted == expected_events
-        && listing.listing_rows == args.listing_count as u64
-        && listing.limited_rows <= listing.listing_rows
-        && search.indexed == args.listing_count as u64
-        && search.text_results > 0
-        && search.browse_results > 0
-        && rebuild.scanned == args.listing_count as u64
-        && rebuild.rebuilt == rebuild.scanned
-        && rebuild.projected == rebuild.scanned
-        && rebuild.listing_rows == args.listing_count as u64
-        && rebuild.checksum.len() == 64;
-    let query_plan_capture =
-        query_plans.listing_plan_steps > 0 && query_plans.search_plan_steps > 0;
-    let restore_drill_smoke = restore.exported == args.listing_count as u64
-        && restore.restored == restore.exported
-        && restore.checksum_matches;
-
-    let summary = json!({
-        "schema": 1,
-        "run_id": args.run_id,
-        "artifact_directory": path_string(&artifact_dir),
-        "surrealdb_mode": "memory",
-        "dataset": {
-            "listing_count": args.listing_count,
-            "note_count": args.note_count,
-            "fixture_builder_family": "tangle_test_support canonical event builders"
-        },
-        "artifacts": {
-            "summary_json": "summary.json",
-            "listing_query_plan": "listing-query-plan.txt",
-            "search_query_plan": "search-query-plan.txt"
-        },
-        "ingest": {
-            "attempted": ingest.attempted,
-            "inserted": ingest.inserted,
-            "elapsed_micros": elapsed(ingest.elapsed_micros)
-        },
-        "listing_query": {
-            "listing_rows": listing.listing_rows,
-            "limited_rows": listing.limited_rows,
-            "elapsed_micros": elapsed(listing.elapsed_micros)
-        },
-        "search": {
-            "indexed": search.indexed,
-            "text_results": search.text_results,
-            "browse_results": search.browse_results,
-            "elapsed_micros": elapsed(search.elapsed_micros)
-        },
-        "query_plan_capture": {
-            "listing_plan_steps": query_plans.listing_plan_steps,
-            "search_plan_steps": query_plans.search_plan_steps,
-            "listing_plan_text": "listing-query-plan.txt",
-            "search_plan_text": "search-query-plan.txt"
-        },
-        "rebuild": {
-            "scanned": rebuild.scanned,
-            "rebuilt": rebuild.rebuilt,
-            "projected": rebuild.projected,
-            "listing_rows": rebuild.listing_rows,
-            "checksum": rebuild.checksum,
-            "elapsed_micros": elapsed(rebuild.elapsed_micros)
-        },
-        "restore_drill": {
-            "exported": restore.exported,
-            "restored": restore.restored,
-            "source_checksum": restore.source_checksum,
-            "restored_checksum": restore.restored_checksum,
-            "checksum_matches": restore.checksum_matches
-        },
-        "supported_nips_audit": {
-            "supported_nips": TANGLE_SUPPORTED_NIPS,
-            "count": TANGLE_SUPPORTED_NIPS.len()
-        },
-        "validation_summary": {
-            "benchmark_smoke": status(benchmark_smoke),
-            "restore_drill_smoke": status(restore_drill_smoke),
-            "query_plan_capture": status(query_plan_capture),
-            "coverage_diagnostic": "not_run_by_release_acceptance"
-        }
+    let mut summary = report.summary_json(&args.run_id, &artifact_dir);
+    summary["supported_nips_audit"] = serde_json::json!({
+        "supported_nips": TANGLE_SUPPORTED_NIPS,
+        "count": TANGLE_SUPPORTED_NIPS.len()
     });
+    summary["run_identity"] = serde_json::json!({
+        "git_commit": git_short_commit(),
+        "rust_toolchain": rust_toolchain(),
+        "host_profile": host_profile()
+    });
+
     let summary_path = artifact_dir.join("summary.json");
     let raw = serde_json::to_string_pretty(&summary).map_err(|error| error.to_string())?;
     fs::write(&summary_path, format!("{raw}\n")).map_err(|error| error.to_string())?;
-    println!("{}", path_string(&artifact_dir));
-    Ok(())
+    Ok(Some(artifact_dir))
 }
 
 impl BenchmarkReportArgs {
-    fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
+    fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Self>, String> {
         let mut output_root = PathBuf::from(".local/tangle/benchmarks");
         let mut run_id = None;
-        let mut listing_count = 12;
-        let mut note_count = 4;
+        let mut config = BenchDatasetConfig::smoke();
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -155,24 +75,35 @@ impl BenchmarkReportArgs {
                 "--run-id" => {
                     run_id = Some(require_value("--run-id", args.next())?);
                 }
-                "--listing-count" => {
-                    listing_count = parse_count("--listing-count", args.next())?;
+                "--group-count" => {
+                    config.group_count = parse_count("--group-count", args.next())?;
                 }
-                "--note-count" => {
-                    note_count = parse_count("--note-count", args.next())?;
+                "--public-events-per-group" => {
+                    config.public_events_per_group =
+                        parse_count("--public-events-per-group", args.next())?;
                 }
-                "--help" => return Err(help_text()),
+                "--private-events-per-group" => {
+                    config.private_events_per_group =
+                        parse_count("--private-events-per-group", args.next())?;
+                }
+                "--public-note-count" => {
+                    config.public_note_count = parse_count("--public-note-count", args.next())?;
+                }
+                "--member-count" => {
+                    config.member_count = parse_count("--member-count", args.next())?;
+                }
+                "--help" => return Ok(None),
                 other => return Err(format!("unsupported argument `{other}`")),
             }
         }
         let run_id = run_id.unwrap_or_else(default_run_id);
         validate_run_id(&run_id)?;
-        Ok(Self {
+        let config = config.validate()?;
+        Ok(Some(Self {
             output_root,
             run_id,
-            listing_count,
-            note_count,
-        })
+            config,
+        }))
     }
 }
 
@@ -205,23 +136,28 @@ fn unix_seconds() -> u64 {
 }
 
 fn git_short_commit() -> String {
-    Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
+    command_text("git", &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn rust_toolchain() -> String {
+    command_text("rustc", &["--version"]).unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn host_profile() -> String {
+    let os = env::consts::OS;
+    let arch = env::consts::ARCH;
+    format!("{os}-{arch}")
+}
+
+fn command_text(command: &str, args: &[&str]) -> Option<String> {
+    Command::new(command)
+        .args(args)
         .output()
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "unknown".to_owned())
-}
-
-fn status(value: bool) -> &'static str {
-    if value { "pass" } else { "fail" }
-}
-
-fn elapsed(value: u128) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn path_string(path: &Path) -> String {
@@ -231,7 +167,9 @@ fn path_string(path: &Path) -> String {
 fn help_text() -> String {
     [
         "usage: tangle-benchmark-report [--output-root PATH] [--run-id ID]",
-        "       [--listing-count COUNT] [--note-count COUNT]",
+        "       [--group-count COUNT] [--public-events-per-group COUNT]",
+        "       [--private-events-per-group COUNT] [--public-note-count COUNT]",
+        "       [--member-count COUNT]",
     ]
     .join("\n")
 }
