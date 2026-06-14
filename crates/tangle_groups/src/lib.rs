@@ -153,6 +153,110 @@ impl Default for GroupRedactionConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupPolicyConfig {
+    #[serde(default)]
+    public_join: bool,
+    #[serde(default)]
+    invites_enabled: bool,
+}
+
+impl GroupPolicyConfig {
+    pub fn strict() -> Self {
+        Self {
+            public_join: false,
+            invites_enabled: false,
+        }
+    }
+
+    pub fn new(public_join: bool, invites_enabled: bool) -> Result<Self, GroupConfigError> {
+        let value = Self {
+            public_join,
+            invites_enabled,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), GroupConfigError> {
+        if self.invites_enabled {
+            return Err(GroupConfigError::invalid(
+                "groups.policy.invites_enabled is not supported until invite flow is implemented",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn public_join(&self) -> bool {
+        self.public_join
+    }
+
+    pub fn invites_enabled(&self) -> bool {
+        self.invites_enabled
+    }
+}
+
+impl Default for GroupPolicyConfig {
+    fn default() -> Self {
+        Self::strict()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupRuntimeSettingsConfig {
+    policy: GroupPolicyConfig,
+    redaction: GroupRedactionConfig,
+    limits: GroupLimitsConfig,
+}
+
+impl GroupRuntimeSettingsConfig {
+    pub fn strict() -> Self {
+        Self {
+            policy: GroupPolicyConfig::strict(),
+            redaction: GroupRedactionConfig::strict(),
+            limits: GroupLimitsConfig::default(),
+        }
+    }
+
+    pub fn new(
+        policy: GroupPolicyConfig,
+        redaction: GroupRedactionConfig,
+        limits: GroupLimitsConfig,
+    ) -> Result<Self, GroupConfigError> {
+        let value = Self {
+            policy,
+            redaction,
+            limits,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), GroupConfigError> {
+        self.policy.validate()?;
+        self.limits.validate()
+    }
+
+    pub fn policy(&self) -> GroupPolicyConfig {
+        self.policy
+    }
+
+    pub fn redaction(&self) -> GroupRedactionConfig {
+        self.redaction
+    }
+
+    pub fn limits(&self) -> GroupLimitsConfig {
+        self.limits
+    }
+}
+
+impl Default for GroupRuntimeSettingsConfig {
+    fn default() -> Self {
+        Self::strict()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub struct GroupLimitsConfig {
     #[serde(default = "default_max_group_id_bytes")]
     max_group_id_bytes: u16,
@@ -246,8 +350,7 @@ pub struct GroupRuntimeConfig {
     relay_secret: Option<RelaySecret>,
     owner_pubkeys: Vec<PublicKeyHex>,
     admin_pubkeys: Vec<PublicKeyHex>,
-    redaction: GroupRedactionConfig,
-    limits: GroupLimitsConfig,
+    settings: GroupRuntimeSettingsConfig,
 }
 
 impl GroupRuntimeConfig {
@@ -258,8 +361,7 @@ impl GroupRuntimeConfig {
             relay_secret: None,
             owner_pubkeys: Vec::new(),
             admin_pubkeys: Vec::new(),
-            redaction: GroupRedactionConfig::default(),
-            limits: GroupLimitsConfig::default(),
+            settings: GroupRuntimeSettingsConfig::default(),
         }
     }
 
@@ -269,10 +371,9 @@ impl GroupRuntimeConfig {
         relay_secret: Option<RelaySecret>,
         owner_pubkeys: Vec<PublicKeyHex>,
         admin_pubkeys: Vec<PublicKeyHex>,
-        redaction: GroupRedactionConfig,
-        limits: GroupLimitsConfig,
+        settings: GroupRuntimeSettingsConfig,
     ) -> Result<Self, GroupConfigError> {
-        limits.validate()?;
+        settings.validate()?;
         if enabled && canonical_relay_url.is_none() {
             return Err(GroupConfigError::invalid(
                 "groups.canonical_relay_url is required when groups are enabled",
@@ -289,8 +390,7 @@ impl GroupRuntimeConfig {
             relay_secret,
             owner_pubkeys,
             admin_pubkeys,
-            redaction,
-            limits,
+            settings,
         })
     }
 
@@ -314,12 +414,16 @@ impl GroupRuntimeConfig {
         &self.admin_pubkeys
     }
 
+    pub fn policy(&self) -> GroupPolicyConfig {
+        self.settings.policy()
+    }
+
     pub fn redaction(&self) -> GroupRedactionConfig {
-        self.redaction
+        self.settings.redaction()
     }
 
     pub fn limits(&self) -> GroupLimitsConfig {
-        self.limits
+        self.settings.limits()
     }
 }
 
@@ -358,6 +462,8 @@ struct GroupRuntimeConfigDocument {
     #[serde(default)]
     admin_pubkeys: Vec<String>,
     #[serde(default)]
+    policy: GroupPolicyConfig,
+    #[serde(default)]
     redaction: GroupRedactionConfig,
     #[serde(default)]
     limits: GroupLimitsConfig,
@@ -383,8 +489,7 @@ pub fn parse_group_runtime_config_json(raw: &str) -> Result<GroupRuntimeConfig, 
         relay_secret,
         parse_pubkeys("groups.owner_pubkeys", document.owner_pubkeys)?,
         parse_pubkeys("groups.admin_pubkeys", document.admin_pubkeys)?,
-        document.redaction,
-        document.limits,
+        GroupRuntimeSettingsConfig::new(document.policy, document.redaction, document.limits)?,
     )
 }
 
@@ -456,7 +561,8 @@ fn default_max_outbox_replay_batch() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CanonicalRelayUrl, GroupLimitsConfig, RelaySecret, parse_group_runtime_config_json,
+        CanonicalRelayUrl, GroupLimitsConfig, GroupPolicyConfig, RelaySecret,
+        parse_group_runtime_config_json,
     };
 
     #[test]
@@ -481,6 +587,7 @@ mod tests {
                 "relay_secret": "{secret}",
                 "owner_pubkeys": ["{owner}"],
                 "admin_pubkeys": ["{admin}"],
+                "policy": {{"public_join": false, "invites_enabled": false}},
                 "redaction": {{"redact_private_tags": true, "redact_invite_codes": true}},
                 "limits": {{
                     "max_group_id_bytes": 64,
@@ -501,6 +608,9 @@ mod tests {
         );
         assert_eq!(config.owner_pubkeys().len(), 1);
         assert_eq!(config.admin_pubkeys().len(), 1);
+        assert_eq!(config.policy(), GroupPolicyConfig::strict());
+        assert!(!config.policy().public_join());
+        assert!(!config.policy().invites_enabled());
         assert!(config.redaction().redact_private_tags());
         assert!(config.redaction().redact_invite_codes());
         assert_eq!(config.limits().max_group_id_bytes(), 64);
@@ -517,6 +627,34 @@ mod tests {
         assert!(!config.enabled());
         assert!(config.canonical_relay_url().is_none());
         assert!(config.relay_secret().is_none());
+        assert_eq!(config.policy(), GroupPolicyConfig::strict());
+    }
+
+    #[test]
+    fn group_policy_rejects_enabled_invites_until_invite_flow_exists() {
+        let error = parse_group_runtime_config_json(
+            r#"{"enabled": false, "policy": {"invites_enabled": true}}"#,
+        )
+        .expect_err("invites");
+
+        assert_eq!(
+            error.message(),
+            "groups.policy.invites_enabled is not supported until invite flow is implemented"
+        );
+    }
+
+    #[test]
+    fn group_policy_rejects_compatibility_fields() {
+        let error = parse_group_runtime_config_json(
+            r#"{"enabled": false, "policy": {"compat_zooid_closed_means_restricted": true}}"#,
+        )
+        .expect_err("compat");
+
+        assert!(
+            error
+                .message()
+                .contains("unknown field `compat_zooid_closed_means_restricted`")
+        );
     }
 
     #[test]

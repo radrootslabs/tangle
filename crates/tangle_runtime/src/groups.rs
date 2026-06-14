@@ -9,9 +9,9 @@ use tangle_crypto::RelaySigner;
 use tangle_groups::{
     GroupAuthContext, GroupAuthority, GroupError, GroupErrorKind, GroupEventClass,
     GroupEventDeletion, GroupGeneratedEventBuilder, GroupId, GroupLimitsConfig, GroupOutbox,
-    GroupOutboxEffect, GroupOutboxKey, GroupOutboxPayload, GroupOutboxRecord, GroupProjection,
-    GroupReadDecision, GroupReadGate, GroupRuntimeConfig, GroupState, GroupTombstone,
-    KIND_GROUP_CREATE_GROUP, KIND_GROUP_DELETE_EVENT, KIND_GROUP_EDIT_METADATA,
+    GroupOutboxEffect, GroupOutboxKey, GroupOutboxPayload, GroupOutboxRecord, GroupPolicyConfig,
+    GroupProjection, GroupReadDecision, GroupReadGate, GroupRuntimeConfig, GroupState,
+    GroupTombstone, KIND_GROUP_CREATE_GROUP, KIND_GROUP_DELETE_EVENT, KIND_GROUP_EDIT_METADATA,
     KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_PUT_USER,
     KIND_GROUP_REMOVE_USER, MemberState, ProjectedRoleDefinition, ProjectionCheckpoint,
     StoreOffset, event_deletion_key, event_view::GroupEventView, group_current_key,
@@ -28,6 +28,7 @@ pub(crate) struct GroupService {
     authority: GroupAuthority,
     projection: GroupProjection,
     outbox: GroupOutbox,
+    policy: GroupPolicyConfig,
     limits: GroupLimitsConfig,
     member_snapshot_cap: u32,
 }
@@ -53,6 +54,7 @@ impl GroupService {
             ),
             projection: load_group_projection(store)?,
             outbox: load_group_outbox(store)?,
+            policy: config.policy(),
             limits: config.limits(),
             member_snapshot_cap: config.limits().max_member_list_pubkeys(),
         };
@@ -76,7 +78,7 @@ impl GroupService {
         class: &GroupEventClass,
         auth: &GroupAuthContext,
     ) -> Result<(), GroupError> {
-        tangle_groups::GroupWritePolicy::new(&self.projection, &self.authority)
+        tangle_groups::GroupWritePolicy::new(&self.projection, &self.authority, self.policy)
             .check_event(event, class, auth)
             .map(|_| ())?;
         self.check_runtime_write_constraints(store, event, class)

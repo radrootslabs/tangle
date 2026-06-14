@@ -6,9 +6,10 @@ use k256::schnorr::{Signature, SigningKey};
 use tangle_crypto::{RelaySigner, compute_event_id};
 use tangle_groups::{
     CanonicalRelayUrl, GroupGeneratedEventBuilder, GroupLimitsConfig, GroupOutboxPayload,
-    GroupRedactionConfig, GroupRuntimeConfig, KIND_GROUP_CREATE_GROUP, KIND_GROUP_DELETE_EVENT,
-    KIND_GROUP_DELETE_GROUP, KIND_GROUP_EDIT_METADATA, KIND_GROUP_JOIN_REQUEST,
-    KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_PUT_USER, KIND_GROUP_REMOVE_USER, RelaySecret,
+    GroupPolicyConfig, GroupRedactionConfig, GroupRuntimeConfig, GroupRuntimeSettingsConfig,
+    KIND_GROUP_CREATE_GROUP, KIND_GROUP_DELETE_EVENT, KIND_GROUP_DELETE_GROUP,
+    KIND_GROUP_EDIT_METADATA, KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST,
+    KIND_GROUP_PUT_USER, KIND_GROUP_REMOVE_USER, RelaySecret,
 };
 use tangle_protocol::{
     Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -87,8 +88,12 @@ pub fn tangle_v2_group_config(
         Some(RelaySecret::from_hex(TANGLE_V2_RELAY_SECRET_HEX).map_err(|error| error.to_string())?),
         vec![owner.public_key()],
         admins.iter().map(|admin| admin.public_key()).collect(),
-        GroupRedactionConfig::strict(),
-        GroupLimitsConfig::default(),
+        GroupRuntimeSettingsConfig::new(
+            GroupPolicyConfig::strict(),
+            GroupRedactionConfig::strict(),
+            GroupLimitsConfig::default(),
+        )
+        .map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())
 }

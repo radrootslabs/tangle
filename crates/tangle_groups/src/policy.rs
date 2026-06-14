@@ -2,11 +2,11 @@ use std::collections::BTreeSet;
 
 use crate::{
     Capability, CapabilitySet, GroupError, GroupErrorKind, GroupEventClass, GroupId,
-    GroupLifecycleState, GroupProjection, KIND_GROUP_CREATE_GROUP, KIND_GROUP_CREATE_INVITE,
-    KIND_GROUP_DELETE_EVENT, KIND_GROUP_DELETE_GROUP, KIND_GROUP_EDIT_METADATA,
-    KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_PUT_USER, KIND_GROUP_REMOVE_USER,
-    MemberStatus, RoleDefinition, RoleName, SupportedKinds, event_view::GroupEventView,
-    require_group_auth_as_author, resolve_capabilities,
+    GroupLifecycleState, GroupPolicyConfig, GroupProjection, KIND_GROUP_CREATE_GROUP,
+    KIND_GROUP_CREATE_INVITE, KIND_GROUP_DELETE_EVENT, KIND_GROUP_DELETE_GROUP,
+    KIND_GROUP_EDIT_METADATA, KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST,
+    KIND_GROUP_PUT_USER, KIND_GROUP_REMOVE_USER, MemberStatus, RoleDefinition, RoleName,
+    SupportedKinds, event_view::GroupEventView, require_group_auth_as_author, resolve_capabilities,
 };
 use tangle_protocol::PublicKeyHex;
 
@@ -62,13 +62,19 @@ pub enum GroupWriteDecision {
 pub struct GroupWritePolicy<'a> {
     projection: &'a GroupProjection,
     authority: &'a GroupAuthority,
+    policy: GroupPolicyConfig,
 }
 
 impl<'a> GroupWritePolicy<'a> {
-    pub fn new(projection: &'a GroupProjection, authority: &'a GroupAuthority) -> Self {
+    pub fn new(
+        projection: &'a GroupProjection,
+        authority: &'a GroupAuthority,
+        policy: GroupPolicyConfig,
+    ) -> Self {
         Self {
             projection,
             authority,
+            policy,
         }
     }
 
@@ -123,7 +129,7 @@ impl<'a> GroupWritePolicy<'a> {
             return self.check_create_group(event, group_id);
         }
         let group = self.require_active_group(group_id)?;
-        if kind == KIND_GROUP_CREATE_INVITE {
+        if kind == KIND_GROUP_CREATE_INVITE && !self.policy.invites_enabled() {
             return Err(GroupError::restricted(
                 GroupErrorKind::MissingCapability,
                 "invites not enabled",
@@ -389,8 +395,8 @@ mod tests {
     use super::{GroupAuthority, GroupWriteDecision, GroupWritePolicy};
     use crate::{
         Capability, CapabilitySet, GroupAuthContext, GroupErrorKind, GroupEventClass, GroupId,
-        GroupMetadata, GroupMetadataFlags, GroupMetadataText, GroupProjection, GroupState,
-        KIND_GROUP_CREATE_GROUP, KIND_GROUP_CREATE_INVITE, KIND_GROUP_DELETE_GROUP,
+        GroupMetadata, GroupMetadataFlags, GroupMetadataText, GroupPolicyConfig, GroupProjection,
+        GroupState, KIND_GROUP_CREATE_GROUP, KIND_GROUP_CREATE_INVITE, KIND_GROUP_DELETE_GROUP,
         KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_REMOVE_USER, MemberState,
         MemberStatus, ProjectedRoleDefinition, ProjectionOrderTuple, RoleDefinition, RoleName,
         StoreOffset, SupportedKinds,
@@ -405,7 +411,7 @@ mod tests {
         let owner = pubkey("1");
         let author = pubkey("2");
         let authority = GroupAuthority::new([owner.clone()], Vec::<PublicKeyHex>::new());
-        let policy = GroupWritePolicy::new(&projection, &authority);
+        let policy = GroupWritePolicy::new(&projection, &authority, GroupPolicyConfig::strict());
         let create_by_non_owner = event(KIND_GROUP_CREATE_GROUP, author.clone(), vec![h("Farm")]);
         let class = GroupEventClass::Moderation {
             kind: create_by_non_owner.unsigned().kind(),
@@ -451,7 +457,7 @@ mod tests {
             group_id: group_id.clone(),
         };
         let authority = GroupAuthority::new([owner.clone()], Vec::<PublicKeyHex>::new());
-        let policy = GroupWritePolicy::new(&projection, &authority);
+        let policy = GroupWritePolicy::new(&projection, &authority, GroupPolicyConfig::strict());
         let create = event(KIND_GROUP_CREATE_GROUP, owner.clone(), vec![h("Farm")]);
 
         assert_eq!(
@@ -467,7 +473,7 @@ mod tests {
             .apply_canonical_event(&delete, StoreOffset::new(2), Default::default())
             .expect("delete");
         let authority = GroupAuthority::new([owner.clone()], Vec::<PublicKeyHex>::new());
-        let policy = GroupWritePolicy::new(&projection, &authority);
+        let policy = GroupWritePolicy::new(&projection, &authority, GroupPolicyConfig::strict());
         let normal = event(1, owner.clone(), vec![h("Farm")]);
 
         assert_eq!(
@@ -503,7 +509,7 @@ mod tests {
         );
         put_member(&mut projection, "Farm", member.clone(), []);
         let authority = GroupAuthority::new([owner], Vec::<PublicKeyHex>::new());
-        let policy = GroupWritePolicy::new(&projection, &authority);
+        let policy = GroupWritePolicy::new(&projection, &authority, GroupPolicyConfig::strict());
 
         assert_eq!(
             policy
@@ -559,7 +565,7 @@ mod tests {
         );
         put_member(&mut projection, "Farm", moderator.clone(), [moderator_role]);
         let authority = GroupAuthority::new([owner], [protected.clone()]);
-        let policy = GroupWritePolicy::new(&projection, &authority);
+        let policy = GroupWritePolicy::new(&projection, &authority, GroupPolicyConfig::strict());
 
         assert_eq!(
             policy
@@ -610,7 +616,7 @@ mod tests {
         );
         put_member(&mut projection, "Farm", member.clone(), []);
         let authority = GroupAuthority::new([owner], Vec::<PublicKeyHex>::new());
-        let policy = GroupWritePolicy::new(&projection, &authority);
+        let policy = GroupWritePolicy::new(&projection, &authority, GroupPolicyConfig::strict());
 
         assert_eq!(
             policy
@@ -661,7 +667,7 @@ mod tests {
             owner.clone(),
         );
         let authority = GroupAuthority::new([owner], Vec::<PublicKeyHex>::new());
-        let policy = GroupWritePolicy::new(&projection, &authority);
+        let policy = GroupWritePolicy::new(&projection, &authority, GroupPolicyConfig::strict());
 
         assert_eq!(
             policy
@@ -687,7 +693,7 @@ mod tests {
             owner.clone(),
         );
         let authority = GroupAuthority::new([owner.clone()], Vec::<PublicKeyHex>::new());
-        let policy = GroupWritePolicy::new(&projection, &authority);
+        let policy = GroupWritePolicy::new(&projection, &authority, GroupPolicyConfig::strict());
         let invite = event(KIND_GROUP_CREATE_INVITE, owner.clone(), vec![h("Farm")]);
 
         let error = policy
