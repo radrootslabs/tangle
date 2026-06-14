@@ -4,7 +4,7 @@ use crate::{
     errors::BaseRelayError,
     nip11::{BaseRelayInfoConfig, BaseRelayInfoDocument, base_relay_info_response},
     ops::{BaseRelayReadinessState, base_relay_ops_router},
-    runtime::{TangleRuntime, TangleShutdownSignal},
+    runtime::{TangleRuntime, TangleRuntimeHandle, TangleShutdownSignal},
     session::TangleWebSocketSession,
 };
 use axum::{
@@ -53,7 +53,7 @@ pub async fn serve_until_shutdown(
 }
 
 pub async fn serve_listener_until_shutdown(
-    mut runtime: TangleRuntime,
+    runtime: TangleRuntime,
     listener: TcpListener,
 ) -> Result<TangleServeReport, BaseRelayError> {
     let listen_addr = listener
@@ -61,13 +61,18 @@ pub async fn serve_listener_until_shutdown(
         .map_err(|error| BaseRelayError::error(error.to_string()))?;
     let info =
         BaseRelayInfoConfig::new("tangle", runtime.config().groups().clone())?.build_document()?;
+    let readiness = runtime.readiness_state().clone();
+    let outbound_queue_capacity = runtime.limits().outbound_queue_capacity();
+    let shutdown_signal = runtime.shutdown_signal().clone();
+    let runtime = TangleRuntimeHandle::new(runtime);
     let router = tangle_http_router(
-        runtime.readiness_state().clone(),
+        readiness,
         info,
-        runtime.limits().outbound_queue_capacity(),
-        runtime.shutdown_signal().clone(),
+        outbound_queue_capacity,
+        shutdown_signal.clone(),
+        runtime.clone(),
     );
-    let mut shutdown = runtime.shutdown_signal().subscribe();
+    let mut shutdown = shutdown_signal.subscribe();
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             loop {
@@ -81,7 +86,7 @@ pub async fn serve_listener_until_shutdown(
         })
         .await
         .map_err(|error| BaseRelayError::error(error.to_string()))?;
-    let shutdown = runtime.shutdown()?;
+    let shutdown = runtime.shutdown().await?;
     Ok(TangleServeReport::new(
         listen_addr,
         shutdown.closed_subscriptions(),
@@ -93,6 +98,7 @@ pub fn tangle_http_router(
     info: BaseRelayInfoDocument,
     outbound_queue_capacity: usize,
     shutdown: TangleShutdownSignal,
+    runtime: TangleRuntimeHandle,
 ) -> Router {
     Router::new()
         .route("/", get(tangle_root))
@@ -100,6 +106,7 @@ pub fn tangle_http_router(
             info,
             outbound_queue_capacity,
             shutdown,
+            runtime,
         })
         .merge(base_relay_ops_router(readiness))
 }
@@ -109,6 +116,7 @@ struct TangleHttpState {
     info: BaseRelayInfoDocument,
     outbound_queue_capacity: usize,
     shutdown: TangleShutdownSignal,
+    runtime: TangleRuntimeHandle,
 }
 
 async fn tangle_root(
@@ -117,10 +125,14 @@ async fn tangle_root(
     headers: HeaderMap,
 ) -> Response {
     match websocket {
-        Ok(websocket) => match TangleWebSocketSession::new(
-            state.outbound_queue_capacity,
-            state.shutdown.subscribe(),
-        ) {
+        Ok(websocket) => match state.runtime.auth_state().await.and_then(|auth| {
+            TangleWebSocketSession::new(
+                state.outbound_queue_capacity,
+                state.shutdown.subscribe(),
+                state.runtime.clone(),
+                auth,
+            )
+        }) {
             Ok(session) => websocket
                 .protocols(["nostr"])
                 .on_upgrade(move |socket| session.run(socket))
@@ -142,13 +154,15 @@ mod tests {
         config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
         nip11::BaseRelayInfoConfig,
         ops::BaseRelayReadinessState,
-        runtime::{TangleRuntime, TangleShutdownSignal},
+        runtime::{TangleRuntime, TangleRuntimeHandle, TangleShutdownSignal},
     };
     use axum::body::to_bytes;
-    use futures_util::StreamExt;
+    use futures_util::{SinkExt, StreamExt};
     use http::{Request, header};
     use serde_json::json;
     use std::path::{Path, PathBuf};
+    use tangle_protocol::event_to_value;
+    use tangle_test_support::{FixtureKey, tangle_v2_auth_event, tangle_v2_event};
     use tokio::net::TcpListener;
     use tokio::time::{Duration, timeout};
     use tokio_tungstenite::tungstenite::{
@@ -252,6 +266,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_session_dispatches_base_client_messages() {
+        let root = temp_root("websocket-dispatch");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntime::open(runtime_config(&root)).expect("runtime");
+        let shutdown = runtime.shutdown_signal().clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("address");
+        let task = tokio::spawn(super::serve_listener_until_shutdown(runtime, listener));
+        let mut request = format!("ws://{address}/")
+            .into_client_request()
+            .expect("request");
+        request.headers_mut().insert(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            http::HeaderValue::from_static("nostr"),
+        );
+        let (mut socket, response) = tokio_tungstenite::connect_async(request)
+            .await
+            .expect("websocket");
+        let event = tangle_v2_event(FixtureKey::Member, 1_714_124_433, 1, Vec::new(), "hello")
+            .expect("event");
+        let auth = tangle_v2_auth_event(FixtureKey::Owner, "missing-challenge", 1_714_124_434)
+            .expect("auth");
+
+        assert_eq!(response.status(), http::StatusCode::SWITCHING_PROTOCOLS);
+
+        send_client_text(&mut socket, "{").await;
+        let notice = read_relay_value(&mut socket).await;
+        assert_eq!(notice[0], "NOTICE");
+        assert!(
+            notice[1]
+                .as_str()
+                .expect("notice")
+                .starts_with("invalid: client message JSON is invalid:")
+        );
+
+        send_client_value(&mut socket, json!(["EVENT", event_to_value(&event)])).await;
+        assert_eq!(
+            read_relay_value(&mut socket).await,
+            json!(["OK", event.id().as_str(), true, ""])
+        );
+
+        send_client_value(&mut socket, json!(["COUNT", "count-a", {}])).await;
+        assert_eq!(
+            read_relay_value(&mut socket).await,
+            json!(["COUNT", "count-a", {"count": 1}])
+        );
+
+        send_client_value(&mut socket, json!(["REQ", "sub-a", {}])).await;
+        let req_event = read_relay_value(&mut socket).await;
+        assert_eq!(req_event[0], "EVENT");
+        assert_eq!(req_event[1], "sub-a");
+        assert_eq!(req_event[2]["id"], event.id().as_str());
+        assert_eq!(
+            read_relay_value(&mut socket).await,
+            json!(["EOSE", "sub-a"])
+        );
+
+        send_client_value(&mut socket, json!(["CLOSE", "sub-a"])).await;
+        assert!(
+            timeout(Duration::from_millis(50), socket.next())
+                .await
+                .is_err()
+        );
+
+        send_client_value(&mut socket, json!(["AUTH", event_to_value(&auth)])).await;
+        let auth_reply = read_relay_value(&mut socket).await;
+        assert_eq!(auth_reply[0], "OK");
+        assert_eq!(auth_reply[1], auth.id().as_str());
+        assert_eq!(auth_reply[2], false);
+        assert!(
+            auth_reply[3]
+                .as_str()
+                .expect("auth message")
+                .starts_with("auth-required:")
+        );
+
+        shutdown.request_shutdown();
+        let report = timeout(Duration::from_secs(1), task)
+            .await
+            .expect("server shutdown")
+            .expect("task")
+            .expect("serve");
+        assert_eq!(report.listen_addr(), address);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn tangle_http_router_serves_nip11_health_and_ready_routes() {
         let root = temp_root("http-router");
         let config = runtime_config(&root);
@@ -264,6 +365,7 @@ mod tests {
             info,
             8,
             TangleShutdownSignal::new(),
+            TangleRuntimeHandle::new(TangleRuntime::open(config).expect("runtime")),
         );
         let nip11 = router
             .clone()
@@ -364,5 +466,32 @@ mod tests {
 
     fn temp_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("tangle-server-{name}-{}", std::process::id()))
+    }
+
+    type TestWebSocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn send_client_value(socket: &mut TestWebSocket, value: serde_json::Value) {
+        send_client_text(socket, &value.to_string()).await;
+    }
+
+    async fn send_client_text(socket: &mut TestWebSocket, value: &str) {
+        socket
+            .send(TungsteniteMessage::Text(value.to_owned().into()))
+            .await
+            .expect("send client message");
+    }
+
+    async fn read_relay_value(socket: &mut TestWebSocket) -> serde_json::Value {
+        let message = timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("relay message timeout")
+            .expect("relay message")
+            .expect("relay message result");
+        let TungsteniteMessage::Text(text) = message else {
+            panic!("expected relay text message, got {message:?}");
+        };
+        serde_json::from_str(text.as_str()).expect("relay json")
     }
 }

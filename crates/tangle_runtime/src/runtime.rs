@@ -11,13 +11,15 @@ use crate::{
     },
 };
 use std::{
+    fmt,
     sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Instant,
 };
-use tokio::sync::watch;
+use tangle_protocol::{ClientMessage, RelayMessage, UnixTimestamp};
+use tokio::sync::{Mutex, watch};
 
 pub struct TangleRuntime {
     config: BaseRelayRuntimeConfig,
@@ -84,6 +86,46 @@ impl TangleRuntime {
     pub fn shutdown(&mut self) -> Result<BaseRelayShutdownReport, BaseRelayError> {
         self.shutdown.request_shutdown();
         self.relay.shutdown()
+    }
+}
+
+#[derive(Clone)]
+pub struct TangleRuntimeHandle {
+    inner: Arc<Mutex<TangleRuntime>>,
+}
+
+impl TangleRuntimeHandle {
+    pub fn new(runtime: TangleRuntime) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(runtime)),
+        }
+    }
+
+    pub async fn auth_state(&self) -> Result<BaseAuthState, BaseRelayError> {
+        self.inner.lock().await.auth_state()
+    }
+
+    pub async fn handle_client_message(
+        &self,
+        message: ClientMessage,
+        auth: &mut BaseAuthState,
+        now: UnixTimestamp,
+    ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+        self.inner
+            .lock()
+            .await
+            .relay_mut()
+            .handle_client_message(message, auth, now)
+    }
+
+    pub async fn shutdown(&self) -> Result<BaseRelayShutdownReport, BaseRelayError> {
+        self.inner.lock().await.shutdown()
+    }
+}
+
+impl fmt::Debug for TangleRuntimeHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("TangleRuntimeHandle")
     }
 }
 
