@@ -33,6 +33,33 @@ pub type PocketExtraRecord = (Vec<u8>, Vec<u8>);
 pub type PocketExtraRecords = Vec<PocketExtraRecord>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PocketStoredEvent {
+    store_offset: u64,
+    event: PocketOwnedEvent,
+}
+
+impl PocketStoredEvent {
+    pub fn new(store_offset: u64, event: PocketOwnedEvent) -> Self {
+        Self {
+            store_offset,
+            event,
+        }
+    }
+
+    pub fn store_offset(&self) -> u64 {
+        self.store_offset
+    }
+
+    pub fn event(&self) -> &PocketEvent {
+        &self.event
+    }
+
+    pub fn into_event(self) -> PocketOwnedEvent {
+        self.event
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PocketScreenedEvents {
     events: Vec<PocketOwnedEvent>,
     redacted: bool,
@@ -170,6 +197,39 @@ impl PocketStoreHandle {
     pub fn count_events(&self, filter: &PocketFilter) -> Result<u64, PocketStoreError> {
         self.find_events(filter)
             .map(|events| u64::try_from(events.len()).expect("usize count fits in u64"))
+    }
+
+    pub fn scan_events(&self) -> Result<Vec<PocketStoredEvent>, PocketStoreError> {
+        self.scan_events_after(None)
+    }
+
+    pub fn scan_events_after(
+        &self,
+        last_offset: Option<u64>,
+    ) -> Result<Vec<PocketStoredEvent>, PocketStoreError> {
+        let stats = self.store.stats().map_err(PocketStoreError::from_pocket)?;
+        let end = u64::try_from(stats.event_bytes)
+            .map_err(|_| PocketStoreError::invalid("Pocket event map size exceeds u64"))?;
+        let mut offset = match last_offset {
+            Some(offset) => {
+                let event = self
+                    .store
+                    .get_event_by_offset(offset)
+                    .map_err(PocketStoreError::from_pocket)?;
+                next_event_offset(offset, event)?
+            }
+            None => event_map_start_offset(),
+        };
+        let mut events = Vec::new();
+        while offset < end {
+            let event = self
+                .store
+                .get_event_by_offset(offset)
+                .map_err(PocketStoreError::from_pocket)?;
+            events.push(PocketStoredEvent::new(offset, event.to_owned()));
+            offset = next_event_offset(offset, event)?;
+        }
+        Ok(events)
     }
 
     pub fn put_extra_record(
@@ -433,6 +493,30 @@ fn pocket_json_buffer_len(raw_len: usize) -> usize {
     raw_len.saturating_mul(2).max(4096)
 }
 
+fn event_map_start_offset() -> u64 {
+    u64::try_from(std::mem::size_of::<usize>()).expect("usize header size fits u64")
+}
+
+fn align_event_offset(offset: u64) -> u64 {
+    if offset.is_multiple_of(8) {
+        offset
+    } else {
+        offset + (8 - offset % 8)
+    }
+}
+
+fn next_event_offset(offset: u64, event: &PocketEvent) -> Result<u64, PocketStoreError> {
+    let next = offset
+        .checked_add(event_len_u64(event)?)
+        .ok_or_else(|| PocketStoreError::invalid("Pocket event offset exceeds u64"))?;
+    Ok(align_event_offset(next))
+}
+
+fn event_len_u64(event: &PocketEvent) -> Result<u64, PocketStoreError> {
+    u64::try_from(event.len())
+        .map_err(|_| PocketStoreError::invalid("Pocket event size exceeds u64"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -511,6 +595,41 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id(), event.id());
         assert_eq!(handle.count_events(&filter).expect("count"), 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pocket_store_handle_scans_canonical_events_with_offsets() {
+        let root = temp_root("tangle-pocket-scan");
+        let config = PocketStoreConfig::new(
+            root.join("pocket"),
+            1024 * 1024 * 1024,
+            128,
+            PocketSyncPolicy::FlushOnShutdown,
+        )
+        .expect("config");
+        let handle = PocketStoreHandle::open(&config).expect("open");
+        let first =
+            parse_pocket_event_json(event_json_with("a", "1", "first").as_bytes()).expect("first");
+        let second = parse_pocket_event_json(event_json_with("c", "2", "second").as_bytes())
+            .expect("second");
+
+        let first_offset = handle.store_event(&first).expect("store first");
+        let second_offset = handle.store_event(&second).expect("store second");
+        let all = handle.scan_events().expect("scan");
+        let after_first = handle
+            .scan_events_after(Some(first_offset))
+            .expect("scan after first");
+
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].store_offset(), first_offset);
+        assert_eq!(all[0].event().id(), first.id());
+        assert_eq!(all[1].store_offset(), second_offset);
+        assert_eq!(all[1].event().id(), second.id());
+        assert_eq!(after_first.len(), 1);
+        assert_eq!(after_first[0].store_offset(), second_offset);
+        assert_eq!(after_first[0].event().id(), second.id());
 
         let _ = std::fs::remove_dir_all(root);
     }

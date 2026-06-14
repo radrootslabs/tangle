@@ -2,20 +2,21 @@
 
 use crate::{
     errors::BaseRelayError,
-    pocket_conversion::{pocket_event_id, tangle_event_to_pocket},
+    pocket_conversion::{pocket_event_id, pocket_event_to_tangle, tangle_event_to_pocket},
 };
 use std::str;
 use tangle_crypto::RelaySigner;
 use tangle_groups::{
-    GroupAuthContext, GroupAuthority, GroupError, GroupErrorKind, GroupEventClass,
-    GroupEventDeletion, GroupGeneratedEventBuilder, GroupId, GroupLimitsConfig, GroupOutbox,
-    GroupOutboxEffect, GroupOutboxKey, GroupOutboxPayload, GroupOutboxRecord, GroupPolicyConfig,
-    GroupProjection, GroupReadDecision, GroupReadGate, GroupRuntimeConfig, GroupState,
-    GroupTombstone, KIND_GROUP_CREATE_GROUP, KIND_GROUP_DELETE_EVENT, KIND_GROUP_EDIT_METADATA,
-    KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_PUT_USER,
-    KIND_GROUP_REMOVE_USER, MemberState, ProjectedRoleDefinition, ProjectionCheckpoint,
-    StoreOffset, event_deletion_key, event_view::GroupEventView, group_current_key,
-    member_current_key, projection_checkpoint_key, role_current_key, tombstone_key,
+    CanonicalGroupEvent, GroupAuthContext, GroupAuthority, GroupError, GroupErrorKind,
+    GroupEventClass, GroupEventDeletion, GroupGeneratedEventBuilder, GroupId, GroupLimitsConfig,
+    GroupOutbox, GroupOutboxEffect, GroupOutboxKey, GroupOutboxPayload, GroupOutboxRecord,
+    GroupPolicyConfig, GroupProjection, GroupReadDecision, GroupReadGate, GroupRuntimeConfig,
+    GroupState, GroupTombstone, KIND_GROUP_CREATE_GROUP, KIND_GROUP_DELETE_EVENT,
+    KIND_GROUP_EDIT_METADATA, KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST,
+    KIND_GROUP_MEMBERS, KIND_GROUP_PUT_USER, KIND_GROUP_REMOVE_USER, MemberState,
+    ProjectedRoleDefinition, ProjectionCheckpoint, StoreOffset, event_deletion_key,
+    event_view::GroupEventView, group_current_key, member_current_key, projection_checkpoint_key,
+    role_current_key, tombstone_key,
 };
 use tangle_protocol::{Event, EventId, PublicKeyHex, UnixTimestamp};
 use tangle_store_pocket::{
@@ -444,6 +445,67 @@ fn load_group_outbox(store: &PocketStoreHandle) -> Result<GroupOutbox, BaseRelay
     Ok(outbox)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalGroupEventScan {
+    events: Vec<CanonicalGroupEvent>,
+    scanned_events: usize,
+    skipped_events: usize,
+}
+
+impl CanonicalGroupEventScan {
+    pub fn events(&self) -> &[CanonicalGroupEvent] {
+        &self.events
+    }
+
+    pub fn into_events(self) -> Vec<CanonicalGroupEvent> {
+        self.events
+    }
+
+    pub fn scanned_events(&self) -> usize {
+        self.scanned_events
+    }
+
+    pub fn skipped_events(&self) -> usize {
+        self.skipped_events
+    }
+}
+
+pub fn scan_canonical_group_events(
+    store: &PocketStoreHandle,
+    limits: GroupLimitsConfig,
+) -> Result<CanonicalGroupEventScan, BaseRelayError> {
+    scan_canonical_group_events_after(store, None, limits)
+}
+
+pub fn scan_canonical_group_events_after(
+    store: &PocketStoreHandle,
+    last_offset: Option<StoreOffset>,
+    limits: GroupLimitsConfig,
+) -> Result<CanonicalGroupEventScan, BaseRelayError> {
+    let stored_events = store.scan_events_after(last_offset.map(StoreOffset::as_u64))?;
+    let scanned_events = stored_events.len();
+    let mut events = Vec::new();
+    let mut skipped_events = 0;
+    for stored in stored_events {
+        match tangle_groups::classify_group_event(stored.event(), limits)? {
+            GroupEventClass::NonGroup => skipped_events += 1,
+            GroupEventClass::Normal { .. }
+            | GroupEventClass::Moderation { .. }
+            | GroupEventClass::RelayGeneratedSnapshot { .. } => {
+                events.push(CanonicalGroupEvent::new(
+                    pocket_event_to_tangle(stored.event())?,
+                    StoreOffset::new(stored.store_offset()),
+                ));
+            }
+        }
+    }
+    Ok(CanonicalGroupEventScan {
+        events,
+        scanned_events,
+        skipped_events,
+    })
+}
+
 fn projection_key_parts(key: &[u8]) -> Result<Vec<&str>, BaseRelayError> {
     let key = str::from_utf8(key).map_err(|error| BaseRelayError::error(error.to_string()))?;
     Ok(key.split('\0').collect())
@@ -496,9 +558,14 @@ fn delete_target_event_id(event: &Event) -> Result<EventId, GroupError> {
 
 #[cfg(test)]
 mod tests {
-    use super::GroupService;
-    use tangle_groups::GroupRuntimeConfig;
+    use super::{GroupService, scan_canonical_group_events, scan_canonical_group_events_after};
+    use crate::pocket_conversion::tangle_event_to_pocket;
+    use tangle_groups::{GroupRuntimeConfig, KIND_GROUP_METADATA, StoreOffset};
+    use tangle_protocol::Tag;
     use tangle_store_pocket::{PocketStoreConfig, PocketStoreHandle, PocketSyncPolicy};
+    use tangle_test_support::{
+        FixtureKey, tangle_v2_event, tangle_v2_group_create_event, tangle_v2_group_event,
+    };
 
     #[test]
     fn group_service_from_disabled_config_is_absent() {
@@ -521,5 +588,89 @@ mod tests {
                 .expect("service")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn canonical_group_event_scanner_returns_group_events_with_offsets() {
+        let root = std::env::temp_dir().join(format!(
+            "tangle-canonical-group-scan-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let config = PocketStoreConfig::new(
+            root.join("pocket"),
+            1024 * 1024 * 1024,
+            128,
+            PocketSyncPolicy::FlushOnShutdown,
+        )
+        .expect("config");
+        let store = PocketStoreHandle::open(&config).expect("store");
+        let public =
+            tangle_v2_event(FixtureKey::Member, 1, 1, Vec::new(), "public").expect("public");
+        let normal =
+            tangle_v2_group_event(FixtureKey::Member, "ScanFarm", 2, 1, "normal").expect("normal");
+        let group =
+            tangle_v2_group_create_event(FixtureKey::Owner, "ScanFarm", 3, &[]).expect("group");
+        let generated = tangle_v2_event(
+            FixtureKey::Owner,
+            4,
+            KIND_GROUP_METADATA.into(),
+            vec![Tag::from_parts("d", &["ScanFarm"]).expect("d")],
+            "",
+        )
+        .expect("generated");
+        let public_offset = store
+            .store_event(&tangle_event_to_pocket(&public).expect("public pocket"))
+            .expect("store public");
+        let normal_offset = store
+            .store_event(&tangle_event_to_pocket(&normal).expect("normal pocket"))
+            .expect("store normal");
+        let group_offset = store
+            .store_event(&tangle_event_to_pocket(&group).expect("group pocket"))
+            .expect("store group");
+        let generated_offset = store
+            .store_event(&tangle_event_to_pocket(&generated).expect("generated pocket"))
+            .expect("store generated");
+
+        let scan = scan_canonical_group_events(&store, Default::default()).expect("scan");
+        let after_public = scan_canonical_group_events_after(
+            &store,
+            Some(StoreOffset::new(public_offset)),
+            Default::default(),
+        )
+        .expect("after public");
+
+        assert_eq!(scan.scanned_events(), 4);
+        assert_eq!(scan.skipped_events(), 1);
+        assert_eq!(
+            scan.events()
+                .iter()
+                .map(|event| event.event().id())
+                .collect::<Vec<_>>(),
+            vec![normal.id(), group.id(), generated.id()]
+        );
+        assert_eq!(
+            scan.events()
+                .iter()
+                .map(|event| event.store_offset())
+                .collect::<Vec<_>>(),
+            vec![
+                StoreOffset::new(normal_offset),
+                StoreOffset::new(group_offset),
+                StoreOffset::new(generated_offset),
+            ]
+        );
+        assert_eq!(after_public.scanned_events(), 3);
+        assert_eq!(after_public.skipped_events(), 0);
+        assert_eq!(
+            after_public
+                .events()
+                .iter()
+                .map(|event| event.event().id())
+                .collect::<Vec<_>>(),
+            vec![normal.id(), group.id(), generated.id()]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }
