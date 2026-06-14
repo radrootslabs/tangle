@@ -23,10 +23,7 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         tangle::TangleCommand::Run => match run_server(&invocation).await {
-            Ok(output) => {
-                println!("{output}");
-                ExitCode::SUCCESS
-            }
+            Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("{error}");
                 ExitCode::from(2)
@@ -35,9 +32,9 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run_server(invocation: &tangle::TangleInvocation) -> Result<String, String> {
+async fn run_server(invocation: &tangle::TangleInvocation) -> Result<(), String> {
     let config_path = tangle::require_config_path(invocation).map_err(|error| error.to_string())?;
-    tangle::run_with_config(config_path)
+    tangle::run_with_config(config_path).await.map(|_| ())
 }
 
 #[cfg(test)]

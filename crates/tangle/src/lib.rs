@@ -145,16 +145,14 @@ pub fn require_config_path(invocation: &TangleInvocation) -> Result<&str, Tangle
         .ok_or(TangleCliError::MissingOptionValue("--config"))
 }
 
-pub fn run_with_config(config_path: &str) -> Result<String, String> {
-    let report = tangle_runtime::open_base_relay_from_config_path(config_path)
+pub async fn run_with_config(
+    config_path: &str,
+) -> Result<tangle_runtime::server::TangleServeReport, String> {
+    let runtime = tangle_runtime::open_tangle_runtime_from_config_path(config_path)
         .map_err(|error| error.to_string())?;
-    Ok(format!(
-        "relay url: {}\npocket data directory: {}\ngroups enabled: {}\nreadiness: {}",
-        report.relay_url(),
-        report.data_directory().display(),
-        report.groups_enabled(),
-        report.readiness().response().status
-    ))
+    tangle_runtime::server::serve_until_shutdown(runtime)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

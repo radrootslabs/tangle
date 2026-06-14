@@ -17,52 +17,11 @@ use std::{fmt, fs, path::Path, path::PathBuf};
 
 use config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json};
 use errors::BaseRelayError;
-use ops::BaseRelayReadinessState;
 use runtime::TangleRuntime;
 
 pub const TANGLE_SUPPORTED_NIPS: [u16; 6] = [1, 11, 29, 42, 45, 70];
 pub const TANGLE_RELAY_SOFTWARE: &str = "https://github.com/radrootslabs/tangle";
 pub const TANGLE_RELAY_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TangleRuntimeStartupReport {
-    relay_url: String,
-    data_directory: PathBuf,
-    groups_enabled: bool,
-    readiness: BaseRelayReadinessState,
-}
-
-impl TangleRuntimeStartupReport {
-    pub(crate) fn new(
-        relay_url: impl Into<String>,
-        data_directory: PathBuf,
-        groups_enabled: bool,
-        readiness: BaseRelayReadinessState,
-    ) -> Self {
-        Self {
-            relay_url: relay_url.into(),
-            data_directory,
-            groups_enabled,
-            readiness,
-        }
-    }
-
-    pub fn relay_url(&self) -> &str {
-        &self.relay_url
-    }
-
-    pub fn data_directory(&self) -> &Path {
-        &self.data_directory
-    }
-
-    pub fn groups_enabled(&self) -> bool {
-        self.groups_enabled
-    }
-
-    pub fn readiness(&self) -> &BaseRelayReadinessState {
-        &self.readiness
-    }
-}
 
 #[derive(Debug)]
 pub enum TangleRuntimeLoadError {
@@ -72,7 +31,6 @@ pub enum TangleRuntimeLoadError {
     },
     ParseConfig(BaseRelayError),
     OpenRelay(BaseRelayError),
-    ShutdownRelay(BaseRelayError),
 }
 
 impl fmt::Display for TangleRuntimeLoadError {
@@ -87,7 +45,6 @@ impl fmt::Display for TangleRuntimeLoadError {
             }
             Self::ParseConfig(error) => write!(formatter, "{error}"),
             Self::OpenRelay(error) => write!(formatter, "{error}"),
-            Self::ShutdownRelay(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -103,17 +60,6 @@ pub fn load_base_relay_runtime_config(
         source,
     })?;
     parse_base_relay_runtime_config_json(&raw).map_err(TangleRuntimeLoadError::ParseConfig)
-}
-
-pub fn open_base_relay_from_config_path(
-    path: impl AsRef<Path>,
-) -> Result<TangleRuntimeStartupReport, TangleRuntimeLoadError> {
-    let mut runtime = open_tangle_runtime_from_config_path(path)?;
-    let report = runtime.startup_report();
-    runtime
-        .shutdown()
-        .map_err(TangleRuntimeLoadError::ShutdownRelay)?;
-    Ok(report)
 }
 
 pub fn open_tangle_runtime_from_config_path(

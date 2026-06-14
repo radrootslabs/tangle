@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 use crate::{
-    TangleRuntimeStartupReport,
     config::BaseRelayRuntimeConfig,
     errors::BaseRelayError,
     event_bus::TangleEventBus,
@@ -80,15 +79,6 @@ impl TangleRuntime {
 
     pub fn shutdown_signal(&self) -> &TangleShutdownSignal {
         &self.shutdown
-    }
-
-    pub fn startup_report(&self) -> TangleRuntimeStartupReport {
-        TangleRuntimeStartupReport::new(
-            self.config.relay_url(),
-            self.config.pocket_config().data_directory().to_path_buf(),
-            self.config.groups().enabled(),
-            self.readiness.clone(),
-        )
     }
 
     pub fn shutdown(&mut self) -> Result<BaseRelayShutdownReport, BaseRelayError> {
@@ -283,7 +273,7 @@ mod tests {
             0
         );
         assert_eq!(
-            runtime.startup_report().data_directory(),
+            runtime.config().pocket_config().data_directory(),
             Path::new(&root).join("pocket")
         );
 
