@@ -15,6 +15,7 @@ use tangle_protocol::{
     filter_from_value, parse_client_message, parse_event_json,
 };
 use tangle_runtime::{
+    config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
     groups::{GroupCheckpointStatus, validate_group_extra_tables},
     nip11::{BASE_RELAY_SUPPORTED_NIPS, BaseRelayInfoConfig},
     relay::{
@@ -75,12 +76,13 @@ fn public_relay_smoke_stores_queries_counts_and_fans_out() {
 
 #[test]
 fn nip11_integration_reports_group_contracts() {
-    let groups = group_config();
-    let document = BaseRelayInfoConfig::new("tangle", groups)
+    let config = runtime_config(true);
+    let disabled_config = runtime_config(false);
+    let document = BaseRelayInfoConfig::new("tangle", &config)
         .expect("config")
         .build_document()
         .expect("document");
-    let disabled = BaseRelayInfoConfig::new("tangle", GroupRuntimeConfig::disabled())
+    let disabled = BaseRelayInfoConfig::new("tangle", &disabled_config)
         .expect("config")
         .build_document()
         .expect("disabled");
@@ -94,6 +96,17 @@ fn nip11_integration_reports_group_contracts() {
     assert!(!document.supported_nips.contains(&77));
     assert!(!document.supported_nips.contains(&99));
     assert!(document.relay_self().is_some());
+    assert_eq!(document.limitation.max_message_length, 1_048_576);
+    assert_eq!(document.limitation.max_subscriptions, 64);
+    assert_eq!(document.limitation.max_filters, 10);
+    assert_eq!(document.limitation.max_limit, 500);
+    assert_eq!(document.limitation.max_subid_length, 64);
+    assert_eq!(document.limitation.max_event_tags, 200);
+    assert_eq!(document.limitation.max_content_length, 65_536);
+    assert!(!document.limitation.auth_required);
+    assert!(!document.limitation.payment_required);
+    assert!(document.limitation.restricted_writes);
+    assert_eq!(document.limitation.default_limit, 100);
     assert!(!disabled.supported_nips.contains(&29));
     assert!(disabled.relay_self().is_none());
 }
@@ -1006,7 +1019,8 @@ fn delete_and_secondary_privacy_surfaces_are_read_gated_or_absent() {
         1,
     );
 
-    let document = BaseRelayInfoConfig::new("tangle", group_config())
+    let config = runtime_config(true);
+    let document = BaseRelayInfoConfig::new("tangle", &config)
         .expect("config")
         .build_document()
         .expect("document");
@@ -1948,6 +1962,86 @@ fn temp_root(name: &str) -> PathBuf {
 
 fn group_config() -> GroupRuntimeConfig {
     tangle_v2_group_config(FixtureKey::Owner, &[FixtureKey::Admin]).expect("groups")
+}
+
+fn runtime_config(groups_enabled: bool) -> BaseRelayRuntimeConfig {
+    let groups = if groups_enabled {
+        serde_json::json!({
+            "enabled": true,
+            "canonical_relay_url": TANGLE_V2_RELAY_URL,
+            "relay_secret": TANGLE_V2_RELAY_SECRET_HEX,
+            "owner_pubkeys": [FixtureKey::Owner.public_key().as_str()],
+            "admin_pubkeys": [FixtureKey::Admin.public_key().as_str()]
+        })
+    } else {
+        serde_json::json!({"enabled": false})
+    };
+    parse_base_relay_runtime_config_json(
+        &serde_json::json!({
+            "server": {
+                "listen_addr": "127.0.0.1:0",
+                "relay_url": TANGLE_V2_RELAY_URL
+            },
+            "pocket": {
+                "data_directory": "runtime/pocket",
+                "map_size_bytes": 1073741824_u64,
+                "reader_slots": 128,
+                "sync_policy": "flush_on_shutdown"
+            },
+            "groups": groups,
+            "auth": {
+                "challenge_ttl_seconds": 300,
+                "created_at_skew_seconds": 600
+            },
+            "limits": {
+                "max_message_length": 1048576,
+                "max_subid_length": 64,
+                "max_subscriptions_per_connection": 64,
+                "max_filters_per_request": 10,
+                "max_tag_values_per_filter": 100,
+                "max_limit": 500,
+                "default_limit": 100,
+                "max_event_tags": 200,
+                "max_content_length": 65536,
+                "broadcast_channel_capacity": 4096,
+                "per_connection_outbound_queue": 256
+            },
+            "rate_limits": {
+                "auth": {
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 30},
+                    "failures": {"window_seconds": 300, "max_hits": 5}
+                },
+                "event": {
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 120},
+                    "per_kind": {"window_seconds": 60, "max_hits": 1000}
+                },
+                "group": {
+                    "write_per_pubkey": {"window_seconds": 60, "max_hits": 60},
+                    "write_per_group": {"window_seconds": 60, "max_hits": 90},
+                    "write_per_kind": {"window_seconds": 60, "max_hits": 300},
+                    "join_flow": {"window_seconds": 300, "max_hits": 10}
+                },
+                "req": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 600},
+                    "per_connection": {"window_seconds": 60, "max_hits": 120},
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 240},
+                    "per_group": {"window_seconds": 60, "max_hits": 240},
+                    "per_kind": {"window_seconds": 60, "max_hits": 500},
+                    "broad": {"window_seconds": 60, "max_hits": 30}
+                },
+                "count": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 300},
+                    "per_connection": {"window_seconds": 60, "max_hits": 60},
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 120},
+                    "per_group": {"window_seconds": 60, "max_hits": 120},
+                    "per_kind": {"window_seconds": 60, "max_hits": 240},
+                    "broad": {"window_seconds": 60, "max_hits": 20}
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("runtime config")
 }
 
 fn group_config_with_public_join() -> GroupRuntimeConfig {

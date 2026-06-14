@@ -291,7 +291,7 @@ fn protected_events_require_author_auth_before_nip70_is_advertised() {
     let root = temp_root("acceptance-nip70");
     let _ = std::fs::remove_dir_all(&root);
     let config = runtime_config(&root, SocketAddr::from(([127, 0, 0, 1], 0)));
-    let document = BaseRelayInfoConfig::new("tangle", config.groups().clone())
+    let document = BaseRelayInfoConfig::new("tangle", &config)
         .expect("info config")
         .build_document()
         .expect("document");

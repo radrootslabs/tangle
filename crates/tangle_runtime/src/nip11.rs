@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
-use crate::errors::BaseRelayError;
+use crate::{
+    config::{BaseRelayRuntimeConfig, BaseRelayRuntimeLimitsConfig},
+    errors::BaseRelayError,
+};
 use axum::{
     Json, Router,
     extract::State,
@@ -22,6 +25,7 @@ pub struct BaseRelayInfoConfig {
     contact: Option<String>,
     icon: Option<String>,
     groups: GroupRuntimeConfig,
+    limits: BaseRelayRuntimeLimitsConfig,
     software: String,
     version: String,
     payment_required: bool,
@@ -31,7 +35,7 @@ pub struct BaseRelayInfoConfig {
 impl BaseRelayInfoConfig {
     pub fn new(
         name: impl Into<String>,
-        groups: GroupRuntimeConfig,
+        runtime: &BaseRelayRuntimeConfig,
     ) -> Result<Self, BaseRelayError> {
         let name = name.into();
         if name.trim().is_empty() {
@@ -42,7 +46,8 @@ impl BaseRelayInfoConfig {
             description: None,
             contact: None,
             icon: None,
-            groups,
+            groups: runtime.groups().clone(),
+            limits: runtime.limits(),
             software: crate::TANGLE_RELAY_SOFTWARE.to_owned(),
             version: crate::TANGLE_RELAY_VERSION.to_owned(),
             payment_required: false,
@@ -82,8 +87,17 @@ impl BaseRelayInfoConfig {
             software: self.software.clone(),
             version: self.version.clone(),
             limitation: BaseRelayInfoLimitationDocument {
+                max_message_length: self.limits.max_message_length(),
+                max_subscriptions: self.limits.max_subscriptions_per_connection(),
+                max_filters: self.limits.max_filters_per_request(),
+                max_limit: self.limits.max_limit(),
+                max_subid_length: self.limits.max_subid_length(),
+                max_event_tags: self.limits.max_event_tags(),
+                max_content_length: self.limits.max_content_length(),
+                auth_required: false,
                 payment_required: self.payment_required,
                 restricted_writes: self.restricted_writes,
+                default_limit: self.limits.default_limit(),
             },
         })
     }
@@ -114,8 +128,17 @@ impl BaseRelayInfoDocument {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BaseRelayInfoLimitationDocument {
+    pub max_message_length: usize,
+    pub max_subscriptions: usize,
+    pub max_filters: usize,
+    pub max_limit: u64,
+    pub max_subid_length: usize,
+    pub max_event_tags: usize,
+    pub max_content_length: usize,
+    pub auth_required: bool,
     pub payment_required: bool,
     pub restricted_writes: bool,
+    pub default_limit: u64,
 }
 
 pub fn base_relay_info_router(document: BaseRelayInfoDocument) -> Router {
@@ -189,21 +212,23 @@ fn accepts_nostr_json(value: Option<&HeaderValue>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{BaseRelayInfoConfig, base_relay_info_router};
+    use crate::config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json};
     use axum::body::to_bytes;
     use http::{Request, StatusCode, header};
+    use serde_json::{Value, json};
     use tangle_crypto::RelaySigner;
-    use tangle_groups::parse_group_runtime_config_json;
     use tower::ServiceExt;
 
     #[test]
     fn nip11_builder_reports_groups_and_relay_self_only_when_configured() {
-        let groups = enabled_groups();
-        let document = BaseRelayInfoConfig::new("tangle", groups)
+        let config = runtime_config(enabled_groups());
+        let disabled_config = runtime_config(json!({"enabled": false}));
+        let document = BaseRelayInfoConfig::new("tangle", &config)
             .expect("config")
             .with_description("Tangle v2 relay")
             .build_document()
             .expect("document");
-        let disabled = BaseRelayInfoConfig::new("tangle", disabled_groups())
+        let disabled = BaseRelayInfoConfig::new("tangle", &disabled_config)
             .expect("config")
             .build_document()
             .expect("disabled");
@@ -213,13 +238,25 @@ mod tests {
         assert!(document.supported_nips.contains(&70));
         assert!(document.relay_self().is_some());
         assert_eq!(document.description.as_deref(), Some("Tangle v2 relay"));
+        assert_eq!(document.limitation.max_message_length, 1_048_576);
+        assert_eq!(document.limitation.max_subscriptions, 64);
+        assert_eq!(document.limitation.max_filters, 10);
+        assert_eq!(document.limitation.max_limit, 500);
+        assert_eq!(document.limitation.max_subid_length, 64);
+        assert_eq!(document.limitation.max_event_tags, 200);
+        assert_eq!(document.limitation.max_content_length, 65_536);
+        assert!(!document.limitation.auth_required);
+        assert!(!document.limitation.payment_required);
+        assert!(document.limitation.restricted_writes);
+        assert_eq!(document.limitation.default_limit, 100);
         assert!(!disabled.supported_nips.contains(&29));
         assert!(disabled.relay_self().is_none());
     }
 
     #[tokio::test]
     async fn nip11_router_serves_nostr_json_only_for_nostr_accept() {
-        let document = BaseRelayInfoConfig::new("tangle", enabled_groups())
+        let config = runtime_config(enabled_groups());
+        let document = BaseRelayInfoConfig::new("tangle", &config)
             .expect("config")
             .build_document()
             .expect("document");
@@ -280,25 +317,85 @@ mod tests {
         assert_eq!(rejected.status(), StatusCode::NOT_FOUND);
     }
 
-    fn enabled_groups() -> tangle_groups::GroupRuntimeConfig {
+    fn enabled_groups() -> Value {
         let owner = RelaySigner::from_secret_hex(&"8".repeat(64))
             .expect("owner")
             .public_key()
             .clone();
-        parse_group_runtime_config_json(&format!(
-            r#"{{
-                "enabled": true,
-                "canonical_relay_url": "wss://relay.radroots.test",
-                "relay_secret": "{}",
-                "owner_pubkeys": ["{}"]
-            }}"#,
-            "7".repeat(64),
-            owner.as_str()
-        ))
-        .expect("groups")
+        json!({
+            "enabled": true,
+            "canonical_relay_url": "wss://relay.radroots.test",
+            "relay_secret": "7".repeat(64),
+            "owner_pubkeys": [owner.as_str()]
+        })
     }
 
-    fn disabled_groups() -> tangle_groups::GroupRuntimeConfig {
-        parse_group_runtime_config_json(r#"{"enabled": false}"#).expect("groups")
+    fn runtime_config(groups: Value) -> BaseRelayRuntimeConfig {
+        parse_base_relay_runtime_config_json(
+            &json!({
+                "server": {
+                    "listen_addr": "127.0.0.1:0",
+                    "relay_url": "wss://relay.radroots.test"
+                },
+                "pocket": {
+                    "data_directory": "runtime/pocket",
+                    "map_size_bytes": 1073741824_u64,
+                    "reader_slots": 128,
+                    "sync_policy": "flush_on_shutdown"
+                },
+                "groups": groups,
+                "auth": {
+                    "challenge_ttl_seconds": 300,
+                    "created_at_skew_seconds": 600
+                },
+                "limits": {
+                    "max_message_length": 1048576,
+                    "max_subid_length": 64,
+                    "max_subscriptions_per_connection": 64,
+                    "max_filters_per_request": 10,
+                    "max_tag_values_per_filter": 100,
+                    "max_limit": 500,
+                    "default_limit": 100,
+                    "max_event_tags": 200,
+                    "max_content_length": 65536,
+                    "broadcast_channel_capacity": 4096,
+                    "per_connection_outbound_queue": 256
+                },
+                "rate_limits": {
+                    "auth": {
+                        "per_pubkey": {"window_seconds": 60, "max_hits": 30},
+                        "failures": {"window_seconds": 300, "max_hits": 5}
+                    },
+                    "event": {
+                        "per_pubkey": {"window_seconds": 60, "max_hits": 120},
+                        "per_kind": {"window_seconds": 60, "max_hits": 1000}
+                    },
+                    "group": {
+                        "write_per_pubkey": {"window_seconds": 60, "max_hits": 60},
+                        "write_per_group": {"window_seconds": 60, "max_hits": 90},
+                        "write_per_kind": {"window_seconds": 60, "max_hits": 300},
+                        "join_flow": {"window_seconds": 300, "max_hits": 10}
+                    },
+                    "req": {
+                        "per_ip": {"window_seconds": 60, "max_hits": 600},
+                        "per_connection": {"window_seconds": 60, "max_hits": 120},
+                        "per_pubkey": {"window_seconds": 60, "max_hits": 240},
+                        "per_group": {"window_seconds": 60, "max_hits": 240},
+                        "per_kind": {"window_seconds": 60, "max_hits": 500},
+                        "broad": {"window_seconds": 60, "max_hits": 30}
+                    },
+                    "count": {
+                        "per_ip": {"window_seconds": 60, "max_hits": 300},
+                        "per_connection": {"window_seconds": 60, "max_hits": 60},
+                        "per_pubkey": {"window_seconds": 60, "max_hits": 120},
+                        "per_group": {"window_seconds": 60, "max_hits": 120},
+                        "per_kind": {"window_seconds": 60, "max_hits": 240},
+                        "broad": {"window_seconds": 60, "max_hits": 20}
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("runtime config")
     }
 }

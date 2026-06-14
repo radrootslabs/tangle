@@ -64,8 +64,7 @@ pub async fn serve_listener_until_shutdown(
         .local_addr()
         .map_err(|error| BaseRelayError::error(error.to_string()))?;
     let relay_url = runtime.config().relay_url().to_owned();
-    let info =
-        BaseRelayInfoConfig::new("tangle", runtime.config().groups().clone())?.build_document()?;
+    let info = BaseRelayInfoConfig::new("tangle", runtime.config())?.build_document()?;
     let readiness = runtime.readiness_state().clone();
     let limits = runtime.limits();
     let metrics = runtime.metrics().clone();
@@ -392,7 +391,7 @@ mod tests {
     async fn tangle_http_router_serves_nip11_health_and_ready_routes() {
         let root = temp_root("http-router");
         let config = runtime_config(&root);
-        let info = BaseRelayInfoConfig::new("tangle", config.groups().clone())
+        let info = BaseRelayInfoConfig::new("tangle", &config)
             .expect("info config")
             .build_document()
             .expect("info");
@@ -468,6 +467,17 @@ mod tests {
         let nip11_body = to_bytes(nip11.into_body(), usize::MAX).await.expect("body");
         let nip11_value = serde_json::from_slice::<serde_json::Value>(&nip11_body).expect("json");
         assert_eq!(nip11_value["name"], "tangle");
+        assert_eq!(nip11_value["limitation"]["max_message_length"], 1_048_576);
+        assert_eq!(nip11_value["limitation"]["max_subscriptions"], 64);
+        assert_eq!(nip11_value["limitation"]["max_filters"], 10);
+        assert_eq!(nip11_value["limitation"]["max_limit"], 500);
+        assert_eq!(nip11_value["limitation"]["max_subid_length"], 64);
+        assert_eq!(nip11_value["limitation"]["max_event_tags"], 200);
+        assert_eq!(nip11_value["limitation"]["max_content_length"], 65_536);
+        assert_eq!(nip11_value["limitation"]["auth_required"], false);
+        assert_eq!(nip11_value["limitation"]["payment_required"], false);
+        assert_eq!(nip11_value["limitation"]["restricted_writes"], true);
+        assert_eq!(nip11_value["limitation"]["default_limit"], 100);
         assert!(
             nip11_value["supported_nips"]
                 .as_array()

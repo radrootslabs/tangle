@@ -189,8 +189,17 @@ fn tangle_run_starts_server_and_stays_alive_until_shutdown() {
     assert_eq!(ready_value["status"], "ready");
     assert_eq!(ready_value["checks"]["pocket_storage"], "ready");
     assert_eq!(nip11_value["name"], "tangle");
+    assert_eq!(nip11_value["limitation"]["max_message_length"], 1_048_576);
+    assert_eq!(nip11_value["limitation"]["max_subscriptions"], 64);
+    assert_eq!(nip11_value["limitation"]["max_filters"], 10);
+    assert_eq!(nip11_value["limitation"]["max_limit"], 500);
+    assert_eq!(nip11_value["limitation"]["max_subid_length"], 64);
+    assert_eq!(nip11_value["limitation"]["max_event_tags"], 200);
+    assert_eq!(nip11_value["limitation"]["max_content_length"], 65_536);
+    assert_eq!(nip11_value["limitation"]["auth_required"], false);
     assert_eq!(nip11_value["limitation"]["payment_required"], false);
     assert_eq!(nip11_value["limitation"]["restricted_writes"], true);
+    assert_eq!(nip11_value["limitation"]["default_limit"], 100);
     assert!(
         nip11_value["supported_nips"]
             .as_array()
