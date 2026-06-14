@@ -30,7 +30,8 @@ use tangle_runtime::{
 };
 use tangle_test_support::{
     FixtureKey, TANGLE_V2_RELAY_SECRET_HEX, TANGLE_V2_RELAY_URL, tangle_v2_auth_event,
-    tangle_v2_event, tangle_v2_group_create_event,
+    tangle_v2_event, tangle_v2_group_create_event, tangle_v2_group_event,
+    tangle_v2_group_metadata_event, tangle_v2_join_event, tangle_v2_put_user_event,
 };
 use tokio::{net::TcpListener, time::timeout};
 use tokio_tungstenite::tungstenite::{Message as TungsteniteMessage, client::IntoClientRequest};
@@ -435,6 +436,194 @@ async fn websocket_public_relay_covers_query_count_ephemeral_and_rejection_flows
     shutdown.request_shutdown();
     read_websocket_close(&mut publisher).await;
     read_websocket_close(&mut subscriber).await;
+    let report = timeout(Duration::from_secs(2), task)
+        .await
+        .expect("shutdown timeout")
+        .expect("task")
+        .expect("serve");
+    assert_eq!(report.listen_addr(), address);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn websocket_nip29_group_lifecycle_state_and_live_paths_are_integrated() {
+    let root = temp_root("acceptance-nip29-websocket");
+    let _ = std::fs::remove_dir_all(&root);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let runtime = TangleRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let shutdown = runtime.shutdown_signal().clone();
+    let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
+    let mut owner = connect_nostr_socket(address).await;
+    let mut member = connect_nostr_socket(address).await;
+    let mut outsider = connect_nostr_socket(address).await;
+    let mut observer = connect_nostr_socket(address).await;
+    let owner_challenge = read_auth_challenge(&mut owner).await;
+    let member_challenge = read_auth_challenge(&mut member).await;
+    let outsider_challenge = read_auth_challenge(&mut outsider).await;
+    let _ = read_auth_challenge(&mut observer).await;
+    let auth_created_at = current_unix_timestamp();
+
+    authenticate_client(
+        &mut owner,
+        FixtureKey::Owner,
+        &owner_challenge,
+        auth_created_at,
+    )
+    .await;
+    authenticate_client(
+        &mut member,
+        FixtureKey::Member,
+        &member_challenge,
+        auth_created_at.saturating_add(1),
+    )
+    .await;
+    authenticate_client(
+        &mut outsider,
+        FixtureKey::Outsider,
+        &outsider_challenge,
+        auth_created_at.saturating_add(2),
+    )
+    .await;
+
+    let create = tangle_v2_group_create_event(FixtureKey::Owner, "SocketFarm", 1_714_124_440, &[])
+        .expect("create");
+    send_client_value(&mut owner, json!(["EVENT", event_to_value(&create)])).await;
+    assert_ok(read_relay_value(&mut owner).await, &create, true, "");
+
+    let denied_join =
+        tangle_v2_join_event(FixtureKey::Outsider, "SocketFarm", 1_714_124_441).expect("join");
+    send_client_value(
+        &mut outsider,
+        json!(["EVENT", event_to_value(&denied_join)]),
+    )
+    .await;
+    assert_ok(
+        read_relay_value(&mut outsider).await,
+        &denied_join,
+        false,
+        "restricted: group is unavailable",
+    );
+
+    let metadata = tangle_v2_group_metadata_event(
+        FixtureKey::Owner,
+        "SocketFarm",
+        "Socket Market",
+        1_714_124_442,
+        &[],
+    )
+    .expect("metadata");
+    send_client_value(&mut owner, json!(["EVENT", event_to_value(&metadata)])).await;
+    assert_ok(read_relay_value(&mut owner).await, &metadata, true, "");
+
+    let put_member = tangle_v2_put_user_event(
+        FixtureKey::Owner,
+        "SocketFarm",
+        FixtureKey::Member,
+        1_714_124_443,
+    )
+    .expect("put member");
+    send_client_value(&mut owner, json!(["EVENT", event_to_value(&put_member)])).await;
+    assert_ok(read_relay_value(&mut owner).await, &put_member, true, "");
+
+    for (subscription_id, kind) in [
+        ("metadata-count", KIND_GROUP_METADATA),
+        ("admins-count", KIND_GROUP_ADMINS),
+        ("members-count", KIND_GROUP_MEMBERS),
+    ] {
+        send_client_value(
+            &mut observer,
+            json!(["COUNT", subscription_id, {"kinds":[kind], "#d":["SocketFarm"]}]),
+        )
+        .await;
+        assert_eq!(
+            read_relay_value(&mut observer).await,
+            json!(["COUNT", subscription_id, {"count": 1}])
+        );
+    }
+
+    for (subscription_id, kind) in [
+        ("metadata-state", KIND_GROUP_METADATA),
+        ("admins-state", KIND_GROUP_ADMINS),
+        ("members-state", KIND_GROUP_MEMBERS),
+    ] {
+        send_client_value(
+            &mut observer,
+            json!(["REQ", subscription_id, {"kinds":[kind], "#d":["SocketFarm"]}]),
+        )
+        .await;
+        assert_relay_event_kind_tag(
+            read_relay_value(&mut observer).await,
+            subscription_id,
+            kind,
+            "d",
+            "SocketFarm",
+        );
+        assert_eq!(
+            read_relay_value(&mut observer).await,
+            json!(["EOSE", subscription_id])
+        );
+        send_client_value(&mut observer, json!(["CLOSE", subscription_id])).await;
+        expect_no_relay_message(&mut observer).await;
+    }
+
+    send_client_value(
+        &mut observer,
+        json!(["REQ", "group-live", {"kinds":[1], "#h":["SocketFarm"]}]),
+    )
+    .await;
+    assert_eq!(
+        read_relay_value(&mut observer).await,
+        json!(["EOSE", "group-live"])
+    );
+
+    let group_note = tangle_v2_group_event(
+        FixtureKey::Member,
+        "SocketFarm",
+        1_714_124_444,
+        1,
+        "harvest",
+    )
+    .expect("group note");
+    send_client_value(&mut member, json!(["EVENT", event_to_value(&group_note)])).await;
+    assert_ok(read_relay_value(&mut member).await, &group_note, true, "");
+    assert_live_event(
+        read_relay_value(&mut observer).await,
+        "group-live",
+        &group_note,
+    );
+
+    send_client_value(
+        &mut observer,
+        json!(["COUNT", "group-note-count", {"kinds":[1], "#h":["SocketFarm"]}]),
+    )
+    .await;
+    assert_eq!(
+        read_relay_value(&mut observer).await,
+        json!(["COUNT", "group-note-count", {"count": 1}])
+    );
+
+    send_client_value(
+        &mut observer,
+        json!(["REQ", "group-note-query", {"kinds":[1], "#h":["SocketFarm"]}]),
+    )
+    .await;
+    assert_live_event(
+        read_relay_value(&mut observer).await,
+        "group-note-query",
+        &group_note,
+    );
+    assert_eq!(
+        read_relay_value(&mut observer).await,
+        json!(["EOSE", "group-note-query"])
+    );
+
+    shutdown.request_shutdown();
+    read_websocket_close(&mut owner).await;
+    read_websocket_close(&mut member).await;
+    read_websocket_close(&mut outsider).await;
+    read_websocket_close(&mut observer).await;
     let report = timeout(Duration::from_secs(2), task)
         .await
         .expect("shutdown timeout")
@@ -1056,6 +1245,17 @@ async fn expect_no_relay_message(socket: &mut TestWebSocket) {
     );
 }
 
+async fn authenticate_client(
+    socket: &mut TestWebSocket,
+    fixture_key: FixtureKey,
+    challenge: &str,
+    created_at: u64,
+) {
+    let auth = tangle_v2_auth_event(fixture_key, challenge, created_at).expect("auth");
+    send_client_value(socket, json!(["AUTH", event_to_value(&auth)])).await;
+    assert_ok(read_relay_value(socket).await, &auth, true, "");
+}
+
 fn assert_notice_prefix(value: Value, prefix: &str) {
     assert_eq!(value[0], "NOTICE");
     assert!(value[1].as_str().expect("notice").starts_with(prefix));
@@ -1069,6 +1269,26 @@ fn assert_live_event(value: Value, subscription_id: &str, event: &Event) {
     assert_eq!(value[0], "EVENT");
     assert_eq!(value[1], subscription_id);
     assert_eq!(value[2]["id"], event.id().as_str());
+}
+
+fn assert_relay_event_kind_tag(
+    value: Value,
+    subscription_id: &str,
+    kind: u32,
+    tag_name: &str,
+    tag_value: &str,
+) {
+    assert_eq!(value[0], "EVENT");
+    assert_eq!(value[1], subscription_id);
+    assert_eq!(value[2]["kind"], json!(kind));
+    let tags = value[2]["tags"].as_array().expect("tags");
+    assert!(tags.iter().any(|tag| {
+        let Some(parts) = tag.as_array() else {
+            return false;
+        };
+        parts.first().and_then(Value::as_str) == Some(tag_name)
+            && parts.get(1).and_then(Value::as_str) == Some(tag_value)
+    }));
 }
 
 fn phase2_projection_with_group(
