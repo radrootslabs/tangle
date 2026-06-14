@@ -1240,6 +1240,7 @@ dependencies = [
 name = "tangle_groups"
 version = "0.1.0"
 dependencies = [
+ "pocket-types",
  "serde",
  "serde_json",
  "tangle_crypto",

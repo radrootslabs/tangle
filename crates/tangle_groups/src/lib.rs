@@ -2,6 +2,7 @@
 
 pub mod classification;
 pub mod errors;
+pub mod event_view;
 pub mod ids;
 pub mod kinds;
 pub mod metadata;
@@ -20,6 +21,7 @@ use tangle_protocol::PublicKeyHex;
 
 pub use classification::{GroupEventClass, classify_group_event};
 pub use errors::{GroupError, GroupErrorKind, GroupReplyPrefix};
+pub use event_view::{GroupEventTag, GroupEventView};
 pub use ids::GroupId;
 pub use kinds::{
     KIND_GROUP_ADMINS, KIND_GROUP_CREATE_GROUP, KIND_GROUP_CREATE_INVITE, KIND_GROUP_DELETE_EVENT,
