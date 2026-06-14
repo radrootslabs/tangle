@@ -244,10 +244,53 @@ async fn websocket_clients_use_nip01_nip42_and_nip45_flows() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-#[test]
-#[ignore = "phase2 target: nip11 truthfulness"]
-fn nip11_includes_cors_headers_and_truthful_supported_nips() {
-    pending("NIP-11 must include CORS headers and advertise only enforced NIPs");
+#[tokio::test]
+async fn nip11_includes_cors_headers_and_truthful_supported_nips() {
+    let root = temp_root("acceptance-nip11");
+    let _ = std::fs::remove_dir_all(&root);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let runtime = TangleRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let shutdown = runtime.shutdown_signal().clone();
+    let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
+
+    let response = wait_for_http_ok(address, "/", Some("application/nostr+json")).await;
+    let lower = response.to_ascii_lowercase();
+    assert!(lower.contains("content-type: application/nostr+json"));
+    assert!(lower.contains("access-control-allow-origin: *"));
+    assert!(lower.contains("access-control-allow-headers: *"));
+    assert!(lower.contains("access-control-allow-methods: *"));
+
+    let document = serde_json::from_str::<Value>(response_body(&response)).expect("nip11 json");
+    assert_eq!(document["supported_nips"], json!([1, 11, 29, 42, 45, 70]));
+    assert!(
+        !document["supported_nips"]
+            .as_array()
+            .expect("supported nips")
+            .contains(&json!(50))
+    );
+    assert!(
+        !document["supported_nips"]
+            .as_array()
+            .expect("supported nips")
+            .contains(&json!(77))
+    );
+    assert!(
+        !document["supported_nips"]
+            .as_array()
+            .expect("supported nips")
+            .contains(&json!(99))
+    );
+
+    shutdown.request_shutdown();
+    let report = timeout(Duration::from_secs(2), task)
+        .await
+        .expect("shutdown timeout")
+        .expect("task")
+        .expect("serve");
+    assert_eq!(report.listen_addr(), address);
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -694,6 +737,10 @@ fn http_get(address: SocketAddr, path: &str, accept: Option<&str>) -> std::io::R
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
     Ok(response)
+}
+
+fn response_body(response: &str) -> &str {
+    response.split_once("\r\n\r\n").expect("response body").1
 }
 
 fn temp_root(name: &str) -> PathBuf {

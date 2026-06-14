@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tangle_bench::{BenchDatasetConfig, BenchmarkRunReport};
-use tangle_runtime::TANGLE_SUPPORTED_NIPS;
+use tangle_runtime::nip11::supported_nips_for_group_capability;
 
 struct BenchmarkReportArgs {
     output_root: PathBuf,
@@ -45,9 +45,12 @@ fn run() -> Result<Option<PathBuf>, String> {
     .map_err(|error| error.to_string())?;
 
     let mut summary = report.summary_json(&args.run_id, &artifact_dir);
+    let supported_nips = supported_nips_for_group_capability(true);
+    let supported_nips_count = supported_nips.len();
     summary["supported_nips_audit"] = serde_json::json!({
-        "supported_nips": TANGLE_SUPPORTED_NIPS,
-        "count": TANGLE_SUPPORTED_NIPS.len()
+        "groups_enabled": true,
+        "supported_nips": supported_nips,
+        "count": supported_nips_count
     });
     summary["run_identity"] = serde_json::json!({
         "git_commit": git_short_commit(),

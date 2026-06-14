@@ -17,7 +17,7 @@ use tangle_protocol::{
 use tangle_runtime::{
     config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
     groups::{GroupCheckpointStatus, validate_group_extra_tables},
-    nip11::{BASE_RELAY_SUPPORTED_NIPS, BaseRelayInfoConfig},
+    nip11::BaseRelayInfoConfig,
     relay::{
         auth::BaseAuthState,
         core::{BaseRelay, BaseRelayLimitSettings, BaseRelayLimits},
@@ -87,11 +87,7 @@ fn nip11_integration_reports_group_contracts() {
         .build_document()
         .expect("disabled");
 
-    assert!(BASE_RELAY_SUPPORTED_NIPS.contains(&1));
-    assert!(document.supported_nips.contains(&29));
-    assert!(document.supported_nips.contains(&42));
-    assert!(document.supported_nips.contains(&45));
-    assert!(document.supported_nips.contains(&70));
+    assert_eq!(document.supported_nips, vec![1, 11, 29, 42, 45, 70]);
     assert!(!document.supported_nips.contains(&50));
     assert!(!document.supported_nips.contains(&77));
     assert!(!document.supported_nips.contains(&99));
@@ -107,7 +103,7 @@ fn nip11_integration_reports_group_contracts() {
     assert!(!document.limitation.payment_required);
     assert!(document.limitation.restricted_writes);
     assert_eq!(document.limitation.default_limit, 100);
-    assert!(!disabled.supported_nips.contains(&29));
+    assert_eq!(disabled.supported_nips, vec![1, 11, 42, 45, 70]);
     assert!(disabled.relay_self().is_none());
 }
 

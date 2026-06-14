@@ -21,7 +21,6 @@ use config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json};
 use errors::BaseRelayError;
 use runtime::TangleRuntime;
 
-pub const TANGLE_SUPPORTED_NIPS: [u16; 6] = [1, 11, 29, 42, 45, 70];
 pub const TANGLE_RELAY_SOFTWARE: &str = "https://github.com/radrootslabs/tangle";
 pub const TANGLE_RELAY_VERSION: &str = env!("CARGO_PKG_VERSION");
 

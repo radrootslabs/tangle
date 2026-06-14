@@ -16,7 +16,21 @@ use tangle_crypto::RelaySigner;
 use tangle_groups::GroupRuntimeConfig;
 use tangle_protocol::PublicKeyHex;
 
-pub const BASE_RELAY_SUPPORTED_NIPS: [u16; 5] = [1, 11, 42, 45, 70];
+const ALWAYS_SUPPORTED_NIPS: [u16; 5] = [1, 11, 42, 45, 70];
+const GROUP_SUPPORTED_NIP: u16 = 29;
+
+pub fn supported_nips_for_runtime(runtime: &BaseRelayRuntimeConfig) -> Vec<u16> {
+    supported_nips_for_group_capability(runtime.groups().enabled())
+}
+
+pub fn supported_nips_for_group_capability(groups_enabled: bool) -> Vec<u16> {
+    let mut supported_nips = ALWAYS_SUPPORTED_NIPS.to_vec();
+    if groups_enabled {
+        supported_nips.push(GROUP_SUPPORTED_NIP);
+        supported_nips.sort_unstable();
+    }
+    supported_nips
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaseRelayInfoConfig {
@@ -30,6 +44,7 @@ pub struct BaseRelayInfoConfig {
     version: String,
     payment_required: bool,
     restricted_writes: bool,
+    supported_nips: Vec<u16>,
 }
 
 impl BaseRelayInfoConfig {
@@ -52,6 +67,7 @@ impl BaseRelayInfoConfig {
             version: crate::TANGLE_RELAY_VERSION.to_owned(),
             payment_required: false,
             restricted_writes: true,
+            supported_nips: supported_nips_for_runtime(runtime),
         })
     }
 
@@ -72,18 +88,13 @@ impl BaseRelayInfoConfig {
 
     pub fn build_document(&self) -> Result<BaseRelayInfoDocument, BaseRelayError> {
         let relay_self = relay_self_from_groups(&self.groups)?;
-        let mut supported_nips = BASE_RELAY_SUPPORTED_NIPS.to_vec();
-        if self.groups.enabled() {
-            supported_nips.push(29);
-            supported_nips.sort_unstable();
-        }
         Ok(BaseRelayInfoDocument {
             name: self.name.clone(),
             description: self.description.clone(),
             contact: self.contact.clone(),
             icon: self.icon.clone(),
             relay_self: relay_self.map(|pubkey| pubkey.as_str().to_owned()),
-            supported_nips,
+            supported_nips: self.supported_nips.clone(),
             software: self.software.clone(),
             version: self.version.clone(),
             limitation: BaseRelayInfoLimitationDocument {
@@ -233,9 +244,7 @@ mod tests {
             .build_document()
             .expect("disabled");
 
-        assert!(document.supported_nips.contains(&29));
-        assert!(document.supported_nips.contains(&45));
-        assert!(document.supported_nips.contains(&70));
+        assert_eq!(document.supported_nips, vec![1, 11, 29, 42, 45, 70]);
         assert!(document.relay_self().is_some());
         assert_eq!(document.description.as_deref(), Some("Tangle v2 relay"));
         assert_eq!(document.limitation.max_message_length, 1_048_576);
@@ -249,7 +258,7 @@ mod tests {
         assert!(!document.limitation.payment_required);
         assert!(document.limitation.restricted_writes);
         assert_eq!(document.limitation.default_limit, 100);
-        assert!(!disabled.supported_nips.contains(&29));
+        assert_eq!(disabled.supported_nips, vec![1, 11, 42, 45, 70]);
         assert!(disabled.relay_self().is_none());
     }
 
