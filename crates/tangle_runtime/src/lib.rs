@@ -7,6 +7,7 @@ pub mod errors;
 pub mod groups;
 pub mod nip11;
 pub mod ops;
+pub(crate) mod pocket_conversion;
 pub mod relay;
 
 use std::{fmt, fs, path::Path, path::PathBuf};

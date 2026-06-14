@@ -1,24 +1,21 @@
 use crate::errors::{BaseRelayError, ok_accepted, ok_rejected};
 use crate::groups::GroupService;
 use crate::ops::BaseRelayReadinessState;
+use crate::pocket_conversion::{
+    pocket_event_id, pocket_event_to_tangle, tangle_event_to_pocket, tangle_filter_to_pocket,
+};
 use crate::relay::{
     auth::BaseAuthState,
     live::{CloseResult, LiveSubscriptionSet},
 };
-use std::{collections::BTreeSet, str};
+use std::collections::BTreeSet;
 use tangle_crypto::verify_event_signature;
 use tangle_groups::{
     GroupAuthContext, GroupEventClass, GroupProjection, GroupRuntimeConfig, StoreOffset,
     validate_client_group_event_structure,
 };
-use tangle_protocol::{
-    ClientMessage, Event, EventId, Filter, RelayMessage, SubscriptionId, UnixTimestamp,
-    event_to_value, filter_to_value, parse_event_json,
-};
-use tangle_store_pocket::{
-    PocketEvent, PocketEventId, PocketOwnedEvent, PocketOwnedFilter, PocketStoreConfig,
-    PocketStoreHandle, parse_pocket_event_json, parse_pocket_filter_json,
-};
+use tangle_protocol::{ClientMessage, Event, Filter, RelayMessage, SubscriptionId, UnixTimestamp};
+use tangle_store_pocket::{PocketStoreConfig, PocketStoreHandle};
 
 pub struct BaseRelay {
     store: PocketStoreHandle,
@@ -343,31 +340,6 @@ impl BaseRelay {
             .unwrap_or(Ok(true))
             .map_err(BaseRelayError::from)
     }
-}
-
-pub(crate) fn tangle_event_to_pocket(event: &Event) -> Result<PocketOwnedEvent, BaseRelayError> {
-    let raw = event_to_value(event).to_string();
-    parse_pocket_event_json(raw.as_bytes()).map_err(BaseRelayError::from)
-}
-
-fn tangle_filter_to_pocket(filter: &Filter) -> Result<PocketOwnedFilter, BaseRelayError> {
-    let raw = filter_to_value(filter).to_string();
-    parse_pocket_filter_json(raw.as_bytes()).map_err(BaseRelayError::from)
-}
-
-pub(crate) fn pocket_event_to_tangle(event: &PocketEvent) -> Result<Event, BaseRelayError> {
-    let raw = event
-        .as_json()
-        .map_err(|error| BaseRelayError::error(error.to_string()))?;
-    let raw = str::from_utf8(&raw).map_err(|error| BaseRelayError::error(error.to_string()))?;
-    let raw = tangle_protocol::RawEventJson::new(raw)
-        .map_err(|error| BaseRelayError::error(error.to_string()))?;
-    parse_event_json(&raw).map_err(|error| BaseRelayError::error(error.to_string()))
-}
-
-pub(crate) fn pocket_event_id(event_id: &EventId) -> Result<PocketEventId, BaseRelayError> {
-    PocketEventId::read_hex(event_id.as_str().as_bytes())
-        .map_err(|error| BaseRelayError::error(error.to_string()))
 }
 
 #[cfg(test)]

@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 use crate::{
-    base_relay::{pocket_event_id, pocket_event_to_tangle, tangle_event_to_pocket},
     errors::BaseRelayError,
+    pocket_conversion::{pocket_event_id, pocket_event_to_tangle, tangle_event_to_pocket},
 };
 use std::str;
 use tangle_crypto::RelaySigner;
