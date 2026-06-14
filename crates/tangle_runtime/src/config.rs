@@ -152,6 +152,7 @@ pub struct BaseRelayRuntimeLimitsConfig {
     max_subscriptions_per_connection: usize,
     max_filters_per_request: usize,
     max_tag_values_per_filter: usize,
+    max_query_complexity: usize,
     max_limit: u64,
     default_limit: u64,
     max_event_tags: usize,
@@ -176,6 +177,7 @@ impl BaseRelayRuntimeLimitsConfig {
             "limits.max_tag_values_per_filter",
             document.max_tag_values_per_filter,
         )?;
+        require_positive("limits.max_query_complexity", document.max_query_complexity)?;
         require_positive_u64("limits.max_limit", document.max_limit)?;
         require_positive_u64("limits.default_limit", document.default_limit)?;
         require_positive("limits.max_event_tags", document.max_event_tags)?;
@@ -205,6 +207,7 @@ impl BaseRelayRuntimeLimitsConfig {
             max_subscriptions_per_connection: document.max_subscriptions_per_connection,
             max_filters_per_request: document.max_filters_per_request,
             max_tag_values_per_filter: document.max_tag_values_per_filter,
+            max_query_complexity: document.max_query_complexity,
             max_limit: document.max_limit,
             default_limit: document.default_limit,
             max_event_tags: document.max_event_tags,
@@ -232,6 +235,10 @@ impl BaseRelayRuntimeLimitsConfig {
 
     pub fn max_tag_values_per_filter(self) -> usize {
         self.max_tag_values_per_filter
+    }
+
+    pub fn max_query_complexity(self) -> usize {
+        self.max_query_complexity
     }
 
     pub fn max_limit(self) -> u64 {
@@ -265,19 +272,12 @@ impl BaseRelayRuntimeLimitsConfig {
             max_subscriptions: self.max_subscriptions_per_connection,
             max_filters_per_request: self.max_filters_per_request,
             max_tag_values_per_filter: self.max_tag_values_per_filter,
-            max_query_complexity: self.query_complexity_budget(),
+            max_query_complexity: self.max_query_complexity,
             max_event_tags: self.max_event_tags,
             max_content_length: self.max_content_length,
             max_limit: self.max_limit,
             default_limit: self.default_limit,
         })
-    }
-
-    fn query_complexity_budget(self) -> usize {
-        usize::try_from(self.max_limit)
-            .unwrap_or(usize::MAX)
-            .saturating_add(self.max_tag_values_per_filter)
-            .saturating_add(self.max_filters_per_request)
     }
 }
 
@@ -332,6 +332,7 @@ struct BaseRelayRuntimeLimitsDocument {
     max_subscriptions_per_connection: usize,
     max_filters_per_request: usize,
     max_tag_values_per_filter: usize,
+    max_query_complexity: usize,
     max_limit: u64,
     default_limit: u64,
     max_event_tags: usize,
@@ -616,6 +617,7 @@ mod tests {
         assert_eq!(config.limits().max_subscriptions_per_connection(), 64);
         assert_eq!(config.limits().max_filters_per_request(), 10);
         assert_eq!(config.limits().max_tag_values_per_filter(), 100);
+        assert_eq!(config.limits().max_query_complexity(), 2_048);
         assert_eq!(config.limits().max_limit(), 500);
         assert_eq!(config.limits().default_limit(), 100);
         assert_eq!(config.limits().max_event_tags(), 200);
@@ -682,6 +684,7 @@ mod tests {
                 "max_subscriptions_per_connection": 64,
                 "max_filters_per_request": 10,
                 "max_tag_values_per_filter": 100,
+                "max_query_complexity": 2048,
                 "max_limit": 500,
                 "default_limit": 100,
                 "max_event_tags": 200,
@@ -757,6 +760,7 @@ mod tests {
                 "max_subscriptions_per_connection": 64,
                 "max_filters_per_request": 10,
                 "max_tag_values_per_filter": 100,
+                "max_query_complexity": 2048,
                 "max_limit": 500,
                 "default_limit": 100,
                 "max_event_tags": 200,
@@ -829,6 +833,7 @@ mod tests {
                 "max_subscriptions_per_connection": 64,
                 "max_filters_per_request": 10,
                 "max_tag_values_per_filter": 100,
+                "max_query_complexity": 2048,
                 "max_limit": 500,
                 "default_limit": 100,
                 "max_event_tags": 200,
@@ -875,6 +880,18 @@ mod tests {
                 .expect_err("unknown nested field")
                 .prefixed_message()
                 .contains("unknown field `max_unimplemented_limit`")
+        );
+    }
+
+    #[test]
+    fn base_relay_runtime_config_requires_explicit_query_complexity() {
+        let raw = include_str!("../../../ops/production/tangle-v2.example.json")
+            .replace("    \"max_query_complexity\": 2048,\n", "");
+        assert!(
+            parse_base_relay_runtime_config_json(&raw)
+                .expect_err("missing query complexity")
+                .prefixed_message()
+                .contains("missing field `max_query_complexity`")
         );
     }
 }

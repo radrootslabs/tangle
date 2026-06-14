@@ -33,6 +33,7 @@ fn operations_surfaces_match_enforced_runtime_contracts() {
     assert_eq!(document.limitation.max_subscriptions, 64);
     assert_eq!(document.limitation.max_filters, 10);
     assert_eq!(document.limitation.max_limit, 500);
+    assert_eq!(document.limitation.max_query_complexity, 2_048);
     assert_eq!(document.limitation.default_limit, 100);
     assert!(document.limitation.restricted_writes);
 
@@ -153,6 +154,7 @@ fn runtime_config(root: &Path) -> BaseRelayRuntimeConfig {
                 "max_subscriptions_per_connection": 64,
                 "max_filters_per_request": 10,
                 "max_tag_values_per_filter": 100,
+                "max_query_complexity": 2048,
                 "max_limit": 500,
                 "default_limit": 100,
                 "max_event_tags": 200,
