@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
-use crate::base_relay::{BaseAuthState, BaseRelay, BaseRelayError};
+use crate::{
+    base_relay::{BaseAuthState, BaseRelay},
+    errors::BaseRelayError,
+};
 use serde::Deserialize;
 use std::{net::SocketAddr, path::PathBuf};
 use tangle_groups::GroupRuntimeConfig;

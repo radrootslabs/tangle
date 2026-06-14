@@ -1,10 +1,10 @@
+use crate::errors::{BaseRelayError, ok_accepted, ok_rejected};
 use axum::{
     Json, Router,
     extract::State,
     response::{IntoResponse, Response},
     routing::get,
 };
-use core::fmt;
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, collections::BTreeSet, str};
@@ -1355,63 +1355,6 @@ pub enum CloseResult {
     NotFound,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BaseRelayError {
-    prefix: &'static str,
-    message: String,
-}
-
-impl BaseRelayError {
-    pub fn invalid(message: impl Into<String>) -> Self {
-        Self {
-            prefix: "invalid",
-            message: message.into(),
-        }
-    }
-
-    pub fn auth_required(message: impl Into<String>) -> Self {
-        Self {
-            prefix: "auth-required",
-            message: message.into(),
-        }
-    }
-
-    pub fn error(message: impl Into<String>) -> Self {
-        Self {
-            prefix: "error",
-            message: message.into(),
-        }
-    }
-
-    pub fn prefixed_message(&self) -> String {
-        format!("{}: {}", self.prefix, self.message)
-    }
-
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-}
-
-impl fmt::Display for BaseRelayError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.prefixed_message())
-    }
-}
-
-impl std::error::Error for BaseRelayError {}
-
-impl From<tangle_store_pocket::PocketStoreError> for BaseRelayError {
-    fn from(error: tangle_store_pocket::PocketStoreError) -> Self {
-        Self::error(error.to_string())
-    }
-}
-
-impl From<GroupError> for BaseRelayError {
-    fn from(error: GroupError) -> Self {
-        Self::error(error.prefixed_message())
-    }
-}
-
 fn relay_self_from_groups(
     groups: &GroupRuntimeConfig,
 ) -> Result<Option<PublicKeyHex>, BaseRelayError> {
@@ -1432,22 +1375,6 @@ fn accepts_nostr_json(value: Option<&HeaderValue>) -> bool {
                 item == "*/*" || item.starts_with("application/nostr+json")
             })
         })
-}
-
-fn ok_accepted(event_id: EventId, message: String) -> RelayMessage {
-    RelayMessage::Ok {
-        event_id,
-        accepted: true,
-        message,
-    }
-}
-
-fn ok_rejected(event_id: EventId, message: String) -> RelayMessage {
-    RelayMessage::Ok {
-        event_id,
-        accepted: false,
-        message,
-    }
 }
 
 fn tangle_event_to_pocket(event: &Event) -> Result<PocketOwnedEvent, BaseRelayError> {

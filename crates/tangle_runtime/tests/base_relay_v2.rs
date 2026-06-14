@@ -735,7 +735,7 @@ fn assert_event_query(
 }
 
 fn assert_count(
-    message: Result<RelayMessage, tangle_runtime::base_relay::BaseRelayError>,
+    message: Result<RelayMessage, tangle_runtime::errors::BaseRelayError>,
     expected: u64,
 ) {
     let RelayMessage::Count { count, .. } = message.expect("count") else {
