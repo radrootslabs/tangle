@@ -77,6 +77,7 @@ fn operations_surfaces_match_enforced_runtime_contracts() {
     assert_eq!(pre_bind.checks.server_bind, "not_ready");
     assert_eq!(pre_bind.checks.group_projection, "ready");
     assert_eq!(pre_bind.checks.group_outbox_replay, "ready");
+    assert_eq!(pre_bind.checks.event_bus, "ready");
     let bound = runtime
         .readiness_state()
         .clone()

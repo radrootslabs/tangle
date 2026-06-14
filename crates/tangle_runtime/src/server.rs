@@ -4,7 +4,7 @@ use crate::{
     errors::BaseRelayError,
     logging,
     nip11::{BaseRelayInfoConfig, BaseRelayInfoDocument, base_relay_info_response},
-    ops::{BaseRelayReadinessCheckStatus, BaseRelayReadinessState, base_relay_ops_router},
+    ops::{BaseRelayReadinessCheckStatus, BaseRelayReadinessHandle, base_relay_ops_router},
     runtime::{
         TangleRuntime, TangleRuntimeHandle, TangleRuntimeLimits, TangleRuntimeMetrics,
         TangleShutdownSignal,
@@ -65,10 +65,8 @@ pub async fn serve_listener_until_shutdown(
         .map_err(|error| BaseRelayError::error(error.to_string()))?;
     let relay_url = runtime.config().relay_url().to_owned();
     let info = BaseRelayInfoConfig::new("tangle", runtime.config())?.build_document()?;
-    let readiness = runtime
-        .readiness_state()
-        .clone()
-        .with_server_bind(BaseRelayReadinessCheckStatus::Ready);
+    let readiness = runtime.readiness_handle();
+    readiness.set_server_bind(BaseRelayReadinessCheckStatus::Ready);
     let limits = runtime.limits();
     let metrics = runtime.metrics().clone();
     let shutdown_signal = runtime.shutdown_signal().clone();
@@ -108,7 +106,7 @@ pub async fn serve_listener_until_shutdown(
 }
 
 pub fn tangle_http_router(
-    readiness: BaseRelayReadinessState,
+    readiness: BaseRelayReadinessHandle,
     info: BaseRelayInfoDocument,
     limits: TangleRuntimeLimits,
     metrics: TangleRuntimeMetrics,
@@ -175,7 +173,7 @@ mod tests {
     use crate::{
         config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
         nip11::BaseRelayInfoConfig,
-        ops::BaseRelayReadinessState,
+        ops::BaseRelayReadinessCheckStatus,
         runtime::{TangleRuntime, TangleRuntimeHandle, TangleShutdownSignal},
     };
     use axum::{body::to_bytes, extract::ConnectInfo};
@@ -399,10 +397,12 @@ mod tests {
             .build_document()
             .expect("info");
         let runtime = TangleRuntime::open(config).expect("runtime");
+        let readiness = runtime.readiness_handle();
+        readiness.set_server_bind(BaseRelayReadinessCheckStatus::Ready);
         let limits = runtime.limits();
         let metrics = runtime.metrics().clone();
         let router = tangle_http_router(
-            BaseRelayReadinessState::ready(),
+            readiness,
             info,
             limits,
             metrics,
@@ -496,6 +496,7 @@ mod tests {
         let ready_body = to_bytes(ready.into_body(), usize::MAX).await.expect("body");
         let ready_value = serde_json::from_slice::<serde_json::Value>(&ready_body).expect("json");
         assert_eq!(ready_value["checks"]["server_bind"], "ready");
+        assert_eq!(ready_value["checks"]["event_bus"], "ready");
         assert_eq!(metrics.status(), http::StatusCode::OK);
         let metrics_body = to_bytes(metrics.into_body(), usize::MAX)
             .await

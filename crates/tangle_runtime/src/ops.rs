@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
-use crate::runtime::{TangleRuntimeMetrics, TangleRuntimeMetricsSnapshot};
 use axum::{Json, Router, extract::State, routing::get};
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, RwLock};
+
+use crate::runtime::{TangleRuntimeMetrics, TangleRuntimeMetricsSnapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BaseRelayReadinessCheckStatus {
@@ -32,6 +34,7 @@ pub struct BaseRelayReadinessState {
     pocket_storage: BaseRelayReadinessCheckStatus,
     group_projection: BaseRelayReadinessCheckStatus,
     group_outbox_replay: BaseRelayReadinessCheckStatus,
+    event_bus: BaseRelayReadinessCheckStatus,
 }
 
 impl BaseRelayReadinessState {
@@ -42,6 +45,7 @@ impl BaseRelayReadinessState {
         pocket_storage: BaseRelayReadinessCheckStatus,
         group_projection: BaseRelayReadinessCheckStatus,
         group_outbox_replay: BaseRelayReadinessCheckStatus,
+        event_bus: BaseRelayReadinessCheckStatus,
     ) -> Self {
         Self {
             config,
@@ -50,11 +54,13 @@ impl BaseRelayReadinessState {
             pocket_storage,
             group_projection,
             group_outbox_replay,
+            event_bus,
         }
     }
 
     pub fn ready() -> Self {
         Self::new(
+            BaseRelayReadinessCheckStatus::Ready,
             BaseRelayReadinessCheckStatus::Ready,
             BaseRelayReadinessCheckStatus::Ready,
             BaseRelayReadinessCheckStatus::Ready,
@@ -68,6 +74,7 @@ impl BaseRelayReadinessState {
         Self::new(
             BaseRelayReadinessCheckStatus::Ready,
             BaseRelayReadinessCheckStatus::NotReady,
+            BaseRelayReadinessCheckStatus::Ready,
             BaseRelayReadinessCheckStatus::Ready,
             BaseRelayReadinessCheckStatus::Ready,
             BaseRelayReadinessCheckStatus::Ready,
@@ -88,6 +95,7 @@ impl BaseRelayReadinessState {
             self.pocket_storage,
             self.group_projection,
             self.group_outbox_replay,
+            self.event_bus,
         ]
         .into_iter()
         .all(BaseRelayReadinessCheckStatus::is_ready)
@@ -107,8 +115,37 @@ impl BaseRelayReadinessState {
                 pocket_storage: self.pocket_storage.as_str().to_owned(),
                 group_projection: self.group_projection.as_str().to_owned(),
                 group_outbox_replay: self.group_outbox_replay.as_str().to_owned(),
+                event_bus: self.event_bus.as_str().to_owned(),
             },
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BaseRelayReadinessHandle {
+    inner: Arc<RwLock<BaseRelayReadinessState>>,
+}
+
+impl BaseRelayReadinessHandle {
+    pub fn new(state: BaseRelayReadinessState) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(state)),
+        }
+    }
+
+    pub fn snapshot(&self) -> BaseRelayReadinessState {
+        match self.inner.read() {
+            Ok(state) => state.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    pub fn set_server_bind(&self, status: BaseRelayReadinessCheckStatus) {
+        let mut state = match self.inner.write() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.server_bind = status;
     }
 }
 
@@ -131,16 +168,17 @@ pub struct BaseRelayReadinessChecksDocument {
     pub pocket_storage: String,
     pub group_projection: String,
     pub group_outbox_replay: String,
+    pub event_bus: String,
 }
 
 #[derive(Debug, Clone)]
 struct BaseRelayOpsState {
-    readiness: BaseRelayReadinessState,
+    readiness: BaseRelayReadinessHandle,
     metrics: TangleRuntimeMetrics,
 }
 
 pub fn base_relay_ops_router(
-    readiness: BaseRelayReadinessState,
+    readiness: BaseRelayReadinessHandle,
     metrics: TangleRuntimeMetrics,
 ) -> Router {
     Router::new()
@@ -159,12 +197,13 @@ async fn base_relay_healthz() -> Json<BaseRelayHealthDocument> {
 async fn base_relay_readyz(
     State(state): State<BaseRelayOpsState>,
 ) -> (StatusCode, Json<BaseRelayReadinessDocument>) {
-    let status = if state.readiness.is_ready() {
+    let readiness = state.readiness.snapshot();
+    let status = if readiness.is_ready() {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (status, Json(state.readiness.response()))
+    (status, Json(readiness.response()))
 }
 
 async fn base_relay_metricsz(
@@ -175,7 +214,10 @@ async fn base_relay_metricsz(
 
 #[cfg(test)]
 mod tests {
-    use super::{BaseRelayReadinessCheckStatus, BaseRelayReadinessState, base_relay_ops_router};
+    use super::{
+        BaseRelayReadinessCheckStatus, BaseRelayReadinessHandle, BaseRelayReadinessState,
+        base_relay_ops_router,
+    };
     use crate::runtime::TangleRuntimeMetrics;
     use axum::body::to_bytes;
     use http::{Request, StatusCode};
@@ -184,7 +226,8 @@ mod tests {
     #[tokio::test]
     async fn base_relay_ops_router_reports_health_and_readiness() {
         let metrics = TangleRuntimeMetrics::new();
-        let health = base_relay_ops_router(BaseRelayReadinessState::ready(), metrics.clone())
+        let readiness = BaseRelayReadinessHandle::new(BaseRelayReadinessState::ready());
+        let health = base_relay_ops_router(readiness.clone(), metrics.clone())
             .oneshot(
                 Request::builder()
                     .uri("/healthz")
@@ -204,7 +247,7 @@ mod tests {
         metrics.record_session_opened();
         metrics.record_client_message(crate::runtime::TangleClientMessageMetricKind::Req);
         metrics.record_subscription_opened();
-        let ready = base_relay_ops_router(BaseRelayReadinessState::ready(), metrics.clone())
+        let ready = base_relay_ops_router(readiness.clone(), metrics.clone())
             .oneshot(
                 Request::builder()
                     .uri("/readyz")
@@ -220,7 +263,8 @@ mod tests {
         assert_eq!(ready_value["status"], "ready");
         assert_eq!(ready_value["checks"]["server_bind"], "ready");
         assert_eq!(ready_value["checks"]["group_outbox_replay"], "ready");
-        let metrics_response = base_relay_ops_router(BaseRelayReadinessState::ready(), metrics)
+        assert_eq!(ready_value["checks"]["event_bus"], "ready");
+        let metrics_response = base_relay_ops_router(readiness, metrics)
             .oneshot(
                 Request::builder()
                     .uri("/metricsz")
@@ -249,16 +293,20 @@ mod tests {
             BaseRelayReadinessCheckStatus::Ready,
             BaseRelayReadinessCheckStatus::NotReady,
             BaseRelayReadinessCheckStatus::Ready,
+            BaseRelayReadinessCheckStatus::Ready,
         );
-        let rejected = base_relay_ops_router(not_ready, TangleRuntimeMetrics::new())
-            .oneshot(
-                Request::builder()
-                    .uri("/readyz")
-                    .body(axum::body::Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("not ready");
+        let rejected = base_relay_ops_router(
+            BaseRelayReadinessHandle::new(not_ready),
+            TangleRuntimeMetrics::new(),
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .body(axum::body::Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("not ready");
 
         assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
         let rejected_body = to_bytes(rejected.into_body(), usize::MAX)
@@ -269,5 +317,40 @@ mod tests {
         assert_eq!(rejected_value["status"], "not_ready");
         assert_eq!(rejected_value["checks"]["server_bind"], "ready");
         assert_eq!(rejected_value["checks"]["group_projection"], "not_ready");
+    }
+
+    #[tokio::test]
+    async fn base_relay_ops_router_reports_live_readiness_state() {
+        let readiness =
+            BaseRelayReadinessHandle::new(BaseRelayReadinessState::runtime_ready_before_bind());
+        let router = base_relay_ops_router(readiness.clone(), TangleRuntimeMetrics::new());
+        let not_ready = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("not ready");
+
+        assert_eq!(not_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        readiness.set_server_bind(BaseRelayReadinessCheckStatus::Ready);
+        let ready = router
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("ready");
+
+        assert_eq!(ready.status(), StatusCode::OK);
+        let body = to_bytes(ready.into_body(), usize::MAX).await.expect("body");
+        let value = serde_json::from_slice::<serde_json::Value>(&body).expect("json");
+        assert_eq!(value["status"], "ready");
+        assert_eq!(value["checks"]["event_bus"], "ready");
     }
 }

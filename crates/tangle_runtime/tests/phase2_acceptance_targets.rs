@@ -1418,6 +1418,7 @@ fn projection_and_outbox_recover_from_canonical_pocket_events() {
     let readiness = recovered.readiness_state().response();
     assert_eq!(readiness.checks.group_projection, "ready");
     assert_eq!(readiness.checks.group_outbox_replay, "ready");
+    assert_eq!(readiness.checks.event_bus, "ready");
     assert!(
         recovered
             .relay()

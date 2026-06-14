@@ -5,7 +5,7 @@ use crate::{
     errors::BaseRelayError,
     event_bus::{TangleEventBus, TangleEventReceiver},
     logging,
-    ops::BaseRelayReadinessState,
+    ops::{BaseRelayReadinessHandle, BaseRelayReadinessState},
     rate_limits::{
         TangleQueryRateLimitConfig, TangleRateLimitDecision, TangleRateLimitKey,
         TangleRateLimitQueryClass, TangleRateLimitRule, TangleRateLimitScope, TangleRateLimiter,
@@ -38,7 +38,7 @@ use tokio::sync::{Mutex, watch};
 pub struct TangleRuntime {
     config: BaseRelayRuntimeConfig,
     relay: BaseRelay,
-    readiness: BaseRelayReadinessState,
+    readiness: BaseRelayReadinessHandle,
     limits: TangleRuntimeLimits,
     event_bus: TangleEventBus,
     rate_limiter: TangleRateLimiter,
@@ -76,7 +76,7 @@ impl TangleRuntime {
     pub fn open(config: BaseRelayRuntimeConfig) -> Result<Self, BaseRelayError> {
         let limits = TangleRuntimeLimits::from_config(&config)?;
         let relay = config.open_relay()?;
-        let readiness = relay.readiness_state();
+        let readiness = BaseRelayReadinessHandle::new(relay.readiness_state());
         let rate_limiter = TangleRateLimiter::new();
         logging::log_runtime_opened(&config);
         Ok(Self {
@@ -107,8 +107,12 @@ impl TangleRuntime {
         self.config.auth_state()
     }
 
-    pub fn readiness_state(&self) -> &BaseRelayReadinessState {
-        &self.readiness
+    pub fn readiness_state(&self) -> BaseRelayReadinessState {
+        self.readiness.snapshot()
+    }
+
+    pub fn readiness_handle(&self) -> BaseRelayReadinessHandle {
+        self.readiness.clone()
     }
 
     pub fn limits(&self) -> TangleRuntimeLimits {
@@ -1106,6 +1110,10 @@ mod tests {
                 .response()
                 .checks
                 .group_outbox_replay,
+            "ready"
+        );
+        assert_eq!(
+            runtime.readiness_state().response().checks.event_bus,
             "ready"
         );
         assert!(!*shutdown.borrow());
