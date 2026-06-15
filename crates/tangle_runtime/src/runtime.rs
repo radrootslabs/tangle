@@ -621,6 +621,21 @@ impl TangleRuntimeShared {
         })
     }
 
+    fn refuse_broad_count(
+        &self,
+        subscription_id: &SubscriptionId,
+        filters: &[Filter],
+    ) -> Option<RelayMessage> {
+        TangleQueryClassifier::new(self.limits.base_relay_limits())
+            .classify_count(filters)
+            .is_broad()
+            .then(|| RelayMessage::Closed {
+                subscription_id: subscription_id.clone(),
+                message: BaseRelayError::restricted("count filters are too broad or expensive")
+                    .prefixed_message(),
+            })
+    }
+
     fn rate_limit_query(&self, request: TangleQueryRateLimitRequest<'_>) -> Option<RelayMessage> {
         if let Some(peer_ip) = request.context.peer_ip
             && let Some(message) = self.rate_limit_closed(
@@ -903,6 +918,12 @@ impl TangleRuntimeHandle {
                 if let Some(message) =
                     BaseRelay::unsupported_search_closed(&subscription_id, &filters)
                 {
+                    self.inner
+                        .metrics
+                        .record_query_latency(elapsed_micros(started_at));
+                    return Ok(vec![message]);
+                }
+                if let Some(message) = self.inner.refuse_broad_count(&subscription_id, &filters) {
                     self.inner
                         .metrics
                         .record_query_latency(elapsed_micros(started_at));
@@ -2946,7 +2967,9 @@ mod tests {
         let handle = TangleRuntimeHandle::new(runtime);
         let mut auth = handle.auth_state().await.expect("auth");
         let subscription_id = SubscriptionId::new("limited-count-ip").expect("subscription");
-        let filters = vec![filter_from_value(&json!({"kinds": [1], "limit": 1})).expect("filter")];
+        let filters = vec![
+            filter_from_value(&json!({"kinds": [1], "#h": ["Farm"], "limit": 1})).expect("filter"),
+        ];
 
         assert_eq!(
             handle
@@ -3037,7 +3060,9 @@ mod tests {
         let handle = TangleRuntimeHandle::new(runtime);
         let mut auth = handle.auth_state().await.expect("auth");
         let subscription_id = SubscriptionId::new("limited-count-kind").expect("subscription");
-        let filters = vec![filter_from_value(&json!({"kinds": [1], "limit": 1})).expect("filter")];
+        let filters = vec![
+            filter_from_value(&json!({"kinds": [1], "#h": ["Farm"], "limit": 1})).expect("filter"),
+        ];
 
         assert_eq!(
             handle
@@ -3061,8 +3086,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_rate_limits_count_broad_queries() {
-        let root = temp_root("runtime-count-broad-rate-limit");
+    async fn runtime_refuses_broad_count_queries_before_rate_limits() {
+        let root = temp_root("runtime-count-broad-refusal");
         let _ = std::fs::remove_dir_all(&root);
         let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
         let rule = runtime.config().rate_limits().count().broad();
@@ -3094,10 +3119,60 @@ mod tests {
                 .expect("count"),
             vec![RelayMessage::Closed {
                 subscription_id,
-                message: "rate-limited: count broad rate limit exceeded until 1714124493"
-                    .to_owned()
+                message: "restricted: count filters are too broad or expensive".to_owned()
             }]
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_refuses_expensive_count_queries_deterministically() {
+        let root = temp_root("runtime-count-expensive-refusal");
+        let _ = std::fs::remove_dir_all(&root);
+        let handle = TangleRuntimeHandle::new(
+            TangleRuntime::open(runtime_config(&root, 8)).expect("runtime"),
+        );
+        let mut auth = handle.auth_state().await.expect("auth");
+        let cases = [
+            ("missing-selector", json!({"kinds": [1], "limit": 1})),
+            (
+                "high-limit",
+                json!({"kinds": [1], "#h": ["Farm"], "limit": 500}),
+            ),
+            (
+                "broad-window",
+                json!({
+                    "kinds": [1],
+                    "since": 1,
+                    "until": BROAD_QUERY_TIME_WINDOW_SECONDS + 2,
+                    "limit": 1
+                }),
+            ),
+        ];
+
+        for (name, value) in cases {
+            let subscription_id = SubscriptionId::new(name).expect("subscription");
+            let filters = vec![filter_from_value(&value).expect("filter")];
+
+            assert_eq!(
+                handle
+                    .handle_client_message(
+                        ClientMessage::Count {
+                            subscription_id: subscription_id.clone(),
+                            filters
+                        },
+                        &mut auth,
+                        UnixTimestamp::new(1_714_124_433)
+                    )
+                    .await
+                    .expect("count"),
+                vec![RelayMessage::Closed {
+                    subscription_id,
+                    message: "restricted: count filters are too broad or expensive".to_owned()
+                }]
+            );
+        }
 
         let _ = std::fs::remove_dir_all(root);
     }

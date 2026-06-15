@@ -364,7 +364,7 @@ async fn websocket_public_relay_covers_query_count_ephemeral_and_rejection_flows
 
     send_client_value(
         &mut publisher,
-        json!(["COUNT", "count-kind-one", {"kinds":[1]}]),
+        json!(["COUNT", "count-kind-one", {"kinds":[1], "since": 1_714_124_433, "until": 1_714_124_435}]),
     )
     .await;
     assert_eq!(
@@ -374,7 +374,7 @@ async fn websocket_public_relay_covers_query_count_ephemeral_and_rejection_flows
 
     send_client_value(
         &mut publisher,
-        json!(["COUNT", "count-ephemeral", {"kinds":[20001]}]),
+        json!(["COUNT", "count-ephemeral", {"kinds":[20001], "since": 1_714_124_437, "until": 1_714_124_437}]),
     )
     .await;
     assert_eq!(

@@ -32,6 +32,13 @@ impl BaseRelayError {
         }
     }
 
+    pub fn restricted(message: impl Into<String>) -> Self {
+        Self {
+            prefix: "restricted",
+            message: message.into(),
+        }
+    }
+
     pub fn error(message: impl Into<String>) -> Self {
         Self {
             prefix: "error",
@@ -101,6 +108,10 @@ mod tests {
         assert_eq!(
             BaseRelayError::rate_limited("slow down").prefixed_message(),
             "rate-limited: slow down"
+        );
+        assert_eq!(
+            BaseRelayError::restricted("nope").prefixed_message(),
+            "restricted: nope"
         );
         assert_eq!(
             BaseRelayError::error("store").prefixed_message(),
