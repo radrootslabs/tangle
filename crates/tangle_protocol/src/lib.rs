@@ -659,6 +659,40 @@ impl Filter {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        ids: Vec<EventId>,
+        authors: Vec<PublicKeyHex>,
+        kinds: Vec<Kind>,
+        tag_filters: BTreeMap<TagName, Vec<TagValue>>,
+        since: Option<UnixTimestamp>,
+        until: Option<UnixTimestamp>,
+        limit: Option<u64>,
+        search: Option<String>,
+    ) -> Result<Self, String> {
+        for (name, values) in &tag_filters {
+            if !name.is_indexable() {
+                return Err(format!(
+                    "filter field `#{}` is invalid: tag name must be a single ASCII letter",
+                    name.as_str()
+                ));
+            }
+            if values.is_empty() {
+                return Err(filter_array_error(&format!("#{}", name.as_str())));
+            }
+        }
+        Ok(Self {
+            ids,
+            authors,
+            kinds,
+            tag_filters,
+            since,
+            until,
+            limit,
+            search,
+        })
+    }
+
     pub fn ids(&self) -> &[EventId] {
         &self.ids
     }
@@ -1363,7 +1397,7 @@ mod tests {
         parse_client_message, parse_event_json, relay_message_to_value, too_long_error,
     };
     use core::str::FromStr;
-    use std::collections::hash_map::DefaultHasher;
+    use std::collections::{BTreeMap, hash_map::DefaultHasher};
     use std::hash::{Hash, Hasher};
 
     #[test]
@@ -2309,6 +2343,46 @@ mod tests {
         assert_eq!(
             filter_from_value(&filter_to_value(&filter)).expect("encoded"),
             filter
+        );
+    }
+
+    #[test]
+    fn filter_from_parts_builds_validated_filter_components() {
+        let name = TagName::new("t").expect("tag name");
+        let value = TagValue::new("market");
+        let filter = Filter::from_parts(
+            vec![EventId::new(&"a".repeat(EventId::HEX_LENGTH)).expect("id")],
+            vec![PublicKeyHex::new(&"b".repeat(PublicKeyHex::HEX_LENGTH)).expect("author")],
+            vec![Kind::new(1).expect("kind")],
+            BTreeMap::from([(name.clone(), vec![value.clone()])]),
+            Some(UnixTimestamp::new(10)),
+            Some(UnixTimestamp::new(20)),
+            Some(30),
+            Some("carrots".to_owned()),
+        )
+        .expect("filter");
+
+        assert_eq!(filter.ids().len(), 1);
+        assert_eq!(filter.authors().len(), 1);
+        assert_eq!(filter.kinds(), &[Kind::new(1).expect("kind")]);
+        assert_eq!(filter.tag_filters().get(&name), Some(&vec![value]));
+        assert_eq!(filter.since(), Some(UnixTimestamp::new(10)));
+        assert_eq!(filter.until(), Some(UnixTimestamp::new(20)));
+        assert_eq!(filter.limit(), Some(30));
+        assert_eq!(filter.search(), Some("carrots"));
+        assert_eq!(
+            Filter::from_parts(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                BTreeMap::from([(TagName::new("ab").expect("tag"), Vec::new())]),
+                None,
+                None,
+                None,
+                None
+            )
+            .expect_err("invalid tag"),
+            "filter field `#ab` is invalid: tag name must be a single ASCII letter"
         );
     }
 
