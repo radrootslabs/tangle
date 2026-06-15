@@ -80,6 +80,159 @@ struct TangleQueryRateLimitRequest<'a> {
     now: UnixTimestamp,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TangleQueryClassification {
+    Bounded,
+    Broad(TangleBroadQueryReason),
+}
+
+impl TangleQueryClassification {
+    fn is_broad(self) -> bool {
+        matches!(self, Self::Broad(_))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TangleBroadQueryReason {
+    EmptyFilters,
+    MissingPrimaryConstraint,
+    MissingBoundedSelector,
+    HighLimit,
+    BroadTimeWindow,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TangleQueryClassifier {
+    limits: BaseRelayLimits,
+}
+
+const BROAD_QUERY_TIME_WINDOW_SECONDS: u64 = 31 * 24 * 60 * 60;
+
+impl TangleQueryClassifier {
+    fn new(limits: BaseRelayLimits) -> Self {
+        Self { limits }
+    }
+
+    fn classify(
+        self,
+        scope: TangleRateLimitScope,
+        filters: &[Filter],
+    ) -> TangleQueryClassification {
+        match scope {
+            TangleRateLimitScope::Req => self.classify_query(filters),
+            TangleRateLimitScope::Count => self.classify_count(filters),
+            TangleRateLimitScope::Auth
+            | TangleRateLimitScope::Event
+            | TangleRateLimitScope::GroupWrite => self.classify_query(filters),
+        }
+    }
+
+    fn classify_query(self, filters: &[Filter]) -> TangleQueryClassification {
+        self.classify_filters(filters, Self::classify_query_filter)
+    }
+
+    fn classify_count(self, filters: &[Filter]) -> TangleQueryClassification {
+        self.classify_filters(filters, Self::classify_count_filter)
+    }
+
+    fn classify_filters(
+        self,
+        filters: &[Filter],
+        classify_filter: fn(Self, &Filter) -> TangleQueryClassification,
+    ) -> TangleQueryClassification {
+        if filters.is_empty() {
+            return TangleQueryClassification::Broad(TangleBroadQueryReason::EmptyFilters);
+        }
+        filters
+            .iter()
+            .map(|filter| classify_filter(self, filter))
+            .find(|classification| classification.is_broad())
+            .unwrap_or(TangleQueryClassification::Bounded)
+    }
+
+    fn classify_query_filter(self, filter: &Filter) -> TangleQueryClassification {
+        if !self.has_primary_constraint(filter) {
+            return TangleQueryClassification::Broad(
+                TangleBroadQueryReason::MissingPrimaryConstraint,
+            );
+        }
+        if self.has_high_limit(filter) {
+            return TangleQueryClassification::Broad(TangleBroadQueryReason::HighLimit);
+        }
+        if self.has_broad_time_window(filter) && !self.has_strong_constraint(filter) {
+            return TangleQueryClassification::Broad(TangleBroadQueryReason::BroadTimeWindow);
+        }
+        TangleQueryClassification::Bounded
+    }
+
+    fn classify_count_filter(self, filter: &Filter) -> TangleQueryClassification {
+        if !self.has_primary_constraint(filter) {
+            return TangleQueryClassification::Broad(
+                TangleBroadQueryReason::MissingPrimaryConstraint,
+            );
+        }
+        if self.has_high_limit(filter) {
+            return TangleQueryClassification::Broad(TangleBroadQueryReason::HighLimit);
+        }
+        if self.has_broad_time_window(filter) {
+            return TangleQueryClassification::Broad(TangleBroadQueryReason::BroadTimeWindow);
+        }
+        if !self.has_count_bounded_selector(filter) {
+            return TangleQueryClassification::Broad(
+                TangleBroadQueryReason::MissingBoundedSelector,
+            );
+        }
+        TangleQueryClassification::Bounded
+    }
+
+    fn has_primary_constraint(self, filter: &Filter) -> bool {
+        !filter.ids().is_empty()
+            || !filter.authors().is_empty()
+            || !filter.kinds().is_empty()
+            || self.has_group_constraint(filter)
+    }
+
+    fn has_strong_constraint(self, filter: &Filter) -> bool {
+        !filter.ids().is_empty()
+            || !filter.authors().is_empty()
+            || self.has_group_constraint(filter)
+    }
+
+    fn has_count_bounded_selector(self, filter: &Filter) -> bool {
+        self.has_strong_constraint(filter)
+            || (!filter.kinds().is_empty() && self.has_bounded_time_window(filter))
+    }
+
+    fn has_group_constraint(self, filter: &Filter) -> bool {
+        filter
+            .tag_filters()
+            .iter()
+            .any(|(name, values)| matches!(name.as_str(), "h" | "d") && !values.is_empty())
+    }
+
+    fn has_high_limit(self, filter: &Filter) -> bool {
+        filter.limit().unwrap_or(self.limits.default_limit()) >= self.limits.max_limit()
+    }
+
+    fn has_bounded_time_window(self, filter: &Filter) -> bool {
+        match (filter.since(), filter.until()) {
+            (Some(since), Some(until)) => {
+                until.as_u64().saturating_sub(since.as_u64()) <= BROAD_QUERY_TIME_WINDOW_SECONDS
+            }
+            _ => false,
+        }
+    }
+
+    fn has_broad_time_window(self, filter: &Filter) -> bool {
+        match (filter.since(), filter.until()) {
+            (Some(since), Some(until)) => {
+                until.as_u64().saturating_sub(since.as_u64()) > BROAD_QUERY_TIME_WINDOW_SECONDS
+            }
+            _ => false,
+        }
+    }
+}
+
 impl TangleRuntime {
     pub fn open(config: BaseRelayRuntimeConfig) -> Result<Self, BaseRelayError> {
         let limits = TangleRuntimeLimits::from_config(&config)?;
@@ -529,7 +682,9 @@ impl TangleRuntimeShared {
                 return Some(message);
             }
         }
-        if query_is_broad(request.filters)
+        if TangleQueryClassifier::new(self.limits.base_relay_limits())
+            .classify(request.scope, request.filters)
+            .is_broad()
             && let Some(message) = self.rate_limit_closed(
                 request.subscription_id,
                 TangleRateLimitKey::query_class(request.scope, TangleRateLimitQueryClass::Broad),
@@ -990,16 +1145,6 @@ fn filter_kinds(filters: &[Filter]) -> Vec<Kind> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
-}
-
-fn query_is_broad(filters: &[Filter]) -> bool {
-    filters.iter().any(|filter| {
-        filter.ids().is_empty()
-            && filter.authors().is_empty()
-            && filter.kinds().is_empty()
-            && filter.tag_filters().is_empty()
-            && filter.search().is_none()
-    })
 }
 
 impl fmt::Debug for TangleRuntimeHandle {
@@ -1639,7 +1784,9 @@ impl Default for TangleShutdownSignal {
 #[cfg(test)]
 mod tests {
     use super::{
-        TangleClientRateLimitContext, TangleRuntime, TangleRuntimeHandle, TangleRuntimeLimits,
+        BROAD_QUERY_TIME_WINDOW_SECONDS, TangleBroadQueryReason, TangleClientRateLimitContext,
+        TangleQueryClassification, TangleQueryClassifier, TangleRuntime, TangleRuntimeHandle,
+        TangleRuntimeLimits,
     };
     use crate::config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json};
     use crate::event_bus::{TangleEventBus, TangleEventReceiveError};
@@ -2719,6 +2866,68 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn query_classifier_identifies_broad_count_shapes() {
+        let classifier = TangleQueryClassifier::new(runtime_relay_limits(8));
+        let empty_filter = filter_from_value(&json!({})).expect("filter");
+        let tag_only_filter =
+            filter_from_value(&json!({"#t": ["market"], "limit": 1})).expect("filter");
+        let kind_only_filter =
+            filter_from_value(&json!({"kinds": [1], "limit": 1})).expect("filter");
+        let high_limit_filter =
+            filter_from_value(&json!({"kinds": [1], "#h": ["Farm"], "limit": 500}))
+                .expect("filter");
+        let broad_time_filter = filter_from_value(&json!({
+            "kinds": [1],
+            "since": 1,
+            "until": BROAD_QUERY_TIME_WINDOW_SECONDS + 2,
+            "limit": 1
+        }))
+        .expect("filter");
+        let bounded_group_filter =
+            filter_from_value(&json!({"kinds": [1], "#h": ["Farm"], "limit": 1})).expect("filter");
+        let bounded_time_filter = filter_from_value(&json!({
+            "kinds": [1],
+            "since": 1,
+            "until": BROAD_QUERY_TIME_WINDOW_SECONDS,
+            "limit": 1
+        }))
+        .expect("filter");
+
+        assert_eq!(
+            classifier.classify_count(&[]),
+            TangleQueryClassification::Broad(TangleBroadQueryReason::EmptyFilters)
+        );
+        assert_eq!(
+            classifier.classify_count(&[empty_filter]),
+            TangleQueryClassification::Broad(TangleBroadQueryReason::MissingPrimaryConstraint)
+        );
+        assert_eq!(
+            classifier.classify_count(&[tag_only_filter]),
+            TangleQueryClassification::Broad(TangleBroadQueryReason::MissingPrimaryConstraint)
+        );
+        assert_eq!(
+            classifier.classify_count(&[kind_only_filter]),
+            TangleQueryClassification::Broad(TangleBroadQueryReason::MissingBoundedSelector)
+        );
+        assert_eq!(
+            classifier.classify_count(&[high_limit_filter]),
+            TangleQueryClassification::Broad(TangleBroadQueryReason::HighLimit)
+        );
+        assert_eq!(
+            classifier.classify_count(&[broad_time_filter]),
+            TangleQueryClassification::Broad(TangleBroadQueryReason::BroadTimeWindow)
+        );
+        assert_eq!(
+            classifier.classify_count(&[bounded_group_filter]),
+            TangleQueryClassification::Bounded
+        );
+        assert_eq!(
+            classifier.classify_count(&[bounded_time_filter]),
+            TangleQueryClassification::Bounded
+        );
     }
 
     #[tokio::test]
