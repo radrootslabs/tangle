@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{fs, panic, path::PathBuf};
-use tangle_crypto::{event_id_matches, verify_event_signature};
+use tangle_crypto::{RelaySigner, event_id_matches, verify_event_signature};
 use tangle_groups::{
     GroupAuthority, GroupGeneratedEventBuilder, GroupId, GroupLimitsConfig, GroupOutboxEffect,
     GroupOutboxKey, GroupOutboxRecord, GroupOutboxStatus, GroupProjection, GroupRuntimeConfig,
@@ -1402,6 +1402,88 @@ fn outbox_before_generated_recovery_materializes_pending_records_without_duplica
 }
 
 #[test]
+fn generated_before_outbox_mark_recovery_marks_records_without_duplicates() {
+    let config = test_store_config("generated-before-outbox-mark-recovery");
+    let events = recovery_equivalence_events();
+    let offsets = store_source_events(&config, &events);
+    let records = seed_pending_recovery_outbox_records(&config, &events, &offsets);
+    store_generated_events_for_pending_outbox_records(&config, &records);
+    let generated_metadata_ids = stored_event_ids_for_kind(&config, KIND_GROUP_METADATA);
+    let generated_admin_ids = stored_event_ids_for_kind(&config, KIND_GROUP_ADMINS);
+    let generated_member_ids = stored_event_ids_for_kind(&config, KIND_GROUP_MEMBERS);
+
+    assert_eq!(
+        outbox_status_counts(&config),
+        OutboxStatusCounts {
+            pending: 5,
+            retryable: 0,
+            stored: 0,
+        }
+    );
+    assert_eq!(generated_metadata_ids.len(), 2);
+    assert_eq!(generated_admin_ids.len(), 2);
+    assert_eq!(generated_member_ids.len(), 1);
+
+    let mut recovered = BaseRelay::open_with_groups(
+        &config,
+        relay_limits(8),
+        &group_config(),
+        PocketQueryConfig::default(),
+    )
+    .expect("recovered");
+    let first_summary = recovery_summary(&mut recovered, "CrashFarm");
+    let first_outbox = outbox_status_counts(&config);
+
+    assert_eq!(first_outbox.pending, 0);
+    assert_eq!(first_outbox.retryable, 0);
+    assert_eq!(first_outbox.stored, 5);
+    assert_eq!(first_summary.group_name.as_deref(), Some("Crash Market"));
+    assert_eq!(first_summary.member_status, Some(MemberStatus::Member));
+    assert_eq!(
+        first_summary.member_roles,
+        vec![PERMANENT_RELAY_OVERRIDE_ROLE.to_owned()]
+    );
+    assert_eq!(first_summary.metadata_event_ids.len(), 1);
+    assert_eq!(first_summary.admin_event_ids.len(), 1);
+    assert_eq!(first_summary.member_event_ids.len(), 1);
+    assert_eq!(
+        stored_event_ids_for_kind(&config, KIND_GROUP_METADATA),
+        generated_metadata_ids
+    );
+    assert_eq!(
+        stored_event_ids_for_kind(&config, KIND_GROUP_ADMINS),
+        generated_admin_ids
+    );
+    assert_eq!(
+        stored_event_ids_for_kind(&config, KIND_GROUP_MEMBERS),
+        generated_member_ids
+    );
+    recovered.shutdown().expect("shutdown");
+
+    let mut reopened = BaseRelay::open_with_groups(
+        &config,
+        relay_limits(8),
+        &group_config(),
+        PocketQueryConfig::default(),
+    )
+    .expect("reopen");
+    assert_eq!(recovery_summary(&mut reopened, "CrashFarm"), first_summary);
+    assert_eq!(outbox_status_counts(&config), first_outbox);
+    assert_eq!(
+        stored_event_ids_for_kind(&config, KIND_GROUP_METADATA),
+        generated_metadata_ids
+    );
+    assert_eq!(
+        stored_event_ids_for_kind(&config, KIND_GROUP_ADMINS),
+        generated_admin_ids
+    );
+    assert_eq!(
+        stored_event_ids_for_kind(&config, KIND_GROUP_MEMBERS),
+        generated_member_ids
+    );
+}
+
+#[test]
 fn rebuilt_projection_matches_live_projection_for_moderation_stream() {
     let config = test_store_config("projection-equivalence");
     let owner_auth = authenticated(FixtureKey::Owner);
@@ -1933,10 +2015,28 @@ fn seed_pending_recovery_outbox_records(
     config: &PocketStoreConfig,
     events: &[Event],
     offsets: &[StoreOffset],
-) {
+) -> Vec<GroupOutboxRecord> {
+    let records = pending_recovery_outbox_records(events, offsets);
+    let store = PocketStoreHandle::open(config).expect("store");
+    for record in &records {
+        store
+            .put_extra_record(
+                TANGLE_GROUP_OUTBOX_TABLE,
+                &record.key().storage_key(),
+                &record.to_json_bytes().expect("record bytes"),
+            )
+            .expect("outbox");
+    }
+    store.sync().expect("sync");
+    records
+}
+
+fn pending_recovery_outbox_records(
+    events: &[Event],
+    offsets: &[StoreOffset],
+) -> Vec<GroupOutboxRecord> {
     assert_eq!(events.len(), 3);
     assert_eq!(offsets.len(), events.len());
-    let store = PocketStoreHandle::open(config).expect("store");
     let group_id = group("CrashFarm");
     let limits = GroupLimitsConfig::default();
     let authority = GroupAuthority::new(
@@ -2032,14 +2132,23 @@ fn seed_pending_recovery_outbox_records(
         .expect("metadata payload"),
     ));
 
+    records
+}
+
+fn store_generated_events_for_pending_outbox_records(
+    config: &PocketStoreConfig,
+    records: &[GroupOutboxRecord],
+) {
+    let store = PocketStoreHandle::open(config).expect("store");
+    let signer = RelaySigner::from_secret_hex(TANGLE_V2_RELAY_SECRET_HEX).expect("relay signer");
+    let builder = GroupGeneratedEventBuilder::new(signer);
     for record in records {
-        store
-            .put_extra_record(
-                TANGLE_GROUP_OUTBOX_TABLE,
-                &record.key().storage_key(),
-                &record.to_json_bytes().expect("record bytes"),
-            )
-            .expect("outbox");
+        let event = builder
+            .sign_payload(record.payload())
+            .expect("generated event");
+        let raw = serde_json::to_vec(&event_to_value(&event)).expect("event JSON");
+        let pocket = parse_pocket_event_json(&raw).expect("pocket event");
+        store.store_event(&pocket).expect("store generated");
     }
     store.sync().expect("sync");
 }
