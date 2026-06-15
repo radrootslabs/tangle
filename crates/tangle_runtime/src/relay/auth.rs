@@ -351,6 +351,134 @@ mod tests {
     }
 
     #[test]
+    fn auth_state_preserves_chorus_auth_parity() {
+        let mut auth = BaseAuthState::new("wss://relay.radroots.test", 20, 10).expect("auth state");
+        auth.issue_challenge("challenge-a", UnixTimestamp::new(100))
+            .expect("challenge");
+        let owner = signed_auth_event(7, "challenge-a", 105);
+        let admin = signed_auth_event(8, "challenge-a", 106);
+
+        let owner_pubkey = auth
+            .authenticate(&owner, UnixTimestamp::new(105))
+            .expect("owner");
+        let admin_pubkey = auth
+            .authenticate(&admin, UnixTimestamp::new(106))
+            .expect("admin");
+        assert_ne!(owner_pubkey, admin_pubkey);
+        assert!(auth.authenticated_pubkeys().contains(&owner_pubkey));
+        assert!(auth.authenticated_pubkeys().contains(&admin_pubkey));
+        assert_eq!(auth.authenticated_pubkeys().len(), 2);
+
+        let wrong_id = Event::new(
+            EventId::new(&"0".repeat(EventId::HEX_LENGTH)).expect("id"),
+            owner.unsigned().clone(),
+            owner.sig().clone(),
+        );
+        assert!(
+            auth.authenticate(&wrong_id, UnixTimestamp::new(105))
+                .expect_err("id")
+                .prefixed_message()
+                .starts_with("invalid: event id mismatch:")
+        );
+
+        let wrong_signature = Event::new(
+            owner.id().clone(),
+            owner.unsigned().clone(),
+            admin.sig().clone(),
+        );
+        assert_eq!(
+            auth.authenticate(&wrong_signature, UnixTimestamp::new(105))
+                .expect_err("signature")
+                .prefixed_message(),
+            "invalid: event signature verification failed"
+        );
+        assert_eq!(
+            auth.authenticate(
+                &signed_event(9, 1, auth_tags("challenge-a"), 105),
+                UnixTimestamp::new(105)
+            )
+            .expect_err("kind")
+            .prefixed_message(),
+            "invalid: AUTH message must contain kind 22242"
+        );
+        assert_eq!(
+            auth.authenticate(
+                &signed_event(
+                    9,
+                    22_242,
+                    auth_tags_for("wss://other.radroots.test", "challenge-a"),
+                    105
+                ),
+                UnixTimestamp::new(105)
+            )
+            .expect_err("relay")
+            .prefixed_message(),
+            "auth-required: auth relay does not match canonical relay URL"
+        );
+        assert_eq!(
+            auth.authenticate(
+                &signed_event(
+                    9,
+                    22_242,
+                    vec![Tag::from_parts("challenge", &["challenge-a"]).expect("challenge")],
+                    105
+                ),
+                UnixTimestamp::new(105)
+            )
+            .expect_err("missing relay")
+            .prefixed_message(),
+            "invalid: tag `relay` is required"
+        );
+        assert_eq!(
+            auth.authenticate(
+                &signed_event(
+                    9,
+                    22_242,
+                    vec![Tag::from_parts("relay", &["wss://relay.radroots.test"]).expect("relay")],
+                    105
+                ),
+                UnixTimestamp::new(105)
+            )
+            .expect_err("missing challenge")
+            .prefixed_message(),
+            "invalid: tag `challenge` is required"
+        );
+        assert_eq!(
+            auth.authenticate(&signed_auth_event(9, "wrong", 105), UnixTimestamp::new(105))
+                .expect_err("challenge")
+                .prefixed_message(),
+            "auth-required: auth challenge does not match"
+        );
+        assert_eq!(
+            auth.authenticate(
+                &signed_auth_event(9, "challenge-a", 121),
+                UnixTimestamp::new(121)
+            )
+            .expect_err("expired")
+            .prefixed_message(),
+            "auth-required: auth challenge expired"
+        );
+        assert_eq!(
+            auth.authenticate(
+                &signed_auth_event(9, "challenge-a", 94),
+                UnixTimestamp::new(105)
+            )
+            .expect_err("stale")
+            .prefixed_message(),
+            "auth-required: auth event created_at is outside configured skew"
+        );
+        assert_eq!(
+            auth.authenticate(
+                &signed_auth_event(9, "challenge-a", 116),
+                UnixTimestamp::new(105)
+            )
+            .expect_err("future")
+            .prefixed_message(),
+            "auth-required: auth event created_at is outside configured skew"
+        );
+    }
+
+    #[test]
     fn generated_auth_challenge_is_lowercase_hex_nonce() {
         let first = generate_auth_challenge().expect("first");
         let second = generate_auth_challenge().expect("second");
@@ -379,8 +507,12 @@ mod tests {
     }
 
     fn auth_tags(challenge: &str) -> Vec<Tag> {
+        auth_tags_for("wss://relay.radroots.test", challenge)
+    }
+
+    fn auth_tags_for(relay: &str, challenge: &str) -> Vec<Tag> {
         vec![
-            Tag::from_parts("relay", &["wss://relay.radroots.test"]).expect("relay"),
+            Tag::from_parts("relay", &[relay]).expect("relay"),
             Tag::from_parts("challenge", &[challenge]).expect("challenge"),
         ]
     }

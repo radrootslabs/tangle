@@ -2235,6 +2235,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_preserves_chorus_auth_failure_rate_limit_parity() {
+        let root = temp_root("runtime-chorus-auth-rate-limit-parity");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let pubkey_event =
+            tangle_v2_event(FixtureKey::Member, 1_714_124_433, 22_242, Vec::new(), "")
+                .expect("pubkey auth event");
+        let pubkey_rule = runtime.config().rate_limits().auth().failures();
+        let pubkey_key =
+            TangleRateLimitKey::auth_failure(None, Some(pubkey_event.unsigned().pubkey().clone()));
+        for _ in 0..pubkey_rule.max_hits() {
+            runtime.rate_limiter().record(
+                pubkey_key.clone(),
+                pubkey_rule,
+                UnixTimestamp::new(1_714_124_433),
+            );
+        }
+        let peer_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 41));
+        let peer_event = tangle_v2_event(FixtureKey::Admin, 1_714_124_434, 22_242, Vec::new(), "")
+            .expect("peer auth event");
+        let peer_rule = runtime.config().rate_limits().auth().failures_per_ip();
+        let peer_key = TangleRateLimitKey::auth_failure(Some(peer_ip), None);
+        for _ in 0..peer_rule.max_hits() {
+            runtime.rate_limiter().record(
+                peer_key.clone(),
+                peer_rule,
+                UnixTimestamp::new(1_714_124_434),
+            );
+        }
+        let handle = TangleRuntimeHandle::new(runtime);
+        let mut auth = handle.auth_state().await.expect("auth");
+
+        assert_eq!(
+            handle
+                .handle_client_message(
+                    ClientMessage::Auth(pubkey_event.clone()),
+                    &mut auth,
+                    UnixTimestamp::new(1_714_124_433)
+                )
+                .await
+                .expect("pubkey failure"),
+            vec![RelayMessage::Ok {
+                event_id: pubkey_event.id().clone(),
+                accepted: false,
+                message: "rate-limited: auth failure rate limit exceeded until 1714124733"
+                    .to_owned()
+            }]
+        );
+        assert_eq!(
+            handle
+                .handle_client_message_with_rate_limit_context(
+                    ClientMessage::Auth(peer_event.clone()),
+                    &mut auth,
+                    TangleClientRateLimitContext::new(Some(peer_ip), None),
+                    UnixTimestamp::new(1_714_124_434)
+                )
+                .await
+                .expect("peer failure"),
+            vec![RelayMessage::Ok {
+                event_id: peer_event.id().clone(),
+                accepted: false,
+                message: "rate-limited: auth failure ip rate limit exceeded until 1714124734"
+                    .to_owned()
+            }]
+        );
+        assert!(auth.authenticated_pubkeys().is_empty());
+        let snapshot = handle.metrics().snapshot();
+        assert_eq!(snapshot.client_messages(), 2);
+        assert_eq!(snapshot.auth_messages(), 2);
+        assert_eq!(snapshot.rate_limit_rejections(), 2);
+        assert_eq!(handle.metrics().auth_successes(), 0);
+        assert_eq!(handle.metrics().auth_failures(), 2);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn runtime_rate_limits_group_writes_by_pubkey() {
         let root = temp_root("runtime-group-pubkey-rate-limit");
         let _ = std::fs::remove_dir_all(&root);
