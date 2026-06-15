@@ -1276,6 +1276,64 @@ fn source_store_crash_recovery_rebuilds_projection_outbox_and_generated_events()
 }
 
 #[test]
+fn source_before_outbox_recovery_derives_missing_records_without_duplicates() {
+    let config = test_store_config("source-before-outbox-recovery");
+    let events = recovery_equivalence_events();
+    let offsets = store_source_events(&config, &events);
+    assert_eq!(offsets.len(), events.len());
+    assert_eq!(outbox_status_counts(&config), OutboxStatusCounts::default());
+
+    let mut recovered = BaseRelay::open_with_groups(
+        &config,
+        relay_limits(8),
+        &group_config(),
+        PocketQueryConfig::default(),
+    )
+    .expect("recovered");
+    let first_summary = recovery_summary(&mut recovered, "CrashFarm");
+    let first_outbox = outbox_status_counts(&config);
+    let first_metadata_ids = stored_event_ids_for_kind(&config, KIND_GROUP_METADATA);
+    let first_admin_ids = stored_event_ids_for_kind(&config, KIND_GROUP_ADMINS);
+    let first_member_ids = stored_event_ids_for_kind(&config, KIND_GROUP_MEMBERS);
+
+    assert_eq!(first_outbox.pending, 0);
+    assert_eq!(first_outbox.retryable, 0);
+    assert_eq!(first_outbox.stored, 5);
+    assert_eq!(first_summary.group_name.as_deref(), Some("Crash Market"));
+    assert_eq!(first_summary.member_status, Some(MemberStatus::Member));
+    assert_eq!(
+        first_summary.member_roles,
+        vec![PERMANENT_RELAY_OVERRIDE_ROLE.to_owned()]
+    );
+    assert_eq!(first_metadata_ids.len(), 2);
+    assert_eq!(first_admin_ids.len(), 2);
+    assert_eq!(first_member_ids.len(), 1);
+    recovered.shutdown().expect("shutdown");
+
+    let mut reopened = BaseRelay::open_with_groups(
+        &config,
+        relay_limits(8),
+        &group_config(),
+        PocketQueryConfig::default(),
+    )
+    .expect("reopen");
+    assert_eq!(recovery_summary(&mut reopened, "CrashFarm"), first_summary);
+    assert_eq!(outbox_status_counts(&config), first_outbox);
+    assert_eq!(
+        stored_event_ids_for_kind(&config, KIND_GROUP_METADATA),
+        first_metadata_ids
+    );
+    assert_eq!(
+        stored_event_ids_for_kind(&config, KIND_GROUP_ADMINS),
+        first_admin_ids
+    );
+    assert_eq!(
+        stored_event_ids_for_kind(&config, KIND_GROUP_MEMBERS),
+        first_member_ids
+    );
+}
+
+#[test]
 fn rebuilt_projection_matches_live_projection_for_moderation_stream() {
     let config = test_store_config("projection-equivalence");
     let owner_auth = authenticated(FixtureKey::Owner);
