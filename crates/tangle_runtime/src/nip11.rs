@@ -247,10 +247,10 @@ fn accepts_nostr_json(value: Option<&HeaderValue>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{BaseRelayInfoConfig, base_relay_info_router};
+    use super::{BaseRelayInfoConfig, base_relay_info_response, base_relay_info_router};
     use crate::config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json};
     use axum::body::to_bytes;
-    use http::{Request, StatusCode, header};
+    use http::{HeaderMap, HeaderValue, Request, StatusCode, header};
     use serde_json::{Value, json};
     use tangle_crypto::RelaySigner;
     use tower::ServiceExt;
@@ -296,6 +296,115 @@ mod tests {
         assert!(!document.retention.compaction_guarantee);
         assert_eq!(disabled.supported_nips, vec![1, 11, 42, 45, 70]);
         assert!(disabled.relay_self().is_none());
+    }
+
+    #[tokio::test]
+    async fn nip11_preserves_chorus_relay_information_parity() {
+        let config = runtime_config(enabled_groups());
+        let disabled_config = runtime_config(json!({"enabled": false}));
+        let document = BaseRelayInfoConfig::new("tangle", &config)
+            .expect("config")
+            .with_description("Tangle relay")
+            .with_contact("ops@radroots.test")
+            .with_icon("https://relay.radroots.test/icon.png")
+            .build_document()
+            .expect("document");
+        let disabled = BaseRelayInfoConfig::new("tangle", &disabled_config)
+            .expect("disabled config")
+            .build_document()
+            .expect("disabled");
+        let relay_self = RelaySigner::from_secret_hex(&"7".repeat(64))
+            .expect("relay signer")
+            .public_key()
+            .clone();
+
+        assert_eq!(document.name, "tangle");
+        assert_eq!(document.description.as_deref(), Some("Tangle relay"));
+        assert_eq!(document.contact.as_deref(), Some("ops@radroots.test"));
+        assert_eq!(
+            document.icon.as_deref(),
+            Some("https://relay.radroots.test/icon.png")
+        );
+        assert_eq!(document.relay_self(), Some(relay_self.as_str()));
+        assert_eq!(document.supported_nips, vec![1, 11, 29, 42, 45, 70]);
+        for absent in [50, 77, 86, 98, 99] {
+            assert!(!document.supported_nips.contains(&absent));
+        }
+        assert_eq!(disabled.supported_nips, vec![1, 11, 42, 45, 70]);
+        assert!(disabled.relay_self().is_none());
+        assert_eq!(document.software, crate::TANGLE_RELAY_SOFTWARE);
+        assert_eq!(document.version, crate::TANGLE_RELAY_VERSION);
+        assert_eq!(document.limitation.max_message_length, 1_048_576);
+        assert_eq!(document.limitation.max_subscriptions, 64);
+        assert_eq!(document.limitation.max_filters, 10);
+        assert_eq!(document.limitation.max_limit, 500);
+        assert_eq!(document.limitation.max_query_complexity, 2_048);
+        assert_eq!(document.limitation.max_subid_length, 64);
+        assert_eq!(document.limitation.max_event_tags, 200);
+        assert_eq!(document.limitation.max_content_length, 65_536);
+        assert!(!document.limitation.auth_required);
+        assert!(!document.limitation.payment_required);
+        assert!(document.limitation.restricted_writes);
+        assert_eq!(document.limitation.default_limit, 100);
+        assert_eq!(
+            document.retention.accepted_events,
+            "accepted events are retained in canonical storage without a time-based expiration policy"
+        );
+        assert_eq!(
+            document.retention.relay_generated_events,
+            "relay-generated group state events are retained with their source events"
+        );
+        assert_eq!(
+            document.retention.group_visibility,
+            "private and hidden group policy gates visibility without implying physical deletion"
+        );
+        assert!(!document.retention.physical_erasure);
+        assert!(!document.retention.compaction_guarantee);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/nostr+json; q=1"),
+        );
+        let response = base_relay_info_response(document.clone(), headers);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).expect("type"),
+            "application/nostr+json"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .expect("origin"),
+            "*"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+                .expect("headers"),
+            "*"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+                .expect("methods"),
+            "*"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let value = serde_json::from_slice::<Value>(&body).expect("json");
+        assert_eq!(value["software"], crate::TANGLE_RELAY_SOFTWARE);
+        assert_eq!(value["version"], crate::TANGLE_RELAY_VERSION);
+        assert_eq!(value["supported_nips"], json!([1, 11, 29, 42, 45, 70]));
+        assert_eq!(value["retention"]["physical_erasure"], false);
+        assert_eq!(value["retention"]["compaction_guarantee"], false);
+
+        let rejected = base_relay_info_response(document, HeaderMap::new());
+        assert_eq!(rejected.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
