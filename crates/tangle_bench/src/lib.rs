@@ -1060,13 +1060,13 @@ fn run_broadcast_lag_benchmark(dataset: &BenchDataset) -> Result<ScenarioReport,
         .iter()
         .filter(|message| matches!(message, RelayMessage::Event { .. }))
         .count();
-    let closed = second_messages
+    let second_events = second_messages
         .iter()
-        .filter(|message| matches!(message, RelayMessage::Closed { .. }))
+        .filter(|message| matches!(message, RelayMessage::Event { .. }))
         .count();
     let accepted = if first_events == subscriber_count
-        && closed == subscriber_count
-        && materialized.relay.active_subscription_count() == 0
+        && second_events == subscriber_count
+        && materialized.relay.active_subscription_count() == subscriber_count
     {
         subscriber_count
     } else {
@@ -1833,7 +1833,7 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_lag_scenario_closes_slow_subscriptions() {
+    fn broadcast_lag_scenario_keeps_healthy_subscriptions_open() {
         let dataset =
             BenchDataset::generate(BenchDatasetConfig::new(3, 1, 1, 0, 1)).expect("dataset");
         let scenario = super::run_broadcast_lag_benchmark(&dataset).expect("lag");

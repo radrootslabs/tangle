@@ -257,6 +257,7 @@ mod tests {
         metrics.record_event_bus_receivers(2);
         metrics.record_event_bus_publish(2);
         metrics.record_event_bus_lagged(3);
+        metrics.record_outbound_queue_full_close();
         metrics.record_outbox_pending_events(5);
         metrics.record_outbox_replayed_event();
         metrics.record_disk_used_bytes(89);
@@ -322,6 +323,7 @@ mod tests {
                 "tangle_event_rejected_total",
                 "tangle_group_read_denied_total",
                 "tangle_group_write_denied_total",
+                "tangle_outbound_queue_full_closes_total",
                 "tangle_outbox_pending_events",
                 "tangle_outbox_replayed_events_total",
                 "tangle_query_latency_count",
@@ -356,6 +358,7 @@ mod tests {
         assert_eq!(metrics_value["tangle_event_bus_published_offsets_total"], 1);
         assert_eq!(metrics_value["tangle_event_bus_lagged_receivers_total"], 1);
         assert_eq!(metrics_value["tangle_event_bus_lagged_offsets_total"], 3);
+        assert_eq!(metrics_value["tangle_outbound_queue_full_closes_total"], 1);
         assert_eq!(metrics_value["tangle_outbox_pending_events"], 5);
         assert_eq!(metrics_value["tangle_outbox_replayed_events_total"], 1);
         assert_eq!(metrics_value["tangle_disk_used_bytes"], 89);

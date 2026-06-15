@@ -452,6 +452,69 @@ async fn websocket_public_relay_covers_query_count_ephemeral_and_rejection_flows
 }
 
 #[tokio::test]
+async fn websocket_healthy_subscriber_receives_more_than_outbound_capacity() {
+    let root = temp_root("acceptance-healthy-live-volume");
+    let _ = std::fs::remove_dir_all(&root);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let runtime = TangleRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let shutdown = runtime.shutdown_signal().clone();
+    let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
+    let mut publisher = connect_nostr_socket(address).await;
+    let mut subscriber = connect_nostr_socket(address).await;
+    let _ = read_auth_challenge(&mut publisher).await;
+    let _ = read_auth_challenge(&mut subscriber).await;
+    send_client_value(
+        &mut subscriber,
+        json!(["REQ", "healthy-live", {"kinds":[1]}]),
+    )
+    .await;
+    assert_eq!(
+        read_relay_value(&mut subscriber).await,
+        json!(["EOSE", "healthy-live"])
+    );
+    let delivered_count = 10_u64;
+    for index in 0..delivered_count {
+        let event = tangle_v2_event(
+            FixtureKey::Member,
+            1_714_124_500 + index,
+            1,
+            Vec::new(),
+            &format!("healthy live {index}"),
+        )
+        .expect("event");
+        send_client_value(&mut publisher, json!(["EVENT", event_to_value(&event)])).await;
+        assert_ok(read_relay_value(&mut publisher).await, &event, true, "");
+        assert_live_event(
+            read_relay_value(&mut subscriber).await,
+            "healthy-live",
+            &event,
+        );
+    }
+    send_client_value(
+        &mut subscriber,
+        json!(["COUNT", "healthy-count", {"kinds":[1]}]),
+    )
+    .await;
+    assert_eq!(
+        read_relay_value(&mut subscriber).await,
+        json!(["COUNT", "healthy-count", {"count": delivered_count}])
+    );
+
+    shutdown.request_shutdown();
+    read_websocket_close(&mut publisher).await;
+    read_websocket_close(&mut subscriber).await;
+    let report = timeout(Duration::from_secs(2), task)
+        .await
+        .expect("shutdown timeout")
+        .expect("task")
+        .expect("serve");
+    assert_eq!(report.listen_addr(), address);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn websocket_nip29_group_lifecycle_state_and_live_paths_are_integrated() {
     let root = temp_root("acceptance-nip29-websocket");
     let _ = std::fs::remove_dir_all(&root);

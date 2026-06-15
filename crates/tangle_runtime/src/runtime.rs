@@ -1107,6 +1107,7 @@ struct TangleRuntimeMetricsInner {
     event_bus_published_offsets: AtomicU64,
     event_bus_lagged_receivers: AtomicU64,
     event_bus_lagged_offsets: AtomicU64,
+    outbound_queue_full_closes: AtomicU64,
     outbox_pending_events: AtomicUsize,
     outbox_replayed_events: AtomicU64,
     disk_used_bytes: AtomicU64,
@@ -1151,6 +1152,7 @@ pub struct TangleRuntimeMetricsSnapshot {
     tangle_event_bus_published_offsets_total: u64,
     tangle_event_bus_lagged_receivers_total: u64,
     tangle_event_bus_lagged_offsets_total: u64,
+    tangle_outbound_queue_full_closes_total: u64,
     tangle_outbox_pending_events: usize,
     tangle_outbox_replayed_events_total: u64,
     tangle_disk_used_bytes: u64,
@@ -1237,6 +1239,7 @@ impl TangleRuntimeMetrics {
                 event_bus_published_offsets: AtomicU64::new(0),
                 event_bus_lagged_receivers: AtomicU64::new(0),
                 event_bus_lagged_offsets: AtomicU64::new(0),
+                outbound_queue_full_closes: AtomicU64::new(0),
                 outbox_pending_events: AtomicUsize::new(0),
                 outbox_replayed_events: AtomicU64::new(0),
                 disk_used_bytes: AtomicU64::new(0),
@@ -1278,6 +1281,7 @@ impl TangleRuntimeMetrics {
             tangle_event_bus_published_offsets_total: self.event_bus_published_offsets(),
             tangle_event_bus_lagged_receivers_total: self.event_bus_lagged_receivers(),
             tangle_event_bus_lagged_offsets_total: self.event_bus_lagged_offsets(),
+            tangle_outbound_queue_full_closes_total: self.outbound_queue_full_closes(),
             tangle_outbox_pending_events: self.outbox_pending_events(),
             tangle_outbox_replayed_events_total: self.outbox_replayed_events(),
             tangle_disk_used_bytes: self.disk_used_bytes(),
@@ -1385,6 +1389,12 @@ impl TangleRuntimeMetrics {
 
     pub fn event_bus_lagged_offsets(&self) -> u64 {
         self.inner.event_bus_lagged_offsets.load(Ordering::Relaxed)
+    }
+
+    pub fn outbound_queue_full_closes(&self) -> u64 {
+        self.inner
+            .outbound_queue_full_closes
+            .load(Ordering::Relaxed)
     }
 
     pub fn outbox_pending_events(&self) -> usize {
@@ -1545,6 +1555,13 @@ impl TangleRuntimeMetrics {
         self.inner
             .event_bus_lagged_offsets
             .fetch_add(skipped, Ordering::Relaxed);
+    }
+
+    pub fn record_outbound_queue_full_close(&self) -> u64 {
+        self.inner
+            .outbound_queue_full_closes
+            .fetch_add(1, Ordering::Relaxed)
+            + 1
     }
 
     pub fn record_outbox_pending_events(&self, count: usize) {
@@ -1735,6 +1752,7 @@ mod tests {
         runtime.metrics().record_event_bus_receivers(3);
         assert_eq!(runtime.metrics().record_event_bus_publish(3), 1);
         runtime.metrics().record_event_bus_lagged(4);
+        assert_eq!(runtime.metrics().record_outbound_queue_full_close(), 1);
         runtime.metrics().record_outbox_pending_events(2);
         assert_eq!(runtime.metrics().record_outbox_replayed_event(), 1);
         runtime.metrics().record_disk_used_bytes(5);
@@ -1764,6 +1782,7 @@ mod tests {
         );
         assert_eq!(snapshot_value["tangle_event_bus_lagged_receivers_total"], 1);
         assert_eq!(snapshot_value["tangle_event_bus_lagged_offsets_total"], 4);
+        assert_eq!(snapshot_value["tangle_outbound_queue_full_closes_total"], 1);
         assert_eq!(snapshot_value["tangle_outbox_pending_events"], 2);
         assert_eq!(snapshot_value["tangle_outbox_replayed_events_total"], 1);
         assert_eq!(snapshot_value["tangle_disk_used_bytes"], 5);
@@ -1801,6 +1820,7 @@ mod tests {
         assert_eq!(value["tangle_event_admitted_total"], 1);
         assert_eq!(value["tangle_event_bus_published_offsets_total"], 1);
         assert_eq!(value["tangle_disk_used_bytes"], 42);
+        assert_eq!(value["tangle_outbound_queue_full_closes_total"], 0);
         assert!(value.get("active_sessions").is_none());
         assert!(value.get("stored_event_offsets").is_none());
     }

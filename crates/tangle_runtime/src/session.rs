@@ -131,8 +131,13 @@ impl TangleWebSocketSession {
                     match incoming {
                         Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
                         Some(Ok(message)) => {
-                            if !self.handle_incoming_message(message).await {
-                                break;
+                            match self.handle_incoming_message(message).await {
+                                TangleSessionControl::Continue => {}
+                                TangleSessionControl::Close(message) => {
+                                    let _ = socket.send(message).await;
+                                    break;
+                                }
+                                TangleSessionControl::Stop => break,
                             }
                         }
                     }
@@ -179,13 +184,7 @@ impl TangleWebSocketSession {
         result: Result<tangle_groups::StoreOffset, TangleEventReceiveError>,
     ) -> TangleSessionControl {
         match result {
-            Ok(offset) => {
-                if self.handle_event_offset(offset).await {
-                    TangleSessionControl::Continue
-                } else {
-                    TangleSessionControl::Stop
-                }
-            }
+            Ok(offset) => self.handle_event_offset(offset).await,
             Err(TangleEventReceiveError::Lagged(skipped)) => {
                 self.runtime.metrics().record_event_bus_lagged(skipped);
                 TangleSessionControl::Close(event_stream_lag_close_message())
@@ -195,7 +194,10 @@ impl TangleWebSocketSession {
         }
     }
 
-    async fn handle_event_offset(&mut self, offset: tangle_groups::StoreOffset) -> bool {
+    async fn handle_event_offset(
+        &mut self,
+        offset: tangle_groups::StoreOffset,
+    ) -> TangleSessionControl {
         let runtime = self.runtime.clone();
         let replies = match runtime
             .fanout_event_offset(offset, &mut self.subscriptions)
@@ -205,23 +207,24 @@ impl TangleWebSocketSession {
             Err(error) => vec![RelayMessage::Notice(error.prefixed_message())],
         };
         for reply in replies {
-            if self.send_relay_message(reply).is_err() {
-                return false;
+            if let Err(control) = self.enqueue_relay_message(reply) {
+                return control;
             }
         }
-        true
+        TangleSessionControl::Continue
     }
 
-    async fn handle_incoming_message(&mut self, message: Message) -> bool {
+    async fn handle_incoming_message(&mut self, message: Message) -> TangleSessionControl {
         match message {
             Message::Text(raw) => self.dispatch_text(raw.as_str()).await,
             Message::Binary(_) => self
-                .send_relay_message(RelayMessage::Notice(
+                .enqueue_relay_message(RelayMessage::Notice(
                     "invalid: client message must be a text frame".to_owned(),
                 ))
-                .is_ok(),
-            Message::Ping(_) | Message::Pong(_) => true,
-            Message::Close(_) => false,
+                .map(|_| TangleSessionControl::Continue)
+                .unwrap_or_else(|control| control),
+            Message::Ping(_) | Message::Pong(_) => TangleSessionControl::Continue,
+            Message::Close(_) => TangleSessionControl::Stop,
         }
     }
 
@@ -235,14 +238,15 @@ impl TangleWebSocketSession {
         self.send_relay_message(message).is_ok()
     }
 
-    async fn dispatch_text(&mut self, raw: &str) -> bool {
+    async fn dispatch_text(&mut self, raw: &str) -> TangleSessionControl {
         if raw.len() > self.limits.max_message_length() {
             return self
-                .send_relay_message(RelayMessage::Notice(format!(
+                .enqueue_relay_message(RelayMessage::Notice(format!(
                     "invalid: client message length exceeds runtime max_message_length {}",
                     self.limits.max_message_length()
                 )))
-                .is_ok();
+                .map(|_| TangleSessionControl::Continue)
+                .unwrap_or_else(|control| control);
         }
         let replies = match parse_client_message(raw) {
             Ok(message) => match self.handle_client_message(message).await {
@@ -252,11 +256,11 @@ impl TangleWebSocketSession {
             Err(error) => vec![RelayMessage::Notice(format!("invalid: {error}"))],
         };
         for reply in replies {
-            if self.send_relay_message(reply).is_err() {
-                return false;
+            if let Err(control) = self.enqueue_relay_message(reply) {
+                return control;
             }
         }
-        true
+        TangleSessionControl::Continue
     }
 
     async fn handle_client_message(
@@ -365,6 +369,24 @@ impl TangleWebSocketSession {
         self.outbound
             .try_send(Message::Text(message.encode().into()))
     }
+
+    fn enqueue_relay_message(&self, message: RelayMessage) -> Result<(), TangleSessionControl> {
+        self.send_relay_message(message)
+            .map_err(|error| self.outbound_queue_error_control(error))
+    }
+
+    fn outbound_queue_error_control(
+        &self,
+        error: TangleOutboundQueueError,
+    ) -> TangleSessionControl {
+        match error {
+            TangleOutboundQueueError::Full => {
+                self.runtime.metrics().record_outbound_queue_full_close();
+                TangleSessionControl::Close(outbound_queue_full_close_message())
+            }
+            TangleOutboundQueueError::Closed => TangleSessionControl::Stop,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -378,6 +400,13 @@ fn event_stream_lag_close_message() -> Message {
     Message::Close(Some(CloseFrame {
         code: 1008,
         reason: Utf8Bytes::from_static("event stream lagged; reconnect required"),
+    }))
+}
+
+fn outbound_queue_full_close_message() -> Message {
+    Message::Close(Some(CloseFrame {
+        code: 1013,
+        reason: Utf8Bytes::from_static("outbound queue full; reconnect required"),
     }))
 }
 
@@ -425,7 +454,7 @@ fn current_unix_timestamp() -> UnixTimestamp {
 mod tests {
     use super::{
         TangleOutboundQueueError, TangleSessionControl, TangleWebSocketSession,
-        current_unix_timestamp, event_stream_lag_close_message,
+        current_unix_timestamp, event_stream_lag_close_message, outbound_queue_full_close_message,
     };
     use crate::{
         config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
@@ -496,7 +525,10 @@ mod tests {
         )
         .expect("session");
 
-        assert!(session.dispatch_text("123456789").await);
+        assert_eq!(
+            session.dispatch_text("123456789").await,
+            TangleSessionControl::Continue
+        );
         let message = session.outbound_receiver.try_recv().expect("notice");
         let Message::Text(text) = message else {
             panic!("expected text notice")
@@ -703,6 +735,31 @@ mod tests {
                 .expect_err("full"),
             TangleOutboundQueueError::Full
         );
+    }
+
+    #[tokio::test]
+    async fn websocket_session_closes_when_outbound_queue_is_full() {
+        let shutdown = TangleShutdownSignal::new();
+        let (runtime, auth, events) = session_runtime("outbound-queue-full-close");
+        let metrics = runtime.metrics();
+        let mut session = TangleWebSocketSession::new(
+            session_limits(1),
+            shutdown.subscribe(),
+            runtime,
+            auth,
+            events,
+        )
+        .expect("session");
+        session
+            .outbound()
+            .try_send(Message::Text("blocked".into()))
+            .expect("fill queue");
+
+        assert_eq!(
+            session.dispatch_text("{").await,
+            TangleSessionControl::Close(outbound_queue_full_close_message())
+        );
+        assert_eq!(metrics.outbound_queue_full_closes(), 1);
     }
 
     fn session_runtime(

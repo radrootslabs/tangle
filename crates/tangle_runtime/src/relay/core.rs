@@ -1010,10 +1010,6 @@ impl BaseRelay {
         })
     }
 
-    pub fn mark_delivered(&mut self, subscription_id: &SubscriptionId) {
-        self.subscriptions.mark_delivered(subscription_id);
-    }
-
     pub fn active_subscription_count(&self) -> usize {
         self.subscriptions.active_count()
     }
@@ -2456,9 +2452,9 @@ mod tests {
     }
 
     #[test]
-    fn live_subscription_lag_closes_subscription_for_resync() {
-        let mut relay = test_relay("base-relay-lag", 1);
-        let subscription_id = SubscriptionId::new("sub-lag").expect("sub");
+    fn live_subscription_delivery_volume_does_not_close_subscription() {
+        let mut relay = test_relay("base-relay-delivery-volume", 1);
+        let subscription_id = SubscriptionId::new("sub-volume").expect("sub");
         let filter = filter_from_value(&serde_json::json!({"kinds":[1]})).expect("filter");
         relay
             .handle_req(subscription_id.clone(), vec![filter])
@@ -2470,14 +2466,11 @@ mod tests {
             relay.fanout(&first).as_slice(),
             [RelayMessage::Event { .. }]
         ));
-        assert_eq!(
-            relay.fanout(&second),
-            vec![RelayMessage::Closed {
-                subscription_id: subscription_id.clone(),
-                message: "error: subscription lagged; resync required".to_owned()
-            }]
-        );
-        assert_eq!(relay.active_subscription_count(), 0);
+        assert!(matches!(
+            relay.fanout(&second).as_slice(),
+            [RelayMessage::Event { .. }]
+        ));
+        assert_eq!(relay.active_subscription_count(), 1);
     }
 
     #[test]

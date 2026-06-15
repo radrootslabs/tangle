@@ -8,8 +8,6 @@ use tangle_protocol::{Event, Filter, RelayMessage, SubscriptionId};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LiveSubscriptionSet {
     subscriptions: BTreeMap<SubscriptionId, LiveSubscription>,
-    pending: BTreeMap<SubscriptionId, usize>,
-    max_pending_events: usize,
     max_subscriptions: usize,
 }
 
@@ -36,8 +34,6 @@ impl LiveSubscriptionSet {
         }
         Ok(Self {
             subscriptions: BTreeMap::new(),
-            pending: BTreeMap::new(),
-            max_pending_events,
             max_subscriptions,
         })
     }
@@ -61,13 +57,11 @@ impl LiveSubscriptionSet {
             ));
         }
         self.subscriptions
-            .insert(subscription_id.clone(), LiveSubscription { filters, auth });
-        self.pending.insert(subscription_id, 0);
+            .insert(subscription_id, LiveSubscription { filters, auth });
         Ok(())
     }
 
     pub(crate) fn close(&mut self, subscription_id: &SubscriptionId) -> CloseResult {
-        self.pending.remove(subscription_id);
         if self.subscriptions.remove(subscription_id).is_some() {
             CloseResult::Closed
         } else {
@@ -78,7 +72,6 @@ impl LiveSubscriptionSet {
     pub(crate) fn close_all(&mut self) -> usize {
         let closed = self.subscriptions.len();
         self.subscriptions.clear();
-        self.pending.clear();
         closed
     }
 
@@ -107,28 +100,12 @@ impl LiveSubscriptionSet {
             .collect::<Vec<_>>();
         let mut messages = Vec::new();
         for subscription_id in matched {
-            let pending = self.pending.entry(subscription_id.clone()).or_insert(0);
-            *pending += 1;
-            if *pending > self.max_pending_events {
-                self.close(&subscription_id);
-                messages.push(RelayMessage::Closed {
-                    subscription_id,
-                    message: "error: subscription lagged; resync required".to_owned(),
-                });
-            } else {
-                messages.push(RelayMessage::Event {
-                    subscription_id,
-                    event: event.clone(),
-                });
-            }
+            messages.push(RelayMessage::Event {
+                subscription_id,
+                event: event.clone(),
+            });
         }
         messages
-    }
-
-    pub(crate) fn mark_delivered(&mut self, subscription_id: &SubscriptionId) {
-        if let Some(pending) = self.pending.get_mut(subscription_id) {
-            *pending = 0;
-        }
     }
 
     pub(crate) fn active_count(&self) -> usize {
@@ -150,7 +127,7 @@ mod tests {
     use tangle_test_support::{FixtureKey, tangle_v2_event};
 
     #[test]
-    fn live_subscription_fanout_closes_lagged_subscriptions() {
+    fn live_subscription_fanout_keeps_healthy_subscriptions_open() {
         let mut subscriptions = LiveSubscriptionSet::new(1, 1).expect("subscriptions");
         let subscription_id = SubscriptionId::new("live").expect("subscription");
         subscriptions
@@ -164,19 +141,24 @@ mod tests {
             .expect("first");
         let second = tangle_v2_event(FixtureKey::Member, 1_714_124_434, 1, Vec::new(), "second")
             .expect("second");
+        let third = tangle_v2_event(FixtureKey::Member, 1_714_124_435, 1, Vec::new(), "third")
+            .expect("third");
 
         assert!(matches!(
             subscriptions.fanout(&first, |_, _| true).as_slice(),
             [RelayMessage::Event { subscription_id: delivered, event }]
                 if delivered == &subscription_id && event.id() == first.id()
         ));
-        assert_eq!(
-            subscriptions.fanout(&second, |_, _| true),
-            vec![RelayMessage::Closed {
-                subscription_id: subscription_id.clone(),
-                message: "error: subscription lagged; resync required".to_owned()
-            }]
-        );
-        assert_eq!(subscriptions.close(&subscription_id), CloseResult::NotFound);
+        assert!(matches!(
+            subscriptions.fanout(&second, |_, _| true).as_slice(),
+            [RelayMessage::Event { subscription_id: delivered, event }]
+                if delivered == &subscription_id && event.id() == second.id()
+        ));
+        assert!(matches!(
+            subscriptions.fanout(&third, |_, _| true).as_slice(),
+            [RelayMessage::Event { subscription_id: delivered, event }]
+                if delivered == &subscription_id && event.id() == third.id()
+        ));
+        assert_eq!(subscriptions.close(&subscription_id), CloseResult::Closed);
     }
 }
