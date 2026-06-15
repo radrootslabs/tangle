@@ -1400,6 +1400,202 @@ mod tests {
     }
 
     #[test]
+    fn base_relay_req_count_paths_preserve_chorus_parity() {
+        let owner = signer(7).public_key().clone();
+        let auth = authenticated_state(7);
+        let mut relay = test_relay_with_groups(
+            "base-relay-req-count-chorus-parity",
+            8,
+            &enabled_groups_for_owner(&owner),
+        );
+        let market_tag = Tag::from_parts("t", &["market"]).expect("tag");
+        let old_market =
+            signed_event_at(7, 1, vec![market_tag.clone()], "old market", 1_714_124_433);
+        let tied_author =
+            signed_event_at(7, 1, vec![market_tag.clone()], "tied author", 1_714_124_434);
+        let tied_other =
+            signed_event_at(8, 1, vec![market_tag.clone()], "tied other", 1_714_124_434);
+        let kind_two = signed_event_at(7, 2, Vec::new(), "kind two", 1_714_124_435);
+        let wrong_tag = signed_event_at(
+            9,
+            1,
+            vec![Tag::from_parts("t", &["other"]).expect("tag")],
+            "wrong tag",
+            1_714_124_436,
+        );
+        for event in [
+            &old_market,
+            &tied_other,
+            &kind_two,
+            &wrong_tag,
+            &tied_author,
+        ] {
+            assert_accepted(relay.handle_event(event.clone()).expect("event"), event);
+        }
+        relay
+            .handle_event_with_auth(signed_private_group_create_event(7, "Private"), &auth)
+            .expect("private create");
+        let private_market = signed_event_at(
+            7,
+            1,
+            vec![h("Private"), market_tag.clone()],
+            "private market",
+            1_714_124_437,
+        );
+        assert_accepted(
+            relay
+                .handle_event_with_auth(private_market.clone(), &auth)
+                .expect("private event"),
+            &private_market,
+        );
+
+        let subscription_id = SubscriptionId::new("req-count-parity").expect("sub");
+        let market_limit =
+            filter_from_value(&serde_json::json!({"kinds":[1],"#t":["market"],"limit":2}))
+                .expect("market filter");
+        let author_limit = filter_from_value(&serde_json::json!({
+            "authors":[tied_author.unsigned().pubkey().as_str()],
+            "kinds":[1,2],
+            "limit":2
+        }))
+        .expect("author filter");
+        let messages = relay
+            .handle_req(
+                subscription_id.clone(),
+                vec![market_limit.clone(), author_limit.clone()],
+            )
+            .expect("req");
+        let mut tied = [tied_author.clone(), tied_other.clone()];
+        tied.sort_by(|left, right| left.id().cmp(right.id()));
+        let expected = [kind_two.clone(), tied[0].clone(), tied[1].clone()];
+        let event_ids = messages
+            .iter()
+            .filter_map(|message| match message {
+                RelayMessage::Event {
+                    subscription_id: actual,
+                    event,
+                } if actual == &subscription_id => Some(event.id().clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let expected_ids = expected
+            .iter()
+            .map(|event| event.id().clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(event_ids, expected_ids);
+        assert_eq!(messages.last(), Some(&RelayMessage::Eose(subscription_id)));
+        assert!(!event_ids.contains(private_market.id()));
+        assert!(!event_ids.contains(old_market.id()));
+        assert!(!event_ids.contains(wrong_tag.id()));
+
+        let private_sub = SubscriptionId::new("private-screened").expect("sub");
+        assert_eq!(
+            relay
+                .handle_req(
+                    private_sub.clone(),
+                    vec![filter_group_tag(1, "h", "Private")]
+                )
+                .expect("private unauth req"),
+            vec![RelayMessage::Eose(private_sub)]
+        );
+        let private_auth_sub = SubscriptionId::new("private-auth").expect("sub");
+        assert!(matches!(
+            relay
+                .handle_req_with_auth(
+                    private_auth_sub.clone(),
+                    vec![filter_group_tag(1, "h", "Private")],
+                    &auth
+                )
+                .expect("private auth req")
+                .as_slice(),
+            [RelayMessage::Event { subscription_id, event }, RelayMessage::Eose(eose)]
+                if subscription_id == &private_auth_sub && event.id() == private_market.id() && eose == &private_auth_sub
+        ));
+
+        let market_notes =
+            filter_from_value(&serde_json::json!({"kinds":[1],"#t":["market"],"limit":10}))
+                .expect("market count filter");
+        let author_events = filter_from_value(&serde_json::json!({
+            "authors":[tied_author.unsigned().pubkey().as_str()],
+            "kinds":[1,2],
+            "limit":10
+        }))
+        .expect("author count filter");
+        assert_eq!(
+            relay
+                .handle_count(
+                    SubscriptionId::new("count-visible").expect("sub"),
+                    vec![market_notes.clone(), author_events.clone()]
+                )
+                .expect("visible count"),
+            RelayMessage::Count {
+                subscription_id: SubscriptionId::new("count-visible").expect("sub"),
+                count: 4
+            }
+        );
+        assert_eq!(
+            relay
+                .handle_count_with_auth(
+                    SubscriptionId::new("count-auth").expect("sub"),
+                    vec![market_notes, author_events],
+                    &auth
+                )
+                .expect("auth count"),
+            RelayMessage::Count {
+                subscription_id: SubscriptionId::new("count-auth").expect("sub"),
+                count: 5
+            }
+        );
+
+        let too_large_limit =
+            filter_from_value(&serde_json::json!({"limit":501})).expect("limit filter");
+        assert!(
+            relay
+                .handle_req(
+                    SubscriptionId::new("limit-req").expect("sub"),
+                    vec![too_large_limit.clone()]
+                )
+                .expect_err("req limit")
+                .prefixed_message()
+                .contains("max_limit 500")
+        );
+        assert!(
+            relay
+                .handle_count(
+                    SubscriptionId::new("limit-count").expect("sub"),
+                    vec![too_large_limit]
+                )
+                .expect_err("count limit")
+                .prefixed_message()
+                .contains("max_limit 500")
+        );
+
+        let search = filter_from_value(&serde_json::json!({"search":"carrots","limit":1}))
+            .expect("search filter");
+        let search_req = SubscriptionId::new("search-req").expect("sub");
+        assert_eq!(
+            relay
+                .handle_req(search_req.clone(), vec![search.clone()])
+                .expect("search req"),
+            vec![RelayMessage::Closed {
+                subscription_id: search_req,
+                message: "unsupported: search filters are not supported".to_owned()
+            }]
+        );
+        let search_count = SubscriptionId::new("search-count").expect("sub");
+        assert_eq!(
+            relay
+                .handle_count(search_count.clone(), vec![search])
+                .expect("search count"),
+            RelayMessage::Closed {
+                subscription_id: search_count,
+                message: "unsupported: search filters are not supported".to_owned()
+            }
+        );
+    }
+
+    #[test]
     fn base_relay_enforces_runtime_limits() {
         let config = test_store_config("base-relay-runtime-limits");
         let mut relay = BaseRelay::open(
