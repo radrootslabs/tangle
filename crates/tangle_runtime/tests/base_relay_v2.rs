@@ -1334,6 +1334,74 @@ fn source_before_outbox_recovery_derives_missing_records_without_duplicates() {
 }
 
 #[test]
+fn outbox_before_generated_recovery_materializes_pending_records_without_duplicates() {
+    let config = test_store_config("outbox-before-generated-recovery");
+    let events = recovery_equivalence_events();
+    let offsets = store_source_events(&config, &events);
+    seed_pending_recovery_outbox_records(&config, &events, &offsets);
+    assert_eq!(
+        outbox_status_counts(&config),
+        OutboxStatusCounts {
+            pending: 5,
+            retryable: 0,
+            stored: 0,
+        }
+    );
+    assert!(stored_event_ids_for_kind(&config, KIND_GROUP_METADATA).is_empty());
+    assert!(stored_event_ids_for_kind(&config, KIND_GROUP_ADMINS).is_empty());
+    assert!(stored_event_ids_for_kind(&config, KIND_GROUP_MEMBERS).is_empty());
+
+    let mut recovered = BaseRelay::open_with_groups(
+        &config,
+        relay_limits(8),
+        &group_config(),
+        PocketQueryConfig::default(),
+    )
+    .expect("recovered");
+    let first_summary = recovery_summary(&mut recovered, "CrashFarm");
+    let first_outbox = outbox_status_counts(&config);
+    let first_metadata_ids = stored_event_ids_for_kind(&config, KIND_GROUP_METADATA);
+    let first_admin_ids = stored_event_ids_for_kind(&config, KIND_GROUP_ADMINS);
+    let first_member_ids = stored_event_ids_for_kind(&config, KIND_GROUP_MEMBERS);
+
+    assert_eq!(first_outbox.pending, 0);
+    assert_eq!(first_outbox.retryable, 0);
+    assert_eq!(first_outbox.stored, 5);
+    assert_eq!(first_summary.group_name.as_deref(), Some("Crash Market"));
+    assert_eq!(first_summary.member_status, Some(MemberStatus::Member));
+    assert_eq!(
+        first_summary.member_roles,
+        vec![PERMANENT_RELAY_OVERRIDE_ROLE.to_owned()]
+    );
+    assert_eq!(first_metadata_ids.len(), 2);
+    assert_eq!(first_admin_ids.len(), 2);
+    assert_eq!(first_member_ids.len(), 1);
+    recovered.shutdown().expect("shutdown");
+
+    let mut reopened = BaseRelay::open_with_groups(
+        &config,
+        relay_limits(8),
+        &group_config(),
+        PocketQueryConfig::default(),
+    )
+    .expect("reopen");
+    assert_eq!(recovery_summary(&mut reopened, "CrashFarm"), first_summary);
+    assert_eq!(outbox_status_counts(&config), first_outbox);
+    assert_eq!(
+        stored_event_ids_for_kind(&config, KIND_GROUP_METADATA),
+        first_metadata_ids
+    );
+    assert_eq!(
+        stored_event_ids_for_kind(&config, KIND_GROUP_ADMINS),
+        first_admin_ids
+    );
+    assert_eq!(
+        stored_event_ids_for_kind(&config, KIND_GROUP_MEMBERS),
+        first_member_ids
+    );
+}
+
+#[test]
 fn rebuilt_projection_matches_live_projection_for_moderation_stream() {
     let config = test_store_config("projection-equivalence");
     let owner_auth = authenticated(FixtureKey::Owner);
@@ -1849,6 +1917,121 @@ fn seed_pending_create_outbox_records(
             .expect("admin payload"),
         ),
     ];
+    for record in records {
+        store
+            .put_extra_record(
+                TANGLE_GROUP_OUTBOX_TABLE,
+                &record.key().storage_key(),
+                &record.to_json_bytes().expect("record bytes"),
+            )
+            .expect("outbox");
+    }
+    store.sync().expect("sync");
+}
+
+fn seed_pending_recovery_outbox_records(
+    config: &PocketStoreConfig,
+    events: &[Event],
+    offsets: &[StoreOffset],
+) {
+    assert_eq!(events.len(), 3);
+    assert_eq!(offsets.len(), events.len());
+    let store = PocketStoreHandle::open(config).expect("store");
+    let group_id = group("CrashFarm");
+    let limits = GroupLimitsConfig::default();
+    let authority = GroupAuthority::new(
+        [FixtureKey::Owner.public_key()],
+        [FixtureKey::Admin.public_key()],
+    );
+    let mut projection = GroupProjection::new();
+    let mut records = Vec::new();
+
+    projection
+        .apply_canonical_event(&events[0], offsets[0], limits)
+        .expect("create projection");
+    let create_group = projection.group(&group_id).expect("create group");
+    records.push(GroupOutboxRecord::pending(
+        GroupOutboxKey::new(
+            events[0].id().clone(),
+            GroupOutboxEffect::MetadataSnapshot,
+            group_id.clone(),
+            None,
+        ),
+        GroupGeneratedEventBuilder::metadata_snapshot_payload(
+            create_group,
+            events[0].unsigned().created_at(),
+        )
+        .expect("create metadata payload"),
+    ));
+    records.push(GroupOutboxRecord::pending(
+        GroupOutboxKey::new(
+            events[0].id().clone(),
+            GroupOutboxEffect::AdminListSnapshot,
+            group_id.clone(),
+            None,
+        ),
+        GroupGeneratedEventBuilder::admin_list_snapshot_payload(
+            &group_id,
+            &projection,
+            &authority,
+            events[0].unsigned().created_at(),
+        )
+        .expect("create admin payload"),
+    ));
+
+    projection
+        .apply_canonical_event(&events[1], offsets[1], limits)
+        .expect("put projection");
+    records.push(GroupOutboxRecord::pending(
+        GroupOutboxKey::new(
+            events[1].id().clone(),
+            GroupOutboxEffect::MemberListSnapshot,
+            group_id.clone(),
+            None,
+        ),
+        GroupGeneratedEventBuilder::member_list_snapshot_payload(
+            &group_id,
+            &projection,
+            events[1].unsigned().created_at(),
+            limits.max_member_list_pubkeys(),
+        )
+        .expect("put member payload")
+        .expect("put member snapshot"),
+    ));
+    records.push(GroupOutboxRecord::pending(
+        GroupOutboxKey::new(
+            events[1].id().clone(),
+            GroupOutboxEffect::AdminListSnapshot,
+            group_id.clone(),
+            None,
+        ),
+        GroupGeneratedEventBuilder::admin_list_snapshot_payload(
+            &group_id,
+            &projection,
+            &authority,
+            events[1].unsigned().created_at(),
+        )
+        .expect("put admin payload"),
+    ));
+
+    projection
+        .apply_canonical_event(&events[2], offsets[2], limits)
+        .expect("metadata projection");
+    let metadata_group = projection.group(&group_id).expect("metadata group");
+    records.push(GroupOutboxRecord::pending(
+        GroupOutboxKey::new(
+            events[2].id().clone(),
+            GroupOutboxEffect::MetadataSnapshot,
+            group_id.clone(),
+            None,
+        ),
+        GroupGeneratedEventBuilder::metadata_snapshot_payload(
+            metadata_group,
+            events[2].unsigned().created_at(),
+        )
+        .expect("metadata payload"),
+    ));
+
     for record in records {
         store
             .put_extra_record(
