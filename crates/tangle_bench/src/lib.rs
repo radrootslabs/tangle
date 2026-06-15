@@ -70,7 +70,7 @@ impl BenchDatasetConfig {
         Self::new(24, 8, 6, 24, 5)
     }
 
-    pub fn production() -> Self {
+    pub fn large_smoke() -> Self {
         Self::new(120, 24, 16, 120, 12)
     }
 
@@ -95,7 +95,7 @@ impl BenchDatasetConfig {
 pub enum BenchmarkProfileName {
     Smoke,
     Medium,
-    Production,
+    LargeSmoke,
 }
 
 impl BenchmarkProfileName {
@@ -103,9 +103,9 @@ impl BenchmarkProfileName {
         match value {
             "smoke" => Ok(Self::Smoke),
             "medium" => Ok(Self::Medium),
-            "production" => Ok(Self::Production),
+            "large-smoke" => Ok(Self::LargeSmoke),
             _ => Err(format!(
-                "unknown benchmark profile `{value}`; expected smoke, medium, or production"
+                "unknown benchmark profile `{value}`; expected smoke, medium, or large-smoke"
             )),
         }
     }
@@ -114,12 +114,12 @@ impl BenchmarkProfileName {
         match self {
             Self::Smoke => "smoke",
             Self::Medium => "medium",
-            Self::Production => "production",
+            Self::LargeSmoke => "large-smoke",
         }
     }
 
     pub fn all() -> [Self; 3] {
-        [Self::Smoke, Self::Medium, Self::Production]
+        [Self::Smoke, Self::Medium, Self::LargeSmoke]
     }
 }
 
@@ -137,7 +137,7 @@ impl BenchmarkProfile {
         match name {
             BenchmarkProfileName::Smoke => Self::smoke(),
             BenchmarkProfileName::Medium => Self::medium(),
-            BenchmarkProfileName::Production => Self::production(),
+            BenchmarkProfileName::LargeSmoke => Self::large_smoke(),
         }
     }
 
@@ -157,11 +157,11 @@ impl BenchmarkProfile {
         )
     }
 
-    pub fn production() -> Self {
+    pub fn large_smoke() -> Self {
         Self::new(
-            BenchmarkProfileName::Production,
-            BenchDatasetConfig::production(),
-            BenchmarkThresholds::production(),
+            BenchmarkProfileName::LargeSmoke,
+            BenchDatasetConfig::large_smoke(),
+            BenchmarkThresholds::large_smoke(),
         )
     }
 
@@ -230,8 +230,8 @@ impl BenchmarkProfile {
         Ok(self)
     }
 
-    pub fn production_claim_eligible(&self) -> bool {
-        self.name == BenchmarkProfileName::Production && self.target_hardware_evidence.is_some()
+    pub fn proof_claim_eligible(&self) -> bool {
+        false
     }
 }
 
@@ -631,7 +631,7 @@ impl BenchmarkThresholds {
         }
     }
 
-    pub fn production() -> Self {
+    pub fn large_smoke() -> Self {
         Self {
             pocket_query_p95_micros: 5_000_000,
             read_gate_p95_micros: 5_000_000,
@@ -794,9 +794,9 @@ impl BenchmarkRunReport {
             "threshold_source": self.profile.threshold_source(),
             "thresholds": self.profile.thresholds().to_json(),
             "validation_summary": self.validation_summary,
-            "production_claim": {
-                "eligible": self.profile.production_claim_eligible(),
-                "profile_required": "production",
+            "proof_claim": {
+                "eligible": self.profile.proof_claim_eligible(),
+                "profile_required": "proof-*",
                 "target_hardware_evidence": self
                     .profile
                     .target_hardware_evidence()
@@ -1878,7 +1878,7 @@ mod tests {
                 .iter()
                 .map(|profile| profile.as_str())
                 .collect::<Vec<_>>(),
-            vec!["smoke", "medium", "production"]
+            vec!["smoke", "medium", "large-smoke"]
         );
         assert_eq!(
             BenchmarkProfileName::parse("smoke")
@@ -1893,11 +1893,12 @@ mod tests {
             "medium"
         );
         assert_eq!(
-            BenchmarkProfileName::parse("production")
-                .expect("production")
+            BenchmarkProfileName::parse("large-smoke")
+                .expect("large-smoke")
                 .as_str(),
-            "production"
+            "large-smoke"
         );
+        assert!(BenchmarkProfileName::parse("production").is_err());
         assert!(
             BenchmarkProfileName::parse("local")
                 .expect_err("unknown")
@@ -1912,8 +1913,8 @@ mod tests {
             BenchDatasetConfig::medium()
         );
         assert_eq!(
-            BenchmarkProfile::production().dataset_config(),
-            BenchDatasetConfig::production()
+            BenchmarkProfile::large_smoke().dataset_config(),
+            BenchDatasetConfig::large_smoke()
         );
     }
 
@@ -1970,20 +1971,20 @@ mod tests {
     }
 
     #[test]
-    fn production_claim_eligibility_requires_production_profile_and_hardware_evidence() {
-        assert!(!BenchmarkProfile::smoke().production_claim_eligible());
+    fn proof_claim_eligibility_requires_manual_proof_profile() {
+        assert!(!BenchmarkProfile::smoke().proof_claim_eligible());
         assert!(
             !BenchmarkProfile::smoke()
                 .with_target_hardware_evidence("target-hardware:ci")
                 .expect("evidence")
-                .production_claim_eligible()
+                .proof_claim_eligible()
         );
-        assert!(!BenchmarkProfile::production().production_claim_eligible());
+        assert!(!BenchmarkProfile::large_smoke().proof_claim_eligible());
         assert!(
-            BenchmarkProfile::production()
-                .with_target_hardware_evidence("target-hardware:prod-node-001")
+            !BenchmarkProfile::large_smoke()
+                .with_target_hardware_evidence("target-hardware:bench-node-001")
                 .expect("evidence")
-                .production_claim_eligible()
+                .proof_claim_eligible()
         );
     }
 
@@ -2028,11 +2029,8 @@ mod tests {
         assert_eq!(summary["run_id"], "unit-run");
         assert_eq!(summary["profile"], "smoke");
         assert_eq!(summary["threshold_source"], "builtin:smoke");
-        assert_eq!(summary["production_claim"]["eligible"], false);
-        assert_eq!(
-            summary["production_claim"]["target_hardware_evidence"],
-            "absent"
-        );
+        assert_eq!(summary["proof_claim"]["eligible"], false);
+        assert_eq!(summary["proof_claim"]["target_hardware_evidence"], "absent");
         assert_eq!(
             summary["dataset"]["fixture_family"],
             "synthetic repo-owned fixtures"

@@ -214,7 +214,7 @@ fn path_string(path: &Path) -> String {
 
 fn help_text() -> String {
     [
-        "usage: tangle-benchmark-report [--output-root PATH] [--run-id ID] [--profile smoke|medium|production]",
+        "usage: tangle-benchmark-report [--output-root PATH] [--run-id ID] [--profile smoke|medium|large-smoke]",
         "       [--thresholds-json PATH] [--target-hardware-evidence TEXT]",
         "       [--group-count COUNT] [--public-events-per-group COUNT]",
         "       [--private-events-per-group COUNT] [--public-note-count COUNT]",
@@ -268,19 +268,32 @@ mod tests {
     }
 
     #[test]
-    fn benchmark_report_args_accept_production_target_hardware_evidence() {
+    fn benchmark_report_args_accept_large_smoke_target_hardware_evidence_without_proof_claim() {
         let args = BenchmarkReportArgs::parse([
             "--profile".to_owned(),
-            "production".to_owned(),
+            "large-smoke".to_owned(),
             "--target-hardware-evidence".to_owned(),
-            "target-hardware:prod-node-001".to_owned(),
+            "target-hardware:bench-node-001".to_owned(),
             "--run-id".to_owned(),
             "unit".to_owned(),
         ])
         .expect("parse")
         .expect("args");
 
-        assert_eq!(args.profile.name(), BenchmarkProfileName::Production);
-        assert!(args.profile.production_claim_eligible());
+        assert_eq!(args.profile.name(), BenchmarkProfileName::LargeSmoke);
+        assert!(!args.profile.proof_claim_eligible());
+    }
+
+    #[test]
+    fn benchmark_report_args_reject_production_profile_alias() {
+        let error = BenchmarkReportArgs::parse([
+            "--profile".to_owned(),
+            "production".to_owned(),
+            "--run-id".to_owned(),
+            "unit".to_owned(),
+        ])
+        .expect_err("production profile removed");
+
+        assert!(error.contains("unknown benchmark profile"));
     }
 }
