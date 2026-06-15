@@ -863,6 +863,13 @@ async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_
         1,
     )
     .await;
+    assert_count_closed(
+        &mut observer,
+        "private-public-broad-count",
+        json!({"kinds":[1], "#h":["PrivateSocket"], "limit":500}),
+        "restricted: count filters are too broad or expensive",
+    )
+    .await;
     assert_empty_req(
         &mut observer,
         "private-public-query",
@@ -975,6 +982,13 @@ async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_
         1,
     )
     .await;
+    assert_count_closed(
+        &mut observer,
+        "hidden-public-broad-count",
+        json!({"kinds":[1], "#h":["HiddenSocket"], "limit":500}),
+        "restricted: count filters are too broad or expensive",
+    )
+    .await;
     assert_empty_req(
         &mut observer,
         "hidden-public-query",
@@ -988,6 +1002,18 @@ async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_
         &hidden_note,
     )
     .await;
+
+    let metrics = wait_for_http_ok(address, "/metricsz", None).await;
+    for private_value in [
+        "PrivateSocket",
+        "HiddenSocket",
+        "private harvest",
+        "hidden harvest",
+        "private-public-broad-count",
+        "hidden-public-broad-count",
+    ] {
+        assert!(!metrics.contains(private_value));
+    }
 
     shutdown.request_shutdown();
     read_websocket_close(&mut owner_writer).await;
@@ -1991,6 +2017,19 @@ async fn assert_count_message(
     assert_eq!(
         read_relay_value(socket).await,
         json!(["COUNT", subscription_id, {"count": count}])
+    );
+}
+
+async fn assert_count_closed(
+    socket: &mut TestWebSocket,
+    subscription_id: &str,
+    filter: Value,
+    message: &str,
+) {
+    send_client_value(socket, json!(["COUNT", subscription_id, filter])).await;
+    assert_eq!(
+        read_relay_value(socket).await,
+        json!(["CLOSED", subscription_id, message])
     );
 }
 
