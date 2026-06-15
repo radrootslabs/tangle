@@ -184,7 +184,7 @@ async fn websocket_clients_use_nip01_nip42_and_nip45_flows() {
 
     send_client_value(
         &mut first,
-        json!(["COUNT", "count-websocket", {"kinds":[1]}]),
+        json!(["COUNT", "count-websocket", {"kinds":[1], "since": 1_714_124_433, "until": 1_714_124_433}]),
     )
     .await;
     assert_eq!(
@@ -493,7 +493,7 @@ async fn websocket_healthy_subscriber_receives_more_than_outbound_capacity() {
     }
     send_client_value(
         &mut subscriber,
-        json!(["COUNT", "healthy-count", {"kinds":[1]}]),
+        json!(["COUNT", "healthy-count", {"kinds":[1], "since": 1_714_124_500, "until": 1_714_124_509}]),
     )
     .await;
     assert_eq!(
