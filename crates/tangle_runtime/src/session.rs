@@ -563,6 +563,10 @@ mod tests {
                 Some("[\"NOTICE\",\"invalid: client message command `NOTICE` is unsupported\"]"),
             ),
             (
+                "[\"NEG-OPEN\",\"sub\",{}]",
+                Some("[\"NOTICE\",\"invalid: client message command `NEG-OPEN` is unsupported\"]"),
+            ),
+            (
                 "[\"REQ\"]",
                 Some(
                     "[\"NOTICE\",\"invalid: REQ client message must contain a subscription id and filters\"]",
