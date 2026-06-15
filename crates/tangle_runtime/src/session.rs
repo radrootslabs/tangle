@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use crate::{
+    client_message::parse_runtime_client_message,
     errors::BaseRelayError,
     event_bus::{TangleEventReceiveError, TangleEventReceiver},
     logging,
@@ -20,9 +21,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
-use tangle_protocol::{
-    ClientMessage, Filter, RelayMessage, SubscriptionId, UnixTimestamp, parse_client_message,
-};
+use tangle_protocol::{ClientMessage, Filter, RelayMessage, SubscriptionId, UnixTimestamp};
 use tokio::sync::{mpsc, watch};
 
 #[derive(Debug)]
@@ -248,7 +247,7 @@ impl TangleWebSocketSession {
                 .map(|_| TangleSessionControl::Continue)
                 .unwrap_or_else(|control| control);
         }
-        let replies = match parse_client_message(raw) {
+        let replies = match parse_runtime_client_message(raw) {
             Ok(message) => match self.handle_client_message(message).await {
                 Ok(replies) => replies,
                 Err(error) => vec![RelayMessage::Notice(error.prefixed_message())],

@@ -12,7 +12,7 @@ axum = { version = "0.8", features = ["ws"] }
 getrandom = "0.3"
 http = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 tangle_crypto = { path = "../tangle_crypto" }
 tangle_groups = { path = "../tangle_groups" }
 tangle_protocol = { path = "../tangle_protocol" }

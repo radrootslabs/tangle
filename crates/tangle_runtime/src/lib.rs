@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub(crate) mod client_message;
 pub mod config;
 pub mod errors;
 pub mod event_bus;
