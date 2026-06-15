@@ -6,7 +6,7 @@ use pocket_db::{
     heed::{Database, types::Bytes},
 };
 use pocket_types::{
-    Event, Filter, Id, Kind, OwnedEvent, OwnedFilter, OwnedTags, Pubkey, Sig, Tags, Time,
+    Event, Filter, Hll8, Id, Kind, OwnedEvent, OwnedFilter, OwnedTags, Pubkey, Sig, Tags, Time,
 };
 use std::{
     io,
@@ -20,6 +20,7 @@ pub const POCKET_SOURCE_REVISION: &str = "329334f20948c796c6016b673b92551ac4855a
 pub type PocketEvent = Event;
 pub type PocketEventId = Id;
 pub type PocketFilter = Filter;
+pub type PocketHll8 = Hll8;
 pub type PocketKind = Kind;
 pub type PocketOwnedEvent = OwnedEvent;
 pub type PocketOwnedFilter = OwnedFilter;

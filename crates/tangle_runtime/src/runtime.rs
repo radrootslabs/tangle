@@ -38,7 +38,8 @@ use tangle_groups::{
     validate_client_group_event_structure,
 };
 use tangle_protocol::{
-    ClientMessage, Event, Filter, Kind, RelayMessage, SubscriptionId, UnixTimestamp,
+    ClientMessage, Event, EventId, Filter, Kind, PublicKeyHex, RelayMessage, SubscriptionId,
+    UnixTimestamp,
 };
 use tangle_store_pocket::PocketStoreHandle;
 use tokio::sync::watch;
@@ -201,6 +202,25 @@ impl TangleQueryClassifier {
     fn has_count_bounded_selector(self, filter: &Filter) -> bool {
         self.has_strong_constraint(filter)
             || (!filter.kinds().is_empty() && self.has_bounded_time_window(filter))
+            || self.has_hll_count_selector(filter)
+    }
+
+    fn has_hll_count_selector(self, filter: &Filter) -> bool {
+        let [kind] = filter.kinds() else {
+            return false;
+        };
+        let mut tags = filter.tag_filters().iter();
+        let Some((name, values)) = tags.next() else {
+            return false;
+        };
+        if tags.next().is_some() || values.len() != 1 {
+            return false;
+        }
+        match (kind.as_u32(), name.as_str()) {
+            (3, "p") => PublicKeyHex::new(values[0].as_str()).is_ok(),
+            (7, "e") => EventId::new(values[0].as_str()).is_ok(),
+            _ => false,
+        }
     }
 
     fn has_group_constraint(self, filter: &Filter) -> bool {
@@ -3038,6 +3058,8 @@ mod tests {
             "limit": 1
         }))
         .expect("filter");
+        let hll_reaction_filter =
+            filter_from_value(&json!({"kinds": [7], "#e": ["a".repeat(64)]})).expect("filter");
 
         assert_eq!(
             classifier.classify_count(&[]),
@@ -3071,6 +3093,78 @@ mod tests {
             classifier.classify_count(&[bounded_time_filter]),
             TangleQueryClassification::Bounded
         );
+        assert_eq!(
+            classifier.classify_count(&[hll_reaction_filter]),
+            TangleQueryClassification::Bounded
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_count_hll_accepts_public_pocket_selector() {
+        let root = temp_root("runtime-count-hll");
+        let _ = std::fs::remove_dir_all(&root);
+        let handle = TangleRuntimeHandle::new(
+            TangleRuntime::open(runtime_config(&root, 8)).expect("runtime"),
+        );
+        let mut auth = handle.auth_state().await.expect("auth");
+        let target = "c".repeat(64);
+        let first = tangle_v2_event(
+            FixtureKey::Member,
+            1_714_124_433,
+            7,
+            vec![Tag::from_parts("e", &[&target]).expect("tag")],
+            "first reaction",
+        )
+        .expect("first");
+        let second = tangle_v2_event(
+            FixtureKey::Admin,
+            1_714_124_434,
+            7,
+            vec![Tag::from_parts("e", &[&target]).expect("tag")],
+            "second reaction",
+        )
+        .expect("second");
+
+        assert_accepted_reply(
+            runtime_event_reply(&handle, first.clone(), &mut auth, 1_714_124_435).await,
+            &first,
+        );
+        assert_accepted_reply(
+            runtime_event_reply(&handle, second.clone(), &mut auth, 1_714_124_436).await,
+            &second,
+        );
+
+        let subscription_id = SubscriptionId::new("count-hll-runtime").expect("subscription");
+        let replies = handle
+            .handle_client_message(
+                ClientMessage::Count {
+                    subscription_id: subscription_id.clone(),
+                    filters: vec![
+                        filter_from_value(&json!({"kinds":[7],"#e":[target]})).expect("filter"),
+                    ],
+                },
+                &mut auth,
+                UnixTimestamp::new(1_714_124_437),
+            )
+            .await
+            .expect("count");
+        let [
+            RelayMessage::Count {
+                subscription_id: actual,
+                count,
+                hll: Some(hll),
+            },
+        ] = replies.as_slice()
+        else {
+            panic!("count hll expected: {replies:?}")
+        };
+
+        assert_eq!(actual, &subscription_id);
+        assert_eq!(*count, 2);
+        assert_eq!(hll.len(), 512);
+        assert_ne!(hll, &"00".repeat(256));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4235,7 +4329,8 @@ mod tests {
                     replies,
                     vec![RelayMessage::Count {
                         subscription_id,
-                        count: u64::try_from(group_write_count).expect("group count")
+                        count: u64::try_from(group_write_count).expect("group count"),
+                        hll: None
                     }]
                 );
             }));
@@ -4265,7 +4360,8 @@ mod tests {
                     replies,
                     vec![RelayMessage::Count {
                         subscription_id,
-                        count: 0
+                        count: 0,
+                        hll: None
                     }]
                 );
             }));

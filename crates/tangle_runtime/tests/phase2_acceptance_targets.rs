@@ -2369,7 +2369,8 @@ fn assert_relay_count(message: RelayMessage, subscription_id: &str, count: u64) 
         message,
         RelayMessage::Count {
             subscription_id: SubscriptionId::new(subscription_id).expect("subscription"),
-            count
+            count,
+            hll: None
         }
     );
 }

@@ -815,6 +815,7 @@ pub enum RelayMessage {
     Count {
         subscription_id: SubscriptionId,
         count: u64,
+        hll: Option<String>,
     },
     Notice(String),
     Auth(String),
@@ -859,7 +860,18 @@ pub fn relay_message_to_value(message: &RelayMessage) -> serde_json::Value {
         RelayMessage::Count {
             subscription_id,
             count,
-        } => serde_json::json!(["COUNT", subscription_id.as_str(), {"count": count}]),
+            hll,
+        } => {
+            let mut payload = serde_json::Map::new();
+            payload.insert(
+                "count".to_owned(),
+                serde_json::Value::Number((*count).into()),
+            );
+            if let Some(hll) = hll {
+                payload.insert("hll".to_owned(), serde_json::Value::String(hll.clone()));
+            }
+            serde_json::json!(["COUNT", subscription_id.as_str(), payload])
+        }
         RelayMessage::Notice(message) => serde_json::json!(["NOTICE", message]),
         RelayMessage::Auth(challenge) => serde_json::json!(["AUTH", challenge]),
         RelayMessage::NegErr {
@@ -1955,6 +1967,7 @@ mod tests {
                 RelayMessage::Count {
                     subscription_id: subscription_id.clone(),
                     count: 3,
+                    hll: None,
                 },
                 serde_json::json!(["COUNT", "sub-vector", {"count": 3}]),
             ),
@@ -2646,7 +2659,8 @@ mod tests {
         assert_eq!(
             relay_message_to_value(&RelayMessage::Count {
                 subscription_id,
-                count: 7
+                count: 7,
+                hll: None
             }),
             serde_json::json!(["COUNT", "sub-a", {"count": 7}])
         );
@@ -2677,6 +2691,21 @@ mod tests {
                 message: "00ff".to_owned()
             }),
             serde_json::json!(["NEG-MSG", "neg-sub", "00ff"])
+        );
+    }
+
+    #[test]
+    fn relay_message_encoder_emits_count_hll_when_present() {
+        let subscription_id = SubscriptionId::new("count-hll").expect("sub");
+        let hll = "0a".repeat(256);
+
+        assert_eq!(
+            relay_message_to_value(&RelayMessage::Count {
+                subscription_id,
+                count: 42,
+                hll: Some(hll.clone())
+            }),
+            serde_json::json!(["COUNT", "count-hll", {"count": 42, "hll": hll}])
         );
     }
 

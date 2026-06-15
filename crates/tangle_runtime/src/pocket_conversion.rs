@@ -155,7 +155,7 @@ pub(crate) fn pocket_event_id(event_id: &EventId) -> Result<PocketEventId, BaseR
         .map_err(|error| BaseRelayError::error(error.to_string()))
 }
 
-fn pocket_pubkey(pubkey: &PublicKeyHex) -> Result<PocketPubkey, BaseRelayError> {
+pub(crate) fn pocket_pubkey(pubkey: &PublicKeyHex) -> Result<PocketPubkey, BaseRelayError> {
     PocketPubkey::read_hex(pubkey.as_str().as_bytes())
         .map_err(|error| BaseRelayError::error(error.to_string()))
 }
