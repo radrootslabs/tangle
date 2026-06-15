@@ -510,6 +510,22 @@ impl BaseRelay {
             })
     }
 
+    fn redacted_req_closed(
+        subscription_id: SubscriptionId,
+        auth: &GroupAuthContext,
+    ) -> RelayMessage {
+        let message = if auth.authenticated_pubkeys().is_empty() {
+            BaseRelayError::auth_required("authentication required to read group events")
+                .prefixed_message()
+        } else {
+            BaseRelayError::restricted("group is unavailable").prefixed_message()
+        };
+        RelayMessage::Closed {
+            subscription_id,
+            message,
+        }
+    }
+
     pub fn open(
         config: &PocketStoreConfig,
         limits: BaseRelayLimits,
@@ -942,7 +958,7 @@ impl BaseRelay {
         }
         let report =
             self.query_req_with_group_auth_report(subscription_id.clone(), filters.clone(), auth)?;
-        if should_subscribe {
+        if should_subscribe && !report.group_read_denied() {
             self.subscriptions.subscribe(subscription_id, filters)?;
         }
         Ok(report)
@@ -995,7 +1011,11 @@ impl BaseRelay {
                 event,
             })
             .collect::<Vec<_>>();
-        messages.push(RelayMessage::Eose(subscription_id));
+        if group_read_denied {
+            messages.push(Self::redacted_req_closed(subscription_id, auth));
+        } else {
+            messages.push(RelayMessage::Eose(subscription_id));
+        }
         Ok(BaseRelayQueryReport::new(
             messages,
             group_read_denied,
@@ -1577,6 +1597,7 @@ mod tests {
     fn base_relay_req_count_paths_preserve_chorus_parity() {
         let owner = signer(7).public_key().clone();
         let auth = authenticated_state(7);
+        let outsider_auth = authenticated_state(8);
         let mut relay = test_relay_with_groups(
             "base-relay-req-count-chorus-parity",
             8,
@@ -1658,10 +1679,51 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(event_ids, expected_ids);
-        assert_eq!(messages.last(), Some(&RelayMessage::Eose(subscription_id)));
+        assert_eq!(
+            messages.last(),
+            Some(&RelayMessage::Closed {
+                subscription_id: subscription_id.clone(),
+                message: "auth-required: authentication required to read group events".to_owned()
+            })
+        );
+        assert!(!messages.iter().any(
+            |message| matches!(message, RelayMessage::Eose(actual) if actual == &subscription_id)
+        ));
         assert!(!event_ids.contains(private_market.id()));
         assert!(!event_ids.contains(old_market.id()));
         assert!(!event_ids.contains(wrong_tag.id()));
+        assert_eq!(relay.active_subscription_count(), 0);
+
+        let restricted_sub = SubscriptionId::new("restricted-screened").expect("sub");
+        let restricted_messages = relay
+            .handle_req_with_auth(
+                restricted_sub.clone(),
+                vec![market_limit.clone(), author_limit.clone()],
+                &outsider_auth,
+            )
+            .expect("restricted req");
+        let restricted_event_ids = restricted_messages
+            .iter()
+            .filter_map(|message| match message {
+                RelayMessage::Event {
+                    subscription_id: actual,
+                    event,
+                } if actual == &restricted_sub => Some(event.id().clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(restricted_event_ids, expected_ids);
+        assert_eq!(
+            restricted_messages.last(),
+            Some(&RelayMessage::Closed {
+                subscription_id: restricted_sub.clone(),
+                message: "restricted: group is unavailable".to_owned()
+            })
+        );
+        assert!(!restricted_messages.iter().any(
+            |message| matches!(message, RelayMessage::Eose(actual) if actual == &restricted_sub)
+        ));
+        assert_eq!(relay.active_subscription_count(), 0);
 
         let private_sub = SubscriptionId::new("private-screened").expect("sub");
         assert_eq!(
@@ -1671,8 +1733,12 @@ mod tests {
                     vec![filter_group_tag(1, "h", "Private")]
                 )
                 .expect("private unauth req"),
-            vec![RelayMessage::Eose(private_sub)]
+            vec![RelayMessage::Closed {
+                subscription_id: private_sub,
+                message: "auth-required: authentication required to read group events".to_owned()
+            }]
         );
+        assert_eq!(relay.active_subscription_count(), 0);
         let private_auth_sub = SubscriptionId::new("private-auth").expect("sub");
         assert!(matches!(
             relay
@@ -2886,8 +2952,12 @@ mod tests {
             relay
                 .handle_req(unauth_sub.clone(), vec![filter_kind(1)])
                 .expect("unauth req"),
-            vec![RelayMessage::Eose(unauth_sub)]
+            vec![RelayMessage::Closed {
+                subscription_id: unauth_sub,
+                message: "auth-required: authentication required to read group events".to_owned()
+            }]
         );
+        assert_eq!(relay.active_subscription_count(), 0);
         assert!(matches!(
             relay
                 .handle_req_with_auth(auth_sub.clone(), vec![filter_kind(1)], &auth)

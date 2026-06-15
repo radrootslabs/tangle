@@ -456,8 +456,12 @@ fn metadata_flags_and_read_privacy_cover_req_count_and_fanout() {
                 vec![filter_group_tag(1, "h", "PrivateFarm")]
             )
             .expect("unauth"),
-        vec![RelayMessage::Eose(unauth_id)]
+        vec![RelayMessage::Closed {
+            subscription_id: unauth_id,
+            message: "auth-required: authentication required to read group events".to_owned()
+        }]
     );
+    assert_eq!(relay.active_subscription_count(), 0);
     assert_count(
         relay.handle_count(
             subscription("private-count-unauth"),
@@ -510,12 +514,18 @@ fn metadata_flags_and_read_privacy_cover_req_count_and_fanout() {
 
     let live_unauth = subscription("live-private-unauth");
     let live_owner = subscription("live-private-owner");
-    relay
-        .handle_req(
-            live_unauth.clone(),
-            vec![filter_group_tag(1, "h", "PrivateFarm")],
-        )
-        .expect("live unauth");
+    assert_eq!(
+        relay
+            .handle_req(
+                live_unauth.clone(),
+                vec![filter_group_tag(1, "h", "PrivateFarm")],
+            )
+            .expect("live unauth"),
+        vec![RelayMessage::Closed {
+            subscription_id: live_unauth,
+            message: "auth-required: authentication required to read group events".to_owned()
+        }]
+    );
     relay
         .handle_req_with_auth(
             live_owner.clone(),
@@ -536,13 +546,6 @@ fn metadata_flags_and_read_privacy_cover_req_count_and_fanout() {
         &second_private,
         &GroupAuthContext::new([FixtureKey::Owner.public_key()]),
     );
-    assert!(owner_live.iter().any(|message| {
-        matches!(
-            message,
-            RelayMessage::Event { subscription_id, event }
-                if subscription_id == &live_unauth && event.id() == second_private.id()
-        )
-    }));
     assert!(owner_live.iter().any(|message| {
         matches!(
             message,
@@ -677,15 +680,17 @@ fn nip29_privacy_leak_suite_covers_relay_exposure_and_rejection_paths() {
     );
 
     let private_unauth = subscription("private-leak-unauth");
-    assert_event_query(
+    assert_eq!(
         relay
             .handle_req(
                 private_unauth.clone(),
                 vec![filter_group_tag(1, "h", "LeakPrivate")],
             )
             .expect("private unauth"),
-        &private_unauth,
-        &[],
+        vec![RelayMessage::Closed {
+            subscription_id: private_unauth,
+            message: "auth-required: authentication required to read group events".to_owned()
+        }]
     );
     assert_count(
         relay.handle_count(
@@ -710,9 +715,18 @@ fn nip29_privacy_leak_suite_covers_relay_exposure_and_rejection_paths() {
 
     let live_unauth = subscription("private-live-unauth");
     let live_member = subscription("private-live-member");
-    relay
-        .handle_req(live_unauth, vec![filter_group_tag(1, "h", "LeakPrivate")])
-        .expect("private live unauth");
+    assert_eq!(
+        relay
+            .handle_req(
+                live_unauth.clone(),
+                vec![filter_group_tag(1, "h", "LeakPrivate")],
+            )
+            .expect("private live unauth"),
+        vec![RelayMessage::Closed {
+            subscription_id: live_unauth,
+            message: "auth-required: authentication required to read group events".to_owned()
+        }]
+    );
     relay
         .handle_req_with_auth(
             live_member.clone(),
@@ -935,15 +949,17 @@ fn nip29_privacy_leak_suite_covers_relay_exposure_and_rejection_paths() {
         0,
     );
     let deleted_query = subscription("deleted-target-query");
-    assert_event_query(
+    assert_eq!(
         relay
             .handle_req(
                 deleted_query.clone(),
                 vec![filter_group_tag(1, "h", "LeakDeleted")],
             )
             .expect("deleted query"),
-        &deleted_query,
-        &[],
+        vec![RelayMessage::Closed {
+            subscription_id: deleted_query,
+            message: "auth-required: authentication required to read group events".to_owned()
+        }]
     );
     let delete_group =
         tangle_v2_delete_group_event(FixtureKey::Owner, "LeakDeleted", 73).expect("delete group");
@@ -1157,13 +1173,10 @@ fn group_tombstone_hides_prior_events_and_generated_snapshots() {
         ),
         0,
     );
-    assert!(
-        query_events(
-            &mut relay,
-            "tombstone-note-query",
-            vec![filter_group_tag(1, "h", "TombstoneFarm")]
-        )
-        .is_empty()
+    assert_auth_required_redacted_query(
+        &mut relay,
+        "tombstone-note-query",
+        vec![filter_group_tag(1, "h", "TombstoneFarm")],
     );
     for (subscription_id, query_id, kind) in [
         (
@@ -1189,13 +1202,10 @@ fn group_tombstone_hides_prior_events_and_generated_snapshots() {
             ),
             0,
         );
-        assert!(
-            query_events(
-                &mut relay,
-                query_id,
-                vec![filter_group_tag(kind, "d", "TombstoneFarm")]
-            )
-            .is_empty()
+        assert_auth_required_redacted_query(
+            &mut relay,
+            query_id,
+            vec![filter_group_tag(kind, "d", "TombstoneFarm")],
         );
     }
     assert_count(
@@ -2357,6 +2367,23 @@ fn query_events(relay: &mut BaseRelay, subscription_id: &str, filters: Vec<Filte
         }
     }
     events
+}
+
+fn assert_auth_required_redacted_query(
+    relay: &mut BaseRelay,
+    subscription_id: &str,
+    filters: Vec<Filter>,
+) {
+    let subscription_id = subscription(subscription_id);
+    assert_eq!(
+        relay
+            .handle_req(subscription_id.clone(), filters)
+            .expect("query"),
+        vec![RelayMessage::Closed {
+            subscription_id,
+            message: "auth-required: authentication required to read group events".to_owned()
+        }]
+    );
 }
 
 fn sorted_strings(values: impl IntoIterator<Item = String>) -> Vec<String> {

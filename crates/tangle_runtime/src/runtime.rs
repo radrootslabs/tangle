@@ -1035,12 +1035,12 @@ impl TangleRuntimeHandle {
             .rate_limit_req(subscription_id, filters, auth, rate_limit_context, now)
     }
 
-    pub(crate) async fn query_req_with_auth(
+    pub(crate) async fn query_req_with_auth_report(
         &self,
         subscription_id: SubscriptionId,
         filters: Vec<Filter>,
         auth: &BaseAuthState,
-    ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+    ) -> Result<BaseRelayQueryReport, BaseRelayError> {
         let started_at = Instant::now();
         let report = self
             .inner
@@ -1051,7 +1051,7 @@ impl TangleRuntimeHandle {
         self.inner
             .metrics
             .record_query_latency(elapsed_micros(started_at));
-        Ok(report.into_messages())
+        Ok(report)
     }
 
     pub async fn event_by_offset_with_auth(
@@ -4174,8 +4174,14 @@ mod tests {
                     )
                     .await
                     .expect("public req");
-                assert_eq!(replies.len(), 1);
-                assert_eq!(replies[0], RelayMessage::Eose(subscription_id));
+                assert_eq!(
+                    replies,
+                    vec![RelayMessage::Closed {
+                        subscription_id,
+                        message: "auth-required: authentication required to read group events"
+                            .to_owned()
+                    }]
+                );
             }));
             let member_count_handle = handle.clone();
             let mut auth = member_auth.clone();

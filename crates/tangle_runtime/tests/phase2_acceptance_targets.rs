@@ -836,7 +836,7 @@ async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_
         "PrivateSocket",
     )
     .await;
-    assert_empty_req(
+    assert_redacted_req_closed(
         &mut observer,
         "private-members-public-query",
         json!({"kinds":[KIND_GROUP_MEMBERS], "#d":["PrivateSocket"]}),
@@ -929,7 +929,7 @@ async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_
             "invalid: filter field `approximate` is unsupported"
         ])
     );
-    assert_empty_req(
+    assert_redacted_req_closed(
         &mut observer,
         "private-public-query",
         json!({"kinds":[1], "#h":["PrivateSocket"]}),
@@ -1012,7 +1012,7 @@ async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_
         ("hidden-admins-public-query", KIND_GROUP_ADMINS),
         ("hidden-members-public-query", KIND_GROUP_MEMBERS),
     ] {
-        assert_empty_req(
+        assert_redacted_req_closed(
             &mut observer,
             subscription_id,
             json!({"kinds":[kind], "#d":["HiddenSocket"]}),
@@ -1126,7 +1126,7 @@ async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_
             "invalid: filter field `approximate` is unsupported"
         ])
     );
-    assert_empty_req(
+    assert_redacted_req_closed(
         &mut observer,
         "hidden-public-query",
         json!({"kinds":[1], "#h":["HiddenSocket"]}),
@@ -2301,11 +2301,19 @@ async fn assert_count_closed(
     );
 }
 
-async fn assert_empty_req(socket: &mut TestWebSocket, subscription_id: &str, filter: Value) {
+async fn assert_redacted_req_closed(
+    socket: &mut TestWebSocket,
+    subscription_id: &str,
+    filter: Value,
+) {
     send_client_value(socket, json!(["REQ", subscription_id, filter])).await;
     assert_eq!(
         read_relay_value(socket).await,
-        json!(["EOSE", subscription_id])
+        json!([
+            "CLOSED",
+            subscription_id,
+            "auth-required: authentication required to read group events"
+        ])
     );
 }
 

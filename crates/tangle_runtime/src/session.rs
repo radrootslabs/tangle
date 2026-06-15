@@ -346,11 +346,13 @@ impl TangleWebSocketSession {
             self.subscriptions
                 .ensure_can_subscribe(&subscription_id, &filters)?;
         }
-        let replies = self
+        let report = self
             .runtime
-            .query_req_with_auth(subscription_id.clone(), filters.clone(), &self.auth)
+            .query_req_with_auth_report(subscription_id.clone(), filters.clone(), &self.auth)
             .await?;
-        if should_subscribe {
+        let closes_subscription = report.group_read_denied();
+        let replies = report.into_messages();
+        if should_subscribe && !closes_subscription {
             self.subscriptions
                 .subscribe(subscription_id.clone(), filters)?;
             metrics.record_subscription_opened();
@@ -957,6 +959,125 @@ mod tests {
             .await;
         assert!(invalid_result.is_err());
         assert_eq!(session.active_subscription_count(), 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn websocket_session_redacted_initial_req_closes_without_live_subscription() {
+        let shutdown = TangleShutdownSignal::new();
+        let root = temp_root("redacted-req-close");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntimeHandle::new(
+            TangleRuntime::open(runtime_config_with_groups(&root)).expect("runtime"),
+        );
+        let mut owner_auth = runtime.auth_state().await.expect("owner auth");
+        owner_auth
+            .issue_challenge("owner-redacted", UnixTimestamp::new(100))
+            .expect("owner challenge");
+        let owner_auth_event = tangle_v2_auth_event(FixtureKey::Owner, "owner-redacted", 120)
+            .expect("owner auth event");
+        assert_eq!(
+            runtime
+                .handle_client_message(
+                    ClientMessage::Auth(owner_auth_event.clone()),
+                    &mut owner_auth,
+                    UnixTimestamp::new(120)
+                )
+                .await
+                .expect("owner auth"),
+            vec![RelayMessage::Ok {
+                event_id: owner_auth_event.id().clone(),
+                accepted: true,
+                message: String::new()
+            }]
+        );
+        let create =
+            tangle_v2_group_create_event(FixtureKey::Owner, "RedactedFarm", 121, &["private"])
+                .expect("create");
+        assert_eq!(
+            runtime
+                .handle_client_message(
+                    ClientMessage::Event(create.clone()),
+                    &mut owner_auth,
+                    UnixTimestamp::new(121)
+                )
+                .await
+                .expect("create"),
+            vec![RelayMessage::Ok {
+                event_id: create.id().clone(),
+                accepted: true,
+                message: String::new()
+            }]
+        );
+        let public_event =
+            tangle_v2_event(FixtureKey::Member, 1_714_124_433, 1, Vec::new(), "public")
+                .expect("public");
+        assert_eq!(
+            runtime
+                .handle_client_message(
+                    ClientMessage::Event(public_event.clone()),
+                    &mut owner_auth,
+                    UnixTimestamp::new(122)
+                )
+                .await
+                .expect("public event"),
+            vec![RelayMessage::Ok {
+                event_id: public_event.id().clone(),
+                accepted: true,
+                message: String::new()
+            }]
+        );
+        let private_event =
+            tangle_v2_group_event(FixtureKey::Owner, "RedactedFarm", 123, 1, "private")
+                .expect("private");
+        assert_eq!(
+            runtime
+                .handle_client_message(
+                    ClientMessage::Event(private_event.clone()),
+                    &mut owner_auth,
+                    UnixTimestamp::new(123)
+                )
+                .await
+                .expect("private event"),
+            vec![RelayMessage::Ok {
+                event_id: private_event.id().clone(),
+                accepted: true,
+                message: String::new()
+            }]
+        );
+
+        let events = runtime.subscribe_events().await;
+        let mut session = TangleWebSocketSession::new(
+            session_limits(8),
+            shutdown.subscribe(),
+            runtime.clone(),
+            runtime.auth_state().await.expect("session auth"),
+            events,
+        )
+        .expect("session");
+        let subscription_id = SubscriptionId::new("redacted-req").expect("subscription");
+        assert_eq!(
+            session
+                .handle_client_message(ClientMessage::Req {
+                    subscription_id: subscription_id.clone(),
+                    filters: vec![filter_from_value(&json!({"kinds":[1]})).expect("filter")],
+                })
+                .await
+                .expect("redacted req"),
+            vec![
+                RelayMessage::Event {
+                    subscription_id: subscription_id.clone(),
+                    event: public_event
+                },
+                RelayMessage::Closed {
+                    subscription_id,
+                    message: "auth-required: authentication required to read group events"
+                        .to_owned()
+                }
+            ]
+        );
+        assert_eq!(session.active_subscription_count(), 0);
 
         let _ = std::fs::remove_dir_all(root);
     }
