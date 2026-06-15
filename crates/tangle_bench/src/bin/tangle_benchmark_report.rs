@@ -57,9 +57,17 @@ fn run() -> Result<Option<PathBuf>, String> {
         "count": supported_nips_count
     });
     summary["run_identity"] = serde_json::json!({
-        "git_commit": git_short_commit(),
+        "git_commit": git_full_commit(),
+        "git_commit_short": git_short_commit(),
         "rust_toolchain": rust_toolchain(),
-        "host_profile": host_profile()
+        "host_profile": host_profile(),
+        "os": env::consts::OS,
+        "arch": env::consts::ARCH
+    });
+    summary["host_hardware"] = serde_json::json!({
+        "cpu_model": cpu_model(),
+        "cpu_parallelism": cpu_parallelism(),
+        "memory_bytes": memory_bytes()
     });
 
     let summary_path = artifact_dir.join("summary.json");
@@ -188,6 +196,10 @@ fn git_short_commit() -> String {
     command_text("git", &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".to_owned())
 }
 
+fn git_full_commit() -> String {
+    command_text("git", &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_owned())
+}
+
 fn rust_toolchain() -> String {
     command_text("rustc", &["--version"]).unwrap_or_else(|| "unknown".to_owned())
 }
@@ -196,6 +208,45 @@ fn host_profile() -> String {
     let os = env::consts::OS;
     let arch = env::consts::ARCH;
     format!("{os}-{arch}")
+}
+
+fn cpu_model() -> String {
+    command_text("sysctl", &["-n", "machdep.cpu.brand_string"])
+        .or_else(cpu_model_from_proc)
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn cpu_parallelism() -> u64 {
+    std::thread::available_parallelism()
+        .map(|value| value.get().try_into().expect("parallelism fits in u64"))
+        .unwrap_or(0)
+}
+
+fn memory_bytes() -> Option<u64> {
+    command_text("sysctl", &["-n", "hw.memsize"])
+        .and_then(|value| value.parse::<u64>().ok())
+        .or_else(memory_bytes_from_proc)
+}
+
+fn cpu_model_from_proc() -> Option<String> {
+    let raw = fs::read_to_string("/proc/cpuinfo").ok()?;
+    raw.lines()
+        .find_map(|line| line.strip_prefix("model name"))
+        .and_then(|value| {
+            value
+                .split_once(':')
+                .map(|(_, model)| model.trim().to_owned())
+        })
+        .filter(|value| !value.is_empty())
+}
+
+fn memory_bytes_from_proc() -> Option<u64> {
+    let raw = fs::read_to_string("/proc/meminfo").ok()?;
+    raw.lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .and_then(|kib| kib.checked_mul(1024))
 }
 
 fn command_text(command: &str, args: &[&str]) -> Option<String> {

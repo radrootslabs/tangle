@@ -35,6 +35,8 @@ pub const SCENARIO_PROJECTION_REBUILD: &str = "projection_rebuild";
 pub const SCENARIO_OUTBOX_REPLAY: &str = "outbox_replay";
 pub const SCENARIO_BROADCAST_LAG: &str = "broadcast_lag";
 pub const SCENARIO_MEMORY_PROFILE: &str = "memory_profile";
+pub const POCKET_SOURCE_REPOSITORY: &str = "https://github.com/triesap/pocket";
+pub const POCKET_SOURCE_REVISION: &str = "329334f20948c796c6016b673b92551ac4855ad7";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BenchDatasetConfig {
@@ -686,6 +688,7 @@ impl ScenarioReport {
     fn to_json(&self) -> serde_json::Value {
         json!({
             "scenario": self.scenario,
+            "status": status(self.accepted == self.attempted && self.rejected == 0),
             "attempted": self.attempted,
             "accepted": self.accepted,
             "rejected": self.rejected,
@@ -694,7 +697,15 @@ impl ScenarioReport {
             "p50_micros": self.p50_micros,
             "p95_micros": self.p95_micros,
             "p99_micros": self.p99_micros,
-            "max_rss_bytes": self.max_rss_bytes
+            "max_rss_bytes": self.max_rss_bytes,
+            "query_metrics": {
+                "candidates_scanned": self.attempted,
+                "events_returned": self.accepted,
+                "events_rejected": self.rejected
+            },
+            "memory": {
+                "max_rss_bytes": self.max_rss_bytes
+            }
         })
     }
 }
@@ -938,15 +949,30 @@ impl BenchmarkRunReport {
 
     pub fn summary_json(&self, run_id: &str, artifact_directory: &Path) -> serde_json::Value {
         json!({
-            "schema": 1,
+            "schema": 2,
             "run_id": run_id,
             "artifact_directory": artifact_directory.to_string_lossy(),
             "profile": self.profile.name().as_str(),
             "dataset": self.dataset_profile.to_json(),
+            "dataset_profile": self.dataset_profile.to_json(),
             "scenarios": self.scenarios.iter().map(ScenarioReport::to_json).collect::<Vec<_>>(),
+            "pocket_source": pocket_source_json(),
             "threshold_source": self.profile.threshold_source(),
             "thresholds": self.profile.thresholds().to_json(),
             "validation_summary": self.validation_summary,
+            "pass_fail_summary": {
+                "overall_status": validation_overall_status(&self.validation_summary),
+                "passed_scenarios": self
+                    .validation_summary
+                    .values()
+                    .filter(|value| value.as_str() == "pass")
+                    .count(),
+                "failed_scenarios": self
+                    .validation_summary
+                    .values()
+                    .filter(|value| value.as_str() == "fail")
+                    .count()
+            },
             "proof_claim": {
                 "eligible": self.profile.proof_claim_eligible(),
                 "profile_required": "proof-*",
@@ -960,6 +986,22 @@ impl BenchmarkRunReport {
                 "dataset_events_jsonl": "dataset-events.jsonl"
             }
         })
+    }
+}
+
+fn pocket_source_json() -> serde_json::Value {
+    json!({
+        "repository": POCKET_SOURCE_REPOSITORY,
+        "revision": POCKET_SOURCE_REVISION,
+        "crates": ["pocket-db", "pocket-types"]
+    })
+}
+
+fn validation_overall_status(summary: &BTreeMap<String, String>) -> &'static str {
+    if summary.values().all(|value| value == "pass") {
+        "pass"
+    } else {
+        "fail"
     }
 }
 
@@ -1892,10 +1934,11 @@ fn lower_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         BenchDataset, BenchDatasetConfig, BenchGroupVisibility, BenchmarkProfile,
-        BenchmarkProfileName, BenchmarkRunReport, BenchmarkThresholds, SCENARIO_BROADCAST_LAG,
-        SCENARIO_COUNT_RESOURCE_CONTROLS, SCENARIO_GROUP_READ_GATE_OVERHEAD,
-        SCENARIO_MEMORY_PROFILE, SCENARIO_OUTBOX_REPLAY, SCENARIO_POCKET_QUERY_VISIBLE_EVENTS,
-        SCENARIO_PROJECTION_REBUILD, ScenarioReport, generated_state_counts, materialize_dataset,
+        BenchmarkProfileName, BenchmarkRunReport, BenchmarkThresholds, POCKET_SOURCE_REPOSITORY,
+        POCKET_SOURCE_REVISION, SCENARIO_BROADCAST_LAG, SCENARIO_COUNT_RESOURCE_CONTROLS,
+        SCENARIO_GROUP_READ_GATE_OVERHEAD, SCENARIO_MEMORY_PROFILE, SCENARIO_OUTBOX_REPLAY,
+        SCENARIO_POCKET_QUERY_VISIBLE_EVENTS, SCENARIO_PROJECTION_REBUILD, ScenarioReport,
+        generated_state_counts, materialize_dataset,
     };
     use std::collections::BTreeSet;
     use tangle_groups::{GroupId, KIND_GROUP_ADMINS, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA};
@@ -2246,21 +2289,58 @@ mod tests {
             .expect("report");
         let summary = report.summary_json("unit-run", std::path::Path::new(".local/unit"));
 
-        assert_eq!(summary["schema"], 1);
+        assert_eq!(summary["schema"], 2);
         assert_eq!(summary["run_id"], "unit-run");
         assert_eq!(summary["profile"], "smoke");
         assert_eq!(summary["threshold_source"], "builtin:smoke");
+        assert_eq!(
+            summary["pocket_source"]["repository"],
+            POCKET_SOURCE_REPOSITORY
+        );
+        assert_eq!(summary["pocket_source"]["revision"], POCKET_SOURCE_REVISION);
         assert_eq!(summary["proof_claim"]["eligible"], false);
         assert_eq!(summary["proof_claim"]["target_hardware_evidence"], "absent");
         assert_eq!(
             summary["dataset"]["fixture_family"],
             "synthetic repo-owned fixtures"
         );
+        assert_eq!(
+            summary["dataset_profile"]["fixture_family"],
+            "synthetic repo-owned fixtures"
+        );
         assert_eq!(summary["scenarios"].as_array().expect("scenarios").len(), 7);
+        let first_scenario = &summary["scenarios"]
+            .as_array()
+            .expect("scenarios")
+            .first()
+            .expect("first scenario");
+        assert_eq!(first_scenario["status"], "pass");
+        assert!(first_scenario["p50_micros"].as_u64().expect("p50") > 0);
+        assert!(first_scenario["p95_micros"].as_u64().expect("p95") > 0);
+        assert!(first_scenario["p99_micros"].as_u64().expect("p99") > 0);
+        assert!(
+            first_scenario["query_metrics"]["candidates_scanned"]
+                .as_u64()
+                .expect("candidates")
+                > 0
+        );
+        assert!(
+            first_scenario["query_metrics"]["events_returned"]
+                .as_u64()
+                .expect("returned")
+                > 0
+        );
+        assert!(
+            first_scenario["memory"]["max_rss_bytes"]
+                .as_u64()
+                .expect("memory")
+                > 0
+        );
         assert_eq!(
             summary["validation_summary"][SCENARIO_POCKET_QUERY_VISIBLE_EVENTS],
             "pass"
         );
+        assert_eq!(summary["pass_fail_summary"]["overall_status"], "pass");
         assert!(
             summary["thresholds"]["read_gate_p95_micros"]
                 .as_u64()
