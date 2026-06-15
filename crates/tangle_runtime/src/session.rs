@@ -468,7 +468,10 @@ mod tests {
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use tangle_groups::StoreOffset;
-    use tangle_protocol::{ClientMessage, Filter, RelayMessage, SubscriptionId, filter_from_value};
+    use tangle_protocol::{
+        ClientMessage, Filter, RelayMessage, SubscriptionId, event_to_value, filter_from_value,
+    };
+    use tangle_test_support::{FixtureKey, tangle_v2_event};
 
     #[test]
     fn websocket_session_records_connection_time() {
@@ -536,6 +539,72 @@ mod tests {
         assert_eq!(
             text.as_str(),
             "[\"NOTICE\",\"invalid: client message length exceeds runtime max_message_length 8\"]"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_session_preserves_chorus_malformed_message_parity() {
+        let shutdown = TangleShutdownSignal::new();
+        let (runtime, auth, events) = session_runtime("chorus-malformed-parity");
+        let mut session = TangleWebSocketSession::new(
+            session_limits(16),
+            shutdown.subscribe(),
+            runtime,
+            auth,
+            events,
+        )
+        .expect("session");
+        let event = tangle_v2_event(FixtureKey::Member, 1_714_124_433, 1, Vec::new(), "parity")
+            .expect("event");
+        for (raw, expected) in [
+            ("{", None),
+            (
+                "[\"NOTICE\",\"client\"]",
+                Some("[\"NOTICE\",\"invalid: client message command `NOTICE` is unsupported\"]"),
+            ),
+            (
+                "[\"REQ\"]",
+                Some(
+                    "[\"NOTICE\",\"invalid: REQ client message must contain a subscription id and filters\"]",
+                ),
+            ),
+            (
+                "[\"CLOSE\",1]",
+                Some("[\"NOTICE\",\"invalid: CLOSE subscription id must be a string\"]"),
+            ),
+        ] {
+            assert_eq!(
+                session.dispatch_text(raw).await,
+                TangleSessionControl::Continue
+            );
+            let text = take_outbound_text(&mut session);
+            if let Some(expected) = expected {
+                assert_eq!(text, expected);
+            } else {
+                assert!(text.starts_with("[\"NOTICE\",\"invalid: client message JSON is invalid:"));
+            }
+        }
+
+        assert_eq!(
+            session
+                .dispatch_text("[\"REQ\",\"sub-search\",{\"search\":\"carrots\"}]")
+                .await,
+            TangleSessionControl::Continue
+        );
+        assert_eq!(
+            take_outbound_text(&mut session),
+            "[\"CLOSED\",\"sub-search\",\"unsupported: search filters are not supported\"]"
+        );
+
+        assert_eq!(
+            session
+                .dispatch_text(&json!(["EVENT", event_to_value(&event)]).to_string())
+                .await,
+            TangleSessionControl::Continue
+        );
+        assert_eq!(
+            take_outbound_text(&mut session),
+            format!("[\"OK\",\"{}\",true,\"\"]", event.id().as_str())
         );
     }
 
@@ -782,6 +851,14 @@ mod tests {
             subscription_id,
             filters: vec![Filter::empty()],
         }
+    }
+
+    fn take_outbound_text(session: &mut TangleWebSocketSession) -> String {
+        let message = session.outbound_receiver.try_recv().expect("message");
+        let Message::Text(text) = message else {
+            panic!("expected text message")
+        };
+        text.to_string()
     }
 
     fn runtime_config(root: &Path) -> BaseRelayRuntimeConfig {
