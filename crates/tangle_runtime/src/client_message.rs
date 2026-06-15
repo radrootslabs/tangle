@@ -35,6 +35,9 @@ pub(crate) fn parse_runtime_client_message(raw: &str) -> Result<ClientMessage, S
             }
         }),
         "CLOSE" => parse_close(&values),
+        "NEG-OPEN" => parse_neg_open(&values),
+        "NEG-MSG" => parse_neg_msg(&values),
+        "NEG-CLOSE" => parse_neg_close(&values),
         unsupported => Err(format!(
             "client message command `{unsupported}` is unsupported"
         )),
@@ -79,6 +82,37 @@ fn parse_close(values: &[Box<RawValue>]) -> Result<ClientMessage, String> {
     parse_subscription_id(&values[1], "CLOSE").map(ClientMessage::Close)
 }
 
+fn parse_neg_open(values: &[Box<RawValue>]) -> Result<ClientMessage, String> {
+    if values.len() != 4 {
+        return Err(
+            "NEG-OPEN client message must contain a subscription id, filter, and message"
+                .to_owned(),
+        );
+    }
+    Ok(ClientMessage::NegOpen {
+        subscription_id: parse_subscription_id(&values[1], "NEG-OPEN")?,
+        filter: parse_filter(&values[2])?,
+        message: parse_negentropy_message(&values[3], "NEG-OPEN")?,
+    })
+}
+
+fn parse_neg_msg(values: &[Box<RawValue>]) -> Result<ClientMessage, String> {
+    if values.len() != 3 {
+        return Err("NEG-MSG client message must contain a subscription id and message".to_owned());
+    }
+    Ok(ClientMessage::NegMsg {
+        subscription_id: parse_subscription_id(&values[1], "NEG-MSG")?,
+        message: parse_negentropy_message(&values[2], "NEG-MSG")?,
+    })
+}
+
+fn parse_neg_close(values: &[Box<RawValue>]) -> Result<ClientMessage, String> {
+    if values.len() != 2 {
+        return Err("NEG-CLOSE client message must contain exactly 2 elements".to_owned());
+    }
+    parse_subscription_id(&values[1], "NEG-CLOSE").map(ClientMessage::NegClose)
+}
+
 fn parse_subscription_id(
     value: &RawValue,
     command: &'static str,
@@ -86,6 +120,22 @@ fn parse_subscription_id(
     serde_json::from_str::<String>(value.get())
         .map_err(|_| format!("{command} subscription id must be a string"))
         .and_then(|subscription_id| SubscriptionId::new(&subscription_id))
+}
+
+fn parse_negentropy_message(value: &RawValue, command: &'static str) -> Result<String, String> {
+    let message = serde_json::from_str::<String>(value.get())
+        .map_err(|_| format!("{command} message must be a string"))?;
+    if message.len() % 2 == 0
+        && message
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        Ok(message)
+    } else {
+        Err(format!(
+            "{command} message must be a lowercase even-length hex string"
+        ))
+    }
 }
 
 fn parse_filter(value: &RawValue) -> Result<Filter, String> {
@@ -352,6 +402,33 @@ mod tests {
     }
 
     #[test]
+    fn runtime_parser_maps_negentropy_commands_without_protocol_parser_delegation() {
+        let filter = filter_from_value(&json!({"kinds": [1]})).expect("filter");
+        assert_eq!(
+            parse_runtime_client_message(
+                &json!(["NEG-OPEN", "neg-sub", json!({"kinds": [1]}), "00ff"]).to_string()
+            )
+            .expect("neg open"),
+            ClientMessage::NegOpen {
+                subscription_id: "neg-sub".parse().expect("subscription"),
+                filter,
+                message: "00ff".to_owned()
+            }
+        );
+        assert_eq!(
+            parse_runtime_client_message("[\"NEG-MSG\",\"neg-sub\",\"\"]").expect("neg msg"),
+            ClientMessage::NegMsg {
+                subscription_id: "neg-sub".parse().expect("subscription"),
+                message: String::new()
+            }
+        );
+        assert_eq!(
+            parse_runtime_client_message("[\"NEG-CLOSE\",\"neg-sub\"]").expect("neg close"),
+            ClientMessage::NegClose("neg-sub".parse().expect("subscription"))
+        );
+    }
+
+    #[test]
     fn runtime_parser_preserves_search_rejection_marker_before_dispatch() {
         let ClientMessage::Req { filters, .. } =
             parse_runtime_client_message("[\"REQ\",\"sub\",{\"search\":\"carrots\",\"limit\":1}]")
@@ -388,6 +465,43 @@ mod tests {
             (
                 "[\"REQ\",\"sub\",{\"limit\":1,\"limit\":2}]",
                 "duplicate object field `limit`",
+            ),
+        ] {
+            let actual = parse_runtime_client_message(raw).expect_err(raw);
+            assert!(actual.contains(expected), "{actual}");
+        }
+    }
+
+    #[test]
+    fn runtime_parser_rejects_malformed_negentropy_commands() {
+        for (raw, expected) in [
+            (
+                "[\"NEG-OPEN\",\"sub\",{}]",
+                "NEG-OPEN client message must contain a subscription id, filter, and message",
+            ),
+            (
+                "[\"NEG-OPEN\",1,{},\"00\"]",
+                "NEG-OPEN subscription id must be a string",
+            ),
+            (
+                "[\"NEG-OPEN\",\"sub\",1,\"00\"]",
+                "expected a filter JSON object",
+            ),
+            (
+                "[\"NEG-OPEN\",\"sub\",{},1]",
+                "NEG-OPEN message must be a string",
+            ),
+            (
+                "[\"NEG-MSG\",\"sub\",\"0\"]",
+                "NEG-MSG message must be a lowercase even-length hex string",
+            ),
+            (
+                "[\"NEG-MSG\",\"sub\",\"0G\"]",
+                "NEG-MSG message must be a lowercase even-length hex string",
+            ),
+            (
+                "[\"NEG-CLOSE\",\"sub\",{}]",
+                "NEG-CLOSE client message must contain exactly 2 elements",
             ),
         ] {
             let actual = parse_runtime_client_message(raw).expect_err(raw);

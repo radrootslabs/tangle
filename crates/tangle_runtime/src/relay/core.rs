@@ -25,6 +25,8 @@ use tangle_store_pocket::{
     PocketQueryConfig, PocketScreenResult, PocketStoreConfig, PocketStoreHandle,
 };
 
+pub(crate) const NEGENTROPY_DISABLED_MESSAGE: &str = "blocked: Negentropy sync is disabled";
+
 pub struct BaseRelay {
     store: PocketStoreHandle,
     subscriptions: LiveSubscriptionSet,
@@ -598,6 +600,20 @@ impl BaseRelay {
                 Ok(Vec::new())
             }
             ClientMessage::Auth(event) => Ok(self.handle_auth_message(event, auth, now)),
+            ClientMessage::NegOpen {
+                subscription_id, ..
+            }
+            | ClientMessage::NegMsg {
+                subscription_id, ..
+            } => Ok(vec![Self::disabled_negentropy_message(subscription_id)]),
+            ClientMessage::NegClose(_) => Ok(Vec::new()),
+        }
+    }
+
+    pub(crate) fn disabled_negentropy_message(subscription_id: SubscriptionId) -> RelayMessage {
+        RelayMessage::NegErr {
+            subscription_id,
+            message: NEGENTROPY_DISABLED_MESSAGE.to_owned(),
         }
     }
 
@@ -1362,7 +1378,7 @@ fn filters_are_complete(filters: &[Filter]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{BaseRelay, BaseRelayLimitSettings, BaseRelayLimits};
+    use super::{BaseRelay, BaseRelayLimitSettings, BaseRelayLimits, NEGENTROPY_DISABLED_MESSAGE};
     use crate::pocket_conversion::tangle_event_to_pocket;
     use crate::relay::auth::BaseAuthState;
     use crate::relay::live::CloseResult;
@@ -1513,6 +1529,58 @@ mod tests {
                 subscription_id: count_id,
                 message: "unsupported: search filters are not supported".to_owned()
             }
+        );
+    }
+
+    #[test]
+    fn base_relay_dispatch_returns_disabled_negentropy_surface() {
+        let mut relay = test_relay("base-relay-negentropy-disabled", 4);
+        let mut auth =
+            BaseAuthState::new("wss://relay.radroots.test", 60, 600).expect("auth state");
+        let subscription_id = SubscriptionId::new("neg-sub").expect("sub");
+
+        assert_eq!(
+            relay
+                .handle_client_message(
+                    ClientMessage::NegOpen {
+                        subscription_id: subscription_id.clone(),
+                        filter: Filter::empty(),
+                        message: "00".to_owned()
+                    },
+                    &mut auth,
+                    UnixTimestamp::new(100)
+                )
+                .expect("neg open"),
+            vec![RelayMessage::NegErr {
+                subscription_id: subscription_id.clone(),
+                message: NEGENTROPY_DISABLED_MESSAGE.to_owned()
+            }]
+        );
+        assert_eq!(
+            relay
+                .handle_client_message(
+                    ClientMessage::NegMsg {
+                        subscription_id: subscription_id.clone(),
+                        message: String::new()
+                    },
+                    &mut auth,
+                    UnixTimestamp::new(101)
+                )
+                .expect("neg msg"),
+            vec![RelayMessage::NegErr {
+                subscription_id: subscription_id.clone(),
+                message: NEGENTROPY_DISABLED_MESSAGE.to_owned()
+            }]
+        );
+        assert_eq!(
+            relay
+                .handle_client_message(
+                    ClientMessage::NegClose(subscription_id),
+                    &mut auth,
+                    UnixTimestamp::new(102)
+                )
+                .expect("neg close"),
+            Vec::<RelayMessage>::new()
         );
     }
 

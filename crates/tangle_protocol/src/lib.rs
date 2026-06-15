@@ -631,6 +631,16 @@ pub enum ClientMessage {
     },
     Close(SubscriptionId),
     Auth(Event),
+    NegOpen {
+        subscription_id: SubscriptionId,
+        filter: Filter,
+        message: String,
+    },
+    NegMsg {
+        subscription_id: SubscriptionId,
+        message: String,
+    },
+    NegClose(SubscriptionId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -808,6 +818,14 @@ pub enum RelayMessage {
     },
     Notice(String),
     Auth(String),
+    NegErr {
+        subscription_id: SubscriptionId,
+        message: String,
+    },
+    NegMsg {
+        subscription_id: SubscriptionId,
+        message: String,
+    },
 }
 
 impl RelayMessage {
@@ -844,6 +862,14 @@ pub fn relay_message_to_value(message: &RelayMessage) -> serde_json::Value {
         } => serde_json::json!(["COUNT", subscription_id.as_str(), {"count": count}]),
         RelayMessage::Notice(message) => serde_json::json!(["NOTICE", message]),
         RelayMessage::Auth(challenge) => serde_json::json!(["AUTH", challenge]),
+        RelayMessage::NegErr {
+            subscription_id,
+            message,
+        } => serde_json::json!(["NEG-ERR", subscription_id.as_str(), message]),
+        RelayMessage::NegMsg {
+            subscription_id,
+            message,
+        } => serde_json::json!(["NEG-MSG", subscription_id.as_str(), message]),
     }
 }
 
@@ -2631,6 +2657,26 @@ mod tests {
         assert_eq!(
             relay_message_to_value(&RelayMessage::Auth("challenge-a".to_owned())),
             serde_json::json!(["AUTH", "challenge-a"])
+        );
+    }
+
+    #[test]
+    fn relay_message_encoder_emits_negentropy_messages() {
+        let subscription_id = SubscriptionId::new("neg-sub").expect("sub");
+
+        assert_eq!(
+            relay_message_to_value(&RelayMessage::NegErr {
+                subscription_id: subscription_id.clone(),
+                message: "blocked: Negentropy sync is disabled".to_owned()
+            }),
+            serde_json::json!(["NEG-ERR", "neg-sub", "blocked: Negentropy sync is disabled"])
+        );
+        assert_eq!(
+            relay_message_to_value(&RelayMessage::NegMsg {
+                subscription_id,
+                message: "00ff".to_owned()
+            }),
+            serde_json::json!(["NEG-MSG", "neg-sub", "00ff"])
         );
     }
 

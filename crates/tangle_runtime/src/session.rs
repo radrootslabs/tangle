@@ -571,7 +571,9 @@ mod tests {
             ),
             (
                 "[\"NEG-OPEN\",\"sub\",{}]",
-                Some("[\"NOTICE\",\"invalid: client message command `NEG-OPEN` is unsupported\"]"),
+                Some(
+                    "[\"NOTICE\",\"invalid: NEG-OPEN client message must contain a subscription id, filter, and message\"]",
+                ),
             ),
             (
                 "[\"REQ\"]",
@@ -617,6 +619,84 @@ mod tests {
             take_outbound_text(&mut session),
             format!("[\"OK\",\"{}\",true,\"\"]", event.id().as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn websocket_session_returns_disabled_negentropy_errors() {
+        let shutdown = TangleShutdownSignal::new();
+        let (runtime, auth, events) = session_runtime("disabled-negentropy");
+        let mut session = TangleWebSocketSession::new(
+            session_limits(16),
+            shutdown.subscribe(),
+            runtime,
+            auth,
+            events,
+        )
+        .expect("session");
+
+        assert_eq!(
+            session
+                .dispatch_text("[\"NEG-OPEN\",\"neg-sub\",{\"kinds\":[1]},\"00\"]")
+                .await,
+            TangleSessionControl::Continue
+        );
+        assert_eq!(
+            take_outbound_text(&mut session),
+            "[\"NEG-ERR\",\"neg-sub\",\"blocked: Negentropy sync is disabled\"]"
+        );
+        assert_eq!(
+            session
+                .dispatch_text("[\"NEG-MSG\",\"neg-sub\",\"\"]")
+                .await,
+            TangleSessionControl::Continue
+        );
+        assert_eq!(
+            take_outbound_text(&mut session),
+            "[\"NEG-ERR\",\"neg-sub\",\"blocked: Negentropy sync is disabled\"]"
+        );
+        assert_eq!(
+            session.dispatch_text("[\"NEG-CLOSE\",\"neg-sub\"]").await,
+            TangleSessionControl::Continue
+        );
+        assert!(session.outbound_receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn websocket_session_disabled_negentropy_privacy_response_omits_filter_material() {
+        let shutdown = TangleShutdownSignal::new();
+        let (runtime, auth, events) = session_runtime("disabled-negentropy-privacy");
+        let mut session = TangleWebSocketSession::new(
+            session_limits(16),
+            shutdown.subscribe(),
+            runtime,
+            auth,
+            events,
+        )
+        .expect("session");
+        let hidden_event_id = "a".repeat(64);
+        let private_group_id = "private-group-alpha";
+        let raw = json!([
+            "NEG-OPEN",
+            "neg-private",
+            {"ids": [hidden_event_id], "#h": [private_group_id]},
+            "00"
+        ])
+        .to_string();
+
+        assert_eq!(
+            session.dispatch_text(&raw).await,
+            TangleSessionControl::Continue
+        );
+        let text = take_outbound_text(&mut session);
+
+        assert_eq!(
+            text,
+            "[\"NEG-ERR\",\"neg-private\",\"blocked: Negentropy sync is disabled\"]"
+        );
+        assert!(!text.contains(private_group_id));
+        assert!(!text.contains(&hidden_event_id));
+        assert!(!text.contains("inventory"));
+        assert!(!text.contains("#h"));
     }
 
     #[tokio::test]

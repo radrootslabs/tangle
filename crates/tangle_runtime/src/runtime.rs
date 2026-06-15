@@ -1008,6 +1008,27 @@ impl TangleRuntimeHandle {
                     .validate_subscription_id(&subscription_id)?;
                 Ok(Vec::new())
             }
+            ClientMessage::NegOpen {
+                subscription_id, ..
+            }
+            | ClientMessage::NegMsg {
+                subscription_id, ..
+            } => {
+                self.inner
+                    .limits
+                    .base_relay_limits()
+                    .validate_subscription_id(&subscription_id)?;
+                Ok(vec![BaseRelay::disabled_negentropy_message(
+                    subscription_id,
+                )])
+            }
+            ClientMessage::NegClose(subscription_id) => {
+                self.inner
+                    .limits
+                    .base_relay_limits()
+                    .validate_subscription_id(&subscription_id)?;
+                Ok(Vec::new())
+            }
         }
     }
 
@@ -1157,6 +1178,9 @@ fn client_message_metric_kind(message: &ClientMessage) -> TangleClientMessageMet
         ClientMessage::Count { .. } => TangleClientMessageMetricKind::Count,
         ClientMessage::Auth(_) => TangleClientMessageMetricKind::Auth,
         ClientMessage::Close(_) => TangleClientMessageMetricKind::Close,
+        ClientMessage::NegOpen { .. }
+        | ClientMessage::NegMsg { .. }
+        | ClientMessage::NegClose(_) => TangleClientMessageMetricKind::Negentropy,
     }
 }
 
@@ -1309,6 +1333,7 @@ pub enum TangleClientMessageMetricKind {
     Count,
     Auth,
     Close,
+    Negentropy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1692,6 +1717,7 @@ impl TangleRuntimeMetrics {
             TangleClientMessageMetricKind::Close => {
                 self.inner.close_messages.fetch_add(1, Ordering::Relaxed);
             }
+            TangleClientMessageMetricKind::Negentropy => {}
         };
         total
     }
