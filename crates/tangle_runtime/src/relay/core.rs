@@ -560,7 +560,16 @@ impl BaseRelay {
         auth: &mut BaseAuthState,
         now: UnixTimestamp,
     ) -> Vec<RelayMessage> {
-        if let Err(error) = self.limits.validate_event(&event) {
+        Self::handle_auth_with_limits(self.limits, event, auth, now)
+    }
+
+    pub(crate) fn handle_auth_with_limits(
+        limits: BaseRelayLimits,
+        event: Event,
+        auth: &mut BaseAuthState,
+        now: UnixTimestamp,
+    ) -> Vec<RelayMessage> {
+        if let Err(error) = limits.validate_event(&event) {
             return vec![RelayMessage::Ok {
                 event_id: event.id().clone(),
                 accepted: false,

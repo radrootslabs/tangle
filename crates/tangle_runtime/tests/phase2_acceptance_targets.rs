@@ -1395,6 +1395,31 @@ fn runtime_live_fanout_offset_lookup_does_not_lock_relay_state() {
 }
 
 #[test]
+fn runtime_shared_shell_does_not_keep_transitional_base_relay_mutex() {
+    let runtime = include_str!("../src/runtime.rs");
+    let shared_shell = runtime
+        .split("struct TangleRuntimeShared {")
+        .nth(1)
+        .expect("shared shell")
+        .split("impl TangleRuntimeShared")
+        .next()
+        .expect("shared shell fields");
+    let handle_impl = runtime
+        .split("impl TangleRuntimeHandle")
+        .nth(1)
+        .expect("runtime handle")
+        .split("fn auth_response_failed")
+        .next()
+        .expect("runtime handle body");
+
+    assert!(!runtime.contains("Mutex<BaseRelay>"));
+    assert!(!runtime.contains("relay.lock().await"));
+    assert!(!shared_shell.contains("relay:"));
+    assert!(handle_impl.contains("BaseRelay::handle_auth_with_limits"));
+    assert!(handle_impl.contains("self.inner.store.sync()?"));
+}
+
+#[test]
 fn runtime_hot_path_does_not_stringify_and_reparse_events() {
     let conversion_boundary = include_str!("../src/pocket_conversion.rs");
     for forbidden in [

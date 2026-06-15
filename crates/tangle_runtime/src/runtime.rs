@@ -41,7 +41,7 @@ use tangle_protocol::{
     ClientMessage, Event, Filter, Kind, RelayMessage, SubscriptionId, UnixTimestamp,
 };
 use tangle_store_pocket::PocketStoreHandle;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::watch;
 
 pub struct TangleRuntime {
     config: BaseRelayRuntimeConfig,
@@ -160,7 +160,6 @@ struct TangleRuntimeShared {
     config: Arc<BaseRelayRuntimeConfig>,
     store: PocketStoreHandle,
     groups: Option<GroupServiceHandle>,
-    relay: Mutex<BaseRelay>,
     readiness: BaseRelayReadinessHandle,
     limits: TangleRuntimeLimits,
     event_bus: TangleEventBus,
@@ -187,7 +186,6 @@ impl TangleRuntimeShared {
             config: Arc::new(config),
             store,
             groups,
-            relay: Mutex::new(relay),
             readiness,
             limits,
             event_bus,
@@ -795,11 +793,12 @@ impl TangleRuntimeHandle {
                     return Ok(vec![message]);
                 }
                 let event_for_failure = event.clone();
-                let replies = self.inner.relay.lock().await.handle_client_message(
-                    ClientMessage::Auth(event),
+                let replies = BaseRelay::handle_auth_with_limits(
+                    self.inner.limits.base_relay_limits(),
+                    event,
                     auth,
                     now,
-                )?;
+                );
                 if auth_response_failed(&replies) {
                     self.inner.metrics.record_auth_failure();
                     if let Some(message) = self.inner.rate_limit_auth_failure(
@@ -814,12 +813,13 @@ impl TangleRuntimeHandle {
                 }
                 Ok(replies)
             }
-            message => self
-                .inner
-                .relay
-                .lock()
-                .await
-                .handle_client_message(message, auth, now),
+            ClientMessage::Close(subscription_id) => {
+                self.inner
+                    .limits
+                    .base_relay_limits()
+                    .validate_subscription_id(&subscription_id)?;
+                Ok(Vec::new())
+            }
         }
     }
 
@@ -901,7 +901,8 @@ impl TangleRuntimeHandle {
 
     pub async fn shutdown(&self) -> Result<BaseRelayShutdownReport, BaseRelayError> {
         self.inner.shutdown.request_shutdown();
-        self.inner.relay.lock().await.shutdown()
+        self.inner.store.sync()?;
+        Ok(BaseRelayShutdownReport::new(0))
     }
 }
 
