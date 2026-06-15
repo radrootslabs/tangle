@@ -2052,6 +2052,20 @@ mod tests {
     }
 
     #[test]
+    fn local_smoke_profiles_run_without_hardware_evidence() {
+        for profile in [BenchmarkProfile::smoke(), BenchmarkProfile::large_smoke()] {
+            assert!(!profile.requires_target_hardware_evidence());
+            let report = BenchmarkRunReport::run(profile).expect("local profile report");
+            assert!(
+                report
+                    .validation_summary()
+                    .values()
+                    .all(|status| status == "pass")
+            );
+        }
+    }
+
+    #[test]
     fn protocol_conversion_for_supported_profile_sizes_is_bounded() {
         let dataset =
             BenchDataset::generate(BenchDatasetConfig::new(4, 3, 3, 4, 3)).expect("dataset");
@@ -2246,10 +2260,17 @@ mod tests {
 
     #[test]
     fn proof_profile_runs_fail_closed_without_hardware_evidence() {
-        let error = BenchmarkRunReport::run(BenchmarkProfile::proof_10m())
-            .expect_err("proof profile requires evidence");
+        for profile in [
+            BenchmarkProfile::proof_10m(),
+            BenchmarkProfile::proof_large_group(),
+            BenchmarkProfile::proof_join_storm(),
+            BenchmarkProfile::proof_slow_client(),
+        ] {
+            let error =
+                BenchmarkRunReport::run(profile).expect_err("proof profile requires evidence");
 
-        assert!(error.contains("target hardware evidence is required"));
+            assert!(error.contains("target hardware evidence is required"));
+        }
     }
 
     #[test]

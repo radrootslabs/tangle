@@ -338,15 +338,22 @@ mod tests {
 
     #[test]
     fn benchmark_report_args_require_hardware_evidence_for_proof_profiles() {
-        let error = BenchmarkReportArgs::parse([
-            "--profile".to_owned(),
-            "proof-10m".to_owned(),
-            "--run-id".to_owned(),
-            "unit".to_owned(),
-        ])
-        .expect_err("proof profile requires evidence");
+        for profile in [
+            "proof-10m",
+            "proof-large-group",
+            "proof-join-storm",
+            "proof-slow-client",
+        ] {
+            let error = BenchmarkReportArgs::parse([
+                "--profile".to_owned(),
+                profile.to_owned(),
+                "--run-id".to_owned(),
+                "unit".to_owned(),
+            ])
+            .expect_err("proof profile requires evidence");
 
-        assert!(error.contains("target hardware evidence is required"));
+            assert!(error.contains("target hardware evidence is required"));
+        }
     }
 
     #[test]
