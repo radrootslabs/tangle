@@ -2388,6 +2388,18 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_pocket_source_matches_store_boundary() {
+        assert_eq!(
+            POCKET_SOURCE_REPOSITORY,
+            tangle_store_pocket::POCKET_SOURCE_REPOSITORY
+        );
+        assert_eq!(
+            POCKET_SOURCE_REVISION,
+            tangle_store_pocket::POCKET_SOURCE_REVISION
+        );
+    }
+
+    #[test]
     fn projection_rebuild_scenario_recreates_groups_and_members() {
         let dataset =
             BenchDataset::generate(BenchDatasetConfig::new(3, 1, 1, 0, 2)).expect("dataset");

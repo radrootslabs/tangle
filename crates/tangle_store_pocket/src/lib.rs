@@ -581,6 +581,27 @@ mod tests {
     }
 
     #[test]
+    fn pocket_dependency_boundary_matches_manifest_and_lock_state() {
+        let store_manifest = include_str!("../Cargo.toml");
+        let groups_manifest = include_str!("../../tangle_groups/Cargo.toml");
+        let lockfile = include_str!("../../../Cargo.lock");
+        let approved_source = format!("git = \"{}\"", POCKET_SOURCE_REPOSITORY);
+        let approved_revision = format!("rev = \"{}\"", POCKET_SOURCE_REVISION);
+        let approved_lock_source = format!(
+            "git+{}?rev={}#{}",
+            POCKET_SOURCE_REPOSITORY, POCKET_SOURCE_REVISION, POCKET_SOURCE_REVISION
+        );
+
+        for manifest in [store_manifest, groups_manifest] {
+            assert!(!manifest.contains("mikedilger/pocket"));
+            assert!(manifest.contains(&approved_source));
+            assert!(manifest.contains(&approved_revision));
+        }
+        assert!(!lockfile.contains("mikedilger/pocket"));
+        assert!(lockfile.contains(&approved_lock_source));
+    }
+
+    #[test]
     fn pocket_store_handle_opens_syncs_and_exposes_tangle_tables() {
         let root = std::env::temp_dir().join(format!("tangle-pocket-store-{}", std::process::id()));
         let config = PocketStoreConfig::new(root.join("pocket"), PocketSyncPolicy::FlushOnShutdown)
