@@ -8,6 +8,7 @@ license.workspace = true
 description = "Protocol types and wire contracts for Tangle"
 
 [dependencies]
+serde = "1"
 serde_json = "1"
 
 [lints]

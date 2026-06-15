@@ -2,6 +2,7 @@
 
 use core::fmt;
 use core::str::FromStr;
+use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -931,7 +932,7 @@ pub fn filter_from_value(value: &serde_json::Value) -> Result<Filter, String> {
 }
 
 pub fn parse_client_message(raw: &str) -> Result<ClientMessage, String> {
-    let value: serde_json::Value = serde_json::from_str(raw)
+    let value = json_value_without_duplicate_fields(raw)
         .map_err(|source| format!("client message JSON is invalid: {source}"))?;
     let array = value
         .as_array()
@@ -955,10 +956,116 @@ pub fn parse_client_message(raw: &str) -> Result<ClientMessage, String> {
 }
 
 pub fn parse_event_json(raw: &RawEventJson) -> Result<Event, EventShapeError> {
-    let value = serde_json::from_str(raw.as_str()).map_err(|source| {
+    let value = json_value_without_duplicate_fields(raw.as_str()).map_err(|source| {
         EventShapeError::invalid_field("event", &format!("invalid JSON: {source}"))
     })?;
     event_from_value(&value)
+}
+
+fn json_value_without_duplicate_fields(raw: &str) -> Result<serde_json::Value, serde_json::Error> {
+    let mut deserializer = serde_json::Deserializer::from_str(raw);
+    let value = UniqueJsonValue::deserialize(&mut deserializer)?.0;
+    deserializer.end()?;
+    Ok(value)
+}
+
+struct UniqueJsonValue(serde_json::Value);
+
+impl<'de> Deserialize<'de> for UniqueJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer
+            .deserialize_any(UniqueJsonValueVisitor)
+            .map(Self)
+    }
+}
+
+struct UniqueJsonValueVisitor;
+
+impl<'de> Visitor<'de> for UniqueJsonValueVisitor {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value without duplicate object fields")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Number(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Number(value.into()))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| E::custom("JSON number must be finite"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::String(value.to_owned()))
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::String(value.to_owned()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::String(value))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        UniqueJsonValue::deserialize(deserializer).map(|value| value.0)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<UniqueJsonValue>()? {
+            values.push(value.0);
+        }
+        Ok(serde_json::Value::Array(values))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = serde_json::Map::new();
+        while let Some(field) = object.next_key::<String>()? {
+            if values.contains_key(&field) {
+                return Err(de::Error::custom(format!(
+                    "duplicate object field `{field}`"
+                )));
+            }
+            let value = object.next_value::<UniqueJsonValue>()?;
+            values.insert(field, value.0);
+        }
+        Ok(serde_json::Value::Object(values))
+    }
 }
 
 pub fn event_from_value(value: &serde_json::Value) -> Result<Event, EventShapeError> {
@@ -1681,6 +1788,33 @@ mod tests {
     }
 
     #[test]
+    fn parser_rejects_duplicate_json_object_fields() {
+        let duplicate_filter_field =
+            parse_client_message(r#"["REQ","sub-a",{"limit":1,"limit":2,"kinds":[1]}]"#)
+                .expect_err("duplicate filter field");
+        let duplicate_event_field = parse_event_json(
+            &RawEventJson::new(&format!(
+                r#"{{"id":"{}","pubkey":"{}","created_at":1714124433,"kind":1,"tags":[],"content":"one","content":"two","sig":"{}"}}"#,
+                "a".repeat(EventId::HEX_LENGTH),
+                "1".repeat(PublicKeyHex::HEX_LENGTH),
+                "b".repeat(SignatureHex::HEX_LENGTH)
+            ))
+            .expect("raw"),
+        )
+        .expect_err("duplicate event field")
+        .to_string();
+
+        assert!(
+            duplicate_filter_field.contains("duplicate object field `limit`"),
+            "{duplicate_filter_field}"
+        );
+        assert!(
+            duplicate_event_field.contains("duplicate object field `content`"),
+            "{duplicate_event_field}"
+        );
+    }
+
+    #[test]
     fn nip01_client_and_relay_message_conformance_vectors_are_exact() {
         let event_payload = event_json("a", "b", 1, tags_json());
         let event =
@@ -1862,6 +1996,49 @@ mod tests {
             })
             .expect("parser must not panic");
         }
+    }
+
+    #[test]
+    fn parser_preserves_addressable_events_and_weird_tag_shapes() {
+        let p_tag = "2".repeat(PublicKeyHex::HEX_LENGTH);
+        let event_payload = format!(
+            r#"{{"id":"{}","pubkey":"{}","created_at":1714124433,"kind":30023,"tags":[["emoji","🌱","https://example.invalid/seed.png"],["d","market-stall"],["d","shadow"],["é","not-indexed"],["h","Farm","extra"],["p","{}","wss://relay.example","mention"]],"content":"addressable 🌱","sig":"{}"}}"#,
+            "a".repeat(EventId::HEX_LENGTH),
+            "1".repeat(PublicKeyHex::HEX_LENGTH),
+            p_tag,
+            "b".repeat(SignatureHex::HEX_LENGTH)
+        );
+        let event =
+            parse_event_json(&RawEventJson::new(&event_payload).expect("raw")).expect("event");
+        let coordinate = AddressCoordinate::from_event(&event)
+            .expect("coordinate")
+            .expect("addressable");
+        let filter = filter_from_value(&serde_json::json!({
+            "#d": ["market-stall"],
+            "#h": ["Farm"],
+            "#p": [p_tag],
+            "limit": u64::MAX
+        }))
+        .expect("filter");
+
+        assert_eq!(event.unsigned().tags().len(), 6);
+        assert_eq!(
+            event.unsigned().tags()[0].values(),
+            &[
+                "emoji".to_owned(),
+                "🌱".to_owned(),
+                "https://example.invalid/seed.png".to_owned()
+            ]
+        );
+        assert_eq!(event.unsigned().tags()[3].indexed_pair(), None);
+        assert_eq!(coordinate.d().as_str(), "market-stall");
+        assert_eq!(filter.limit(), Some(u64::MAX));
+        assert!(filter.matches(&event));
+        assert_eq!(
+            filter_from_value(&serde_json::json!({"#é": ["value"]}))
+                .expect_err("non ascii tag filter"),
+            "filter field `#é` is invalid: tag name must be a single ASCII letter"
+        );
     }
 
     #[test]
