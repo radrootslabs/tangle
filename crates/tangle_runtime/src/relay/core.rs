@@ -214,6 +214,12 @@ impl BaseRelayCountEventsReport {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseRelayFilterLimitMode {
+    ApplyDefaultLimit,
+    PreserveCountLimitless,
+}
+
 fn is_nip70_protected_event(event: &Event) -> bool {
     event
         .unsigned()
@@ -1157,7 +1163,13 @@ impl BaseRelay {
         let mut query_metrics = BaseRelayQueryMetrics::default();
         for filter in filters {
             let report = Self::query_filter_events_report_with_services(
-                store, groups, limits, query, filter, auth,
+                store,
+                groups,
+                limits,
+                query,
+                filter,
+                auth,
+                BaseRelayFilterLimitMode::ApplyDefaultLimit,
             )?;
             group_read_denied |= report.group_read_denied;
             query_metrics = query_metrics.add(report.query_metrics);
@@ -1185,10 +1197,17 @@ impl BaseRelay {
         let mut seen = BTreeSet::new();
         let mut group_read_denied = false;
         let mut query_metrics = BaseRelayQueryMetrics::default();
+        let count_query = query.exact_count();
         for filter in filters {
             let filter = filter.without_limit();
             let report = Self::query_filter_events_report_with_services(
-                store, groups, limits, query, &filter, auth,
+                store,
+                groups,
+                limits,
+                count_query,
+                &filter,
+                auth,
+                BaseRelayFilterLimitMode::PreserveCountLimitless,
             )?;
             group_read_denied |= report.group_read_denied;
             query_metrics = query_metrics.add(report.query_metrics);
@@ -1212,8 +1231,9 @@ impl BaseRelay {
         query: PocketQueryConfig,
         filter: &Filter,
         auth: &GroupAuthContext,
+        limit_mode: BaseRelayFilterLimitMode,
     ) -> Result<BaseRelayEventQueryReport, BaseRelayError> {
-        let effective_filter = Self::filter_with_limits(limits, filter);
+        let effective_filter = Self::filter_with_limit_mode(limits, filter, limit_mode);
         let pocket_filter = tangle_filter_to_pocket(&effective_filter)?;
         let screen_error = RefCell::new(None);
         let candidates_scanned = Cell::new(0_u64);
@@ -1260,10 +1280,16 @@ impl BaseRelay {
         ))
     }
 
-    fn filter_with_limits(limits: BaseRelayLimits, filter: &Filter) -> Filter {
-        match filter.limit() {
-            Some(_) => filter.clone(),
-            None => filter.with_limit(limits.default_limit()),
+    fn filter_with_limit_mode(
+        limits: BaseRelayLimits,
+        filter: &Filter,
+        limit_mode: BaseRelayFilterLimitMode,
+    ) -> Filter {
+        match (limit_mode, filter.limit()) {
+            (BaseRelayFilterLimitMode::ApplyDefaultLimit, None) => {
+                filter.with_limit(limits.default_limit())
+            }
+            _ => filter.clone(),
         }
     }
 
@@ -1930,6 +1956,73 @@ mod tests {
                 .expect("count"),
             RelayMessage::Count {
                 subscription_id: SubscriptionId::new("count-dedupe").expect("sub"),
+                count: 3
+            }
+        );
+    }
+
+    #[test]
+    fn base_relay_count_does_not_apply_default_or_client_limits() {
+        let config = test_store_config("base-relay-count-no-default-limit");
+        let relay = BaseRelay::open(
+            &config,
+            BaseRelayLimits::new(BaseRelayLimitSettings {
+                max_pending_events: 4,
+                max_subscription_id_length: 64,
+                max_subscriptions: 64,
+                max_filters_per_request: 10,
+                max_tag_values_per_filter: 10,
+                max_query_complexity: 4,
+                max_event_tags: 200,
+                max_content_length: 65_536,
+                max_limit: 10,
+                default_limit: 1,
+            })
+            .expect("limits"),
+            PocketQueryConfig::default(),
+        )
+        .expect("relay");
+        let first = signed_event_at(7, 1, Vec::new(), "first", 1_714_124_433);
+        let second = signed_event_at(7, 1, Vec::new(), "second", 1_714_124_434);
+        let third = signed_event_at(7, 1, Vec::new(), "third", 1_714_124_435);
+
+        for event in [&first, &second, &third] {
+            assert_accepted(relay.handle_event(event.clone()).expect("event"), event);
+        }
+
+        let unbounded = filter_from_value(&serde_json::json!({
+            "authors": [first.unsigned().pubkey().as_str()],
+            "kinds": [1]
+        }))
+        .expect("unbounded");
+        let client_limited = filter_from_value(&serde_json::json!({
+            "authors": [first.unsigned().pubkey().as_str()],
+            "kinds": [1],
+            "limit": 1
+        }))
+        .expect("client limited");
+
+        assert_eq!(
+            relay
+                .handle_count(
+                    SubscriptionId::new("count-unbounded").expect("sub"),
+                    vec![unbounded]
+                )
+                .expect("count"),
+            RelayMessage::Count {
+                subscription_id: SubscriptionId::new("count-unbounded").expect("sub"),
+                count: 3
+            }
+        );
+        assert_eq!(
+            relay
+                .handle_count(
+                    SubscriptionId::new("count-client-limited").expect("sub"),
+                    vec![client_limited]
+                )
+                .expect("count"),
+            RelayMessage::Count {
+                subscription_id: SubscriptionId::new("count-client-limited").expect("sub"),
                 count: 3
             }
         );

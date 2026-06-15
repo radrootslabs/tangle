@@ -124,6 +124,14 @@ impl PocketQueryConfig {
     pub fn allow_scrape_if_max_seconds(self) -> u64 {
         self.allow_scrape_if_max_seconds
     }
+
+    pub fn exact_count(self) -> Self {
+        Self::new(
+            true,
+            self.allow_scrape_if_limited_to,
+            self.allow_scrape_if_max_seconds,
+        )
+    }
 }
 
 impl Default for PocketQueryConfig {
@@ -599,6 +607,15 @@ mod tests {
         }
         assert!(!lockfile.contains("mikedilger/pocket"));
         assert!(lockfile.contains(&approved_lock_source));
+    }
+
+    #[test]
+    fn pocket_query_config_exact_count_enables_scrape_scan() {
+        let config = PocketQueryConfig::new(false, 7, 11).exact_count();
+
+        assert!(config.allow_scraping());
+        assert_eq!(config.allow_scrape_if_limited_to(), 7);
+        assert_eq!(config.allow_scrape_if_max_seconds(), 11);
     }
 
     #[test]

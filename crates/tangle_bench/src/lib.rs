@@ -1169,15 +1169,27 @@ fn run_count_resource_control_benchmark(dataset: &BenchDataset) -> Result<Scenar
     let operations = vec![
         QueryOperation::new(
             "bounded-public-count",
-            filter_from_value(&json!({"kinds": [1], "#h": [public_group.id()], "limit": 25}))?,
+            filter_from_value(&json!({"kinds": [1], "#h": [public_group.id()]}))?,
             QueryAuth::None,
-            QueryExpectation::AtLeast(1),
+            QueryExpectation::Exactly(
+                dataset
+                    .config
+                    .public_events_per_group
+                    .try_into()
+                    .expect("public event count fits in u64"),
+            ),
         ),
         QueryOperation::new(
             "bounded-private-owner-count",
-            filter_from_value(&json!({"kinds": [1], "#h": [private_group.id()], "limit": 25}))?,
+            filter_from_value(&json!({"kinds": [1], "#h": [private_group.id()]}))?,
             QueryAuth::Owner,
-            QueryExpectation::AtLeast(1),
+            QueryExpectation::Exactly(
+                dataset
+                    .config
+                    .private_events_per_group
+                    .try_into()
+                    .expect("private event count fits in u64"),
+            ),
         ),
     ];
     let started = Instant::now();
@@ -2377,7 +2389,7 @@ mod tests {
     #[test]
     fn count_resource_controls_scenario_accepts_bounded_counts_and_refuses_broad_counts() {
         let dataset =
-            BenchDataset::generate(BenchDatasetConfig::new(3, 1, 1, 0, 1)).expect("dataset");
+            BenchDataset::generate(BenchDatasetConfig::new(3, 101, 101, 0, 1)).expect("dataset");
         let scenario =
             super::run_count_resource_control_benchmark(&dataset).expect("count controls");
 
