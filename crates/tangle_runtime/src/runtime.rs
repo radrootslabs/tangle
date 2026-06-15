@@ -3041,6 +3041,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn runtime_count_source_stays_exact() {
+        let sources = [
+            include_str!("runtime.rs"),
+            include_str!("relay/core.rs"),
+            include_str!("../../tangle_protocol/src/lib.rs"),
+        ];
+        let forbidden = [
+            concat!("approximate", "_count"),
+            concat!("approx", "_count"),
+            concat!("estimated", "_count"),
+            concat!("count", "_estimate"),
+            concat!("private", "_count", "_estimate"),
+        ];
+
+        for source in sources {
+            for needle in forbidden {
+                assert!(!source.contains(needle));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn runtime_rate_limits_count_peer_ips() {
         let root = temp_root("runtime-count-ip-rate-limit");

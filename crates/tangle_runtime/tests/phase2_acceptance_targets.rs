@@ -870,6 +870,18 @@ async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_
         "restricted: count filters are too broad or expensive",
     )
     .await;
+    send_client_value(
+        &mut observer,
+        json!(["COUNT", "private-approx-count", {"kinds":[1], "#h":["PrivateSocket"], "approximate":true}]),
+    )
+    .await;
+    assert_eq!(
+        read_relay_value(&mut observer).await,
+        json!([
+            "NOTICE",
+            "invalid: filter field `approximate` is unsupported"
+        ])
+    );
     assert_empty_req(
         &mut observer,
         "private-public-query",
@@ -989,6 +1001,18 @@ async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_
         "restricted: count filters are too broad or expensive",
     )
     .await;
+    send_client_value(
+        &mut observer,
+        json!(["COUNT", "hidden-approx-count", {"kinds":[1], "#h":["HiddenSocket"], "approximate":true}]),
+    )
+    .await;
+    assert_eq!(
+        read_relay_value(&mut observer).await,
+        json!([
+            "NOTICE",
+            "invalid: filter field `approximate` is unsupported"
+        ])
+    );
     assert_empty_req(
         &mut observer,
         "hidden-public-query",
@@ -1011,6 +1035,8 @@ async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_
         "hidden harvest",
         "private-public-broad-count",
         "hidden-public-broad-count",
+        "private-approx-count",
+        "hidden-approx-count",
     ] {
         assert!(!metrics.contains(private_value));
     }
