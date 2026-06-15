@@ -1635,6 +1635,121 @@ mod tests {
     }
 
     #[test]
+    fn projection_rebuild_matches_incremental_projection_for_full_event_stream() {
+        let limits = GroupLimitsConfig::default();
+        let events = vec![
+            CanonicalGroupEvent::new(
+                event(
+                    KIND_GROUP_EDIT_METADATA,
+                    "20",
+                    20,
+                    vec![
+                        Tag::from_parts("h", &["Farm"]).expect("h"),
+                        Tag::from_parts("name", &["Market"]).expect("name"),
+                    ],
+                ),
+                StoreOffset::new(2),
+            ),
+            CanonicalGroupEvent::new(
+                event(
+                    1,
+                    "b",
+                    15,
+                    vec![Tag::from_parts("h", &["Farm"]).expect("h")],
+                ),
+                StoreOffset::new(7),
+            ),
+            CanonicalGroupEvent::new(
+                event(
+                    KIND_GROUP_DELETE_GROUP,
+                    "50",
+                    50,
+                    vec![Tag::from_parts("h", &["Farm"]).expect("h")],
+                ),
+                StoreOffset::new(6),
+            ),
+            CanonicalGroupEvent::new(
+                event(
+                    KIND_GROUP_CREATE_GROUP,
+                    "10",
+                    10,
+                    vec![
+                        Tag::from_parts("h", &["Farm"]).expect("h"),
+                        Tag::from_parts("name", &["Farmers"]).expect("name"),
+                    ],
+                ),
+                StoreOffset::new(1),
+            ),
+            CanonicalGroupEvent::new(
+                event(
+                    KIND_GROUP_PUT_USER,
+                    "30",
+                    30,
+                    vec![
+                        Tag::from_parts("h", &["Farm"]).expect("h"),
+                        Tag::from_parts("p", &[&"8".repeat(64)]).expect("p"),
+                        Tag::from_parts("role", &["moderator"]).expect("role"),
+                    ],
+                ),
+                StoreOffset::new(3),
+            ),
+            CanonicalGroupEvent::new(event(1, "a", 5, Vec::new()), StoreOffset::new(8)),
+            CanonicalGroupEvent::new(
+                event(
+                    KIND_GROUP_METADATA,
+                    "40",
+                    40,
+                    vec![
+                        Tag::from_parts("d", &["Farm"]).expect("d"),
+                        Tag::from_parts("name", &["Snapshot"]).expect("name"),
+                    ],
+                ),
+                StoreOffset::new(4),
+            ),
+            CanonicalGroupEvent::new(
+                event(
+                    KIND_GROUP_DELETE_EVENT,
+                    "45",
+                    45,
+                    vec![
+                        Tag::from_parts("h", &["Farm"]).expect("h"),
+                        Tag::from_parts("e", &[id("30")]).expect("e"),
+                    ],
+                ),
+                StoreOffset::new(5),
+            ),
+        ];
+        let mut incremental_events = events.clone();
+        incremental_events.sort_by_key(CanonicalGroupEvent::tuple);
+        let mut incremental = GroupProjection::new();
+        for item in &incremental_events {
+            incremental
+                .apply_canonical_event(item.event(), item.store_offset(), limits)
+                .expect("incremental");
+        }
+
+        let report =
+            rebuild_group_projection(events, limits, UnixTimestamp::new(100)).expect("rebuild");
+        let rebuilt = report.projection();
+
+        assert_eq!(report.applied_events(), 6);
+        assert_eq!(report.ignored_events(), 1);
+        assert_eq!(report.skipped_events(), 1);
+        assert_eq!(report.last_offset(), Some(StoreOffset::new(8)));
+        assert_eq!(incremental.groups(), rebuilt.groups());
+        assert_eq!(incremental.members(), rebuilt.members());
+        assert_eq!(incremental.roles(), rebuilt.roles());
+        assert_eq!(incremental.tombstones(), rebuilt.tombstones());
+        assert_eq!(incremental.event_deletions(), rebuilt.event_deletions());
+        assert_eq!(
+            rebuilt
+                .checkpoint()
+                .and_then(ProjectionCheckpoint::last_offset),
+            Some(StoreOffset::new(8))
+        );
+    }
+
+    #[test]
     fn projection_records_round_trip_for_persistence() {
         let base_tuple = tuple(10, "10", 1);
         let state = super::GroupState::new(
