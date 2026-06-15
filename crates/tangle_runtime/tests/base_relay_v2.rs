@@ -1066,6 +1066,129 @@ fn delete_and_secondary_privacy_surfaces_are_read_gated_or_absent() {
 }
 
 #[test]
+fn group_tombstone_hides_prior_events_and_generated_snapshots() {
+    let config = test_store_config("group-tombstone-visibility");
+    let mut relay = BaseRelay::open_with_groups(
+        &config,
+        relay_limits(8),
+        &group_config(),
+        PocketQueryConfig::default(),
+    )
+    .expect("relay");
+    let owner_auth = authenticated(FixtureKey::Owner);
+    let admin_auth = authenticated(FixtureKey::Admin);
+    let member_auth = authenticated(FixtureKey::Member);
+
+    accept_group_create(&mut relay, "TombstoneFarm", &[], 1, &owner_auth);
+    let put = tangle_v2_put_user_event(FixtureKey::Admin, "TombstoneFarm", FixtureKey::Member, 2)
+        .expect("put");
+    assert_accepted(
+        relay
+            .handle_event_with_auth(put.clone(), &admin_auth)
+            .expect("put"),
+        &put,
+    );
+    let note =
+        tangle_v2_group_event(FixtureKey::Member, "TombstoneFarm", 3, 1, "harvest").expect("note");
+    assert_accepted(
+        relay
+            .handle_event_with_auth(note.clone(), &member_auth)
+            .expect("note"),
+        &note,
+    );
+
+    assert_count(
+        relay.handle_count(
+            subscription("tombstone-note-before"),
+            vec![filter_group_tag(1, "h", "TombstoneFarm")],
+        ),
+        1,
+    );
+    for (subscription_id, kind) in [
+        ("tombstone-metadata-before", KIND_GROUP_METADATA),
+        ("tombstone-admins-before", KIND_GROUP_ADMINS),
+        ("tombstone-members-before", KIND_GROUP_MEMBERS),
+    ] {
+        assert_count(
+            relay.handle_count(
+                subscription(subscription_id),
+                vec![filter_group_tag(kind, "d", "TombstoneFarm")],
+            ),
+            1,
+        );
+    }
+
+    let delete_group =
+        tangle_v2_delete_group_event(FixtureKey::Owner, "TombstoneFarm", 4).expect("delete group");
+    assert_accepted(
+        relay
+            .handle_event_with_auth(delete_group.clone(), &owner_auth)
+            .expect("delete group"),
+        &delete_group,
+    );
+
+    assert_count(
+        relay.handle_count(
+            subscription("tombstone-note-after"),
+            vec![filter_group_tag(1, "h", "TombstoneFarm")],
+        ),
+        0,
+    );
+    assert!(
+        query_events(
+            &mut relay,
+            "tombstone-note-query",
+            vec![filter_group_tag(1, "h", "TombstoneFarm")]
+        )
+        .is_empty()
+    );
+    for (subscription_id, query_id, kind) in [
+        (
+            "tombstone-metadata-after",
+            "tombstone-metadata-query",
+            KIND_GROUP_METADATA,
+        ),
+        (
+            "tombstone-admins-after",
+            "tombstone-admins-query",
+            KIND_GROUP_ADMINS,
+        ),
+        (
+            "tombstone-members-after",
+            "tombstone-members-query",
+            KIND_GROUP_MEMBERS,
+        ),
+    ] {
+        assert_count(
+            relay.handle_count(
+                subscription(subscription_id),
+                vec![filter_group_tag(kind, "d", "TombstoneFarm")],
+            ),
+            0,
+        );
+        assert!(
+            query_events(
+                &mut relay,
+                query_id,
+                vec![filter_group_tag(kind, "d", "TombstoneFarm")]
+            )
+            .is_empty()
+        );
+    }
+    assert_count(
+        relay.handle_count(
+            subscription("tombstone-marker-after"),
+            vec![filter_group_tag(
+                KIND_GROUP_DELETE_GROUP,
+                "h",
+                "TombstoneFarm",
+            )],
+        ),
+        1,
+    );
+}
+
+#[test]
 fn projection_rebuild_after_restart_matches_live_state_and_outbox_is_idempotent() {
     let config = test_store_config("projection-restart");
     let owner_auth = authenticated(FixtureKey::Owner);
