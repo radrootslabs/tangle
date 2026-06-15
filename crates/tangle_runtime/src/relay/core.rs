@@ -2769,7 +2769,7 @@ mod tests {
     }
 
     #[test]
-    fn private_group_offset_lookup_uses_reader_auth() {
+    fn private_and_hidden_group_offset_lookup_uses_reader_auth() {
         let owner = signer(7).public_key().clone();
         let owner_auth = authenticated_state(7);
         let unauth = BaseAuthState::new("wss://relay.radroots.test", 60, 600).expect("auth state");
@@ -2802,6 +2802,34 @@ mod tests {
             .expect("owner offset")
             .expect("visible");
         assert_eq!(visible.id(), private_event.id());
+
+        relay
+            .handle_event_with_auth(
+                signed_group_create_event_with_tags(7, "HiddenFarm", vec![hidden()], 1_714_124_436),
+                &owner_auth,
+            )
+            .expect("hidden create");
+        let hidden_event = signed_event_at(
+            7,
+            1,
+            vec![Tag::from_parts("h", &["HiddenFarm"]).expect("h")],
+            "hidden harvest",
+            1_714_124_437,
+        );
+        let pocket = tangle_event_to_pocket(&hidden_event).expect("hidden pocket");
+        let offset = StoreOffset::new(relay.store.store_event(&pocket).expect("store hidden"));
+
+        assert_eq!(
+            relay
+                .event_by_offset_with_auth(offset, &unauth)
+                .expect("hidden unauth offset"),
+            None
+        );
+        let visible = relay
+            .event_by_offset_with_auth(offset, &owner_auth)
+            .expect("hidden owner offset")
+            .expect("hidden visible");
+        assert_eq!(visible.id(), hidden_event.id());
     }
 
     #[test]

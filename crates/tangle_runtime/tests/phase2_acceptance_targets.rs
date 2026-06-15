@@ -799,9 +799,56 @@ async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_
     .await;
     assert_count_message(
         &mut observer,
+        "private-admins-public-count",
+        json!({"kinds":[KIND_GROUP_ADMINS], "#d":["PrivateSocket"]}),
+        1,
+    )
+    .await;
+    assert_count_message(
+        &mut observer,
         "private-members-public-count",
         json!({"kinds":[KIND_GROUP_MEMBERS], "#d":["PrivateSocket"]}),
         0,
+    )
+    .await;
+    assert_count_message(
+        &mut member_reader,
+        "private-members-member-count",
+        json!({"kinds":[KIND_GROUP_MEMBERS], "#d":["PrivateSocket"]}),
+        1,
+    )
+    .await;
+    assert_req_kind_tag_then_eose(
+        &mut observer,
+        "private-metadata-public-query",
+        json!({"kinds":[KIND_GROUP_METADATA], "#d":["PrivateSocket"]}),
+        KIND_GROUP_METADATA,
+        "d",
+        "PrivateSocket",
+    )
+    .await;
+    assert_req_kind_tag_then_eose(
+        &mut observer,
+        "private-admins-public-query",
+        json!({"kinds":[KIND_GROUP_ADMINS], "#d":["PrivateSocket"]}),
+        KIND_GROUP_ADMINS,
+        "d",
+        "PrivateSocket",
+    )
+    .await;
+    assert_empty_req(
+        &mut observer,
+        "private-members-public-query",
+        json!({"kinds":[KIND_GROUP_MEMBERS], "#d":["PrivateSocket"]}),
+    )
+    .await;
+    assert_req_kind_tag_then_eose(
+        &mut member_reader,
+        "private-members-member-query",
+        json!({"kinds":[KIND_GROUP_MEMBERS], "#d":["PrivateSocket"]}),
+        KIND_GROUP_MEMBERS,
+        "d",
+        "PrivateSocket",
     )
     .await;
 
@@ -915,26 +962,78 @@ async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_
         "",
     );
 
-    assert_count_message(
-        &mut observer,
-        "hidden-metadata-public-count",
-        json!({"kinds":[KIND_GROUP_METADATA], "#d":["HiddenSocket"]}),
-        0,
+    let hidden_put = tangle_v2_put_user_event(
+        FixtureKey::Owner,
+        "HiddenSocket",
+        FixtureKey::Member,
+        1_714_124_454,
+    )
+    .expect("hidden put");
+    send_client_value(
+        &mut owner_writer,
+        json!(["EVENT", event_to_value(&hidden_put)]),
     )
     .await;
-    assert_count_message(
-        &mut owner_reader,
-        "hidden-metadata-owner-count",
-        json!({"kinds":[KIND_GROUP_METADATA], "#d":["HiddenSocket"]}),
-        1,
-    )
-    .await;
-    assert_empty_req(
-        &mut observer,
-        "hidden-metadata-public-query",
-        json!({"kinds":[KIND_GROUP_METADATA], "#d":["HiddenSocket"]}),
-    )
-    .await;
+    assert_ok(
+        read_relay_value(&mut owner_writer).await,
+        &hidden_put,
+        true,
+        "",
+    );
+
+    for (subscription_id, kind) in [
+        ("hidden-metadata-public-count", KIND_GROUP_METADATA),
+        ("hidden-admins-public-count", KIND_GROUP_ADMINS),
+        ("hidden-members-public-count", KIND_GROUP_MEMBERS),
+    ] {
+        assert_count_message(
+            &mut observer,
+            subscription_id,
+            json!({"kinds":[kind], "#d":["HiddenSocket"]}),
+            0,
+        )
+        .await;
+    }
+    for (subscription_id, kind) in [
+        ("hidden-metadata-owner-count", KIND_GROUP_METADATA),
+        ("hidden-admins-owner-count", KIND_GROUP_ADMINS),
+        ("hidden-members-owner-count", KIND_GROUP_MEMBERS),
+    ] {
+        assert_count_message(
+            &mut owner_reader,
+            subscription_id,
+            json!({"kinds":[kind], "#d":["HiddenSocket"]}),
+            1,
+        )
+        .await;
+    }
+    for (subscription_id, kind) in [
+        ("hidden-metadata-public-query", KIND_GROUP_METADATA),
+        ("hidden-admins-public-query", KIND_GROUP_ADMINS),
+        ("hidden-members-public-query", KIND_GROUP_MEMBERS),
+    ] {
+        assert_empty_req(
+            &mut observer,
+            subscription_id,
+            json!({"kinds":[kind], "#d":["HiddenSocket"]}),
+        )
+        .await;
+    }
+    for (subscription_id, kind) in [
+        ("hidden-metadata-owner-query", KIND_GROUP_METADATA),
+        ("hidden-admins-owner-query", KIND_GROUP_ADMINS),
+        ("hidden-members-owner-query", KIND_GROUP_MEMBERS),
+    ] {
+        assert_req_kind_tag_then_eose(
+            &mut owner_reader,
+            subscription_id,
+            json!({"kinds":[kind], "#d":["HiddenSocket"]}),
+            kind,
+            "d",
+            "HiddenSocket",
+        )
+        .await;
+    }
 
     send_client_value(
         &mut observer,
@@ -954,11 +1053,20 @@ async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_
         read_relay_value(&mut owner_reader).await,
         json!(["EOSE", "hidden-owner-live"])
     );
+    send_client_value(
+        &mut member_reader,
+        json!(["REQ", "hidden-member-live", {"kinds":[1], "#h":["HiddenSocket"]}]),
+    )
+    .await;
+    assert_eq!(
+        read_relay_value(&mut member_reader).await,
+        json!(["EOSE", "hidden-member-live"])
+    );
 
     let hidden_note = tangle_v2_group_event(
         FixtureKey::Owner,
         "HiddenSocket",
-        1_714_124_454,
+        1_714_124_455,
         1,
         "hidden harvest",
     )
@@ -977,6 +1085,11 @@ async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_
     assert_live_event(
         read_relay_value(&mut owner_reader).await,
         "hidden-owner-live",
+        &hidden_note,
+    );
+    assert_live_event(
+        read_relay_value(&mut member_reader).await,
+        "hidden-member-live",
         &hidden_note,
     );
     expect_no_relay_message(&mut observer).await;
@@ -2204,6 +2317,28 @@ async fn assert_req_event_then_eose(
 ) {
     send_client_value(socket, json!(["REQ", subscription_id, filter])).await;
     assert_live_event(read_relay_value(socket).await, subscription_id, event);
+    assert_eq!(
+        read_relay_value(socket).await,
+        json!(["EOSE", subscription_id])
+    );
+}
+
+async fn assert_req_kind_tag_then_eose(
+    socket: &mut TestWebSocket,
+    subscription_id: &str,
+    filter: Value,
+    kind: u32,
+    tag_name: &str,
+    tag_value: &str,
+) {
+    send_client_value(socket, json!(["REQ", subscription_id, filter])).await;
+    assert_relay_event_kind_tag(
+        read_relay_value(socket).await,
+        subscription_id,
+        kind,
+        tag_name,
+        tag_value,
+    );
     assert_eq!(
         read_relay_value(socket).await,
         json!(["EOSE", subscription_id])
