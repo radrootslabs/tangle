@@ -16,7 +16,7 @@ use crate::{
         auth::BaseAuthState,
         core::{
             BaseRelay, BaseRelayCountReport, BaseRelayEventWrite, BaseRelayLimits,
-            BaseRelayQueryReport, BaseRelayShutdownReport,
+            BaseRelayQueryMetrics, BaseRelayQueryReport, BaseRelayShutdownReport,
         },
         live::LiveSubscriptionSet,
     },
@@ -626,14 +626,19 @@ impl TangleRuntimeShared {
         subscription_id: &SubscriptionId,
         filters: &[Filter],
     ) -> Option<RelayMessage> {
-        TangleQueryClassifier::new(self.limits.base_relay_limits())
+        if TangleQueryClassifier::new(self.limits.base_relay_limits())
             .classify_count(filters)
             .is_broad()
-            .then(|| RelayMessage::Closed {
+        {
+            self.metrics.record_count_refusal();
+            self.metrics.record_broad_query_rejection();
+            return Some(RelayMessage::Closed {
                 subscription_id: subscription_id.clone(),
                 message: BaseRelayError::restricted("count filters are too broad or expensive")
                     .prefixed_message(),
-            })
+            });
+        }
+        None
     }
 
     fn rate_limit_query(&self, request: TangleQueryRateLimitRequest<'_>) -> Option<RelayMessage> {
@@ -697,9 +702,9 @@ impl TangleRuntimeShared {
                 return Some(message);
             }
         }
-        if TangleQueryClassifier::new(self.limits.base_relay_limits())
-            .classify(request.scope, request.filters)
-            .is_broad()
+        let query_classification = TangleQueryClassifier::new(self.limits.base_relay_limits())
+            .classify(request.scope, request.filters);
+        if query_classification.is_broad()
             && let Some(message) = self.rate_limit_closed(
                 request.subscription_id,
                 TangleRateLimitKey::query_class(request.scope, TangleRateLimitQueryClass::Broad),
@@ -709,6 +714,7 @@ impl TangleRuntimeShared {
                 request.now,
             )
         {
+            self.metrics.record_broad_query_rejection();
             return Some(message);
         }
         None
@@ -894,6 +900,9 @@ impl TangleRuntimeHandle {
                 let report =
                     self.inner
                         .query_req_with_auth_report(subscription_id, filters, auth)?;
+                self.inner
+                    .metrics
+                    .record_query_metrics(report.query_metrics());
                 if report.group_read_denied() {
                     self.inner.metrics.record_group_read_denial();
                 }
@@ -944,6 +953,9 @@ impl TangleRuntimeHandle {
                 let report =
                     self.inner
                         .handle_count_with_auth_report(subscription_id, filters, auth)?;
+                self.inner
+                    .metrics
+                    .record_query_metrics(report.query_metrics());
                 if report.group_read_denied() {
                     self.inner.metrics.record_group_read_denial();
                 }
@@ -1281,6 +1293,11 @@ struct TangleRuntimeMetricsInner {
     event_admission_latency_count: AtomicU64,
     query_latency_total_micros: AtomicU64,
     query_latency_count: AtomicU64,
+    query_candidates_scanned: AtomicU64,
+    query_returned_events: AtomicU64,
+    query_redacted_events: AtomicU64,
+    count_refusals: AtomicU64,
+    broad_query_rejections: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1326,6 +1343,11 @@ pub struct TangleRuntimeMetricsSnapshot {
     tangle_event_admission_latency_count: u64,
     tangle_query_latency_total_micros: u64,
     tangle_query_latency_count: u64,
+    tangle_query_candidates_scanned_total: u64,
+    tangle_query_returned_events_total: u64,
+    tangle_query_redacted_events_total: u64,
+    tangle_count_refusals_total: u64,
+    tangle_broad_query_rejections_total: u64,
 }
 
 impl TangleRuntimeMetricsSnapshot {
@@ -1413,6 +1435,11 @@ impl TangleRuntimeMetrics {
                 event_admission_latency_count: AtomicU64::new(0),
                 query_latency_total_micros: AtomicU64::new(0),
                 query_latency_count: AtomicU64::new(0),
+                query_candidates_scanned: AtomicU64::new(0),
+                query_returned_events: AtomicU64::new(0),
+                query_redacted_events: AtomicU64::new(0),
+                count_refusals: AtomicU64::new(0),
+                broad_query_rejections: AtomicU64::new(0),
             }),
         }
     }
@@ -1456,6 +1483,11 @@ impl TangleRuntimeMetrics {
             tangle_event_admission_latency_count: self.event_admission_latency_count(),
             tangle_query_latency_total_micros: self.query_latency_total_micros(),
             tangle_query_latency_count: self.query_latency_count(),
+            tangle_query_candidates_scanned_total: self.query_candidates_scanned(),
+            tangle_query_returned_events_total: self.query_returned_events(),
+            tangle_query_redacted_events_total: self.query_redacted_events(),
+            tangle_count_refusals_total: self.count_refusals(),
+            tangle_broad_query_rejections_total: self.broad_query_rejections(),
         }
     }
 
@@ -1595,6 +1627,26 @@ impl TangleRuntimeMetrics {
 
     pub fn query_latency_count(&self) -> u64 {
         self.inner.query_latency_count.load(Ordering::Relaxed)
+    }
+
+    pub fn query_candidates_scanned(&self) -> u64 {
+        self.inner.query_candidates_scanned.load(Ordering::Relaxed)
+    }
+
+    pub fn query_returned_events(&self) -> u64 {
+        self.inner.query_returned_events.load(Ordering::Relaxed)
+    }
+
+    pub fn query_redacted_events(&self) -> u64 {
+        self.inner.query_redacted_events.load(Ordering::Relaxed)
+    }
+
+    pub fn count_refusals(&self) -> u64 {
+        self.inner.count_refusals.load(Ordering::Relaxed)
+    }
+
+    pub fn broad_query_rejections(&self) -> u64 {
+        self.inner.broad_query_rejections.load(Ordering::Relaxed)
     }
 
     pub fn record_session_opened(&self) -> usize {
@@ -1764,6 +1816,29 @@ impl TangleRuntimeMetrics {
             .query_latency_count
             .fetch_add(1, Ordering::Relaxed);
     }
+
+    pub(crate) fn record_query_metrics(&self, metrics: BaseRelayQueryMetrics) {
+        self.inner
+            .query_candidates_scanned
+            .fetch_add(metrics.candidates_scanned(), Ordering::Relaxed);
+        self.inner
+            .query_returned_events
+            .fetch_add(metrics.returned_events(), Ordering::Relaxed);
+        self.inner
+            .query_redacted_events
+            .fetch_add(metrics.redacted_events(), Ordering::Relaxed);
+    }
+
+    pub fn record_count_refusal(&self) -> u64 {
+        self.inner.count_refusals.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub fn record_broad_query_rejection(&self) -> u64 {
+        self.inner
+            .broad_query_rejections
+            .fetch_add(1, Ordering::Relaxed)
+            + 1
+    }
 }
 
 impl Default for TangleRuntimeMetrics {
@@ -1812,7 +1887,7 @@ mod tests {
     use crate::config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json};
     use crate::event_bus::{TangleEventBus, TangleEventReceiveError};
     use crate::rate_limits::{TangleRateLimitKey, TangleRateLimitQueryClass, TangleRateLimitScope};
-    use crate::relay::core::{BaseRelayLimitSettings, BaseRelayLimits};
+    use crate::relay::core::{BaseRelayLimitSettings, BaseRelayLimits, BaseRelayQueryMetrics};
     use crate::relay::live::LiveSubscriptionSet;
     use serde_json::json;
     use std::{
@@ -1926,6 +2001,11 @@ mod tests {
         runtime.metrics().record_disk_used_bytes(5);
         runtime.metrics().record_event_admission_latency(13);
         runtime.metrics().record_query_latency(17);
+        runtime
+            .metrics()
+            .record_query_metrics(BaseRelayQueryMetrics::new(5, 3, 2));
+        assert_eq!(runtime.metrics().record_count_refusal(), 1);
+        assert_eq!(runtime.metrics().record_broad_query_rejection(), 1);
         let snapshot = runtime.metrics().snapshot_with_readiness(true);
         assert_eq!(snapshot.active_sessions(), 0);
         assert_eq!(snapshot.total_sessions(), 1);
@@ -1961,6 +2041,11 @@ mod tests {
         assert_eq!(snapshot_value["tangle_event_admission_latency_count"], 1);
         assert_eq!(snapshot_value["tangle_query_latency_total_micros"], 17);
         assert_eq!(snapshot_value["tangle_query_latency_count"], 1);
+        assert_eq!(snapshot_value["tangle_query_candidates_scanned_total"], 5);
+        assert_eq!(snapshot_value["tangle_query_returned_events_total"], 3);
+        assert_eq!(snapshot_value["tangle_query_redacted_events_total"], 2);
+        assert_eq!(snapshot_value["tangle_count_refusals_total"], 1);
+        assert_eq!(snapshot_value["tangle_broad_query_rejections_total"], 1);
 
         let report = runtime.shutdown().expect("shutdown");
 
@@ -1989,6 +2074,11 @@ mod tests {
         assert_eq!(value["tangle_event_bus_published_offsets_total"], 1);
         assert_eq!(value["tangle_disk_used_bytes"], 42);
         assert_eq!(value["tangle_outbound_queue_full_closes_total"], 0);
+        assert_eq!(value["tangle_query_candidates_scanned_total"], 0);
+        assert_eq!(value["tangle_query_returned_events_total"], 0);
+        assert_eq!(value["tangle_query_redacted_events_total"], 0);
+        assert_eq!(value["tangle_count_refusals_total"], 0);
+        assert_eq!(value["tangle_broad_query_rejections_total"], 0);
         assert!(value.get("active_sessions").is_none());
         assert!(value.get("stored_event_offsets").is_none());
     }
@@ -3122,6 +3212,8 @@ mod tests {
                 message: "restricted: count filters are too broad or expensive".to_owned()
             }]
         );
+        assert_eq!(handle.metrics().count_refusals(), 1);
+        assert_eq!(handle.metrics().broad_query_rejections(), 1);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3173,6 +3265,8 @@ mod tests {
                 }]
             );
         }
+        assert_eq!(handle.metrics().count_refusals(), 3);
+        assert_eq!(handle.metrics().broad_query_rejections(), 3);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3694,6 +3788,12 @@ mod tests {
         })
         .await
         .expect("query concurrency timeout");
+        assert!(handle.metrics().query_candidates_scanned() > 0);
+        assert!(
+            handle.metrics().query_returned_events()
+                >= u64::try_from(group_write_count * 3).expect("returned event count")
+        );
+        assert!(handle.metrics().query_redacted_events() > 0);
         handle.shutdown().await.expect("shutdown");
 
         let _ = std::fs::remove_dir_all(root);

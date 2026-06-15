@@ -1014,6 +1014,24 @@ async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_
     ] {
         assert!(!metrics.contains(private_value));
     }
+    let metrics_body = metrics.split_once("\r\n\r\n").expect("metrics body").1;
+    let metrics_value: Value = serde_json::from_str(metrics_body).expect("metrics json");
+    assert_eq!(metrics_value["tangle_count_refusals_total"], 2);
+    assert_eq!(metrics_value["tangle_broad_query_rejections_total"], 2);
+    assert!(
+        metrics_value["tangle_query_candidates_scanned_total"]
+            .as_u64()
+            .expect("candidates")
+            >= metrics_value["tangle_query_redacted_events_total"]
+                .as_u64()
+                .expect("redacted")
+    );
+    assert!(
+        metrics_value["tangle_query_redacted_events_total"]
+            .as_u64()
+            .expect("redacted")
+            >= 2
+    );
 
     shutdown.request_shutdown();
     read_websocket_close(&mut owner_writer).await;

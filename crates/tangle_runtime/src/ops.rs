@@ -219,6 +219,7 @@ mod tests {
         BaseRelayReadinessCheckStatus, BaseRelayReadinessHandle, BaseRelayReadinessState,
         base_relay_ops_router,
     };
+    use crate::relay::core::BaseRelayQueryMetrics;
     use crate::runtime::TangleRuntimeMetrics;
     use axum::body::to_bytes;
     use http::{Request, StatusCode};
@@ -263,6 +264,9 @@ mod tests {
         metrics.record_disk_used_bytes(89);
         metrics.record_event_admission_latency(11);
         metrics.record_query_latency(17);
+        metrics.record_query_metrics(BaseRelayQueryMetrics::new(5, 3, 2));
+        metrics.record_count_refusal();
+        metrics.record_broad_query_rejection();
         let ready = base_relay_ops_router(readiness.clone(), metrics.clone())
             .oneshot(
                 Request::builder()
@@ -311,6 +315,7 @@ mod tests {
                 "tangle_client_messages_total",
                 "tangle_close_messages_total",
                 "tangle_count_messages_total",
+                "tangle_count_refusals_total",
                 "tangle_disk_used_bytes",
                 "tangle_event_admission_latency_count",
                 "tangle_event_admission_latency_total_micros",
@@ -326,8 +331,12 @@ mod tests {
                 "tangle_outbound_queue_full_closes_total",
                 "tangle_outbox_pending_events",
                 "tangle_outbox_replayed_events_total",
+                "tangle_broad_query_rejections_total",
+                "tangle_query_candidates_scanned_total",
                 "tangle_query_latency_count",
                 "tangle_query_latency_total_micros",
+                "tangle_query_redacted_events_total",
+                "tangle_query_returned_events_total",
                 "tangle_rate_limit_rejections_total",
                 "tangle_readiness_ready",
                 "tangle_req_messages_total",
@@ -369,6 +378,11 @@ mod tests {
         assert_eq!(metrics_value["tangle_event_admission_latency_count"], 1);
         assert_eq!(metrics_value["tangle_query_latency_total_micros"], 17);
         assert_eq!(metrics_value["tangle_query_latency_count"], 1);
+        assert_eq!(metrics_value["tangle_query_candidates_scanned_total"], 5);
+        assert_eq!(metrics_value["tangle_query_returned_events_total"], 3);
+        assert_eq!(metrics_value["tangle_query_redacted_events_total"], 2);
+        assert_eq!(metrics_value["tangle_count_refusals_total"], 1);
+        assert_eq!(metrics_value["tangle_broad_query_rejections_total"], 1);
         let metrics_text = String::from_utf8(metrics_body.to_vec()).expect("utf8");
         assert!(!metrics_text.contains("relay_secret"));
         assert!(!metrics_text.contains("invite"));

@@ -9,7 +9,10 @@ use crate::relay::{
     auth::BaseAuthState,
     live::{CloseResult, LiveSubscriptionSet},
 };
-use std::{cell::RefCell, collections::BTreeSet};
+use std::{
+    cell::{Cell, RefCell},
+    collections::BTreeSet,
+};
 use tangle_crypto::verify_event_signature;
 use tangle_groups::{
     GroupAuthContext, GroupEventClass, GroupEventView, GroupRuntimeConfig, StoreOffset,
@@ -63,18 +66,28 @@ impl BaseRelayEventWrite {
 pub(crate) struct BaseRelayQueryReport {
     messages: Vec<RelayMessage>,
     group_read_denied: bool,
+    query_metrics: BaseRelayQueryMetrics,
 }
 
 impl BaseRelayQueryReport {
-    fn new(messages: Vec<RelayMessage>, group_read_denied: bool) -> Self {
+    fn new(
+        messages: Vec<RelayMessage>,
+        group_read_denied: bool,
+        query_metrics: BaseRelayQueryMetrics,
+    ) -> Self {
         Self {
             messages,
             group_read_denied,
+            query_metrics,
         }
     }
 
     pub(crate) fn group_read_denied(&self) -> bool {
         self.group_read_denied
+    }
+
+    pub(crate) fn query_metrics(&self) -> BaseRelayQueryMetrics {
+        self.query_metrics
     }
 
     pub(crate) fn into_messages(self) -> Vec<RelayMessage> {
@@ -86,18 +99,28 @@ impl BaseRelayQueryReport {
 pub(crate) struct BaseRelayCountReport {
     message: RelayMessage,
     group_read_denied: bool,
+    query_metrics: BaseRelayQueryMetrics,
 }
 
 impl BaseRelayCountReport {
-    fn new(message: RelayMessage, group_read_denied: bool) -> Self {
+    fn new(
+        message: RelayMessage,
+        group_read_denied: bool,
+        query_metrics: BaseRelayQueryMetrics,
+    ) -> Self {
         Self {
             message,
             group_read_denied,
+            query_metrics,
         }
     }
 
     pub(crate) fn group_read_denied(&self) -> bool {
         self.group_read_denied
+    }
+
+    pub(crate) fn query_metrics(&self) -> BaseRelayQueryMetrics {
+        self.query_metrics
     }
 
     pub(crate) fn into_message(self) -> RelayMessage {
@@ -109,14 +132,66 @@ impl BaseRelayCountReport {
 struct BaseRelayEventQueryReport {
     events: Vec<Event>,
     group_read_denied: bool,
+    query_metrics: BaseRelayQueryMetrics,
 }
 
 impl BaseRelayEventQueryReport {
-    fn new(events: Vec<Event>, group_read_denied: bool) -> Self {
+    fn new(
+        events: Vec<Event>,
+        group_read_denied: bool,
+        query_metrics: BaseRelayQueryMetrics,
+    ) -> Self {
         Self {
             events,
             group_read_denied,
+            query_metrics,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BaseRelayQueryMetrics {
+    candidates_scanned: u64,
+    returned_events: u64,
+    redacted_events: u64,
+}
+
+impl BaseRelayQueryMetrics {
+    pub(crate) fn new(candidates_scanned: u64, returned_events: u64, redacted_events: u64) -> Self {
+        Self {
+            candidates_scanned,
+            returned_events,
+            redacted_events,
+        }
+    }
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            candidates_scanned: self
+                .candidates_scanned
+                .saturating_add(other.candidates_scanned),
+            returned_events: self.returned_events.saturating_add(other.returned_events),
+            redacted_events: self.redacted_events.saturating_add(other.redacted_events),
+        }
+    }
+
+    fn with_returned_events(self, returned_events: usize) -> Self {
+        Self {
+            returned_events: u64::try_from(returned_events).expect("returned events fit in u64"),
+            ..self
+        }
+    }
+
+    pub(crate) fn candidates_scanned(self) -> u64 {
+        self.candidates_scanned
+    }
+
+    pub(crate) fn returned_events(self) -> u64 {
+        self.returned_events
+    }
+
+    pub(crate) fn redacted_events(self) -> u64 {
+        self.redacted_events
     }
 }
 
@@ -124,13 +199,15 @@ impl BaseRelayEventQueryReport {
 struct BaseRelayCountEventsReport {
     count: u64,
     group_read_denied: bool,
+    query_metrics: BaseRelayQueryMetrics,
 }
 
 impl BaseRelayCountEventsReport {
-    fn new(count: u64, group_read_denied: bool) -> Self {
+    fn new(count: u64, group_read_denied: bool, query_metrics: BaseRelayQueryMetrics) -> Self {
         Self {
             count,
             group_read_denied,
+            query_metrics,
         }
     }
 }
@@ -835,7 +912,11 @@ impl BaseRelay {
         self.limits.validate_subscription_id(&subscription_id)?;
         self.limits.validate_filters(&filters)?;
         if let Some(message) = Self::unsupported_search_closed(&subscription_id, &filters) {
-            return Ok(BaseRelayQueryReport::new(vec![message], false));
+            return Ok(BaseRelayQueryReport::new(
+                vec![message],
+                false,
+                BaseRelayQueryMetrics::default(),
+            ));
         }
         self.subscriptions
             .subscribe(subscription_id.clone(), filters.clone(), auth.clone())?;
@@ -871,11 +952,16 @@ impl BaseRelay {
         limits.validate_subscription_id(&subscription_id)?;
         limits.validate_filters(&filters)?;
         if let Some(message) = Self::unsupported_search_closed(&subscription_id, &filters) {
-            return Ok(BaseRelayQueryReport::new(vec![message], false));
+            return Ok(BaseRelayQueryReport::new(
+                vec![message],
+                false,
+                BaseRelayQueryMetrics::default(),
+            ));
         }
         let report =
             Self::query_events_report_with_services(store, groups, limits, query, &filters, auth)?;
         let group_read_denied = report.group_read_denied;
+        let query_metrics = report.query_metrics;
         let mut messages = report
             .events
             .into_iter()
@@ -885,7 +971,11 @@ impl BaseRelay {
             })
             .collect::<Vec<_>>();
         messages.push(RelayMessage::Eose(subscription_id));
-        Ok(BaseRelayQueryReport::new(messages, group_read_denied))
+        Ok(BaseRelayQueryReport::new(
+            messages,
+            group_read_denied,
+            query_metrics,
+        ))
     }
 
     pub fn handle_count(
@@ -986,7 +1076,11 @@ impl BaseRelay {
         limits.validate_subscription_id(&subscription_id)?;
         limits.validate_filters(&filters)?;
         if let Some(message) = Self::unsupported_search_closed(&subscription_id, &filters) {
-            return Ok(BaseRelayCountReport::new(message, false));
+            return Ok(BaseRelayCountReport::new(
+                message,
+                false,
+                BaseRelayQueryMetrics::default(),
+            ));
         }
         let report =
             Self::count_events_report_with_services(store, groups, limits, query, &filters, auth)?;
@@ -996,6 +1090,7 @@ impl BaseRelay {
                 count: report.count,
             },
             report.group_read_denied,
+            report.query_metrics,
         ))
     }
 
@@ -1048,18 +1143,23 @@ impl BaseRelay {
     ) -> Result<BaseRelayEventQueryReport, BaseRelayError> {
         let mut output = Vec::new();
         let mut group_read_denied = false;
+        let mut query_metrics = BaseRelayQueryMetrics::default();
         for filter in filters {
             let report = Self::query_filter_events_report_with_services(
                 store, groups, limits, query, filter, auth,
             )?;
             group_read_denied |= report.group_read_denied;
+            query_metrics = query_metrics.add(report.query_metrics);
             let mut events = Self::sort_and_dedupe_query_events(report.events);
             events.truncate(limits.effective_filter_limit(filter));
             output.extend(events);
         }
+        let events = Self::sort_and_dedupe_query_events(output);
+        query_metrics = query_metrics.with_returned_events(events.len());
         Ok(BaseRelayEventQueryReport::new(
-            Self::sort_and_dedupe_query_events(output),
+            events,
             group_read_denied,
+            query_metrics,
         ))
     }
 
@@ -1073,19 +1173,25 @@ impl BaseRelay {
     ) -> Result<BaseRelayCountEventsReport, BaseRelayError> {
         let mut seen = BTreeSet::new();
         let mut group_read_denied = false;
+        let mut query_metrics = BaseRelayQueryMetrics::default();
         for filter in filters {
             let filter = filter.without_limit();
             let report = Self::query_filter_events_report_with_services(
                 store, groups, limits, query, &filter, auth,
             )?;
             group_read_denied |= report.group_read_denied;
+            query_metrics = query_metrics.add(report.query_metrics);
             for event in report.events {
                 seen.insert(event.id().clone());
             }
         }
         let count = u64::try_from(seen.len())
             .map_err(|_| BaseRelayError::error("visible event count overflow"))?;
-        Ok(BaseRelayCountEventsReport::new(count, group_read_denied))
+        Ok(BaseRelayCountEventsReport::new(
+            count,
+            group_read_denied,
+            query_metrics,
+        ))
     }
 
     fn query_filter_events_report_with_services(
@@ -1099,7 +1205,10 @@ impl BaseRelay {
         let effective_filter = Self::filter_with_limits(limits, filter);
         let pocket_filter = tangle_filter_to_pocket(&effective_filter)?;
         let screen_error = RefCell::new(None);
+        let candidates_scanned = Cell::new(0_u64);
+        let redacted_events = Cell::new(0_u64);
         let screened = store.find_events_with_screen(&pocket_filter, query, |pocket_event| {
+            candidates_scanned.set(candidates_scanned.get().saturating_add(1));
             if screen_error.borrow().is_some() {
                 return PocketScreenResult::Mismatch;
             }
@@ -1108,7 +1217,10 @@ impl BaseRelay {
                 Ok(true) => {
                     match Self::group_read_gate_visible_to_auth(groups, pocket_event, auth) {
                         Ok(true) => PocketScreenResult::Match,
-                        Ok(false) => PocketScreenResult::Redacted,
+                        Ok(false) => {
+                            redacted_events.set(redacted_events.get().saturating_add(1));
+                            PocketScreenResult::Redacted
+                        }
                         Err(error) => {
                             *screen_error.borrow_mut() = Some(error);
                             PocketScreenResult::Mismatch
@@ -1130,7 +1242,11 @@ impl BaseRelay {
             .into_iter()
             .map(|pocket_event| pocket_event_to_tangle(&pocket_event))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(BaseRelayEventQueryReport::new(events, group_read_denied))
+        Ok(BaseRelayEventQueryReport::new(
+            events,
+            group_read_denied,
+            BaseRelayQueryMetrics::new(candidates_scanned.get(), 0, redacted_events.get()),
+        ))
     }
 
     fn filter_with_limits(limits: BaseRelayLimits, filter: &Filter) -> Filter {
