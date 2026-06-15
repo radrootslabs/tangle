@@ -753,6 +753,67 @@ mod tests {
         assert_eq!(screened.events().len(), 1);
         assert_eq!(screened.events()[0].id(), visible.id());
 
+        let mismatched = handle
+            .find_events_with_screen(&filter, PocketQueryConfig::default(), |event| {
+                if event.id() == visible.id() {
+                    ScreenResult::Match
+                } else {
+                    ScreenResult::Mismatch
+                }
+            })
+            .expect("mismatched");
+
+        assert!(!mismatched.redacted());
+        assert_eq!(mismatched.events().len(), 1);
+        assert_eq!(mismatched.events()[0].id(), visible.id());
+
+        let hidden = handle
+            .find_events_with_screen(&filter, PocketQueryConfig::default(), |_| {
+                ScreenResult::Mismatch
+            })
+            .expect("hidden");
+
+        assert!(!hidden.redacted());
+        assert!(hidden.events().is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pocket_store_handle_rejects_duplicate_event_writes_without_duplicate_materialization() {
+        let root = temp_root("tangle-pocket-duplicate");
+        let config = PocketStoreConfig::new(root.join("pocket"), PocketSyncPolicy::FlushOnShutdown)
+            .expect("config");
+        let handle = PocketStoreHandle::open(&config).expect("open");
+        let event = parse_pocket_event_json(event_json().as_bytes()).expect("event");
+        let filter = parse_pocket_filter_json(filter_json().as_bytes()).expect("filter");
+
+        let first_offset = handle.store_event(&event).expect("store first");
+        let duplicate_error = handle.store_event(&event).expect_err("duplicate");
+        let by_id = handle
+            .event_by_id(event.id())
+            .expect("lookup")
+            .expect("event");
+        let by_offset = handle.event_by_offset(first_offset).expect("offset");
+        let found = handle
+            .find_events(&filter, PocketQueryConfig::default())
+            .expect("find");
+        let scanned = handle.scan_events().expect("scan");
+
+        assert!(
+            duplicate_error
+                .message()
+                .to_lowercase()
+                .contains("duplicate")
+        );
+        assert_eq!(by_id.id(), event.id());
+        assert_eq!(by_offset.id(), event.id());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id(), event.id());
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].store_offset(), first_offset);
+        assert_eq!(scanned[0].event().id(), event.id());
+
         let _ = std::fs::remove_dir_all(root);
     }
 
