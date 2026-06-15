@@ -20,7 +20,6 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
-use tangle_groups::GroupAuthContext;
 use tangle_protocol::{
     ClientMessage, Filter, RelayMessage, SubscriptionId, UnixTimestamp, parse_client_message,
 };
@@ -199,8 +198,9 @@ impl TangleWebSocketSession {
         offset: tangle_groups::StoreOffset,
     ) -> TangleSessionControl {
         let runtime = self.runtime.clone();
+        let auth = self.auth.clone();
         let replies = match runtime
-            .fanout_event_offset(offset, &mut self.subscriptions)
+            .fanout_event_offset(offset, &mut self.subscriptions, &auth)
             .await
         {
             Ok(replies) => replies,
@@ -341,24 +341,22 @@ impl TangleWebSocketSession {
         {
             return Ok(vec![message]);
         }
-        self.subscriptions.subscribe(
-            subscription_id.clone(),
-            filters.clone(),
-            GroupAuthContext::new(self.auth.authenticated_pubkeys().iter().cloned()),
-        )?;
-        metrics.record_subscription_opened();
-        logging::log_subscription_opened(self.connection_id, &subscription_id);
-        match self
-            .runtime
-            .query_req_with_auth(subscription_id.clone(), filters, &self.auth)
-            .await
-        {
-            Ok(replies) => Ok(replies),
-            Err(error) => {
-                self.subscriptions.close(&subscription_id);
-                Err(error)
-            }
+        let should_subscribe = !filters_are_complete(&filters);
+        if should_subscribe {
+            self.subscriptions
+                .ensure_can_subscribe(&subscription_id, &filters)?;
         }
+        let replies = self
+            .runtime
+            .query_req_with_auth(subscription_id.clone(), filters.clone(), &self.auth)
+            .await?;
+        if should_subscribe {
+            self.subscriptions
+                .subscribe(subscription_id.clone(), filters)?;
+            metrics.record_subscription_opened();
+            logging::log_subscription_opened(self.connection_id, &subscription_id);
+        }
+        Ok(replies)
     }
 
     fn client_rate_limit_context(&self) -> TangleClientRateLimitContext {
@@ -450,6 +448,10 @@ fn current_unix_timestamp() -> UnixTimestamp {
     )
 }
 
+fn filters_are_complete(filters: &[Filter]) -> bool {
+    !filters.is_empty() && filters.iter().all(Filter::is_complete)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -469,9 +471,13 @@ mod tests {
     use std::path::{Path, PathBuf};
     use tangle_groups::StoreOffset;
     use tangle_protocol::{
-        ClientMessage, Filter, RelayMessage, SubscriptionId, event_to_value, filter_from_value,
+        ClientMessage, Filter, RelayMessage, SubscriptionId, UnixTimestamp, event_to_value,
+        filter_from_value,
     };
-    use tangle_test_support::{FixtureKey, tangle_v2_event};
+    use tangle_test_support::{
+        FixtureKey, tangle_v2_auth_event, tangle_v2_event, tangle_v2_group_create_event,
+        tangle_v2_group_event,
+    };
 
     #[test]
     fn websocket_session_records_connection_time() {
@@ -693,6 +699,264 @@ mod tests {
         assert_eq!(snapshot.close_messages(), 2);
         assert_eq!(snapshot.opened_subscriptions(), 3);
         assert_eq!(snapshot.closed_subscriptions(), 2);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn websocket_session_live_fanout_uses_current_auth() {
+        let shutdown = TangleShutdownSignal::new();
+        let root = temp_root("current-auth-live");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = TangleRuntimeHandle::new(
+            TangleRuntime::open(runtime_config_with_groups(&root)).expect("runtime"),
+        );
+        let mut owner_auth = runtime.auth_state().await.expect("owner auth");
+        owner_auth
+            .issue_challenge("owner-live", UnixTimestamp::new(100))
+            .expect("owner challenge");
+        let owner_auth_event =
+            tangle_v2_auth_event(FixtureKey::Owner, "owner-live", 120).expect("owner auth event");
+        assert_eq!(
+            runtime
+                .handle_client_message(
+                    ClientMessage::Auth(owner_auth_event.clone()),
+                    &mut owner_auth,
+                    UnixTimestamp::new(120)
+                )
+                .await
+                .expect("owner auth"),
+            vec![RelayMessage::Ok {
+                event_id: owner_auth_event.id().clone(),
+                accepted: true,
+                message: String::new()
+            }]
+        );
+        let create = tangle_v2_group_create_event(FixtureKey::Owner, "LiveFarm", 121, &["private"])
+            .expect("create");
+        assert_eq!(
+            runtime
+                .handle_client_message(
+                    ClientMessage::Event(create.clone()),
+                    &mut owner_auth,
+                    UnixTimestamp::new(121)
+                )
+                .await
+                .expect("create"),
+            vec![RelayMessage::Ok {
+                event_id: create.id().clone(),
+                accepted: true,
+                message: String::new()
+            }]
+        );
+        let session_auth = runtime.auth_state().await.expect("session auth");
+        let events = runtime.subscribe_events().await;
+        let mut session = TangleWebSocketSession::new(
+            session_limits(8),
+            shutdown.subscribe(),
+            runtime.clone(),
+            session_auth,
+            events,
+        )
+        .expect("session");
+        let subscription_id = SubscriptionId::new("current-auth-live").expect("subscription");
+
+        assert_eq!(
+            session
+                .handle_client_message(ClientMessage::Req {
+                    subscription_id: subscription_id.clone(),
+                    filters: vec![
+                        filter_from_value(&json!({"kinds":[1], "#h":["LiveFarm"]}))
+                            .expect("filter")
+                    ],
+                })
+                .await
+                .expect("req"),
+            vec![RelayMessage::Eose(subscription_id.clone())]
+        );
+        assert_eq!(session.active_subscription_count(), 1);
+        let before_auth =
+            tangle_v2_group_event(FixtureKey::Owner, "LiveFarm", 122, 1, "before auth")
+                .expect("before auth");
+        let before_auth_id = before_auth.id().clone();
+        assert_eq!(
+            runtime
+                .handle_client_message(
+                    ClientMessage::Event(before_auth),
+                    &mut owner_auth,
+                    UnixTimestamp::new(122)
+                )
+                .await
+                .expect("before event"),
+            vec![RelayMessage::Ok {
+                event_id: before_auth_id,
+                accepted: true,
+                message: String::new()
+            }]
+        );
+        let offset = session.events.recv().await;
+        assert_eq!(
+            session.handle_event_receive_result(offset).await,
+            TangleSessionControl::Continue
+        );
+        assert!(session.outbound_receiver.try_recv().is_err());
+
+        let session_now = current_unix_timestamp();
+        session
+            .auth
+            .issue_challenge("session-live", session_now)
+            .expect("session challenge");
+        let session_auth_event =
+            tangle_v2_auth_event(FixtureKey::Owner, "session-live", session_now.as_u64())
+                .expect("auth event");
+        assert_eq!(
+            session
+                .handle_client_message(ClientMessage::Auth(session_auth_event.clone()))
+                .await
+                .expect("session auth"),
+            vec![RelayMessage::Ok {
+                event_id: session_auth_event.id().clone(),
+                accepted: true,
+                message: String::new()
+            }]
+        );
+        let after_auth = tangle_v2_group_event(FixtureKey::Owner, "LiveFarm", 132, 1, "after auth")
+            .expect("after auth");
+        assert_eq!(
+            runtime
+                .handle_client_message(
+                    ClientMessage::Event(after_auth.clone()),
+                    &mut owner_auth,
+                    UnixTimestamp::new(132)
+                )
+                .await
+                .expect("after event"),
+            vec![RelayMessage::Ok {
+                event_id: after_auth.id().clone(),
+                accepted: true,
+                message: String::new()
+            }]
+        );
+        let offset = session.events.recv().await;
+        assert_eq!(
+            session.handle_event_receive_result(offset).await,
+            TangleSessionControl::Continue
+        );
+        assert_eq!(
+            take_outbound_text(&mut session),
+            RelayMessage::Event {
+                subscription_id,
+                event: after_auth
+            }
+            .encode()
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn websocket_session_complete_and_failed_reqs_do_not_subscribe() {
+        let shutdown = TangleShutdownSignal::new();
+        let root = temp_root("complete-req-lifecycle");
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime =
+            TangleRuntimeHandle::new(TangleRuntime::open(runtime_config(&root)).expect("runtime"));
+        let mut auth = runtime.auth_state().await.expect("auth");
+        let events = runtime.subscribe_events().await;
+        let mut session = TangleWebSocketSession::new(
+            session_limits(8),
+            shutdown.subscribe(),
+            runtime.clone(),
+            runtime.auth_state().await.expect("session auth"),
+            events,
+        )
+        .expect("session");
+        let event = tangle_v2_event(FixtureKey::Member, 1_714_124_433, 1, Vec::new(), "complete")
+            .expect("event");
+
+        assert_eq!(
+            runtime
+                .handle_client_message(
+                    ClientMessage::Event(event.clone()),
+                    &mut auth,
+                    UnixTimestamp::new(1_714_124_433)
+                )
+                .await
+                .expect("event"),
+            vec![RelayMessage::Ok {
+                event_id: event.id().clone(),
+                accepted: true,
+                message: String::new()
+            }]
+        );
+        let exact_id = SubscriptionId::new("exact-id").expect("subscription");
+        assert_eq!(
+            session
+                .handle_client_message(ClientMessage::Req {
+                    subscription_id: exact_id.clone(),
+                    filters: vec![
+                        filter_from_value(&json!({"ids":[event.id().as_str()]}))
+                            .expect("exact filter")
+                    ],
+                })
+                .await
+                .expect("exact req"),
+            vec![
+                RelayMessage::Event {
+                    subscription_id: exact_id.clone(),
+                    event: event.clone()
+                },
+                RelayMessage::Eose(exact_id)
+            ]
+        );
+        assert_eq!(session.active_subscription_count(), 0);
+
+        let open = SubscriptionId::new("open").expect("subscription");
+        assert_eq!(
+            session
+                .handle_client_message(ClientMessage::Req {
+                    subscription_id: open.clone(),
+                    filters: vec![filter_from_value(&json!({"kinds":[1]})).expect("open filter")],
+                })
+                .await
+                .expect("open req"),
+            vec![
+                RelayMessage::Event {
+                    subscription_id: open.clone(),
+                    event
+                },
+                RelayMessage::Eose(open.clone())
+            ]
+        );
+        assert_eq!(session.active_subscription_count(), 1);
+
+        let search = SubscriptionId::new("search").expect("subscription");
+        assert_eq!(
+            session
+                .handle_client_message(ClientMessage::Req {
+                    subscription_id: search.clone(),
+                    filters: vec![
+                        filter_from_value(&json!({"search":"carrots"})).expect("search filter")
+                    ],
+                })
+                .await
+                .expect("search req"),
+            vec![RelayMessage::Closed {
+                subscription_id: search,
+                message: "unsupported: search filters are not supported".to_owned()
+            }]
+        );
+        assert_eq!(session.active_subscription_count(), 1);
+
+        let invalid = SubscriptionId::new("invalid").expect("subscription");
+        let invalid_result = session
+            .handle_client_message(ClientMessage::Req {
+                subscription_id: invalid,
+                filters: vec![Filter::empty(); 11],
+            })
+            .await;
+        assert!(invalid_result.is_err());
+        assert_eq!(session.active_subscription_count(), 1);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1109,6 +1373,91 @@ mod tests {
 
     fn runtime_config(root: &Path) -> BaseRelayRuntimeConfig {
         runtime_config_with_outbound_queue(root, 8)
+    }
+
+    fn runtime_config_with_groups(root: &Path) -> BaseRelayRuntimeConfig {
+        let raw = json!({
+            "server": {
+                "listen_addr": "127.0.0.1:0",
+                "relay_url": "wss://relay.radroots.test"
+            },
+            "pocket": {
+                "data_directory": root.join("pocket"),
+                "sync_policy": "flush_on_shutdown",
+                "query": {
+                  "allow_scraping": false,
+                  "allow_scrape_if_limited_to": 100,
+                  "allow_scrape_if_max_seconds": 3600
+                }
+            },
+            "groups": {
+                "enabled": true,
+                "canonical_relay_url": "wss://relay.radroots.test",
+                "relay_secret": "7777777777777777777777777777777777777777777777777777777777777777",
+                "owner_pubkeys": [FixtureKey::Owner.public_key().as_str()],
+                "policy": {
+                    "public_join": false,
+                    "invites_enabled": false
+                }
+            },
+            "auth": {
+                "challenge_ttl_seconds": 300,
+                "created_at_skew_seconds": 600
+            },
+            "limits": {
+                "max_message_length": 1048576,
+                "max_subid_length": 64,
+                "max_subscriptions_per_connection": 64,
+                "max_filters_per_request": 10,
+                "max_tag_values_per_filter": 100,
+                "max_query_complexity": 2048,
+                "max_limit": 500,
+                "default_limit": 100,
+                "max_event_tags": 200,
+                "max_content_length": 65536,
+                "broadcast_channel_capacity": 8,
+                "per_connection_outbound_queue": 8
+            },
+            "rate_limits": {
+                "auth": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 120},
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 30},
+                    "failures": {"window_seconds": 300, "max_hits": 5},
+                    "failures_per_ip": {"window_seconds": 300, "max_hits": 20}
+                },
+                "event": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 600},
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 120},
+                    "per_kind": {"window_seconds": 60, "max_hits": 1000}
+                },
+                "group": {
+                    "write_per_ip": {"window_seconds": 60, "max_hits": 300},
+                    "write_per_pubkey": {"window_seconds": 60, "max_hits": 60},
+                    "write_per_group": {"window_seconds": 60, "max_hits": 90},
+                    "write_per_kind": {"window_seconds": 60, "max_hits": 300},
+                    "join_flow": {"window_seconds": 300, "max_hits": 10},
+                    "join_flow_per_ip": {"window_seconds": 300, "max_hits": 30}
+                },
+                "req": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 600},
+                    "per_connection": {"window_seconds": 60, "max_hits": 120},
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 240},
+                    "per_group": {"window_seconds": 60, "max_hits": 240},
+                    "per_kind": {"window_seconds": 60, "max_hits": 500},
+                    "broad": {"window_seconds": 60, "max_hits": 30}
+                },
+                "count": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 300},
+                    "per_connection": {"window_seconds": 60, "max_hits": 60},
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 120},
+                    "per_group": {"window_seconds": 60, "max_hits": 120},
+                    "per_kind": {"window_seconds": 60, "max_hits": 240},
+                    "broad": {"window_seconds": 60, "max_hits": 20}
+                }
+            }
+        })
+        .to_string();
+        parse_base_relay_runtime_config_json(&raw).expect("config")
     }
 
     fn runtime_config_with_outbound_queue(

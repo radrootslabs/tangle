@@ -3,12 +3,13 @@
 use std::{fs, panic, path::PathBuf};
 use tangle_crypto::{RelaySigner, event_id_matches, verify_event_signature};
 use tangle_groups::{
-    GroupAuthority, GroupGeneratedEventBuilder, GroupId, GroupLimitsConfig, GroupOutboxEffect,
-    GroupOutboxKey, GroupOutboxRecord, GroupOutboxStatus, GroupProjection, GroupRuntimeConfig,
-    KIND_GROUP_ADMINS, KIND_GROUP_DELETE_GROUP, KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST,
-    KIND_GROUP_MEMBERS, KIND_GROUP_METADATA, KIND_GROUP_PUT_USER, MemberStatus,
-    NIP29_RELAY_GENERATED_KIND_VALUES, PERMANENT_RELAY_OVERRIDE_ROLE, ProjectionCheckpoint,
-    StoreOffset, member_current_key, parse_group_runtime_config_json, projection_checkpoint_key,
+    GroupAuthContext, GroupAuthority, GroupGeneratedEventBuilder, GroupId, GroupLimitsConfig,
+    GroupOutboxEffect, GroupOutboxKey, GroupOutboxRecord, GroupOutboxStatus, GroupProjection,
+    GroupRuntimeConfig, KIND_GROUP_ADMINS, KIND_GROUP_DELETE_GROUP, KIND_GROUP_JOIN_REQUEST,
+    KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA, KIND_GROUP_PUT_USER,
+    MemberStatus, NIP29_RELAY_GENERATED_KIND_VALUES, PERMANENT_RELAY_OVERRIDE_ROLE,
+    ProjectionCheckpoint, StoreOffset, member_current_key, parse_group_runtime_config_json,
+    projection_checkpoint_key,
 };
 use tangle_protocol::{
     Event, Filter, RawEventJson, RelayMessage, SubscriptionId, Tag, UnixTimestamp, event_to_value,
@@ -510,7 +511,10 @@ fn metadata_flags_and_read_privacy_cover_req_count_and_fanout() {
     let live_unauth = subscription("live-private-unauth");
     let live_owner = subscription("live-private-owner");
     relay
-        .handle_req(live_unauth, vec![filter_group_tag(1, "h", "PrivateFarm")])
+        .handle_req(
+            live_unauth.clone(),
+            vec![filter_group_tag(1, "h", "PrivateFarm")],
+        )
         .expect("live unauth");
     relay
         .handle_req_with_auth(
@@ -527,11 +531,25 @@ fn metadata_flags_and_read_privacy_cover_req_count_and_fanout() {
             .expect("second"),
         &second_private,
     );
-    assert!(matches!(
-        relay.fanout(&second_private).as_slice(),
-        [RelayMessage::Event { subscription_id, event }]
-            if subscription_id == &live_owner && event.id() == second_private.id()
-    ));
+    assert!(relay.fanout(&second_private).is_empty());
+    let owner_live = relay.fanout_with_group_auth(
+        &second_private,
+        &GroupAuthContext::new([FixtureKey::Owner.public_key()]),
+    );
+    assert!(owner_live.iter().any(|message| {
+        matches!(
+            message,
+            RelayMessage::Event { subscription_id, event }
+                if subscription_id == &live_unauth && event.id() == second_private.id()
+        )
+    }));
+    assert!(owner_live.iter().any(|message| {
+        matches!(
+            message,
+            RelayMessage::Event { subscription_id, event }
+                if subscription_id == &live_owner && event.id() == second_private.id()
+        )
+    }));
 
     accept_group_create(&mut relay, "HiddenFarm", &["hidden"], 10, &owner_auth);
     assert_count(
@@ -710,11 +728,16 @@ fn nip29_privacy_leak_suite_covers_relay_exposure_and_rejection_paths() {
             .expect("live private"),
         &live_private,
     );
-    assert!(matches!(
-        relay.fanout(&live_private).as_slice(),
-        [RelayMessage::Event { subscription_id, event }]
+    assert!(relay.fanout(&live_private).is_empty());
+    let member_live = relay.fanout_with_group_auth(
+        &live_private,
+        &GroupAuthContext::new([FixtureKey::Member.public_key()]),
+    );
+    assert!(member_live.iter().any(|message| matches!(
+        message,
+        RelayMessage::Event { subscription_id, event }
             if subscription_id == &live_member && event.id() == live_private.id()
-    ));
+    )));
 
     assert_count(
         relay.handle_count(

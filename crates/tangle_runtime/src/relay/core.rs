@@ -935,9 +935,17 @@ impl BaseRelay {
                 BaseRelayQueryMetrics::default(),
             ));
         }
-        self.subscriptions
-            .subscribe(subscription_id.clone(), filters.clone(), auth.clone())?;
-        self.query_req_with_group_auth_report(subscription_id, filters, auth)
+        let should_subscribe = !filters_are_complete(&filters);
+        if should_subscribe {
+            self.subscriptions
+                .ensure_can_subscribe(&subscription_id, &filters)?;
+        }
+        let report =
+            self.query_req_with_group_auth_report(subscription_id.clone(), filters.clone(), auth)?;
+        if should_subscribe {
+            self.subscriptions.subscribe(subscription_id, filters)?;
+        }
+        Ok(report)
     }
 
     fn query_req_with_group_auth_report(
@@ -1116,8 +1124,16 @@ impl BaseRelay {
     }
 
     pub fn fanout(&mut self, event: &Event) -> Vec<RelayMessage> {
+        self.fanout_with_group_auth(event, &GroupAuthContext::unauthenticated())
+    }
+
+    pub fn fanout_with_group_auth(
+        &mut self,
+        event: &Event,
+        auth: &GroupAuthContext,
+    ) -> Vec<RelayMessage> {
         let groups = self.groups.as_ref();
-        self.subscriptions.fanout(event, |event, auth| {
+        self.subscriptions.fanout(event, auth, |event, auth| {
             Self::group_read_gate_visible_to_auth(groups, event, auth).unwrap_or(false)
         })
     }
@@ -1320,6 +1336,10 @@ impl BaseRelay {
     }
 }
 
+fn filters_are_complete(filters: &[Filter]) -> bool {
+    !filters.is_empty() && filters.iter().all(Filter::is_complete)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BaseRelay, BaseRelayLimitSettings, BaseRelayLimits};
@@ -1328,11 +1348,12 @@ mod tests {
     use crate::relay::live::CloseResult;
     use tangle_crypto::RelaySigner;
     use tangle_groups::{
-        GroupId, KIND_GROUP_ADMINS, KIND_GROUP_CREATE_GROUP, KIND_GROUP_CREATE_INVITE,
-        KIND_GROUP_DELETE_EVENT, KIND_GROUP_DELETE_GROUP, KIND_GROUP_EDIT_METADATA,
-        KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA,
-        KIND_GROUP_PUT_USER, KIND_GROUP_REMOVE_USER, MemberStatus,
-        NIP29_RELAY_GENERATED_KIND_VALUES, StoreOffset, parse_group_runtime_config_json,
+        GroupAuthContext, GroupId, KIND_GROUP_ADMINS, KIND_GROUP_CREATE_GROUP,
+        KIND_GROUP_CREATE_INVITE, KIND_GROUP_DELETE_EVENT, KIND_GROUP_DELETE_GROUP,
+        KIND_GROUP_EDIT_METADATA, KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST,
+        KIND_GROUP_MEMBERS, KIND_GROUP_METADATA, KIND_GROUP_PUT_USER, KIND_GROUP_REMOVE_USER,
+        MemberStatus, NIP29_RELAY_GENERATED_KIND_VALUES, StoreOffset,
+        parse_group_runtime_config_json,
     };
     use tangle_protocol::{
         ClientMessage, Event, EventId, Filter, Kind, PublicKeyHex, RelayMessage, SubscriptionId,
@@ -2949,7 +2970,7 @@ mod tests {
     }
 
     #[test]
-    fn private_group_live_fanout_uses_subscription_auth() {
+    fn private_group_live_fanout_uses_current_auth() {
         let owner = signer(7).public_key().clone();
         let auth = authenticated_state(7);
         let mut relay = test_relay_with_groups(
@@ -2960,14 +2981,10 @@ mod tests {
         relay
             .handle_event_with_auth(signed_private_group_create_event(7, "Farm"), &auth)
             .expect("create");
-        let unauth_sub = SubscriptionId::new("fanout-unauth").expect("sub");
-        let auth_sub = SubscriptionId::new("fanout-auth").expect("sub");
+        let subscription_id = SubscriptionId::new("fanout-current-auth").expect("sub");
         relay
-            .handle_req(unauth_sub, vec![filter_kind(1)])
-            .expect("unauth sub");
-        relay
-            .handle_req_with_auth(auth_sub.clone(), vec![filter_kind(1)], &auth)
-            .expect("auth sub");
+            .handle_req(subscription_id.clone(), vec![filter_kind(1)])
+            .expect("sub");
         let private_event = signed_event_at(
             7,
             1,
@@ -2979,10 +2996,18 @@ mod tests {
             .handle_event_with_auth(private_event.clone(), &auth)
             .expect("private event");
 
+        assert!(relay.fanout(&private_event).is_empty());
         assert!(matches!(
-            relay.fanout(&private_event).as_slice(),
-            [RelayMessage::Event { subscription_id, event }]
-                if subscription_id == &auth_sub && event.id() == private_event.id()
+            relay
+                .fanout_with_group_auth(
+                    &private_event,
+                    &GroupAuthContext::new([owner])
+                )
+                .as_slice(),
+            [RelayMessage::Event {
+                subscription_id: delivered,
+                event
+            }] if delivered == &subscription_id && event.id() == private_event.id()
         ));
     }
 

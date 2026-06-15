@@ -703,6 +703,10 @@ impl Filter {
         self.search.as_deref()
     }
 
+    pub fn is_complete(&self) -> bool {
+        !self.ids.is_empty()
+    }
+
     pub fn matches(&self, event: &Event) -> bool {
         if !self.ids.is_empty() && !self.ids.iter().any(|id| id == event.id()) {
             return false;
@@ -2306,6 +2310,23 @@ mod tests {
             filter_from_value(&filter_to_value(&filter)).expect("encoded"),
             filter
         );
+    }
+
+    #[test]
+    fn filter_complete_semantics_are_exact_id_only() {
+        assert!(
+            filter_from_value(&serde_json::json!({
+                "ids": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+            }))
+            .expect("id filter")
+            .is_complete()
+        );
+        assert!(
+            !filter_from_value(&serde_json::json!({"kinds": [1]}))
+                .expect("kind filter")
+                .is_complete()
+        );
+        assert!(!Filter::empty().is_complete());
     }
 
     #[test]

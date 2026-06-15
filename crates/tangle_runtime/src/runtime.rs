@@ -1078,10 +1078,12 @@ impl TangleRuntimeHandle {
         &self,
         offset: StoreOffset,
         subscriptions: &mut LiveSubscriptionSet,
+        auth: &BaseAuthState,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
         let pocket_event = self.inner.store.event_by_offset(offset.as_u64())?;
         let event = pocket_event_to_tangle(&pocket_event)?;
-        Ok(subscriptions.fanout(&event, |event, auth| {
+        let group_auth = GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned());
+        Ok(subscriptions.fanout(&event, &group_auth, |event, auth| {
             BaseRelay::group_read_gate_visible_to_auth(self.inner.groups.as_ref(), event, auth)
                 .unwrap_or(false)
         }))
@@ -1899,9 +1901,9 @@ mod tests {
         time::Duration,
     };
     use tangle_groups::{
-        CanonicalGroupEvent, GroupAuthContext, GroupEventClass, GroupId, GroupProjection,
-        KIND_GROUP_ADMINS, KIND_GROUP_DELETE_GROUP, KIND_GROUP_JOIN_REQUEST, KIND_GROUP_MEMBERS,
-        KIND_GROUP_METADATA, MemberStatus, StoreOffset, rebuild_group_projection,
+        CanonicalGroupEvent, GroupEventClass, GroupId, GroupProjection, KIND_GROUP_ADMINS,
+        KIND_GROUP_DELETE_GROUP, KIND_GROUP_JOIN_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA,
+        MemberStatus, StoreOffset, rebuild_group_projection,
     };
     use tangle_protocol::{
         ClientMessage, Event, Filter, Kind, PublicKeyHex, RelayMessage, SubscriptionId, Tag,
@@ -2111,7 +2113,6 @@ mod tests {
             .subscribe(
                 subscription_id.clone(),
                 vec![filter_from_value(&json!({"kinds":[1]})).expect("filter")],
-                GroupAuthContext::unauthenticated(),
             )
             .expect("subscribe");
         let event = tangle_v2_event(FixtureKey::Member, 1_714_124_433, 1, Vec::new(), "live")
@@ -2135,7 +2136,7 @@ mod tests {
         let offset = offsets.try_recv().expect("offset");
         assert!(matches!(
             handle
-                .fanout_event_offset(offset, &mut subscriptions)
+                .fanout_event_offset(offset, &mut subscriptions, &auth)
                 .await
                 .expect("fanout")
                 .as_slice(),
@@ -3325,7 +3326,6 @@ mod tests {
                     }))
                     .expect("filter"),
                 ],
-                GroupAuthContext::unauthenticated(),
             )
             .expect("subscribe");
 
@@ -3396,7 +3396,7 @@ mod tests {
         let mut generated_kinds = BTreeSet::new();
         for offset in generated_offsets {
             let messages = handle
-                .fanout_event_offset(offset, &mut subscriptions)
+                .fanout_event_offset(offset, &mut subscriptions, &auth)
                 .await
                 .expect("fanout");
             assert!(matches!(
@@ -4076,28 +4076,20 @@ mod tests {
         let stress_filter =
             filter_from_value(&json!({"kinds":[1], "#h":["StressPrivate"]})).expect("filter");
         member_subscriptions
-            .subscribe(
-                member_subscription.clone(),
-                vec![stress_filter.clone()],
-                GroupAuthContext::new([FixtureKey::Member.public_key()]),
-            )
+            .subscribe(member_subscription.clone(), vec![stress_filter.clone()])
             .expect("member subscribe");
         public_subscriptions
-            .subscribe(
-                public_subscription,
-                vec![stress_filter],
-                GroupAuthContext::unauthenticated(),
-            )
+            .subscribe(public_subscription, vec![stress_filter])
             .expect("public subscribe");
         let mut member_fanout_count = 0;
         for offset in &published_offsets {
             let public_replies = handle
-                .fanout_event_offset(*offset, &mut public_subscriptions)
+                .fanout_event_offset(*offset, &mut public_subscriptions, &public_auth)
                 .await
                 .expect("public fanout");
             assert!(public_replies.is_empty());
             let member_replies = handle
-                .fanout_event_offset(*offset, &mut member_subscriptions)
+                .fanout_event_offset(*offset, &mut member_subscriptions, &member_auth)
                 .await
                 .expect("member fanout");
             for reply in member_replies {

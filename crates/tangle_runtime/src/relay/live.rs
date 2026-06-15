@@ -14,7 +14,6 @@ pub(crate) struct LiveSubscriptionSet {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LiveSubscription {
     filters: Vec<Filter>,
-    auth: GroupAuthContext,
 }
 
 impl LiveSubscriptionSet {
@@ -42,22 +41,30 @@ impl LiveSubscriptionSet {
         &mut self,
         subscription_id: SubscriptionId,
         filters: Vec<Filter>,
-        auth: GroupAuthContext,
+    ) -> Result<(), BaseRelayError> {
+        self.ensure_can_subscribe(&subscription_id, &filters)?;
+        self.subscriptions
+            .insert(subscription_id, LiveSubscription { filters });
+        Ok(())
+    }
+
+    pub(crate) fn ensure_can_subscribe(
+        &self,
+        subscription_id: &SubscriptionId,
+        filters: &[Filter],
     ) -> Result<(), BaseRelayError> {
         if filters.is_empty() {
             return Err(BaseRelayError::invalid(
                 "subscription must include at least one filter",
             ));
         }
-        if !self.subscriptions.contains_key(&subscription_id)
+        if !self.subscriptions.contains_key(subscription_id)
             && self.subscriptions.len() >= self.max_subscriptions
         {
             return Err(BaseRelayError::invalid(
                 "connection subscription limit exceeded",
             ));
         }
-        self.subscriptions
-            .insert(subscription_id, LiveSubscription { filters, auth });
         Ok(())
     }
 
@@ -78,6 +85,7 @@ impl LiveSubscriptionSet {
     pub(crate) fn fanout(
         &mut self,
         event: &Event,
+        auth: &GroupAuthContext,
         visible_to_auth: impl Fn(&Event, &GroupAuthContext) -> bool,
     ) -> Vec<RelayMessage> {
         let matched = self
@@ -91,7 +99,7 @@ impl LiveSubscriptionSet {
                 {
                     return None;
                 }
-                if visible_to_auth(event, &subscription.auth) {
+                if visible_to_auth(event, auth) {
                     Some(subscription_id.clone())
                 } else {
                     None
@@ -134,7 +142,6 @@ mod tests {
             .subscribe(
                 subscription_id.clone(),
                 vec![filter_from_value(&serde_json::json!({"kinds":[1]})).expect("filter")],
-                GroupAuthContext::unauthenticated(),
             )
             .expect("subscribe");
         let first = tangle_v2_event(FixtureKey::Member, 1_714_124_433, 1, Vec::new(), "first")
@@ -145,17 +152,23 @@ mod tests {
             .expect("third");
 
         assert!(matches!(
-            subscriptions.fanout(&first, |_, _| true).as_slice(),
+            subscriptions
+                .fanout(&first, &GroupAuthContext::unauthenticated(), |_, _| true)
+                .as_slice(),
             [RelayMessage::Event { subscription_id: delivered, event }]
                 if delivered == &subscription_id && event.id() == first.id()
         ));
         assert!(matches!(
-            subscriptions.fanout(&second, |_, _| true).as_slice(),
+            subscriptions
+                .fanout(&second, &GroupAuthContext::unauthenticated(), |_, _| true)
+                .as_slice(),
             [RelayMessage::Event { subscription_id: delivered, event }]
                 if delivered == &subscription_id && event.id() == second.id()
         ));
         assert!(matches!(
-            subscriptions.fanout(&third, |_, _| true).as_slice(),
+            subscriptions
+                .fanout(&third, &GroupAuthContext::unauthenticated(), |_, _| true)
+                .as_slice(),
             [RelayMessage::Event { subscription_id: delivered, event }]
                 if delivered == &subscription_id && event.id() == third.id()
         ));
