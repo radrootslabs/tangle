@@ -147,6 +147,7 @@ impl BenchmarkReportArgs {
         if let Some(evidence) = target_hardware_evidence {
             profile = profile.with_target_hardware_evidence(evidence)?;
         }
+        profile.validate_for_run()?;
         Ok(Some(Self {
             output_root,
             run_id,
@@ -214,7 +215,7 @@ fn path_string(path: &Path) -> String {
 
 fn help_text() -> String {
     [
-        "usage: tangle-benchmark-report [--output-root PATH] [--run-id ID] [--profile smoke|medium|large-smoke]",
+        "usage: tangle-benchmark-report [--output-root PATH] [--run-id ID] [--profile smoke|medium|large-smoke|proof-10m|proof-large-group|proof-join-storm|proof-slow-client]",
         "       [--thresholds-json PATH] [--target-hardware-evidence TEXT]",
         "       [--group-count COUNT] [--public-events-per-group COUNT]",
         "       [--private-events-per-group COUNT] [--public-note-count COUNT]",
@@ -282,6 +283,36 @@ mod tests {
 
         assert_eq!(args.profile.name(), BenchmarkProfileName::LargeSmoke);
         assert!(!args.profile.proof_claim_eligible());
+    }
+
+    #[test]
+    fn benchmark_report_args_require_hardware_evidence_for_proof_profiles() {
+        let error = BenchmarkReportArgs::parse([
+            "--profile".to_owned(),
+            "proof-10m".to_owned(),
+            "--run-id".to_owned(),
+            "unit".to_owned(),
+        ])
+        .expect_err("proof profile requires evidence");
+
+        assert!(error.contains("target hardware evidence is required"));
+    }
+
+    #[test]
+    fn benchmark_report_args_accept_proof_profile_with_hardware_evidence() {
+        let args = BenchmarkReportArgs::parse([
+            "--profile".to_owned(),
+            "proof-10m".to_owned(),
+            "--target-hardware-evidence".to_owned(),
+            "target-hardware:proof-node-001".to_owned(),
+            "--run-id".to_owned(),
+            "unit".to_owned(),
+        ])
+        .expect("parse")
+        .expect("args");
+
+        assert_eq!(args.profile.name(), BenchmarkProfileName::Proof10m);
+        assert!(args.profile.proof_claim_eligible());
     }
 
     #[test]

@@ -74,6 +74,22 @@ impl BenchDatasetConfig {
         Self::new(120, 24, 16, 120, 12)
     }
 
+    pub fn proof_10m() -> Self {
+        Self::new(30_000, 100, 100, 6_670_000, 10)
+    }
+
+    pub fn proof_large_group() -> Self {
+        Self::new(3, 50, 50, 10_000, 100_000)
+    }
+
+    pub fn proof_join_storm() -> Self {
+        Self::new(25_000, 1, 1, 25_000, 40)
+    }
+
+    pub fn proof_slow_client() -> Self {
+        Self::new(50_000, 2, 1, 50_000, 2)
+    }
+
     pub fn validate(self) -> Result<Self, String> {
         if self.group_count < 3 {
             return Err("group-count must be at least 3".to_owned());
@@ -89,6 +105,17 @@ impl BenchDatasetConfig {
         }
         Ok(self)
     }
+
+    pub fn estimated_source_event_count(self) -> u64 {
+        let public_groups = self.group_count.div_ceil(3);
+        let private_and_hidden_groups = self.group_count - public_groups;
+        let total = self.group_count
+            + self.group_count * self.member_count
+            + public_groups * self.public_events_per_group
+            + private_and_hidden_groups * self.private_events_per_group
+            + self.public_note_count;
+        total.try_into().expect("estimated event count fits in u64")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +123,10 @@ pub enum BenchmarkProfileName {
     Smoke,
     Medium,
     LargeSmoke,
+    Proof10m,
+    ProofLargeGroup,
+    ProofJoinStorm,
+    ProofSlowClient,
 }
 
 impl BenchmarkProfileName {
@@ -104,8 +135,12 @@ impl BenchmarkProfileName {
             "smoke" => Ok(Self::Smoke),
             "medium" => Ok(Self::Medium),
             "large-smoke" => Ok(Self::LargeSmoke),
+            "proof-10m" => Ok(Self::Proof10m),
+            "proof-large-group" => Ok(Self::ProofLargeGroup),
+            "proof-join-storm" => Ok(Self::ProofJoinStorm),
+            "proof-slow-client" => Ok(Self::ProofSlowClient),
             _ => Err(format!(
-                "unknown benchmark profile `{value}`; expected smoke, medium, or large-smoke"
+                "unknown benchmark profile `{value}`; expected smoke, medium, large-smoke, proof-10m, proof-large-group, proof-join-storm, or proof-slow-client"
             )),
         }
     }
@@ -115,11 +150,30 @@ impl BenchmarkProfileName {
             Self::Smoke => "smoke",
             Self::Medium => "medium",
             Self::LargeSmoke => "large-smoke",
+            Self::Proof10m => "proof-10m",
+            Self::ProofLargeGroup => "proof-large-group",
+            Self::ProofJoinStorm => "proof-join-storm",
+            Self::ProofSlowClient => "proof-slow-client",
         }
     }
 
-    pub fn all() -> [Self; 3] {
-        [Self::Smoke, Self::Medium, Self::LargeSmoke]
+    pub fn all() -> [Self; 7] {
+        [
+            Self::Smoke,
+            Self::Medium,
+            Self::LargeSmoke,
+            Self::Proof10m,
+            Self::ProofLargeGroup,
+            Self::ProofJoinStorm,
+            Self::ProofSlowClient,
+        ]
+    }
+
+    pub fn is_proof(self) -> bool {
+        matches!(
+            self,
+            Self::Proof10m | Self::ProofLargeGroup | Self::ProofJoinStorm | Self::ProofSlowClient
+        )
     }
 }
 
@@ -138,6 +192,10 @@ impl BenchmarkProfile {
             BenchmarkProfileName::Smoke => Self::smoke(),
             BenchmarkProfileName::Medium => Self::medium(),
             BenchmarkProfileName::LargeSmoke => Self::large_smoke(),
+            BenchmarkProfileName::Proof10m => Self::proof_10m(),
+            BenchmarkProfileName::ProofLargeGroup => Self::proof_large_group(),
+            BenchmarkProfileName::ProofJoinStorm => Self::proof_join_storm(),
+            BenchmarkProfileName::ProofSlowClient => Self::proof_slow_client(),
         }
     }
 
@@ -162,6 +220,38 @@ impl BenchmarkProfile {
             BenchmarkProfileName::LargeSmoke,
             BenchDatasetConfig::large_smoke(),
             BenchmarkThresholds::large_smoke(),
+        )
+    }
+
+    pub fn proof_10m() -> Self {
+        Self::new(
+            BenchmarkProfileName::Proof10m,
+            BenchDatasetConfig::proof_10m(),
+            BenchmarkThresholds::proof_10m(),
+        )
+    }
+
+    pub fn proof_large_group() -> Self {
+        Self::new(
+            BenchmarkProfileName::ProofLargeGroup,
+            BenchDatasetConfig::proof_large_group(),
+            BenchmarkThresholds::proof_large_group(),
+        )
+    }
+
+    pub fn proof_join_storm() -> Self {
+        Self::new(
+            BenchmarkProfileName::ProofJoinStorm,
+            BenchDatasetConfig::proof_join_storm(),
+            BenchmarkThresholds::proof_join_storm(),
+        )
+    }
+
+    pub fn proof_slow_client() -> Self {
+        Self::new(
+            BenchmarkProfileName::ProofSlowClient,
+            BenchDatasetConfig::proof_slow_client(),
+            BenchmarkThresholds::proof_slow_client(),
         )
     }
 
@@ -199,6 +289,20 @@ impl BenchmarkProfile {
         self.target_hardware_evidence.as_deref()
     }
 
+    pub fn requires_target_hardware_evidence(&self) -> bool {
+        self.name.is_proof()
+    }
+
+    pub fn validate_for_run(&self) -> Result<(), String> {
+        if self.requires_target_hardware_evidence() && self.target_hardware_evidence.is_none() {
+            return Err(format!(
+                "target hardware evidence is required for `{}` benchmark profile",
+                self.name.as_str()
+            ));
+        }
+        Ok(())
+    }
+
     pub fn with_dataset_config(mut self, config: BenchDatasetConfig) -> Result<Self, String> {
         self.dataset_config = config.validate()?;
         Ok(self)
@@ -231,7 +335,7 @@ impl BenchmarkProfile {
     }
 
     pub fn proof_claim_eligible(&self) -> bool {
-        false
+        self.name.is_proof() && self.target_hardware_evidence.is_some()
     }
 }
 
@@ -643,6 +747,54 @@ impl BenchmarkThresholds {
         }
     }
 
+    pub fn proof_10m() -> Self {
+        Self {
+            pocket_query_p95_micros: 10_000_000,
+            read_gate_p95_micros: 10_000_000,
+            count_resource_controls_p95_micros: 10_000_000,
+            projection_rebuild_elapsed_micros: 300_000_000,
+            outbox_replay_elapsed_micros: 300_000_000,
+            broadcast_lag_p95_micros: 10_000_000,
+            memory_profile_max_bytes: 16 * 1024 * 1024 * 1024,
+        }
+    }
+
+    pub fn proof_large_group() -> Self {
+        Self {
+            pocket_query_p95_micros: 10_000_000,
+            read_gate_p95_micros: 10_000_000,
+            count_resource_controls_p95_micros: 10_000_000,
+            projection_rebuild_elapsed_micros: 300_000_000,
+            outbox_replay_elapsed_micros: 300_000_000,
+            broadcast_lag_p95_micros: 10_000_000,
+            memory_profile_max_bytes: 16 * 1024 * 1024 * 1024,
+        }
+    }
+
+    pub fn proof_join_storm() -> Self {
+        Self {
+            pocket_query_p95_micros: 10_000_000,
+            read_gate_p95_micros: 10_000_000,
+            count_resource_controls_p95_micros: 10_000_000,
+            projection_rebuild_elapsed_micros: 300_000_000,
+            outbox_replay_elapsed_micros: 300_000_000,
+            broadcast_lag_p95_micros: 10_000_000,
+            memory_profile_max_bytes: 16 * 1024 * 1024 * 1024,
+        }
+    }
+
+    pub fn proof_slow_client() -> Self {
+        Self {
+            pocket_query_p95_micros: 10_000_000,
+            read_gate_p95_micros: 10_000_000,
+            count_resource_controls_p95_micros: 10_000_000,
+            projection_rebuild_elapsed_micros: 300_000_000,
+            outbox_replay_elapsed_micros: 300_000_000,
+            broadcast_lag_p95_micros: 10_000_000,
+            memory_profile_max_bytes: 16 * 1024 * 1024 * 1024,
+        }
+    }
+
     pub fn from_json_str(raw: &str) -> Result<Self, String> {
         let value = serde_json::from_str::<serde_json::Value>(raw)
             .map_err(|error| format!("benchmark thresholds JSON is invalid: {error}"))?;
@@ -728,6 +880,7 @@ pub struct BenchmarkRunReport {
 
 impl BenchmarkRunReport {
     pub fn run(profile: BenchmarkProfile) -> Result<Self, String> {
+        profile.validate_for_run()?;
         let dataset = BenchDataset::generate(profile.dataset_config())?;
         let thresholds = profile.thresholds();
         let pocket_query = run_pocket_query_benchmark(&dataset)?;
@@ -1878,7 +2031,15 @@ mod tests {
                 .iter()
                 .map(|profile| profile.as_str())
                 .collect::<Vec<_>>(),
-            vec!["smoke", "medium", "large-smoke"]
+            vec![
+                "smoke",
+                "medium",
+                "large-smoke",
+                "proof-10m",
+                "proof-large-group",
+                "proof-join-storm",
+                "proof-slow-client"
+            ]
         );
         assert_eq!(
             BenchmarkProfileName::parse("smoke")
@@ -1916,6 +2077,51 @@ mod tests {
             BenchmarkProfile::large_smoke().dataset_config(),
             BenchDatasetConfig::large_smoke()
         );
+        assert_eq!(
+            BenchmarkProfile::proof_10m().dataset_config(),
+            BenchDatasetConfig::proof_10m()
+        );
+        assert_eq!(
+            BenchmarkProfile::proof_large_group().dataset_config(),
+            BenchDatasetConfig::proof_large_group()
+        );
+        assert_eq!(
+            BenchmarkProfile::proof_join_storm().dataset_config(),
+            BenchDatasetConfig::proof_join_storm()
+        );
+        assert_eq!(
+            BenchmarkProfile::proof_slow_client().dataset_config(),
+            BenchDatasetConfig::proof_slow_client()
+        );
+    }
+
+    #[test]
+    fn proof_profile_dataset_definitions_are_hardware_scale_without_materialization() {
+        assert_eq!(
+            BenchDatasetConfig::proof_10m().estimated_source_event_count(),
+            10_000_000
+        );
+        assert_eq!(
+            BenchDatasetConfig::proof_large_group().member_count,
+            100_000
+        );
+        assert_eq!(
+            BenchDatasetConfig::proof_join_storm().group_count
+                * BenchDatasetConfig::proof_join_storm().member_count,
+            1_000_000
+        );
+        assert_eq!(BenchDatasetConfig::proof_slow_client().group_count, 50_000);
+        for profile in [
+            BenchmarkProfile::proof_10m(),
+            BenchmarkProfile::proof_large_group(),
+            BenchmarkProfile::proof_join_storm(),
+            BenchmarkProfile::proof_slow_client(),
+        ] {
+            assert!(profile.requires_target_hardware_evidence());
+            assert!(profile.validate_for_run().is_err());
+            assert!(!profile.proof_claim_eligible());
+            assert!(profile.dataset_config().validate().is_ok());
+        }
     }
 
     #[test]
@@ -1986,6 +2192,21 @@ mod tests {
                 .expect("evidence")
                 .proof_claim_eligible()
         );
+        assert!(!BenchmarkProfile::proof_10m().proof_claim_eligible());
+        assert!(
+            BenchmarkProfile::proof_10m()
+                .with_target_hardware_evidence("target-hardware:proof-node-001")
+                .expect("evidence")
+                .proof_claim_eligible()
+        );
+    }
+
+    #[test]
+    fn proof_profile_runs_fail_closed_without_hardware_evidence() {
+        let error = BenchmarkRunReport::run(BenchmarkProfile::proof_10m())
+            .expect_err("proof profile requires evidence");
+
+        assert!(error.contains("target hardware evidence is required"));
     }
 
     #[test]
