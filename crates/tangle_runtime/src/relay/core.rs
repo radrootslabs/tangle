@@ -1,5 +1,7 @@
 use crate::errors::{BaseRelayError, ok_accepted, ok_rejected};
-use crate::groups::{GroupProjectionReadGuard, GroupServiceHandle};
+use crate::groups::{
+    GroupEventWrite, GroupEventWriteError, GroupProjectionReadGuard, GroupServiceHandle,
+};
 use crate::logging::{self, TangleModerationAuditResult};
 use crate::ops::BaseRelayReadinessState;
 use crate::pocket_conversion::{
@@ -820,22 +822,42 @@ impl BaseRelay {
                     "blocked: NIP-29 group events are not accepted before group service".to_owned(),
                 )));
             };
-            if let Err(error) = groups.check_event(store, &event, &class, auth) {
-                logging::log_group_moderation_audit(
-                    &event,
-                    &class,
-                    TangleModerationAuditResult::Rejected,
-                );
-                return Ok(BaseRelayEventWrite::unstored(ok_rejected(
-                    event_id,
-                    error.prefixed_message(),
-                )));
+            match groups.store_group_event(store, &event, &class, auth) {
+                Ok(GroupEventWrite::Stored(stored_offsets)) => {
+                    logging::log_group_moderation_audit(
+                        &event,
+                        &class,
+                        TangleModerationAuditResult::Accepted,
+                    );
+                    return Ok(BaseRelayEventWrite::stored(
+                        ok_accepted(event_id, String::new()),
+                        stored_offsets,
+                    ));
+                }
+                Ok(GroupEventWrite::Duplicate) => {
+                    logging::log_group_moderation_audit(
+                        &event,
+                        &class,
+                        TangleModerationAuditResult::Accepted,
+                    );
+                    return Ok(BaseRelayEventWrite::unstored(ok_accepted(
+                        event_id,
+                        "duplicate: already have this event".to_owned(),
+                    )));
+                }
+                Err(GroupEventWriteError::Rejected(error)) => {
+                    logging::log_group_moderation_audit(
+                        &event,
+                        &class,
+                        TangleModerationAuditResult::Rejected,
+                    );
+                    return Ok(BaseRelayEventWrite::unstored(ok_rejected(
+                        event_id,
+                        error.prefixed_message(),
+                    )));
+                }
+                Err(GroupEventWriteError::Storage(error)) => return Err(error),
             }
-            logging::log_group_moderation_audit(
-                &event,
-                &class,
-                TangleModerationAuditResult::Accepted,
-            );
         }
         if event.unsigned().kind().is_ephemeral() {
             return Ok(BaseRelayEventWrite::unstored(ok_accepted(
@@ -851,20 +873,9 @@ impl BaseRelay {
         }
         let pocket_event = tangle_event_to_pocket(&event)?;
         let store_offset = StoreOffset::new(store.store_event(&pocket_event)?);
-        let mut stored_offsets = vec![store_offset];
-        if !matches!(class, GroupEventClass::NonGroup)
-            && let Some(groups) = groups
-        {
-            stored_offsets.extend(groups.after_source_event_stored(
-                store,
-                &event,
-                &class,
-                store_offset,
-            )?);
-        }
         Ok(BaseRelayEventWrite::stored(
             ok_accepted(event_id, String::new()),
-            stored_offsets,
+            vec![store_offset],
         ))
     }
 
@@ -1963,6 +1974,18 @@ mod tests {
             &ephemeral,
         );
         assert_eq!(count_kind(&relay, 20_001), 0);
+    }
+
+    #[test]
+    fn group_write_source_uses_atomic_service_boundary() {
+        let core_source = include_str!("core.rs");
+        let group_source = include_str!("../groups.rs");
+
+        assert!(core_source.contains("groups.store_group_event"));
+        assert!(!core_source.contains(concat!("groups.", "check_event")));
+        assert!(!core_source.contains(concat!("groups.", "after_source_event_stored")));
+        assert!(!group_source.contains("pub(crate) fn check_event("));
+        assert!(!group_source.contains("pub(crate) fn after_source_event_stored("));
     }
 
     #[test]

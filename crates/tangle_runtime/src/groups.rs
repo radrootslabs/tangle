@@ -34,6 +34,22 @@ pub(crate) struct GroupServiceHandle {
     state: Arc<RwLock<GroupServiceState>>,
 }
 
+pub(crate) enum GroupEventWrite {
+    Stored(Vec<StoreOffset>),
+    Duplicate,
+}
+
+pub(crate) enum GroupEventWriteError {
+    Rejected(GroupError),
+    Storage(BaseRelayError),
+}
+
+impl From<BaseRelayError> for GroupEventWriteError {
+    fn from(error: BaseRelayError) -> Self {
+        Self::Storage(error)
+    }
+}
+
 pub struct GroupProjectionReadGuard<'a> {
     state: RwLockReadGuard<'a, GroupServiceState>,
 }
@@ -92,19 +108,6 @@ impl GroupServiceHandle {
             .outbox_pending_events()
     }
 
-    pub(crate) fn check_event(
-        &self,
-        store: &PocketStoreHandle,
-        event: &Event,
-        class: &GroupEventClass,
-        auth: &GroupAuthContext,
-    ) -> Result<(), GroupError> {
-        self.state
-            .read()
-            .map_err(|_| GroupError::internal("group service state lock is poisoned"))?
-            .check_event(store, event, class, auth)
-    }
-
     pub(crate) fn event_visible_to_auth(
         &self,
         event: &(impl GroupEventView + ?Sized),
@@ -116,17 +119,17 @@ impl GroupServiceHandle {
             .event_visible_to_auth(event, auth)
     }
 
-    pub(crate) fn after_source_event_stored(
+    pub(crate) fn store_group_event(
         &self,
         store: &PocketStoreHandle,
         event: &Event,
         class: &GroupEventClass,
-        store_offset: StoreOffset,
-    ) -> Result<Vec<StoreOffset>, BaseRelayError> {
+        auth: &GroupAuthContext,
+    ) -> Result<GroupEventWrite, GroupEventWriteError> {
         self.state
             .write()
             .map_err(|_| BaseRelayError::error("group service state lock is poisoned"))?
-            .after_source_event_stored(store, event, class, store_offset)
+            .store_group_event(store, event, class, auth)
     }
 }
 
@@ -224,6 +227,33 @@ impl GroupServiceState {
             ));
         }
         Ok(())
+    }
+
+    fn store_group_event(
+        &mut self,
+        store: &PocketStoreHandle,
+        event: &Event,
+        class: &GroupEventClass,
+        auth: &GroupAuthContext,
+    ) -> Result<GroupEventWrite, GroupEventWriteError> {
+        self.check_event(store, event, class, auth)
+            .map_err(GroupEventWriteError::Rejected)?;
+        if store
+            .event_by_id(pocket_event_id(event.id())?)
+            .map_err(BaseRelayError::from)?
+            .is_some()
+        {
+            return Ok(GroupEventWrite::Duplicate);
+        }
+        let pocket_event = tangle_event_to_pocket(event)?;
+        let store_offset = StoreOffset::new(
+            store
+                .store_event(&pocket_event)
+                .map_err(BaseRelayError::from)?,
+        );
+        let mut stored_offsets = vec![store_offset];
+        stored_offsets.extend(self.after_source_event_stored(store, event, class, store_offset)?);
+        Ok(GroupEventWrite::Stored(stored_offsets))
     }
 
     fn event_visible_to_auth(
