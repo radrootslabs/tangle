@@ -1681,6 +1681,104 @@ mod tests {
     }
 
     #[test]
+    fn nip01_client_and_relay_message_conformance_vectors_are_exact() {
+        let event_payload = event_json("a", "b", 1, tags_json());
+        let event =
+            parse_event_json(&RawEventJson::new(&event_payload).expect("raw")).expect("event");
+        let subscription_id = SubscriptionId::new("sub-vector").expect("sub");
+        let event_id = EventId::new(&"c".repeat(EventId::HEX_LENGTH)).expect("id");
+        let client_vectors = [
+            (
+                format!("[\"EVENT\",{event_payload}]"),
+                ClientMessage::Event(event.clone()),
+            ),
+            (
+                format!("[\"AUTH\",{event_payload}]"),
+                ClientMessage::Auth(event.clone()),
+            ),
+            (
+                "[\"REQ\",\"sub-vector\",{\"kinds\":[1]}]".to_owned(),
+                ClientMessage::Req {
+                    subscription_id: subscription_id.clone(),
+                    filters: vec![
+                        filter_from_value(&serde_json::json!({"kinds":[1]})).expect("filter"),
+                    ],
+                },
+            ),
+            (
+                "[\"COUNT\",\"sub-vector\",{\"kinds\":[1]}]".to_owned(),
+                ClientMessage::Count {
+                    subscription_id: subscription_id.clone(),
+                    filters: vec![
+                        filter_from_value(&serde_json::json!({"kinds":[1]})).expect("filter"),
+                    ],
+                },
+            ),
+            (
+                "[\"CLOSE\",\"sub-vector\"]".to_owned(),
+                ClientMessage::Close(subscription_id.clone()),
+            ),
+        ];
+        for (raw, expected) in client_vectors {
+            assert_eq!(parse_client_message(&raw), Ok(expected));
+        }
+        let relay_vectors = [
+            (
+                RelayMessage::Event {
+                    subscription_id: subscription_id.clone(),
+                    event: event.clone(),
+                },
+                serde_json::json!(["EVENT", "sub-vector", event_to_value(&event)]),
+            ),
+            (
+                RelayMessage::Ok {
+                    event_id: event_id.clone(),
+                    accepted: true,
+                    message: String::new(),
+                },
+                serde_json::json!(["OK", event_id.as_str(), true, ""]),
+            ),
+            (
+                RelayMessage::Eose(subscription_id.clone()),
+                serde_json::json!(["EOSE", "sub-vector"]),
+            ),
+            (
+                RelayMessage::Closed {
+                    subscription_id: subscription_id.clone(),
+                    message: "unsupported: search filters are not supported".to_owned(),
+                },
+                serde_json::json!([
+                    "CLOSED",
+                    "sub-vector",
+                    "unsupported: search filters are not supported"
+                ]),
+            ),
+            (
+                RelayMessage::Count {
+                    subscription_id: subscription_id.clone(),
+                    count: 3,
+                },
+                serde_json::json!(["COUNT", "sub-vector", {"count": 3}]),
+            ),
+            (
+                RelayMessage::Notice("invalid: bad envelope".to_owned()),
+                serde_json::json!(["NOTICE", "invalid: bad envelope"]),
+            ),
+            (
+                RelayMessage::Auth("challenge".to_owned()),
+                serde_json::json!(["AUTH", "challenge"]),
+            ),
+        ];
+        for (message, expected) in relay_vectors {
+            assert_eq!(relay_message_to_value(&message), expected);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&message.encode()).expect("encoded"),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn protocol_conformance_fixtures_cover_dense_envelopes_and_parser_stress() {
         let event_payload = event_json(
             "a",
@@ -1845,6 +1943,38 @@ mod tests {
             parse_client_message("[\"CLOSE\",1]").expect_err("close sub type"),
             "CLOSE subscription id must be a string"
         );
+    }
+
+    #[test]
+    fn malformed_client_message_corpus_is_rejected_or_parsed_without_panic() {
+        let valid_event = event_json("a", "b", 1, tags_json());
+        let long_sub = "x".repeat(SubscriptionId::MAX_LENGTH + 1);
+        let oversized_kind = u64::from(u32::MAX) + 1;
+        let corpus = [
+            String::new(),
+            "[".to_owned(),
+            "null".to_owned(),
+            "[null]".to_owned(),
+            "[\"EVENT\",null]".to_owned(),
+            format!("[\"EVENT\",{valid_event},{}]", serde_json::json!({})),
+            "[\"REQ\",{},{}]".to_owned(),
+            "[\"REQ\",\"sub\",{\"ids\":[]}]".to_owned(),
+            "[\"REQ\",\"sub\",{\"ids\":[1]}]".to_owned(),
+            "[\"REQ\",\"sub\",{\"#aa\":[\"value\"]}]".to_owned(),
+            format!("[\"REQ\",\"sub\",{{\"kinds\":[{oversized_kind}]}}]"),
+            format!("[\"REQ\",\"{long_sub}\",{{}}]"),
+            "[\"COUNT\",\"sub\",{\"authors\":[\"BAD\"]}]".to_owned(),
+            "[\"COUNT\",\"sub\",{\"unknown\":true}]".to_owned(),
+            "[\"CLOSE\",\"sub\",{}]".to_owned(),
+            "[\"AUTH\",[]]".to_owned(),
+            "[\"NOTICE\",\"not a client command\"]".to_owned(),
+        ];
+        for raw in corpus {
+            std::panic::catch_unwind(|| {
+                let _ = parse_client_message(&raw);
+            })
+            .expect("parser must not panic");
+        }
     }
 
     #[test]
@@ -2297,6 +2427,52 @@ mod tests {
             event.canonical_json(),
             include_str!("../tests/fixtures/canonical_repeated_tags_event.json").trim_end()
         );
+    }
+
+    #[test]
+    fn canonical_event_json_preserves_large_tags_without_shape_drift() {
+        let tags = (0..64)
+            .map(|index| Tag::from_parts("t", &[&format!("topic-{index}")]).expect("tag"))
+            .collect::<Vec<_>>();
+        let event = unsigned_event(tags, "large tag set");
+        let value =
+            serde_json::from_str::<serde_json::Value>(&event.canonical_json()).expect("json");
+
+        assert_eq!(value[0], 0);
+        assert_eq!(value[4].as_array().expect("tags").len(), 64);
+        assert_eq!(value[5], "large tag set");
+    }
+
+    #[test]
+    fn parser_fuzz_style_scalar_corpus_is_total() {
+        let ids = ["0", "a", "f", "g", "A", "00", "ff"];
+        for id_seed in ids {
+            let id = id_seed.repeat(EventId::HEX_LENGTH);
+            let raw = serde_json::json!([
+                "EVENT",
+                {
+                    "id": id,
+                    "pubkey": "1".repeat(PublicKeyHex::HEX_LENGTH),
+                    "created_at": 1_714_124_433_u64,
+                    "kind": 1,
+                    "tags": [["e", "a".repeat(EventId::HEX_LENGTH)]],
+                    "content": "fuzz",
+                    "sig": "2".repeat(SignatureHex::HEX_LENGTH)
+                }
+            ])
+            .to_string();
+            std::panic::catch_unwind(|| {
+                let _ = parse_client_message(&raw);
+            })
+            .expect("event parser must not panic");
+        }
+        for size in [1_usize, 2, 4, 8, 16, 32, 64, 128] {
+            let values = (0..size)
+                .map(|index| serde_json::Value::String(format!("topic-{index}")))
+                .collect::<Vec<_>>();
+            let raw = serde_json::json!(["REQ", "fuzz", {"#t": values}]).to_string();
+            assert!(parse_client_message(&raw).is_ok());
+        }
     }
 
     fn unsigned_event(tags: Vec<Tag>, content: &str) -> UnsignedEvent {

@@ -1632,6 +1632,22 @@ mod tests {
     }
 
     #[test]
+    fn protocol_conversion_for_supported_profile_sizes_is_bounded() {
+        let dataset =
+            BenchDataset::generate(BenchDatasetConfig::new(4, 3, 3, 4, 3)).expect("dataset");
+        let mut total_event_json_bytes = 0_usize;
+        for source in dataset.source_events() {
+            let event_json = tangle_protocol::event_to_value(source.event()).to_string();
+            total_event_json_bytes += event_json.len();
+            assert!(
+                tangle_protocol::parse_client_message(&format!("[\"EVENT\",{event_json}]")).is_ok()
+            );
+        }
+
+        assert!(total_event_json_bytes < 1_000_000);
+    }
+
+    #[test]
     fn benchmark_profiles_are_explicit_and_unknown_profiles_fail_closed() {
         assert_eq!(
             BenchmarkProfileName::all()

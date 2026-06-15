@@ -68,3 +68,31 @@ pub fn open_tangle_runtime_from_config_path(
     let config = load_base_relay_runtime_config(path)?;
     TangleRuntime::open(config).map_err(TangleRuntimeLoadError::OpenRelay)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::pocket_conversion::{pocket_event_to_tangle, tangle_event_to_pocket};
+    use tangle_protocol::{Tag, event_from_value, event_to_value};
+    use tangle_test_support::{FixtureKey, tangle_v2_event};
+
+    #[test]
+    fn pocket_event_conversion_accepts_protocol_event_json_shapes() {
+        let event = tangle_v2_event(
+            FixtureKey::Owner,
+            1_714_124_433,
+            30_402,
+            vec![
+                Tag::from_parts("d", &["market"]).expect("d"),
+                Tag::from_parts("t", &["radroots", "farm"]).expect("t"),
+            ],
+            "json parity",
+        )
+        .expect("event");
+        let parsed = event_from_value(&event_to_value(&event)).expect("parsed");
+        let pocket = tangle_event_to_pocket(&parsed).expect("pocket");
+        let converted = pocket_event_to_tangle(&pocket).expect("converted");
+
+        assert_eq!(parsed, event);
+        assert_eq!(converted, event);
+    }
+}

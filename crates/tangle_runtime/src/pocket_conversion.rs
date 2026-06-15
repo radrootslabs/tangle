@@ -264,4 +264,41 @@ mod tests {
 
         assert!(pocket_filter.event_matches(&pocket_event).expect("match"));
     }
+
+    #[test]
+    fn pocket_filter_conversion_matches_tangle_filter_matching_for_supported_fields() {
+        let event = tangle_v2_event(
+            FixtureKey::Member,
+            1_714_124_433,
+            1,
+            vec![
+                Tag::from_parts("e", &[&"a".repeat(64)]).expect("e"),
+                Tag::from_parts("p", &[FixtureKey::Owner.public_key().as_str()]).expect("p"),
+                Tag::from_parts("t", &["market"]).expect("t"),
+            ],
+            "filter parity",
+        )
+        .expect("event");
+        let pocket_event = tangle_event_to_pocket(&event).expect("event");
+        for value in [
+            serde_json::json!({"ids": [event.id().as_str()]}),
+            serde_json::json!({"authors": [event.unsigned().pubkey().as_str()]}),
+            serde_json::json!({"kinds": [1]}),
+            serde_json::json!({"#e": ["a".repeat(64)]}),
+            serde_json::json!({"#p": [FixtureKey::Owner.public_key().as_str()]}),
+            serde_json::json!({"#t": ["market"]}),
+            serde_json::json!({"since": 1_714_124_400, "until": 1_714_124_500}),
+            serde_json::json!({"limit": 1}),
+            serde_json::json!({"kinds": [2]}),
+            serde_json::json!({"#t": ["other"]}),
+        ] {
+            let filter = filter_from_value(&value).expect("filter");
+            let pocket_filter = tangle_filter_to_pocket(&filter).expect("pocket filter");
+
+            assert_eq!(
+                pocket_filter.event_matches(&pocket_event).expect("match"),
+                filter.matches(&event)
+            );
+        }
+    }
 }
