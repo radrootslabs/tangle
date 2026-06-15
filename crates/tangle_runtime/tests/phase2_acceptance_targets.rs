@@ -1829,6 +1829,117 @@ async fn relay_generated_events_are_stored_projected_and_broadcast_to_websocket_
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn private_relay_generated_events_reach_authorized_websocket_subscribers() {
+    let root = temp_root("acceptance-private-generated-websocket");
+    let _ = std::fs::remove_dir_all(&root);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let runtime = TangleRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let shutdown = runtime.shutdown_signal().clone();
+    let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
+    let mut owner_writer = connect_nostr_socket(address).await;
+    let mut owner_reader = connect_nostr_socket(address).await;
+    let writer_challenge = read_auth_challenge(&mut owner_writer).await;
+    let reader_challenge = read_auth_challenge(&mut owner_reader).await;
+    let auth_created_at = current_unix_timestamp();
+
+    authenticate_client(
+        &mut owner_writer,
+        FixtureKey::Owner,
+        &writer_challenge,
+        auth_created_at,
+    )
+    .await;
+    authenticate_client(
+        &mut owner_reader,
+        FixtureKey::Owner,
+        &reader_challenge,
+        auth_created_at.saturating_add(1),
+    )
+    .await;
+
+    send_client_value(
+        &mut owner_reader,
+        json!([
+            "REQ",
+            "private-generated-live",
+            {"kinds":[KIND_GROUP_METADATA, KIND_GROUP_ADMINS, KIND_GROUP_MEMBERS], "#d":["PrivateGeneratedSocket"]}
+        ]),
+    )
+    .await;
+    assert_eq!(
+        read_relay_value(&mut owner_reader).await,
+        json!(["EOSE", "private-generated-live"])
+    );
+
+    let create = tangle_v2_group_create_event(
+        FixtureKey::Owner,
+        "PrivateGeneratedSocket",
+        1_714_124_470,
+        &["private"],
+    )
+    .expect("create");
+    send_client_value(&mut owner_writer, json!(["EVENT", event_to_value(&create)])).await;
+    assert_ok(read_relay_value(&mut owner_writer).await, &create, true, "");
+    let create_generated_kinds = [
+        relay_event_kind_tag(
+            read_relay_value(&mut owner_reader).await,
+            "private-generated-live",
+            "d",
+            "PrivateGeneratedSocket",
+        ),
+        relay_event_kind_tag(
+            read_relay_value(&mut owner_reader).await,
+            "private-generated-live",
+            "d",
+            "PrivateGeneratedSocket",
+        ),
+    ];
+    assert!(create_generated_kinds.contains(&KIND_GROUP_METADATA));
+    assert!(create_generated_kinds.contains(&KIND_GROUP_ADMINS));
+
+    let put_member = tangle_v2_put_user_event(
+        FixtureKey::Owner,
+        "PrivateGeneratedSocket",
+        FixtureKey::Member,
+        1_714_124_471,
+    )
+    .expect("put member");
+    send_client_value(
+        &mut owner_writer,
+        json!(["EVENT", event_to_value(&put_member)]),
+    )
+    .await;
+    assert_ok(
+        read_relay_value(&mut owner_writer).await,
+        &put_member,
+        true,
+        "",
+    );
+    assert_eq!(
+        relay_event_kind_tag(
+            read_relay_value(&mut owner_reader).await,
+            "private-generated-live",
+            "d",
+            "PrivateGeneratedSocket",
+        ),
+        KIND_GROUP_MEMBERS
+    );
+
+    shutdown.request_shutdown();
+    read_websocket_close(&mut owner_writer).await;
+    read_websocket_close(&mut owner_reader).await;
+    let report = timeout(Duration::from_secs(2), task)
+        .await
+        .expect("shutdown timeout")
+        .expect("task")
+        .expect("serve");
+    assert_eq!(report.listen_addr(), address);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 fn runtime_config(root: &Path, listen_addr: SocketAddr) -> BaseRelayRuntimeConfig {
     parse_base_relay_runtime_config_json(&runtime_config_value(root, listen_addr).to_string())
         .expect("config")

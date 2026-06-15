@@ -1897,8 +1897,8 @@ mod tests {
         time::Duration,
     };
     use tangle_groups::{
-        GroupAuthContext, GroupId, KIND_GROUP_ADMINS, KIND_GROUP_JOIN_REQUEST, KIND_GROUP_METADATA,
-        StoreOffset,
+        GroupAuthContext, GroupId, KIND_GROUP_ADMINS, KIND_GROUP_JOIN_REQUEST, KIND_GROUP_MEMBERS,
+        KIND_GROUP_METADATA, StoreOffset,
     };
     use tangle_protocol::{
         ClientMessage, Kind, RelayMessage, SubscriptionId, Tag, UnixTimestamp, filter_from_value,
@@ -3314,8 +3314,11 @@ mod tests {
             .subscribe(
                 subscription_id.clone(),
                 vec![
-                    filter_from_value(&json!({"kinds":[KIND_GROUP_METADATA, KIND_GROUP_ADMINS]}))
-                        .expect("filter"),
+                    filter_from_value(&json!({
+                        "kinds":[KIND_GROUP_METADATA, KIND_GROUP_ADMINS, KIND_GROUP_MEMBERS],
+                        "#d":["RuntimeFarm"]
+                    }))
+                    .expect("filter"),
                 ],
                 GroupAuthContext::unauthenticated(),
             )
@@ -3358,24 +3361,55 @@ mod tests {
         ];
         assert!(source_offset < generated_offsets[0]);
         assert!(generated_offsets[0] < generated_offsets[1]);
+        let put_member =
+            tangle_v2_put_user_event(FixtureKey::Owner, "RuntimeFarm", FixtureKey::Member, 122)
+                .expect("put member");
+        assert_eq!(
+            handle
+                .handle_client_message(
+                    ClientMessage::Event(put_member.clone()),
+                    &mut auth,
+                    UnixTimestamp::new(122)
+                )
+                .await
+                .expect("put member"),
+            vec![RelayMessage::Ok {
+                event_id: put_member.id().clone(),
+                accepted: true,
+                message: String::new()
+            }]
+        );
+        let put_source_offset = offsets.try_recv().expect("put source offset");
+        let member_generated_offset = offsets.try_recv().expect("member generated offset");
+        assert!(generated_offsets[1] < put_source_offset);
+        assert!(put_source_offset < member_generated_offset);
+        let generated_offsets = [
+            generated_offsets[0],
+            generated_offsets[1],
+            member_generated_offset,
+        ];
+        let mut generated_kinds = BTreeSet::new();
         for offset in generated_offsets {
+            let messages = handle
+                .fanout_event_offset(offset, &mut subscriptions)
+                .await
+                .expect("fanout");
             assert!(matches!(
-                handle
-                    .fanout_event_offset(offset, &mut subscriptions)
-                    .await
-                    .expect("fanout")
-                    .as_slice(),
+                messages.as_slice(),
                 [RelayMessage::Event {
                     subscription_id: delivered,
                     event
                 }] if delivered == &subscription_id
-                    && [KIND_GROUP_METADATA, KIND_GROUP_ADMINS]
-                        .contains(&event.unsigned().kind().as_u32())
+                    && generated_kinds.insert(event.unsigned().kind().as_u32())
             ));
         }
-        assert_eq!(handle.metrics().outbox_replayed_events(), 2);
+        assert_eq!(
+            generated_kinds,
+            BTreeSet::from([KIND_GROUP_METADATA, KIND_GROUP_ADMINS, KIND_GROUP_MEMBERS])
+        );
+        assert_eq!(handle.metrics().outbox_replayed_events(), 3);
         assert_eq!(handle.metrics().outbox_pending_events(), 0);
-        assert_eq!(handle.metrics().event_bus_published_offsets(), 3);
+        assert_eq!(handle.metrics().event_bus_published_offsets(), 5);
         assert_eq!(
             offsets.try_recv().expect_err("only source plus generated"),
             TangleEventReceiveError::Empty

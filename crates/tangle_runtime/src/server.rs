@@ -343,7 +343,11 @@ mod tests {
             json!(["OK", event.id().as_str(), true, ""])
         );
 
-        send_client_value(&mut socket, json!(["COUNT", "count-a", {}])).await;
+        send_client_value(
+            &mut socket,
+            json!(["COUNT", "count-a", {"kinds":[1], "since": 1_714_124_433, "until": 1_714_124_433}]),
+        )
+        .await;
         assert_eq!(
             read_relay_value(&mut socket).await,
             json!(["COUNT", "count-a", {"count": 1}])
