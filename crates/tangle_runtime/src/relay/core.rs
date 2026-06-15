@@ -1654,6 +1654,85 @@ mod tests {
     }
 
     #[test]
+    fn base_relay_event_path_preserves_chorus_parity() {
+        let owner = signer(7).public_key().clone();
+        let relay = test_relay_with_groups(
+            "base-relay-event-chorus-parity",
+            8,
+            &enabled_groups_for_owner(&owner),
+        );
+        let valid = signed_public_event(7, 1, Vec::new(), "valid");
+        let signature_source = signed_public_event(8, 1, Vec::new(), "signature source");
+        let invalid = Event::new(
+            valid.id().clone(),
+            valid.unsigned().clone(),
+            signature_source.sig().clone(),
+        );
+        let ephemeral = signed_public_event(7, 20_001, Vec::new(), "ephemeral");
+        let protected = signed_public_event(
+            7,
+            1,
+            vec![Tag::from_parts("-", &[]).expect("protected")],
+            "protected",
+        );
+        let group_create = signed_group_create_event(7, "ParityFarm");
+        let empty_auth = BaseAuthState::new("wss://relay.radroots.test", 60, 600).expect("auth");
+
+        assert_eq!(
+            rejected_message(relay.handle_event(invalid.clone()).expect("invalid")),
+            "invalid: event signature verification failed"
+        );
+        assert_eq!(count_kind(&relay, 1), 0);
+
+        assert_accepted(relay.handle_event(valid.clone()).expect("valid"), &valid);
+        assert_eq!(count_kind(&relay, 1), 1);
+        assert_eq!(
+            relay.handle_event(valid.clone()).expect("duplicate"),
+            RelayMessage::Ok {
+                event_id: valid.id().clone(),
+                accepted: true,
+                message: "duplicate: already have this event".to_owned()
+            }
+        );
+        assert_eq!(count_kind(&relay, 1), 1);
+
+        assert_accepted(
+            relay.handle_event(ephemeral.clone()).expect("ephemeral"),
+            &ephemeral,
+        );
+        assert_eq!(count_kind(&relay, 20_001), 0);
+
+        assert_eq!(
+            rejected_message(relay.handle_event(protected.clone()).expect("protected")),
+            "auth-required: protected event requires authenticated event author"
+        );
+        assert_eq!(
+            rejected_message(
+                relay
+                    .handle_event_with_auth(group_create.clone(), &empty_auth)
+                    .expect("group unauth")
+            ),
+            "auth-required: group event author must authenticate with AUTH"
+        );
+        assert_eq!(count_kind(&relay, KIND_GROUP_CREATE_GROUP), 0);
+
+        assert_accepted(
+            relay
+                .handle_event_with_auth(group_create.clone(), &authenticated_state(7))
+                .expect("group auth"),
+            &group_create,
+        );
+        assert_eq!(count_kind(&relay, KIND_GROUP_CREATE_GROUP), 1);
+        assert!(
+            relay
+                .group_projection()
+                .expect("projection")
+                .group(&GroupId::new("ParityFarm").expect("group"))
+                .is_some()
+        );
+    }
+
+    #[test]
     fn base_relay_enforces_nip70_protected_event_author_auth() {
         let relay = test_relay("base-relay-nip70-protected", 8);
         let protected = signed_public_event(
