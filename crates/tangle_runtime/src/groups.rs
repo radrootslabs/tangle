@@ -25,8 +25,8 @@ use tangle_groups::{
 };
 use tangle_protocol::{Event, EventId, PublicKeyHex, UnixTimestamp};
 use tangle_store_pocket::{
-    PocketEvent, PocketStoreHandle, TANGLE_GROUP_CHECKPOINT_TABLE, TANGLE_GROUP_OUTBOX_TABLE,
-    TANGLE_GROUP_PROJECTION_TABLE,
+    PocketEvent, PocketOwnedEvent, PocketStoreHandle, TANGLE_GROUP_CHECKPOINT_TABLE,
+    TANGLE_GROUP_OUTBOX_TABLE, TANGLE_GROUP_PROJECTION_TABLE,
 };
 
 #[derive(Clone)]
@@ -42,6 +42,33 @@ pub(crate) enum GroupEventWrite {
 pub(crate) enum GroupEventWriteError {
     Rejected(GroupError),
     Storage(BaseRelayError),
+}
+
+struct GeneratedGroupStorageEvent {
+    event: Event,
+    pocket_event: PocketOwnedEvent,
+}
+
+impl GeneratedGroupStorageEvent {
+    fn build(
+        builder: &GroupGeneratedEventBuilder,
+        payload: &GroupOutboxPayload,
+    ) -> Result<Self, BaseRelayError> {
+        let event = builder.sign_payload(payload)?;
+        let pocket_event = tangle_event_to_pocket(&event)?;
+        Ok(Self {
+            event,
+            pocket_event,
+        })
+    }
+
+    fn event(&self) -> &Event {
+        &self.event
+    }
+
+    fn pocket_event(&self) -> &PocketEvent {
+        &self.pocket_event
+    }
 }
 
 impl From<BaseRelayError> for GroupEventWriteError {
@@ -494,16 +521,15 @@ impl GroupServiceState {
         store: &PocketStoreHandle,
         record: &GroupOutboxRecord,
     ) -> Result<(EventId, Option<StoreOffset>), BaseRelayError> {
-        let event = self.builder.sign_payload(record.payload())?;
-        if generated_event_already_stored(store, event.id())? {
-            return Ok((event.id().clone(), None));
+        let generated = GeneratedGroupStorageEvent::build(&self.builder, record.payload())?;
+        if generated_event_already_stored(store, generated.event().id())? {
+            return Ok((generated.event().id().clone(), None));
         }
-        let pocket_event = tangle_event_to_pocket(&event)?;
-        let offset = StoreOffset::new(store.store_event(&pocket_event)?);
+        let offset = StoreOffset::new(store.store_event(generated.pocket_event())?);
         self.projection
-            .apply_canonical_event(&event, offset, self.limits)?;
+            .apply_canonical_event(generated.event(), offset, self.limits)?;
         self.persist_group_projection(store, record.key().group_id())?;
-        Ok((event.id().clone(), Some(offset)))
+        Ok((generated.event().id().clone(), Some(offset)))
     }
 
     fn persist_group_projection(
@@ -1212,22 +1238,62 @@ fn delete_target_event_id(event: &(impl GroupEventView + ?Sized)) -> Result<Even
 #[cfg(test)]
 mod tests {
     use super::{
-        GroupCheckpointStatus, GroupServiceHandle, scan_canonical_group_events,
-        scan_canonical_group_events_after, validate_group_extra_tables,
+        GeneratedGroupStorageEvent, GroupCheckpointStatus, GroupServiceHandle,
+        scan_canonical_group_events, scan_canonical_group_events_after,
+        validate_group_extra_tables,
     };
     use crate::pocket_conversion::tangle_event_to_pocket;
+    use crate::pocket_event_validation::verify_pocket_event_signature;
+    use tangle_crypto::RelaySigner;
     use tangle_groups::{
-        GroupRuntimeConfig, KIND_GROUP_METADATA, ProjectionCheckpoint, StoreOffset,
-        projection_checkpoint_key,
+        GroupGeneratedEventBuilder, GroupId, GroupRuntimeConfig, KIND_GROUP_METADATA,
+        KIND_GROUP_PUT_USER, ProjectionCheckpoint, StoreOffset, projection_checkpoint_key,
     };
     use tangle_protocol::{Tag, UnixTimestamp};
     use tangle_store_pocket::{
-        PocketStoreConfig, PocketStoreHandle, PocketSyncPolicy, TANGLE_GROUP_CHECKPOINT_TABLE,
-        TANGLE_GROUP_PROJECTION_TABLE,
+        PocketEvent, PocketStoreConfig, PocketStoreHandle, PocketSyncPolicy,
+        TANGLE_GROUP_CHECKPOINT_TABLE, TANGLE_GROUP_PROJECTION_TABLE,
     };
     use tangle_test_support::{
         FixtureKey, tangle_v2_event, tangle_v2_group_create_event, tangle_v2_group_event,
     };
+
+    #[test]
+    fn generated_group_storage_event_adapter_preserves_pocket_id_signature_and_tags() {
+        let builder = GroupGeneratedEventBuilder::new(
+            RelaySigner::from_secret_hex(&"7".repeat(64)).expect("key"),
+        );
+        let group_id = GroupId::new("PocketFarm").expect("group");
+        let member = FixtureKey::Member.public_key();
+        let payload = GroupGeneratedEventBuilder::join_accepted_payload(
+            &group_id,
+            &member,
+            UnixTimestamp::new(1_714_124_433),
+        );
+        let generated = GeneratedGroupStorageEvent::build(&builder, &payload).expect("generated");
+
+        assert_eq!(
+            generated.pocket_event().id().as_hex_string(),
+            generated.event().id().as_str()
+        );
+        assert_eq!(
+            generated.pocket_event().pubkey().as_hex_string(),
+            generated.event().unsigned().pubkey().as_str()
+        );
+        assert_eq!(
+            u32::from(generated.pocket_event().kind().as_u16()),
+            KIND_GROUP_PUT_USER
+        );
+        assert!(has_pocket_tag(
+            generated.pocket_event(),
+            &["h", "PocketFarm"]
+        ));
+        assert!(has_pocket_tag(
+            generated.pocket_event(),
+            &["p", member.as_str()]
+        ));
+        verify_pocket_event_signature(generated.pocket_event()).expect("signature");
+    }
 
     #[test]
     fn group_service_from_disabled_config_is_absent() {
@@ -1413,5 +1479,12 @@ mod tests {
             .expect("config");
         let store = PocketStoreHandle::open(&config).expect("store");
         (root, store)
+    }
+
+    fn has_pocket_tag(event: &PocketEvent, expected: &[&str]) -> bool {
+        event.tags().expect("tags").iter().any(|tag| {
+            tag.map(|value| std::str::from_utf8(value).expect("utf8"))
+                .eq(expected.iter().copied())
+        })
     }
 }
