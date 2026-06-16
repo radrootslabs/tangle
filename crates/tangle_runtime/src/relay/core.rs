@@ -6,7 +6,7 @@ use crate::logging::{self, TangleModerationAuditResult};
 use crate::ops::BaseRelayReadinessState;
 #[cfg(test)]
 use crate::pocket_conversion::{pocket_event_id, tangle_event_to_pocket};
-use crate::pocket_conversion::{pocket_event_to_tangle, pocket_pubkey, tangle_filter_to_pocket};
+use crate::pocket_conversion::{pocket_event_to_tangle, tangle_filter_to_pocket};
 use crate::pocket_event_validation::{
     is_pocket_nip70_protected_event, pocket_event_id as pocket_runtime_event_id, pocket_event_kind,
     pocket_event_pubkey, validate_pocket_event_shape, verify_pocket_event_signature,
@@ -14,6 +14,7 @@ use crate::pocket_event_validation::{
 use crate::relay::{
     auth::BaseAuthState,
     live::{CloseResult, LiveSubscriptionSet},
+    outbound::{RuntimeRelayMessage, protocol_messages},
 };
 use std::{
     cell::{Cell, RefCell},
@@ -29,8 +30,8 @@ use tangle_groups::{
 use tangle_protocol::ClientMessage;
 use tangle_protocol::{Event, Filter, RelayMessage, SubscriptionId, UnixTimestamp};
 use tangle_store_pocket::{
-    PocketEvent, PocketHll8, PocketQueryConfig, PocketScreenResult, PocketStoreConfig,
-    PocketStoreHandle,
+    PocketEvent, PocketHll8, PocketOwnedEvent, PocketQueryConfig, PocketScreenResult,
+    PocketStoreConfig, PocketStoreHandle,
 };
 
 pub(crate) const NEGENTROPY_DISABLED_MESSAGE: &str = "blocked: Negentropy sync is disabled";
@@ -76,14 +77,14 @@ impl BaseRelayEventWrite {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BaseRelayQueryReport {
-    messages: Vec<RelayMessage>,
+    messages: Vec<RuntimeRelayMessage>,
     group_read_denied: bool,
     query_metrics: BaseRelayQueryMetrics,
 }
 
 impl BaseRelayQueryReport {
     fn new(
-        messages: Vec<RelayMessage>,
+        messages: Vec<RuntimeRelayMessage>,
         group_read_denied: bool,
         query_metrics: BaseRelayQueryMetrics,
     ) -> Self {
@@ -102,8 +103,12 @@ impl BaseRelayQueryReport {
         self.query_metrics
     }
 
-    pub(crate) fn into_messages(self) -> Vec<RelayMessage> {
+    pub(crate) fn into_messages(self) -> Vec<RuntimeRelayMessage> {
         self.messages
+    }
+
+    pub(crate) fn into_protocol_messages(self) -> Result<Vec<RelayMessage>, BaseRelayError> {
+        protocol_messages(self.messages)
     }
 }
 
@@ -142,14 +147,14 @@ impl BaseRelayCountReport {
 
 #[derive(Debug, Clone, PartialEq)]
 struct BaseRelayEventQueryReport {
-    events: Vec<Event>,
+    events: Vec<PocketOwnedEvent>,
     group_read_denied: bool,
     query_metrics: BaseRelayQueryMetrics,
 }
 
 impl BaseRelayEventQueryReport {
     fn new(
-        events: Vec<Event>,
+        events: Vec<PocketOwnedEvent>,
         group_read_denied: bool,
         query_metrics: BaseRelayQueryMetrics,
     ) -> Self {
@@ -658,16 +663,17 @@ impl BaseRelay {
         )
     }
 
-    fn event_by_offset(&self, offset: StoreOffset) -> Result<Event, BaseRelayError> {
-        let event = self.store.event_by_offset(offset.as_u64())?;
-        pocket_event_to_tangle(&event)
+    fn event_by_offset(&self, offset: StoreOffset) -> Result<PocketOwnedEvent, BaseRelayError> {
+        self.store
+            .event_by_offset(offset.as_u64())
+            .map_err(BaseRelayError::from)
     }
 
     pub fn event_by_offset_with_auth(
         &self,
         offset: StoreOffset,
         auth: &BaseAuthState,
-    ) -> Result<Option<Event>, BaseRelayError> {
+    ) -> Result<Option<PocketOwnedEvent>, BaseRelayError> {
         let event = self.event_by_offset(offset)?;
         if Self::group_read_gate_visible_to_auth(
             self.groups.as_ref(),
@@ -1184,7 +1190,7 @@ impl BaseRelay {
         auth: &GroupAuthContext,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
         self.handle_req_with_group_auth_report(subscription_id, filters, auth)
-            .map(BaseRelayQueryReport::into_messages)
+            .and_then(BaseRelayQueryReport::into_protocol_messages)
     }
 
     fn handle_req_with_group_auth_report(
@@ -1197,7 +1203,7 @@ impl BaseRelay {
         self.limits.validate_filters(&filters)?;
         if let Some(message) = Self::unsupported_search_closed(&subscription_id, &filters) {
             return Ok(BaseRelayQueryReport::new(
-                vec![message],
+                vec![message.into()],
                 false,
                 BaseRelayQueryMetrics::default(),
             ));
@@ -1245,7 +1251,7 @@ impl BaseRelay {
         limits.validate_filters(&filters)?;
         if let Some(message) = Self::unsupported_search_closed(&subscription_id, &filters) {
             return Ok(BaseRelayQueryReport::new(
-                vec![message],
+                vec![message.into()],
                 false,
                 BaseRelayQueryMetrics::default(),
             ));
@@ -1257,15 +1263,12 @@ impl BaseRelay {
         let mut messages = report
             .events
             .into_iter()
-            .map(|event| RelayMessage::Event {
-                subscription_id: subscription_id.clone(),
-                event,
-            })
+            .map(|event| RuntimeRelayMessage::event(subscription_id.clone(), event))
             .collect::<Vec<_>>();
         if group_read_denied {
-            messages.push(Self::redacted_req_closed(subscription_id, auth));
+            messages.push(Self::redacted_req_closed(subscription_id, auth).into());
         } else {
-            messages.push(RelayMessage::Eose(subscription_id));
+            messages.push(RelayMessage::Eose(subscription_id).into());
         }
         Ok(BaseRelayQueryReport::new(
             messages,
@@ -1419,8 +1422,13 @@ impl BaseRelay {
         filters: &[Filter],
         auth: &GroupAuthContext,
     ) -> Result<Vec<Event>, BaseRelayError> {
-        self.query_events_report(filters, auth)
-            .map(|report| report.events)
+        self.query_events_report(filters, auth).and_then(|report| {
+            report
+                .events
+                .into_iter()
+                .map(|event| pocket_event_to_tangle(&event))
+                .collect()
+        })
     }
 
     fn query_events_report(
@@ -1502,12 +1510,12 @@ impl BaseRelay {
             group_read_denied |= report.group_read_denied;
             query_metrics = query_metrics.add(report.query_metrics);
             for event in report.events {
+                let event: &PocketEvent = &event;
                 if let (Some(hll), Some(offset)) = (&mut hll, hll_offset) {
-                    let pubkey = pocket_pubkey(event.unsigned().pubkey())?;
-                    hll.add_element(pubkey.as_bytes(), offset)
+                    hll.add_element(event.pubkey().as_bytes(), offset)
                         .map_err(|error| BaseRelayError::error(error.to_string()))?;
                 }
-                seen.insert(event.id().clone());
+                seen.insert(event.id());
             }
         }
         let count = u64::try_from(seen.len())
@@ -1577,11 +1585,7 @@ impl BaseRelay {
             return Err(error);
         }
         let group_read_denied = screened.redacted();
-        let events = screened
-            .into_events()
-            .into_iter()
-            .map(|pocket_event| pocket_event_to_tangle(&pocket_event))
-            .collect::<Result<Vec<_>, _>>()?;
+        let events = screened.into_events();
         Ok(BaseRelayEventQueryReport::new(
             events,
             group_read_denied,
@@ -1602,18 +1606,22 @@ impl BaseRelay {
         }
     }
 
-    fn sort_and_dedupe_query_events(mut events: Vec<Event>) -> Vec<Event> {
+    fn sort_and_dedupe_query_events(mut events: Vec<PocketOwnedEvent>) -> Vec<PocketOwnedEvent> {
         events.sort_by(|left, right| {
+            let left: &PocketEvent = left;
+            let right: &PocketEvent = right;
             right
-                .unsigned()
                 .created_at()
-                .cmp(&left.unsigned().created_at())
-                .then_with(|| left.id().cmp(right.id()))
+                .cmp(&left.created_at())
+                .then_with(|| left.id().cmp(&right.id()))
         });
         let mut seen = BTreeSet::new();
         events
             .into_iter()
-            .filter(|event| seen.insert(event.id().clone()))
+            .filter(|event| {
+                let event: &PocketEvent = event;
+                seen.insert(event.id())
+            })
             .collect()
     }
 
@@ -1652,7 +1660,9 @@ mod tests {
         ClientMessage, Event, EventId, Filter, Kind, PublicKeyHex, RelayMessage, SubscriptionId,
         Tag, UnixTimestamp, UnsignedEvent, filter_from_value,
     };
-    use tangle_store_pocket::{PocketQueryConfig, PocketStoreConfig, PocketSyncPolicy};
+    use tangle_store_pocket::{
+        PocketEvent, PocketQueryConfig, PocketStoreConfig, PocketSyncPolicy,
+    };
     #[test]
     fn base_relay_stores_queries_counts_closes_and_fans_out_public_events() {
         let mut relay = test_relay("base-relay-public", 4);
@@ -1849,7 +1859,9 @@ mod tests {
         let pocket = tangle_event_to_pocket(&event).expect("pocket");
         let offset = StoreOffset::new(relay.store.store_event(&pocket).expect("store"));
 
-        assert_eq!(relay.event_by_offset(offset).expect("offset"), event);
+        let found = relay.event_by_offset(offset).expect("offset");
+        let found: &PocketEvent = &found;
+        assert_eq!(found.id().as_hex_string(), event.id().as_str());
     }
 
     #[test]
@@ -3520,7 +3532,8 @@ mod tests {
             .event_by_offset_with_auth(offset, &owner_auth)
             .expect("owner offset")
             .expect("visible");
-        assert_eq!(visible.id(), private_event.id());
+        let visible: &PocketEvent = &visible;
+        assert_eq!(visible.id().as_hex_string(), private_event.id().as_str());
 
         relay
             .handle_event_with_auth(
@@ -3548,7 +3561,8 @@ mod tests {
             .event_by_offset_with_auth(offset, &owner_auth)
             .expect("hidden owner offset")
             .expect("hidden visible");
-        assert_eq!(visible.id(), hidden_event.id());
+        let visible: &PocketEvent = &visible;
+        assert_eq!(visible.id().as_hex_string(), hidden_event.id().as_str());
     }
 
     #[test]

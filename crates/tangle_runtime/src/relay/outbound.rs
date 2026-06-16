@@ -1,0 +1,125 @@
+#![forbid(unsafe_code)]
+
+use crate::{errors::BaseRelayError, pocket_conversion::pocket_event_to_tangle};
+use std::str;
+use tangle_protocol::{RelayMessage, SubscriptionId};
+use tangle_store_pocket::PocketOwnedEvent;
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RuntimeRelayMessage {
+    Event {
+        subscription_id: SubscriptionId,
+        event: PocketOwnedEvent,
+    },
+    Protocol(RelayMessage),
+}
+
+impl RuntimeRelayMessage {
+    pub(crate) fn event(subscription_id: SubscriptionId, event: PocketOwnedEvent) -> Self {
+        Self::Event {
+            subscription_id,
+            event,
+        }
+    }
+
+    pub(crate) fn encode(&self) -> Result<String, BaseRelayError> {
+        match self {
+            Self::Event {
+                subscription_id,
+                event,
+            } => encode_pocket_event_message(subscription_id, event),
+            Self::Protocol(message) => Ok(message.encode()),
+        }
+    }
+
+    pub(crate) fn into_protocol_message(self) -> Result<RelayMessage, BaseRelayError> {
+        match self {
+            Self::Event {
+                subscription_id,
+                event,
+            } => Ok(RelayMessage::Event {
+                subscription_id,
+                event: pocket_event_to_tangle(&event)?,
+            }),
+            Self::Protocol(message) => Ok(message),
+        }
+    }
+}
+
+impl From<RelayMessage> for RuntimeRelayMessage {
+    fn from(message: RelayMessage) -> Self {
+        Self::Protocol(message)
+    }
+}
+
+pub(crate) fn protocol_messages(
+    messages: Vec<RuntimeRelayMessage>,
+) -> Result<Vec<RelayMessage>, BaseRelayError> {
+    messages
+        .into_iter()
+        .map(RuntimeRelayMessage::into_protocol_message)
+        .collect()
+}
+
+fn encode_pocket_event_message(
+    subscription_id: &SubscriptionId,
+    event: &PocketOwnedEvent,
+) -> Result<String, BaseRelayError> {
+    let subscription = serde_json::to_string(subscription_id.as_str()).map_err(|error| {
+        BaseRelayError::error(format!("outbound subscription encode failed: {error}"))
+    })?;
+    let event_json = event.as_json().map_err(|error| {
+        BaseRelayError::error(format!("outbound Pocket event encode failed: {error}"))
+    })?;
+    let event_json = str::from_utf8(&event_json).map_err(|error| {
+        BaseRelayError::error(format!("outbound Pocket event JSON is not UTF-8: {error}"))
+    })?;
+    Ok(format!(r#"["EVENT",{subscription},{event_json}]"#))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RuntimeRelayMessage;
+    use crate::pocket_conversion::tangle_event_to_pocket;
+    use serde_json::json;
+    use tangle_protocol::{RelayMessage, SubscriptionId, event_to_value, relay_message_to_value};
+    use tangle_test_support::{FixtureKey, tangle_v2_event};
+
+    #[test]
+    fn outbound_pocket_event_encoding_preserves_event_fields() {
+        let event = tangle_v2_event(
+            FixtureKey::Member,
+            1_714_124_433,
+            1,
+            vec![tangle_protocol::Tag::from_parts("t", &["market"]).expect("tag")],
+            "fresh carrots",
+        )
+        .expect("event");
+        let pocket = tangle_event_to_pocket(&event).expect("pocket");
+        let subscription_id = SubscriptionId::new("outbound-event").expect("subscription");
+        let encoded = RuntimeRelayMessage::event(subscription_id.clone(), pocket)
+            .encode()
+            .expect("encoded");
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encoded).expect("json"),
+            json!(["EVENT", subscription_id.as_str(), event_to_value(&event)])
+        );
+    }
+
+    #[test]
+    fn outbound_protocol_messages_still_use_protocol_encoder() {
+        let subscription_id = SubscriptionId::new("outbound-eose").expect("subscription");
+        let message = RelayMessage::Eose(subscription_id);
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &RuntimeRelayMessage::from(message.clone())
+                    .encode()
+                    .expect("encoded")
+            )
+            .expect("json"),
+            relay_message_to_value(&message)
+        );
+    }
+}

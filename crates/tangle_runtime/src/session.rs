@@ -10,6 +10,7 @@ use crate::{
         auth::{BaseAuthState, generate_auth_challenge},
         core::BaseRelay,
         live::{CloseResult, LiveSubscriptionSet},
+        outbound::RuntimeRelayMessage,
     },
     runtime::{
         TangleClientMessageMetricKind, TangleClientRateLimitContext, TangleRuntimeHandle,
@@ -205,7 +206,7 @@ impl TangleWebSocketSession {
             .await
         {
             Ok(replies) => replies,
-            Err(error) => vec![RelayMessage::Notice(error.prefixed_message())],
+            Err(error) => vec![RelayMessage::Notice(error.prefixed_message()).into()],
         };
         for reply in replies {
             if let Err(control) = self.enqueue_relay_message(reply) {
@@ -219,9 +220,10 @@ impl TangleWebSocketSession {
         match message {
             Message::Text(raw) => self.dispatch_text(raw.as_str()).await,
             Message::Binary(_) => self
-                .enqueue_relay_message(RelayMessage::Notice(
-                    "invalid: client message must be a text frame".to_owned(),
-                ))
+                .enqueue_relay_message(
+                    RelayMessage::Notice("invalid: client message must be a text frame".to_owned())
+                        .into(),
+                )
                 .map(|_| TangleSessionControl::Continue)
                 .unwrap_or_else(|control| control),
             Message::Ping(_) | Message::Pong(_) => TangleSessionControl::Continue,
@@ -236,25 +238,28 @@ impl TangleWebSocketSession {
                     .issue_challenge(challenge, current_unix_timestamp())
             })
             .unwrap_or_else(|error| RelayMessage::Notice(error.prefixed_message()));
-        self.send_relay_message(message).is_ok()
+        self.send_relay_message(message.into()).is_ok()
     }
 
     async fn dispatch_text(&mut self, raw: &str) -> TangleSessionControl {
         if raw.len() > self.limits.max_message_length() {
             return self
-                .enqueue_relay_message(RelayMessage::Notice(format!(
-                    "invalid: client message length exceeds runtime max_message_length {}",
-                    self.limits.max_message_length()
-                )))
+                .enqueue_relay_message(
+                    RelayMessage::Notice(format!(
+                        "invalid: client message length exceeds runtime max_message_length {}",
+                        self.limits.max_message_length()
+                    ))
+                    .into(),
+                )
                 .map(|_| TangleSessionControl::Continue)
                 .unwrap_or_else(|control| control);
         }
         let replies = match parse_runtime_client_message(raw) {
             Ok(message) => match self.handle_client_message(message).await {
                 Ok(replies) => replies,
-                Err(error) => vec![RelayMessage::Notice(error.prefixed_message())],
+                Err(error) => vec![RelayMessage::Notice(error.prefixed_message()).into()],
             },
-            Err(error) => vec![RelayMessage::Notice(format!("invalid: {error}"))],
+            Err(error) => vec![RelayMessage::Notice(format!("invalid: {error}")).into()],
         };
         for reply in replies {
             if let Err(control) = self.enqueue_relay_message(reply) {
@@ -267,7 +272,7 @@ impl TangleWebSocketSession {
     async fn handle_client_message(
         &mut self,
         message: RuntimeClientMessage,
-    ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+    ) -> Result<Vec<RuntimeRelayMessage>, BaseRelayError> {
         match message {
             RuntimeClientMessage::Req {
                 subscription_id,
@@ -328,7 +333,7 @@ impl TangleWebSocketSession {
         &mut self,
         subscription_id: SubscriptionId,
         filters: Vec<Filter>,
-    ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+    ) -> Result<Vec<RuntimeRelayMessage>, BaseRelayError> {
         let metrics = self.runtime.metrics();
         metrics.record_client_message(TangleClientMessageMetricKind::Req);
         self.limits
@@ -336,7 +341,7 @@ impl TangleWebSocketSession {
             .validate_subscription_id(&subscription_id)?;
         self.limits.base_relay_limits().validate_filters(&filters)?;
         if let Some(message) = BaseRelay::unsupported_search_closed(&subscription_id, &filters) {
-            return Ok(vec![message]);
+            return Ok(vec![message.into()]);
         }
         if let Some(message) = self
             .runtime
@@ -349,7 +354,7 @@ impl TangleWebSocketSession {
             )
             .await
         {
-            return Ok(vec![message]);
+            return Ok(vec![message.into()]);
         }
         let should_subscribe = !filters_are_complete(&filters);
         if should_subscribe {
@@ -375,14 +380,20 @@ impl TangleWebSocketSession {
         TangleClientRateLimitContext::new(self.peer_ip, Some(self.connection_id))
     }
 
-    fn send_relay_message(&self, message: RelayMessage) -> Result<(), TangleOutboundQueueError> {
+    fn send_relay_message(&self, message: RuntimeRelayMessage) -> Result<(), TangleSessionControl> {
+        let text = message
+            .encode()
+            .map_err(|_| TangleSessionControl::Close(outbound_encode_close_message()))?;
         self.outbound
-            .try_send(Message::Text(message.encode().into()))
+            .try_send(Message::Text(text.into()))
+            .map_err(|error| self.outbound_queue_error_control(error))
     }
 
-    fn enqueue_relay_message(&self, message: RelayMessage) -> Result<(), TangleSessionControl> {
+    fn enqueue_relay_message(
+        &self,
+        message: RuntimeRelayMessage,
+    ) -> Result<(), TangleSessionControl> {
         self.send_relay_message(message)
-            .map_err(|error| self.outbound_queue_error_control(error))
     }
 
     fn outbound_queue_error_control(
@@ -431,6 +442,13 @@ fn outbound_queue_full_close_message() -> Message {
     Message::Close(Some(CloseFrame {
         code: 1013,
         reason: Utf8Bytes::from_static("outbound queue full; reconnect required"),
+    }))
+}
+
+fn outbound_encode_close_message() -> Message {
+    Message::Close(Some(CloseFrame {
+        code: 1011,
+        reason: Utf8Bytes::from_static("outbound relay message encode failed"),
     }))
 }
 
@@ -484,10 +502,12 @@ impl TangleWebSocketSession {
         &mut self,
         message: tangle_protocol::ClientMessage,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
-        self.handle_client_message(protocol_client_message_to_runtime_for_session_test(
-            message,
-        )?)
-        .await
+        let messages = self
+            .handle_client_message(protocol_client_message_to_runtime_for_session_test(
+                message,
+            )?)
+            .await?;
+        crate::relay::outbound::protocol_messages(messages)
     }
 }
 

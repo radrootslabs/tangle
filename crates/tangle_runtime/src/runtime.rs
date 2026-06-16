@@ -21,6 +21,7 @@ use crate::{
             BaseRelayQueryMetrics, BaseRelayQueryReport, BaseRelayShutdownReport,
         },
         live::LiveSubscriptionSet,
+        outbound::{RuntimeRelayMessage, protocol_messages},
     },
 };
 use serde::{Deserialize, Serialize};
@@ -40,9 +41,9 @@ use tangle_groups::{
     validate_client_group_event_structure,
 };
 use tangle_protocol::{
-    Event, EventId, Filter, Kind, PublicKeyHex, RelayMessage, SubscriptionId, UnixTimestamp,
+    EventId, Filter, Kind, PublicKeyHex, RelayMessage, SubscriptionId, UnixTimestamp,
 };
-use tangle_store_pocket::{PocketEvent, PocketOwnedFilter, PocketStoreHandle};
+use tangle_store_pocket::{PocketEvent, PocketOwnedEvent, PocketOwnedFilter, PocketStoreHandle};
 use tokio::sync::watch;
 
 pub struct TangleRuntime {
@@ -824,17 +825,19 @@ impl TangleRuntimeHandle {
         auth: &mut BaseAuthState,
         now: UnixTimestamp,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
-        self.handle_client_message_with_rate_limit_context(
-            RuntimeClientMessage::Count {
-                subscription_id,
-                filters,
-                search_present: false,
-            },
-            auth,
-            TangleClientRateLimitContext::default(),
-            now,
-        )
-        .await
+        let messages = self
+            .handle_client_message_with_rate_limit_context(
+                RuntimeClientMessage::Count {
+                    subscription_id,
+                    filters,
+                    search_present: false,
+                },
+                auth,
+                TangleClientRateLimitContext::default(),
+                now,
+            )
+            .await?;
+        protocol_messages(messages)
     }
 
     #[cfg(test)]
@@ -844,13 +847,15 @@ impl TangleRuntimeHandle {
         auth: &mut BaseAuthState,
         now: UnixTimestamp,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
-        self.handle_client_message_with_rate_limit_context(
-            message,
-            auth,
-            TangleClientRateLimitContext::default(),
-            now,
-        )
-        .await
+        let messages = self
+            .handle_client_message_with_rate_limit_context(
+                message,
+                auth,
+                TangleClientRateLimitContext::default(),
+                now,
+            )
+            .await?;
+        protocol_messages(messages)
     }
 
     #[cfg(test)]
@@ -876,13 +881,15 @@ impl TangleRuntimeHandle {
         rate_limit_context: TangleClientRateLimitContext,
         now: UnixTimestamp,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
-        self.handle_client_message_with_rate_limit_context(
-            protocol_client_message_to_runtime_for_test(message)?,
-            auth,
-            rate_limit_context,
-            now,
-        )
-        .await
+        let messages = self
+            .handle_client_message_with_rate_limit_context(
+                protocol_client_message_to_runtime_for_test(message)?,
+                auth,
+                rate_limit_context,
+                now,
+            )
+            .await?;
+        protocol_messages(messages)
     }
 
     pub(crate) async fn handle_client_message_with_rate_limit_context(
@@ -891,7 +898,7 @@ impl TangleRuntimeHandle {
         auth: &mut BaseAuthState,
         rate_limit_context: TangleClientRateLimitContext,
         now: UnixTimestamp,
-    ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+    ) -> Result<Vec<RuntimeRelayMessage>, BaseRelayError> {
         self.inner
             .metrics
             .record_client_message(runtime_client_message_metric_kind(&message));
@@ -905,7 +912,7 @@ impl TangleRuntimeHandle {
                         .rate_limit_event_pocket(&pocket_event, rate_limit_context, now)?
                 {
                     record_event_metrics(&self.inner.metrics, &message, is_group_event, started_at);
-                    return Ok(vec![message]);
+                    return Ok(vec![message.into()]);
                 }
                 if let Some(message) = self.inner.rate_limit_group_write_pocket(
                     &pocket_event,
@@ -913,7 +920,7 @@ impl TangleRuntimeHandle {
                     now,
                 )? {
                     record_event_metrics(&self.inner.metrics, &message, is_group_event, started_at);
-                    return Ok(vec![message]);
+                    return Ok(vec![message.into()]);
                 }
                 let result = self
                     .inner
@@ -942,7 +949,7 @@ impl TangleRuntimeHandle {
                 }
                 let message = result.into_message();
                 record_event_metrics(&self.inner.metrics, &message, is_group_event, started_at);
-                Ok(vec![message])
+                Ok(vec![message.into()])
             }
             RuntimeClientMessage::Req {
                 subscription_id,
@@ -965,7 +972,7 @@ impl TangleRuntimeHandle {
                     self.inner
                         .metrics
                         .record_query_latency(elapsed_micros(started_at));
-                    return Ok(vec![message]);
+                    return Ok(vec![message.into()]);
                 }
                 if let Some(message) = self.inner.rate_limit_req(
                     &subscription_id,
@@ -977,7 +984,7 @@ impl TangleRuntimeHandle {
                     self.inner
                         .metrics
                         .record_query_latency(elapsed_micros(started_at));
-                    return Ok(vec![message]);
+                    return Ok(vec![message.into()]);
                 }
                 let report =
                     self.inner
@@ -1014,13 +1021,13 @@ impl TangleRuntimeHandle {
                     self.inner
                         .metrics
                         .record_query_latency(elapsed_micros(started_at));
-                    return Ok(vec![message]);
+                    return Ok(vec![message.into()]);
                 }
                 if let Some(message) = self.inner.refuse_broad_count(&subscription_id, &filters) {
                     self.inner
                         .metrics
                         .record_query_latency(elapsed_micros(started_at));
-                    return Ok(vec![message]);
+                    return Ok(vec![message.into()]);
                 }
                 if let Some(message) = self.inner.rate_limit_count(
                     &subscription_id,
@@ -1032,7 +1039,7 @@ impl TangleRuntimeHandle {
                     self.inner
                         .metrics
                         .record_query_latency(elapsed_micros(started_at));
-                    return Ok(vec![message]);
+                    return Ok(vec![message.into()]);
                 }
                 let report =
                     self.inner
@@ -1046,7 +1053,7 @@ impl TangleRuntimeHandle {
                 self.inner
                     .metrics
                     .record_query_latency(elapsed_micros(started_at));
-                Ok(vec![report.into_message()])
+                Ok(vec![report.into_message().into()])
             }
             RuntimeClientMessage::Auth(pocket_event) => {
                 let event_id = pocket_event_id(&pocket_event)?;
@@ -1057,11 +1064,11 @@ impl TangleRuntimeHandle {
                     .validate_pocket_event(&pocket_event)
                 {
                     self.inner.metrics.record_auth_failure();
-                    return Ok(vec![RelayMessage::Ok {
+                    return Ok(vec![RuntimeRelayMessage::from(RelayMessage::Ok {
                         event_id,
                         accepted: false,
                         message: error.prefixed_message(),
-                    }]);
+                    })]);
                 }
                 if let Some(message) = self.inner.rate_limit_auth_attempt_pocket(
                     &pocket_event,
@@ -1069,7 +1076,7 @@ impl TangleRuntimeHandle {
                     now,
                 )? {
                     self.inner.metrics.record_auth_failure();
-                    return Ok(vec![message]);
+                    return Ok(vec![message.into()]);
                 }
                 let event_for_failure = pocket_event.clone();
                 let replies = BaseRelay::handle_pocket_auth_with_limits(
@@ -1085,12 +1092,12 @@ impl TangleRuntimeHandle {
                         rate_limit_context,
                         now,
                     )? {
-                        return Ok(vec![message]);
+                        return Ok(vec![message.into()]);
                     }
                 } else {
                     self.inner.metrics.record_auth_success();
                 }
-                Ok(replies)
+                Ok(replies.into_iter().map(Into::into).collect())
             }
             RuntimeClientMessage::Close(subscription_id) => {
                 self.inner
@@ -1109,9 +1116,9 @@ impl TangleRuntimeHandle {
                     .limits
                     .base_relay_limits()
                     .validate_subscription_id(&subscription_id)?;
-                Ok(vec![BaseRelay::disabled_negentropy_message(
-                    subscription_id,
-                )])
+                Ok(vec![
+                    BaseRelay::disabled_negentropy_message(subscription_id).into(),
+                ])
             }
             RuntimeClientMessage::NegClose(subscription_id) => {
                 self.inner
@@ -1170,20 +1177,19 @@ impl TangleRuntimeHandle {
         &self,
         offset: StoreOffset,
         auth: &BaseAuthState,
-    ) -> Result<Option<Event>, BaseRelayError> {
+    ) -> Result<Option<PocketOwnedEvent>, BaseRelayError> {
         let pocket_event = self.inner.store.event_by_offset(offset.as_u64())?;
-        let event = pocket_event_to_tangle(&pocket_event)?;
         let group_auth = GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned());
         let visible = BaseRelay::group_read_gate_visible_to_auth(
             self.inner.groups.as_ref(),
-            &event,
+            &pocket_event,
             &group_auth,
         )?;
         if !visible {
             self.inner.metrics.record_group_read_denial();
             return Ok(None);
         }
-        Ok(Some(event))
+        Ok(Some(pocket_event))
     }
 
     pub(crate) async fn fanout_event_offset(
@@ -1191,14 +1197,23 @@ impl TangleRuntimeHandle {
         offset: StoreOffset,
         subscriptions: &mut LiveSubscriptionSet,
         auth: &BaseAuthState,
-    ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+    ) -> Result<Vec<RuntimeRelayMessage>, BaseRelayError> {
         let pocket_event = self.inner.store.event_by_offset(offset.as_u64())?;
         let event = pocket_event_to_tangle(&pocket_event)?;
         let group_auth = GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned());
-        Ok(subscriptions.fanout(&event, &group_auth, |event, auth| {
+        let messages = subscriptions.fanout(&event, &group_auth, |event, auth| {
             BaseRelay::group_read_gate_visible_to_auth(self.inner.groups.as_ref(), event, auth)
                 .unwrap_or(false)
-        }))
+        });
+        Ok(messages
+            .into_iter()
+            .map(|message| match message {
+                RelayMessage::Event {
+                    subscription_id, ..
+                } => RuntimeRelayMessage::event(subscription_id, pocket_event.clone()),
+                message => message.into(),
+            })
+            .collect())
     }
 
     pub async fn shutdown(&self) -> Result<BaseRelayShutdownReport, BaseRelayError> {
@@ -2084,6 +2099,7 @@ mod tests {
     use crate::relay::auth::BaseAuthState;
     use crate::relay::core::{BaseRelayLimitSettings, BaseRelayLimits, BaseRelayQueryMetrics};
     use crate::relay::live::LiveSubscriptionSet;
+    use crate::relay::outbound::RuntimeRelayMessage;
     use serde_json::json;
     use std::{
         collections::{BTreeMap, BTreeSet},
@@ -2097,8 +2113,8 @@ mod tests {
         MemberStatus, StoreOffset, rebuild_group_projection,
     };
     use tangle_protocol::{
-        ClientMessage, Event, Filter, Kind, PublicKeyHex, RelayMessage, SubscriptionId, Tag,
-        UnixTimestamp, filter_from_value,
+        ClientMessage, Event, EventId, Filter, Kind, PublicKeyHex, RelayMessage, SubscriptionId,
+        Tag, UnixTimestamp, filter_from_value,
     };
     use tangle_test_support::{
         FixtureKey, tangle_v2_auth_event, tangle_v2_delete_group_event, tangle_v2_event,
@@ -2331,10 +2347,10 @@ mod tests {
                 .await
                 .expect("fanout")
                 .as_slice(),
-            [RelayMessage::Event {
+            [RuntimeRelayMessage::Event {
                 subscription_id: delivered,
                 event: found
-            }] if delivered == &subscription_id && found.id() == event.id()
+            }] if delivered == &subscription_id && found.id().as_hex_string() == event.id().as_str()
         ));
 
         assert_eq!(
@@ -3666,11 +3682,11 @@ mod tests {
                 .expect("fanout");
             assert!(matches!(
                 messages.as_slice(),
-                [RelayMessage::Event {
+                [RuntimeRelayMessage::Event {
                     subscription_id: delivered,
                     event
                 }] if delivered == &subscription_id
-                    && generated_kinds.insert(event.unsigned().kind().as_u32())
+                    && generated_kinds.insert(u32::from(event.kind().as_u16()))
             ));
         }
         assert_eq!(
@@ -4313,7 +4329,9 @@ mod tests {
                     .event_by_offset_with_auth(offset, &public_auth)
                     .await
                     .expect("public offset");
-                let is_group_event = group_event_ids.contains(member_event.id());
+                let member_event_id =
+                    EventId::new(&member_event.id().as_hex_string()).expect("pocket id");
+                let is_group_event = group_event_ids.contains(&member_event_id);
                 if is_group_event {
                     assert!(public_event.is_none());
                 } else {
@@ -4359,12 +4377,14 @@ mod tests {
                 .expect("member fanout");
             for reply in member_replies {
                 match reply {
-                    RelayMessage::Event {
+                    RuntimeRelayMessage::Event {
                         subscription_id,
                         event,
                     } => {
                         assert_eq!(subscription_id, member_subscription);
-                        assert!(group_event_ids.contains(event.id()));
+                        let event_id =
+                            EventId::new(&event.id().as_hex_string()).expect("pocket id");
+                        assert!(group_event_ids.contains(&event_id));
                         member_fanout_count += 1;
                     }
                     other => panic!("unexpected fanout reply {other:?}"),
