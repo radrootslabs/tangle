@@ -1633,8 +1633,11 @@ fn runtime_req_handling_does_not_lock_relay_state() {
 
     assert!(!req_branch.contains("relay.lock().await"));
     assert!(!query_helper.contains("relay.lock().await"));
-    assert!(req_branch.contains("query_req_with_auth_report(subscription_id, filters, auth)?"));
-    assert!(query_helper.contains("query_req_with_auth_report(subscription_id, filters, auth)?"));
+    assert!(!req_branch.contains("runtime_filters_to_protocol(filters, search_present)?"));
+    assert!(req_branch.contains("validate_pocket_filters(&filters)?"));
+    assert!(req_branch.contains("rate_limit_req_pocket("));
+    assert!(req_branch.contains("query_req_with_auth_report("));
+    assert!(query_helper.contains("query_req_with_auth_report("));
 }
 
 #[test]

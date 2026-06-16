@@ -32,8 +32,8 @@ use tangle_groups::{
 use tangle_protocol::ClientMessage;
 use tangle_protocol::{Event, Filter, RelayMessage, SubscriptionId, UnixTimestamp};
 use tangle_store_pocket::{
-    PocketEvent, PocketHll8, PocketOwnedEvent, PocketQueryConfig, PocketScreenResult,
-    PocketStoreConfig, PocketStoreHandle,
+    PocketEvent, PocketFilter, PocketHll8, PocketOwnedEvent, PocketOwnedFilter, PocketQueryConfig,
+    PocketScreenResult, PocketStoreConfig, PocketStoreHandle,
 };
 
 pub(crate) const NEGENTROPY_DISABLED_MESSAGE: &str = "blocked: Negentropy sync is disabled";
@@ -82,6 +82,36 @@ pub(crate) struct BaseRelayQueryReport {
     messages: Vec<RuntimeRelayMessage>,
     group_read_denied: bool,
     query_metrics: BaseRelayQueryMetrics,
+}
+
+pub(crate) struct BaseRelayReqQuery<'a> {
+    subscription_id: SubscriptionId,
+    filters: Vec<PocketOwnedFilter>,
+    search_present: bool,
+    auth: &'a BaseAuthState,
+}
+
+impl<'a> BaseRelayReqQuery<'a> {
+    pub(crate) fn new(
+        subscription_id: SubscriptionId,
+        filters: Vec<PocketOwnedFilter>,
+        search_present: bool,
+        auth: &'a BaseAuthState,
+    ) -> Self {
+        Self {
+            subscription_id,
+            filters,
+            search_present,
+            auth,
+        }
+    }
+}
+
+struct BaseRelayGroupReqQuery<'a> {
+    subscription_id: SubscriptionId,
+    filters: Vec<PocketOwnedFilter>,
+    search_present: bool,
+    auth: &'a GroupAuthContext,
 }
 
 impl BaseRelayQueryReport {
@@ -489,14 +519,78 @@ impl BaseRelayLimits {
         Ok(())
     }
 
+    pub(crate) fn validate_pocket_filters(
+        &self,
+        filters: &[PocketOwnedFilter],
+    ) -> Result<(), BaseRelayError> {
+        if filters.is_empty() {
+            return Err(BaseRelayError::invalid(
+                "request must include at least one filter",
+            ));
+        }
+        if filters.len() > self.max_filters_per_request {
+            return Err(BaseRelayError::invalid(format!(
+                "filter count exceeds runtime max_filters_per_request {}",
+                self.max_filters_per_request
+            )));
+        }
+        for filter in filters {
+            let tag_values = filter
+                .tags()
+                .map_err(|error| BaseRelayError::error(error.to_string()))?
+                .iter()
+                .map(|tag| tag.skip(1).count())
+                .sum::<usize>();
+            if tag_values > self.max_tag_values_per_filter {
+                return Err(BaseRelayError::invalid(format!(
+                    "filter tag value count exceeds runtime max_tag_values_per_filter {}",
+                    self.max_tag_values_per_filter
+                )));
+            }
+            if filter.limit() != u32::MAX && u64::from(filter.limit()) > self.max_limit {
+                return Err(BaseRelayError::invalid(format!(
+                    "filter limit exceeds runtime max_limit {}",
+                    self.max_limit
+                )));
+            }
+        }
+        self.validate_pocket_query_complexity(filters)?;
+        Ok(())
+    }
+
     fn effective_filter_limit(self, filter: &Filter) -> usize {
         usize::try_from(filter.limit().unwrap_or(self.default_limit)).unwrap_or(usize::MAX)
+    }
+
+    fn effective_pocket_filter_limit(self, filter: &PocketFilter) -> usize {
+        if filter.limit() == u32::MAX {
+            usize::try_from(self.default_limit).unwrap_or(usize::MAX)
+        } else {
+            usize::try_from(filter.limit()).unwrap_or(usize::MAX)
+        }
     }
 
     fn validate_query_complexity(&self, filters: &[Filter]) -> Result<(), BaseRelayError> {
         let score = filters
             .iter()
             .map(|filter| self.filter_complexity(filter))
+            .fold(0_usize, usize::saturating_add);
+        if score > self.max_query_complexity {
+            return Err(BaseRelayError::invalid(format!(
+                "query complexity {score} exceeds runtime max_query_complexity {}",
+                self.max_query_complexity
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_pocket_query_complexity(
+        &self,
+        filters: &[PocketOwnedFilter],
+    ) -> Result<(), BaseRelayError> {
+        let score = filters
+            .iter()
+            .map(|filter| self.pocket_filter_complexity(filter))
             .fold(0_usize, usize::saturating_add);
         if score > self.max_query_complexity {
             return Err(BaseRelayError::invalid(format!(
@@ -523,6 +617,29 @@ impl BaseRelayLimits {
             .saturating_add(filter.search().map(str::len).unwrap_or(0))
             .saturating_add(self.effective_filter_limit(filter))
     }
+
+    fn pocket_filter_complexity(&self, filter: &PocketFilter) -> usize {
+        let tag_score = filter
+            .tags()
+            .map(|tags| {
+                tags.iter()
+                    .map(|tag| 1_usize.saturating_add(tag.skip(1).count()))
+                    .fold(0_usize, usize::saturating_add)
+            })
+            .unwrap_or(usize::MAX);
+        1_usize
+            .saturating_add(filter.num_ids())
+            .saturating_add(filter.num_authors())
+            .saturating_add(filter.num_kinds())
+            .saturating_add(tag_score)
+            .saturating_add(usize::from(
+                filter.since() != tangle_store_pocket::PocketTime::min(),
+            ))
+            .saturating_add(usize::from(
+                filter.until() != tangle_store_pocket::PocketTime::max(),
+            ))
+            .saturating_add(self.effective_pocket_filter_limit(filter))
+    }
 }
 
 impl BaseRelay {
@@ -537,6 +654,16 @@ impl BaseRelay {
                 subscription_id: subscription_id.clone(),
                 message: "unsupported: search filters are not supported".to_owned(),
             })
+    }
+
+    pub(crate) fn unsupported_search_present_closed(
+        subscription_id: &SubscriptionId,
+        search_present: bool,
+    ) -> Option<RelayMessage> {
+        search_present.then(|| RelayMessage::Closed {
+            subscription_id: subscription_id.clone(),
+            message: "unsupported: search filters are not supported".to_owned(),
+        })
     }
 
     fn redacted_req_closed(
@@ -650,18 +777,21 @@ impl BaseRelay {
         groups: Option<&GroupServiceHandle>,
         limits: BaseRelayLimits,
         query: PocketQueryConfig,
-        subscription_id: SubscriptionId,
-        filters: Vec<Filter>,
-        auth: &BaseAuthState,
+        request: BaseRelayReqQuery<'_>,
     ) -> Result<BaseRelayQueryReport, BaseRelayError> {
+        let group_auth =
+            GroupAuthContext::new(request.auth.authenticated_pubkeys().iter().cloned());
         Self::query_req_with_group_auth_shared_services(
             store,
             groups,
             limits,
             query,
-            subscription_id,
-            filters,
-            &GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned()),
+            BaseRelayGroupReqQuery {
+                subscription_id: request.subscription_id,
+                filters: request.filters,
+                search_present: request.search_present,
+                auth: &group_auth,
+            },
         )
     }
 
@@ -1201,38 +1331,60 @@ impl BaseRelay {
         filters: Vec<Filter>,
         auth: &GroupAuthContext,
     ) -> Result<BaseRelayQueryReport, BaseRelayError> {
+        let search_present = filters.iter().any(|filter| filter.search().is_some());
+        let filters = filters
+            .iter()
+            .map(tangle_filter_to_pocket)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.handle_pocket_req_with_group_auth_report(
+            subscription_id,
+            filters,
+            search_present,
+            auth,
+        )
+    }
+
+    fn handle_pocket_req_with_group_auth_report(
+        &mut self,
+        subscription_id: SubscriptionId,
+        filters: Vec<PocketOwnedFilter>,
+        search_present: bool,
+        auth: &GroupAuthContext,
+    ) -> Result<BaseRelayQueryReport, BaseRelayError> {
         self.limits.validate_subscription_id(&subscription_id)?;
-        self.limits.validate_filters(&filters)?;
-        if let Some(message) = Self::unsupported_search_closed(&subscription_id, &filters) {
+        self.limits.validate_pocket_filters(&filters)?;
+        if let Some(message) =
+            Self::unsupported_search_present_closed(&subscription_id, search_present)
+        {
             return Ok(BaseRelayQueryReport::new(
                 vec![message.into()],
                 false,
                 BaseRelayQueryMetrics::default(),
             ));
         }
-        let should_subscribe = !filters_are_complete(&filters);
+        let should_subscribe = !pocket_filters_are_complete(&filters);
         if should_subscribe {
-            let pocket_filters = filters
-                .iter()
-                .map(tangle_filter_to_pocket)
-                .collect::<Result<Vec<_>, _>>()?;
             self.subscriptions
-                .ensure_can_subscribe(&subscription_id, &pocket_filters)?;
-            let report =
-                self.query_req_with_group_auth_report(subscription_id.clone(), filters, auth)?;
+                .ensure_can_subscribe(&subscription_id, &filters)?;
+            let report = self.query_req_with_group_auth_report(
+                subscription_id.clone(),
+                filters.clone(),
+                false,
+                auth,
+            )?;
             if !report.group_read_denied() {
-                self.subscriptions
-                    .subscribe(subscription_id, pocket_filters)?;
+                self.subscriptions.subscribe(subscription_id, filters)?;
             }
             return Ok(report);
         }
-        self.query_req_with_group_auth_report(subscription_id, filters, auth)
+        self.query_req_with_group_auth_report(subscription_id, filters, false, auth)
     }
 
     fn query_req_with_group_auth_report(
         &self,
         subscription_id: SubscriptionId,
-        filters: Vec<Filter>,
+        filters: Vec<PocketOwnedFilter>,
+        search_present: bool,
         auth: &GroupAuthContext,
     ) -> Result<BaseRelayQueryReport, BaseRelayError> {
         Self::query_req_with_group_auth_shared_services(
@@ -1240,9 +1392,12 @@ impl BaseRelay {
             self.groups.as_ref(),
             self.limits,
             self.query,
-            subscription_id,
-            filters,
-            auth,
+            BaseRelayGroupReqQuery {
+                subscription_id,
+                filters,
+                search_present,
+                auth,
+            },
         )
     }
 
@@ -1251,13 +1406,19 @@ impl BaseRelay {
         groups: Option<&GroupServiceHandle>,
         limits: BaseRelayLimits,
         query: PocketQueryConfig,
-        subscription_id: SubscriptionId,
-        filters: Vec<Filter>,
-        auth: &GroupAuthContext,
+        request: BaseRelayGroupReqQuery<'_>,
     ) -> Result<BaseRelayQueryReport, BaseRelayError> {
+        let BaseRelayGroupReqQuery {
+            subscription_id,
+            filters,
+            search_present,
+            auth,
+        } = request;
         limits.validate_subscription_id(&subscription_id)?;
-        limits.validate_filters(&filters)?;
-        if let Some(message) = Self::unsupported_search_closed(&subscription_id, &filters) {
+        limits.validate_pocket_filters(&filters)?;
+        if let Some(message) =
+            Self::unsupported_search_present_closed(&subscription_id, search_present)
+        {
             return Ok(BaseRelayQueryReport::new(
                 vec![message.into()],
                 false,
@@ -1439,7 +1600,12 @@ impl BaseRelay {
         filters: &[Filter],
         auth: &GroupAuthContext,
     ) -> Result<Vec<Event>, BaseRelayError> {
-        self.query_events_report(filters, auth).and_then(|report| {
+        self.limits.validate_filters(filters)?;
+        let filters = filters
+            .iter()
+            .map(tangle_filter_to_pocket)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.query_events_report(&filters, auth).and_then(|report| {
             report
                 .events
                 .into_iter()
@@ -1450,7 +1616,7 @@ impl BaseRelay {
 
     fn query_events_report(
         &self,
-        filters: &[Filter],
+        filters: &[PocketOwnedFilter],
         auth: &GroupAuthContext,
     ) -> Result<BaseRelayEventQueryReport, BaseRelayError> {
         Self::query_events_report_with_services(
@@ -1468,7 +1634,7 @@ impl BaseRelay {
         groups: Option<&GroupServiceHandle>,
         limits: BaseRelayLimits,
         query: PocketQueryConfig,
-        filters: &[Filter],
+        filters: &[PocketOwnedFilter],
         auth: &GroupAuthContext,
     ) -> Result<BaseRelayEventQueryReport, BaseRelayError> {
         let mut output = Vec::new();
@@ -1487,7 +1653,7 @@ impl BaseRelay {
             group_read_denied |= report.group_read_denied;
             query_metrics = query_metrics.add(report.query_metrics);
             let mut events = Self::sort_and_dedupe_query_events(report.events);
-            events.truncate(limits.effective_filter_limit(filter));
+            events.truncate(limits.effective_pocket_filter_limit(filter));
             output.extend(events);
         }
         let events = Self::sort_and_dedupe_query_events(output);
@@ -1515,6 +1681,7 @@ impl BaseRelay {
         let mut hll = hll_offset.map(|_| PocketHll8::new());
         for filter in filters {
             let filter = filter.without_limit();
+            let filter = tangle_filter_to_pocket(&filter)?;
             let report = Self::query_filter_events_report_with_services(
                 store,
                 groups,
@@ -1563,12 +1730,11 @@ impl BaseRelay {
         groups: Option<&GroupServiceHandle>,
         limits: BaseRelayLimits,
         query: PocketQueryConfig,
-        filter: &Filter,
+        filter: &PocketFilter,
         auth: &GroupAuthContext,
         limit_mode: BaseRelayFilterLimitMode,
     ) -> Result<BaseRelayEventQueryReport, BaseRelayError> {
-        let effective_filter = Self::filter_with_limit_mode(limits, filter, limit_mode);
-        let pocket_filter = tangle_filter_to_pocket(&effective_filter)?;
+        let pocket_filter = Self::pocket_filter_with_limit_mode(limits, filter, limit_mode)?;
         let screen_error = RefCell::new(None);
         let candidates_scanned = Cell::new(0_u64);
         let redacted_events = Cell::new(0_u64);
@@ -1610,17 +1776,38 @@ impl BaseRelay {
         ))
     }
 
-    fn filter_with_limit_mode(
+    fn pocket_filter_with_limit_mode(
         limits: BaseRelayLimits,
-        filter: &Filter,
+        filter: &PocketFilter,
         limit_mode: BaseRelayFilterLimitMode,
-    ) -> Filter {
-        match (limit_mode, filter.limit()) {
-            (BaseRelayFilterLimitMode::ApplyDefaultLimit, None) => {
-                filter.with_limit(limits.default_limit())
+    ) -> Result<PocketOwnedFilter, BaseRelayError> {
+        let limit = match (limit_mode, filter.limit()) {
+            (BaseRelayFilterLimitMode::ApplyDefaultLimit, u32::MAX) => {
+                u32::try_from(limits.default_limit)
+                    .map_err(|_| BaseRelayError::invalid("default filter limit exceeds u32"))?
             }
-            _ => filter.clone(),
-        }
+            (_, limit) => limit,
+        };
+        let ids = filter.ids().collect::<Vec<_>>();
+        let authors = filter.authors().collect::<Vec<_>>();
+        let kinds = filter.kinds().collect::<Vec<_>>();
+        let since =
+            (filter.since() != tangle_store_pocket::PocketTime::min()).then(|| filter.since());
+        let until =
+            (filter.until() != tangle_store_pocket::PocketTime::max()).then(|| filter.until());
+        let limit = (limit != u32::MAX).then_some(limit);
+        PocketOwnedFilter::new(
+            &ids,
+            &authors,
+            &kinds,
+            filter
+                .tags()
+                .map_err(|error| BaseRelayError::error(error.to_string()))?,
+            since,
+            until,
+            limit,
+        )
+        .map_err(|error| BaseRelayError::error(error.to_string()))
     }
 
     fn sort_and_dedupe_query_events(mut events: Vec<PocketOwnedEvent>) -> Vec<PocketOwnedEvent> {
@@ -1654,8 +1841,8 @@ impl BaseRelay {
     }
 }
 
-fn filters_are_complete(filters: &[Filter]) -> bool {
-    !filters.is_empty() && filters.iter().all(Filter::is_complete)
+fn pocket_filters_are_complete(filters: &[PocketOwnedFilter]) -> bool {
+    !filters.is_empty() && filters.iter().all(|filter| filter.completes())
 }
 
 #[cfg(test)]

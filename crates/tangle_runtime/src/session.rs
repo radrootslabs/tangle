@@ -5,7 +5,6 @@ use crate::{
     errors::BaseRelayError,
     event_bus::{TangleEventReceiveError, TangleEventReceiver},
     logging,
-    pocket_conversion::pocket_filter_to_tangle,
     relay::{
         auth::{BaseAuthState, generate_auth_challenge},
         core::BaseRelay,
@@ -23,7 +22,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
-use tangle_protocol::{Filter, RelayMessage, SubscriptionId, UnixTimestamp};
+use tangle_protocol::{RelayMessage, SubscriptionId, UnixTimestamp};
 use tangle_store_pocket::PocketOwnedFilter;
 use tokio::sync::{mpsc, watch};
 
@@ -279,9 +278,7 @@ impl TangleWebSocketSession {
                 filters,
                 search_present,
             } => {
-                let protocol_filters =
-                    runtime_filters_to_protocol(filters.clone(), search_present)?;
-                self.handle_req(subscription_id, protocol_filters, filters)
+                self.handle_req(subscription_id, filters, search_present)
                     .await
             }
             RuntimeClientMessage::Count {
@@ -331,21 +328,25 @@ impl TangleWebSocketSession {
     async fn handle_req(
         &mut self,
         subscription_id: SubscriptionId,
-        filters: Vec<Filter>,
-        pocket_filters: Vec<PocketOwnedFilter>,
+        filters: Vec<PocketOwnedFilter>,
+        search_present: bool,
     ) -> Result<Vec<RuntimeRelayMessage>, BaseRelayError> {
         let metrics = self.runtime.metrics();
         metrics.record_client_message(TangleClientMessageMetricKind::Req);
         self.limits
             .base_relay_limits()
             .validate_subscription_id(&subscription_id)?;
-        self.limits.base_relay_limits().validate_filters(&filters)?;
-        if let Some(message) = BaseRelay::unsupported_search_closed(&subscription_id, &filters) {
+        self.limits
+            .base_relay_limits()
+            .validate_pocket_filters(&filters)?;
+        if let Some(message) =
+            BaseRelay::unsupported_search_present_closed(&subscription_id, search_present)
+        {
             return Ok(vec![message.into()]);
         }
         if let Some(message) = self
             .runtime
-            .rate_limit_req(
+            .rate_limit_req_pocket(
                 &subscription_id,
                 &filters,
                 &self.auth,
@@ -356,20 +357,25 @@ impl TangleWebSocketSession {
         {
             return Ok(vec![message.into()]);
         }
-        let should_subscribe = !filters_are_complete(&filters);
+        let should_subscribe = !pocket_filters_are_complete(&filters);
         if should_subscribe {
             self.subscriptions
-                .ensure_can_subscribe(&subscription_id, &pocket_filters)?;
+                .ensure_can_subscribe(&subscription_id, &filters)?;
         }
         let report = self
             .runtime
-            .query_req_with_auth_report(subscription_id.clone(), filters.clone(), &self.auth)
+            .query_req_with_auth_report(
+                subscription_id.clone(),
+                filters.clone(),
+                search_present,
+                &self.auth,
+            )
             .await?;
         let closes_subscription = report.group_read_denied();
         let replies = report.into_messages();
         if should_subscribe && !closes_subscription {
             self.subscriptions
-                .subscribe(subscription_id.clone(), pocket_filters)?;
+                .subscribe(subscription_id.clone(), filters)?;
             metrics.record_subscription_opened();
             logging::log_subscription_opened(self.connection_id, &subscription_id);
         }
@@ -408,20 +414,6 @@ impl TangleWebSocketSession {
             TangleOutboundQueueError::Closed => TangleSessionControl::Stop,
         }
     }
-}
-
-fn runtime_filters_to_protocol(
-    filters: Vec<PocketOwnedFilter>,
-    search_present: bool,
-) -> Result<Vec<Filter>, BaseRelayError> {
-    filters
-        .into_iter()
-        .enumerate()
-        .map(|(index, filter)| {
-            let search = (search_present && index == 0).then(String::new);
-            pocket_filter_to_tangle(&filter, search)
-        })
-        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -492,8 +484,8 @@ fn current_unix_timestamp() -> UnixTimestamp {
     )
 }
 
-fn filters_are_complete(filters: &[Filter]) -> bool {
-    !filters.is_empty() && filters.iter().all(Filter::is_complete)
+fn pocket_filters_are_complete(filters: &[PocketOwnedFilter]) -> bool {
+    !filters.is_empty() && filters.iter().all(|filter| filter.completes())
 }
 
 #[cfg(test)]

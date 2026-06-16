@@ -18,7 +18,8 @@ use crate::{
         auth::BaseAuthState,
         core::{
             BaseRelay, BaseRelayCountReport, BaseRelayEventWrite, BaseRelayLimits,
-            BaseRelayQueryMetrics, BaseRelayQueryReport, BaseRelayShutdownReport,
+            BaseRelayQueryMetrics, BaseRelayQueryReport, BaseRelayReqQuery,
+            BaseRelayShutdownReport,
         },
         live::LiveSubscriptionSet,
         outbound::{RuntimeRelayMessage, protocol_messages},
@@ -43,7 +44,9 @@ use tangle_groups::{
 use tangle_protocol::{
     EventId, Filter, Kind, PublicKeyHex, RelayMessage, SubscriptionId, UnixTimestamp,
 };
-use tangle_store_pocket::{PocketEvent, PocketOwnedEvent, PocketOwnedFilter, PocketStoreHandle};
+use tangle_store_pocket::{
+    PocketEvent, PocketFilter, PocketOwnedEvent, PocketOwnedFilter, PocketStoreHandle, PocketTime,
+};
 use tokio::sync::watch;
 
 pub struct TangleRuntime {
@@ -78,6 +81,17 @@ struct TangleQueryRateLimitRequest<'a> {
     label: &'static str,
     subscription_id: &'a SubscriptionId,
     filters: &'a [Filter],
+    auth: &'a BaseAuthState,
+    context: TangleClientRateLimitContext,
+    now: UnixTimestamp,
+}
+
+struct TanglePocketQueryRateLimitRequest<'a> {
+    scope: TangleRateLimitScope,
+    rules: TangleQueryRateLimitConfig,
+    label: &'static str,
+    subscription_id: &'a SubscriptionId,
+    filters: &'a [PocketOwnedFilter],
     auth: &'a BaseAuthState,
     context: TangleClientRateLimitContext,
     now: UnixTimestamp,
@@ -138,6 +152,17 @@ impl TangleQueryClassifier {
         self.classify_filters(filters, Self::classify_count_filter)
     }
 
+    fn classify_pocket_query(self, filters: &[PocketOwnedFilter]) -> TangleQueryClassification {
+        if filters.is_empty() {
+            return TangleQueryClassification::Broad(TangleBroadQueryReason::EmptyFilters);
+        }
+        filters
+            .iter()
+            .map(|filter| self.classify_pocket_query_filter(filter))
+            .find(|classification| classification.is_broad())
+            .unwrap_or(TangleQueryClassification::Bounded)
+    }
+
     fn classify_filters(
         self,
         filters: &[Filter],
@@ -184,6 +209,21 @@ impl TangleQueryClassifier {
             return TangleQueryClassification::Broad(
                 TangleBroadQueryReason::MissingBoundedSelector,
             );
+        }
+        TangleQueryClassification::Bounded
+    }
+
+    fn classify_pocket_query_filter(self, filter: &PocketFilter) -> TangleQueryClassification {
+        if !self.has_pocket_primary_constraint(filter) {
+            return TangleQueryClassification::Broad(
+                TangleBroadQueryReason::MissingPrimaryConstraint,
+            );
+        }
+        if self.has_pocket_high_limit(filter) {
+            return TangleQueryClassification::Broad(TangleBroadQueryReason::HighLimit);
+        }
+        if self.has_pocket_broad_time_window(filter) && !self.has_pocket_strong_constraint(filter) {
+            return TangleQueryClassification::Broad(TangleBroadQueryReason::BroadTimeWindow);
         }
         TangleQueryClassification::Bounded
     }
@@ -252,6 +292,50 @@ impl TangleQueryClassifier {
             }
             _ => false,
         }
+    }
+
+    fn has_pocket_primary_constraint(self, filter: &PocketFilter) -> bool {
+        filter.num_ids() > 0
+            || filter.num_authors() > 0
+            || filter.num_kinds() > 0
+            || self.has_pocket_group_constraint(filter)
+    }
+
+    fn has_pocket_strong_constraint(self, filter: &PocketFilter) -> bool {
+        filter.num_ids() > 0 || filter.num_authors() > 0 || self.has_pocket_group_constraint(filter)
+    }
+
+    fn has_pocket_group_constraint(self, filter: &PocketFilter) -> bool {
+        filter
+            .tags()
+            .map(|tags| {
+                tags.iter().any(|mut tag| {
+                    let name = tag.next();
+                    let has_value = tag.next().is_some();
+                    matches!(name, Some(value) if matches!(value, b"h" | b"d")) && has_value
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    fn has_pocket_high_limit(self, filter: &PocketFilter) -> bool {
+        let limit = if filter.limit() == u32::MAX {
+            self.limits.default_limit()
+        } else {
+            u64::from(filter.limit())
+        };
+        limit >= self.limits.max_limit()
+    }
+
+    fn has_pocket_broad_time_window(self, filter: &PocketFilter) -> bool {
+        if filter.since() == PocketTime::min() || filter.until() == PocketTime::max() {
+            return false;
+        }
+        filter
+            .until()
+            .as_ref()
+            .saturating_sub(*filter.since().as_ref())
+            > BROAD_QUERY_TIME_WINDOW_SECONDS
     }
 }
 
@@ -573,7 +657,8 @@ impl TangleRuntimeShared {
     fn query_req_with_auth_report(
         &self,
         subscription_id: SubscriptionId,
-        filters: Vec<Filter>,
+        filters: Vec<PocketOwnedFilter>,
+        search_present: bool,
         auth: &BaseAuthState,
     ) -> Result<BaseRelayQueryReport, BaseRelayError> {
         BaseRelay::query_req_with_shared_services(
@@ -581,9 +666,7 @@ impl TangleRuntimeShared {
             self.groups.as_ref(),
             self.limits.base_relay_limits(),
             self.config.pocket_query_config(),
-            subscription_id,
-            filters,
-            auth,
+            BaseRelayReqQuery::new(subscription_id, filters, search_present, auth),
         )
     }
 
@@ -613,6 +696,26 @@ impl TangleRuntimeShared {
         now: UnixTimestamp,
     ) -> Option<RelayMessage> {
         self.rate_limit_query(TangleQueryRateLimitRequest {
+            scope: TangleRateLimitScope::Req,
+            rules: self.config.rate_limits().req(),
+            label: "req",
+            subscription_id,
+            filters,
+            auth,
+            context,
+            now,
+        })
+    }
+
+    fn rate_limit_req_pocket(
+        &self,
+        subscription_id: &SubscriptionId,
+        filters: &[PocketOwnedFilter],
+        auth: &BaseAuthState,
+        context: TangleClientRateLimitContext,
+        now: UnixTimestamp,
+    ) -> Option<RelayMessage> {
+        self.rate_limit_pocket_query(TanglePocketQueryRateLimitRequest {
             scope: TangleRateLimitScope::Req,
             rules: self.config.rate_limits().req(),
             label: "req",
@@ -727,6 +830,88 @@ impl TangleRuntimeShared {
         }
         let query_classification = TangleQueryClassifier::new(self.limits.base_relay_limits())
             .classify(request.scope, request.filters);
+        if query_classification.is_broad()
+            && let Some(message) = self.rate_limit_closed(
+                request.subscription_id,
+                TangleRateLimitKey::query_class(request.scope, TangleRateLimitQueryClass::Broad),
+                request.rules.broad(),
+                request.label,
+                "broad",
+                request.now,
+            )
+        {
+            self.metrics.record_broad_query_rejection();
+            return Some(message);
+        }
+        None
+    }
+
+    fn rate_limit_pocket_query(
+        &self,
+        request: TanglePocketQueryRateLimitRequest<'_>,
+    ) -> Option<RelayMessage> {
+        if let Some(peer_ip) = request.context.peer_ip
+            && let Some(message) = self.rate_limit_closed(
+                request.subscription_id,
+                TangleRateLimitKey::ip(request.scope, peer_ip),
+                request.rules.per_ip(),
+                request.label,
+                "ip",
+                request.now,
+            )
+        {
+            return Some(message);
+        }
+        if let Some(connection_id) = request.context.connection_id
+            && let Some(message) = self.rate_limit_closed(
+                request.subscription_id,
+                TangleRateLimitKey::connection(request.scope, connection_id),
+                request.rules.per_connection(),
+                request.label,
+                "connection",
+                request.now,
+            )
+        {
+            return Some(message);
+        }
+        for pubkey in request.auth.authenticated_pubkeys() {
+            if let Some(message) = self.rate_limit_closed(
+                request.subscription_id,
+                TangleRateLimitKey::pubkey(request.scope, pubkey.clone()),
+                request.rules.per_pubkey(),
+                request.label,
+                "pubkey",
+                request.now,
+            ) {
+                return Some(message);
+            }
+        }
+        for group_id in pocket_filter_group_ids(request.filters) {
+            if let Some(message) = self.rate_limit_closed(
+                request.subscription_id,
+                TangleRateLimitKey::group(request.scope, group_id),
+                request.rules.per_group(),
+                request.label,
+                "group",
+                request.now,
+            ) {
+                return Some(message);
+            }
+        }
+        for kind in pocket_filter_kinds(request.filters) {
+            if let Some(message) = self.rate_limit_closed(
+                request.subscription_id,
+                TangleRateLimitKey::kind(request.scope, kind),
+                request.rules.per_kind(),
+                request.label,
+                "kind",
+                request.now,
+            ) {
+                return Some(message);
+            }
+        }
+        let query_classification = TangleQueryClassifier::new(self.limits.base_relay_limits())
+            .classify_pocket_query(request.filters);
         if query_classification.is_broad()
             && let Some(message) = self.rate_limit_closed(
                 request.subscription_id,
@@ -956,7 +1141,6 @@ impl TangleRuntimeHandle {
                 filters,
                 search_present,
             } => {
-                let filters = runtime_filters_to_protocol(filters, search_present)?;
                 let started_at = Instant::now();
                 self.inner
                     .limits
@@ -965,16 +1149,16 @@ impl TangleRuntimeHandle {
                 self.inner
                     .limits
                     .base_relay_limits()
-                    .validate_filters(&filters)?;
+                    .validate_pocket_filters(&filters)?;
                 if let Some(message) =
-                    BaseRelay::unsupported_search_closed(&subscription_id, &filters)
+                    BaseRelay::unsupported_search_present_closed(&subscription_id, search_present)
                 {
                     self.inner
                         .metrics
                         .record_query_latency(elapsed_micros(started_at));
                     return Ok(vec![message.into()]);
                 }
-                if let Some(message) = self.inner.rate_limit_req(
+                if let Some(message) = self.inner.rate_limit_req_pocket(
                     &subscription_id,
                     &filters,
                     auth,
@@ -986,9 +1170,12 @@ impl TangleRuntimeHandle {
                         .record_query_latency(elapsed_micros(started_at));
                     return Ok(vec![message.into()]);
                 }
-                let report =
-                    self.inner
-                        .query_req_with_auth_report(subscription_id, filters, auth)?;
+                let report = self.inner.query_req_with_auth_report(
+                    subscription_id,
+                    filters,
+                    search_present,
+                    auth,
+                )?;
                 self.inner
                     .metrics
                     .record_query_metrics(report.query_metrics());
@@ -1154,16 +1341,32 @@ impl TangleRuntimeHandle {
             .rate_limit_req(subscription_id, filters, auth, rate_limit_context, now)
     }
 
+    pub(crate) async fn rate_limit_req_pocket(
+        &self,
+        subscription_id: &SubscriptionId,
+        filters: &[PocketOwnedFilter],
+        auth: &BaseAuthState,
+        rate_limit_context: TangleClientRateLimitContext,
+        now: UnixTimestamp,
+    ) -> Option<RelayMessage> {
+        self.inner
+            .rate_limit_req_pocket(subscription_id, filters, auth, rate_limit_context, now)
+    }
+
     pub(crate) async fn query_req_with_auth_report(
         &self,
         subscription_id: SubscriptionId,
-        filters: Vec<Filter>,
+        filters: Vec<PocketOwnedFilter>,
+        search_present: bool,
         auth: &BaseAuthState,
     ) -> Result<BaseRelayQueryReport, BaseRelayError> {
         let started_at = Instant::now();
-        let report = self
-            .inner
-            .query_req_with_auth_report(subscription_id, filters, auth)?;
+        let report = self.inner.query_req_with_auth_report(
+            subscription_id,
+            filters,
+            search_present,
+            auth,
+        )?;
         if report.group_read_denied() {
             self.inner.metrics.record_group_read_denial();
         }
@@ -1377,6 +1580,39 @@ fn filter_kinds(filters: &[Filter]) -> Vec<Kind> {
         .iter()
         .flat_map(Filter::kinds)
         .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn pocket_filter_group_ids(filters: &[PocketOwnedFilter]) -> Vec<GroupId> {
+    let mut group_ids = BTreeSet::new();
+    for filter in filters {
+        let Ok(tags) = filter.tags() else {
+            continue;
+        };
+        for mut tag in tags.iter() {
+            let name = tag.next();
+            if !matches!(name, Some(value) if matches!(value, b"h" | b"d")) {
+                continue;
+            }
+            for value in tag {
+                if let Ok(value) = std::str::from_utf8(value)
+                    && let Ok(group_id) = GroupId::new(value)
+                {
+                    group_ids.insert(group_id);
+                }
+            }
+        }
+    }
+    group_ids.into_iter().collect()
+}
+
+fn pocket_filter_kinds(filters: &[PocketOwnedFilter]) -> Vec<Kind> {
+    filters
+        .iter()
+        .flat_map(|filter| filter.kinds())
+        .filter_map(|kind| Kind::new(u64::from(kind.as_u16())).ok())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
