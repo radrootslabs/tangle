@@ -1572,10 +1572,10 @@ fn req_count_and_live_fanout_share_one_group_read_gate() {
 fn runtime_event_handling_does_not_lock_relay_state() {
     let runtime = include_str!("../src/runtime.rs");
     let event_branch = runtime
-        .split("ClientMessage::Event(event) => {")
+        .split("RuntimeClientMessage::Event(pocket_event) => {")
         .nth(1)
         .expect("event branch")
-        .split("ClientMessage::Req")
+        .split("RuntimeClientMessage::Req")
         .next()
         .expect("req branch");
 
@@ -1587,10 +1587,10 @@ fn runtime_event_handling_does_not_lock_relay_state() {
 fn runtime_req_handling_does_not_lock_relay_state() {
     let runtime = include_str!("../src/runtime.rs");
     let req_branch = runtime
-        .split("ClientMessage::Req {")
+        .split("RuntimeClientMessage::Req {")
         .nth(1)
         .expect("req branch")
-        .split("ClientMessage::Count")
+        .split("RuntimeClientMessage::Count")
         .next()
         .expect("count branch");
     let query_helper = runtime
@@ -1611,10 +1611,10 @@ fn runtime_req_handling_does_not_lock_relay_state() {
 fn runtime_count_handling_does_not_lock_relay_state() {
     let runtime = include_str!("../src/runtime.rs");
     let count_branch = runtime
-        .split("ClientMessage::Count {")
+        .split("RuntimeClientMessage::Count {")
         .nth(1)
         .expect("count branch")
-        .split("ClientMessage::Auth")
+        .split("RuntimeClientMessage::Auth")
         .next()
         .expect("auth branch");
 

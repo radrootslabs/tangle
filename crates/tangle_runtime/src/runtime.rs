@@ -1,13 +1,14 @@
 #![forbid(unsafe_code)]
 
 use crate::{
+    client_message::RuntimeClientMessage,
     config::BaseRelayRuntimeConfig,
     errors::BaseRelayError,
     event_bus::{TangleEventBus, TangleEventReceiver},
     groups::GroupServiceHandle,
     logging,
     ops::{BaseRelayReadinessHandle, BaseRelayReadinessState},
-    pocket_conversion::pocket_event_to_tangle,
+    pocket_conversion::{pocket_event_to_tangle, pocket_filter_to_tangle},
     rate_limits::{
         TangleQueryRateLimitConfig, TangleRateLimitDecision, TangleRateLimitKey,
         TangleRateLimitQueryClass, TangleRateLimitRule, TangleRateLimitScope, TangleRateLimiter,
@@ -38,8 +39,7 @@ use tangle_groups::{
     validate_client_group_event_structure,
 };
 use tangle_protocol::{
-    ClientMessage, Event, EventId, Filter, Kind, PublicKeyHex, RelayMessage, SubscriptionId,
-    UnixTimestamp,
+    Event, EventId, Filter, Kind, PublicKeyHex, RelayMessage, SubscriptionId, UnixTimestamp,
 };
 use tangle_store_pocket::PocketStoreHandle;
 use tokio::sync::watch;
@@ -815,9 +815,10 @@ impl TangleRuntimeHandle {
         self.inner.config.auth_state()
     }
 
-    pub async fn handle_client_message(
+    #[cfg(test)]
+    pub(crate) async fn handle_client_message(
         &self,
-        message: ClientMessage,
+        message: RuntimeClientMessage,
         auth: &mut BaseAuthState,
         now: UnixTimestamp,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
@@ -830,18 +831,51 @@ impl TangleRuntimeHandle {
         .await
     }
 
-    pub async fn handle_client_message_with_rate_limit_context(
+    #[cfg(test)]
+    pub(crate) async fn handle_protocol_client_message_for_test(
         &self,
-        message: ClientMessage,
+        message: tangle_protocol::ClientMessage,
+        auth: &mut BaseAuthState,
+        now: UnixTimestamp,
+    ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+        self.handle_client_message(
+            protocol_client_message_to_runtime_for_test(message)?,
+            auth,
+            now,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn handle_protocol_client_message_with_rate_limit_context_for_test(
+        &self,
+        message: tangle_protocol::ClientMessage,
+        auth: &mut BaseAuthState,
+        rate_limit_context: TangleClientRateLimitContext,
+        now: UnixTimestamp,
+    ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+        self.handle_client_message_with_rate_limit_context(
+            protocol_client_message_to_runtime_for_test(message)?,
+            auth,
+            rate_limit_context,
+            now,
+        )
+        .await
+    }
+
+    pub(crate) async fn handle_client_message_with_rate_limit_context(
+        &self,
+        message: RuntimeClientMessage,
         auth: &mut BaseAuthState,
         rate_limit_context: TangleClientRateLimitContext,
         now: UnixTimestamp,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
         self.inner
             .metrics
-            .record_client_message(client_message_metric_kind(&message));
+            .record_client_message(runtime_client_message_metric_kind(&message));
         match message {
-            ClientMessage::Event(event) => {
+            RuntimeClientMessage::Event(pocket_event) => {
+                let event = pocket_event_to_tangle(&pocket_event)?;
                 let started_at = Instant::now();
                 let event_id = event.id().clone();
                 let is_group_event = self.inner.is_group_event(&event);
@@ -884,10 +918,12 @@ impl TangleRuntimeHandle {
                 record_event_metrics(&self.inner.metrics, &message, is_group_event, started_at);
                 Ok(vec![message])
             }
-            ClientMessage::Req {
+            RuntimeClientMessage::Req {
                 subscription_id,
                 filters,
+                search_present,
             } => {
+                let filters = runtime_filters_to_protocol(filters, search_present)?;
                 let started_at = Instant::now();
                 self.inner
                     .limits
@@ -931,10 +967,12 @@ impl TangleRuntimeHandle {
                     .record_query_latency(elapsed_micros(started_at));
                 Ok(report.into_messages())
             }
-            ClientMessage::Count {
+            RuntimeClientMessage::Count {
                 subscription_id,
                 filters,
+                search_present,
             } => {
+                let filters = runtime_filters_to_protocol(filters, search_present)?;
                 let started_at = Instant::now();
                 self.inner
                     .limits
@@ -984,7 +1022,8 @@ impl TangleRuntimeHandle {
                     .record_query_latency(elapsed_micros(started_at));
                 Ok(vec![report.into_message()])
             }
-            ClientMessage::Auth(event) => {
+            RuntimeClientMessage::Auth(pocket_event) => {
+                let event = pocket_event_to_tangle(&pocket_event)?;
                 if let Err(error) = self.inner.limits.base_relay_limits().validate_event(&event) {
                     self.inner.metrics.record_auth_failure();
                     return Ok(vec![RelayMessage::Ok {
@@ -1021,17 +1060,17 @@ impl TangleRuntimeHandle {
                 }
                 Ok(replies)
             }
-            ClientMessage::Close(subscription_id) => {
+            RuntimeClientMessage::Close(subscription_id) => {
                 self.inner
                     .limits
                     .base_relay_limits()
                     .validate_subscription_id(&subscription_id)?;
                 Ok(Vec::new())
             }
-            ClientMessage::NegOpen {
+            RuntimeClientMessage::NegOpen {
                 subscription_id, ..
             }
-            | ClientMessage::NegMsg {
+            | RuntimeClientMessage::NegMsg {
                 subscription_id, ..
             } => {
                 self.inner
@@ -1042,7 +1081,7 @@ impl TangleRuntimeHandle {
                     subscription_id,
                 )])
             }
-            ClientMessage::NegClose(subscription_id) => {
+            RuntimeClientMessage::NegClose(subscription_id) => {
                 self.inner
                     .limits
                     .base_relay_limits()
@@ -1191,16 +1230,90 @@ fn directory_size_bytes(path: &Path) -> u64 {
         .sum()
 }
 
-fn client_message_metric_kind(message: &ClientMessage) -> TangleClientMessageMetricKind {
+fn runtime_filters_to_protocol(
+    filters: Vec<tangle_store_pocket::PocketOwnedFilter>,
+    search_present: bool,
+) -> Result<Vec<Filter>, BaseRelayError> {
+    filters
+        .into_iter()
+        .enumerate()
+        .map(|(index, filter)| {
+            let search = (search_present && index == 0).then(String::new);
+            pocket_filter_to_tangle(&filter, search)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn protocol_client_message_to_runtime_for_test(
+    message: tangle_protocol::ClientMessage,
+) -> Result<RuntimeClientMessage, BaseRelayError> {
     match message {
-        ClientMessage::Event(_) => TangleClientMessageMetricKind::Event,
-        ClientMessage::Req { .. } => TangleClientMessageMetricKind::Req,
-        ClientMessage::Count { .. } => TangleClientMessageMetricKind::Count,
-        ClientMessage::Auth(_) => TangleClientMessageMetricKind::Auth,
-        ClientMessage::Close(_) => TangleClientMessageMetricKind::Close,
-        ClientMessage::NegOpen { .. }
-        | ClientMessage::NegMsg { .. }
-        | ClientMessage::NegClose(_) => TangleClientMessageMetricKind::Negentropy,
+        tangle_protocol::ClientMessage::Event(event) => Ok(RuntimeClientMessage::Event(
+            crate::pocket_conversion::tangle_event_to_pocket(&event)?,
+        )),
+        tangle_protocol::ClientMessage::Req {
+            subscription_id,
+            filters,
+        } => Ok(RuntimeClientMessage::Req {
+            subscription_id,
+            search_present: filters.iter().any(|filter| filter.search().is_some()),
+            filters: filters
+                .iter()
+                .map(crate::pocket_conversion::tangle_filter_to_pocket)
+                .collect::<Result<Vec<_>, _>>()?,
+        }),
+        tangle_protocol::ClientMessage::Count {
+            subscription_id,
+            filters,
+        } => Ok(RuntimeClientMessage::Count {
+            subscription_id,
+            search_present: filters.iter().any(|filter| filter.search().is_some()),
+            filters: filters
+                .iter()
+                .map(crate::pocket_conversion::tangle_filter_to_pocket)
+                .collect::<Result<Vec<_>, _>>()?,
+        }),
+        tangle_protocol::ClientMessage::Close(subscription_id) => {
+            Ok(RuntimeClientMessage::Close(subscription_id))
+        }
+        tangle_protocol::ClientMessage::Auth(event) => Ok(RuntimeClientMessage::Auth(
+            crate::pocket_conversion::tangle_event_to_pocket(&event)?,
+        )),
+        tangle_protocol::ClientMessage::NegOpen {
+            subscription_id,
+            filter,
+            message,
+        } => Ok(RuntimeClientMessage::NegOpen {
+            subscription_id,
+            filter: crate::pocket_conversion::tangle_filter_to_pocket(&filter)?,
+            message,
+        }),
+        tangle_protocol::ClientMessage::NegMsg {
+            subscription_id,
+            message,
+        } => Ok(RuntimeClientMessage::NegMsg {
+            subscription_id,
+            message,
+        }),
+        tangle_protocol::ClientMessage::NegClose(subscription_id) => {
+            Ok(RuntimeClientMessage::NegClose(subscription_id))
+        }
+    }
+}
+
+fn runtime_client_message_metric_kind(
+    message: &RuntimeClientMessage,
+) -> TangleClientMessageMetricKind {
+    match message {
+        RuntimeClientMessage::Event(_) => TangleClientMessageMetricKind::Event,
+        RuntimeClientMessage::Req { .. } => TangleClientMessageMetricKind::Req,
+        RuntimeClientMessage::Count { .. } => TangleClientMessageMetricKind::Count,
+        RuntimeClientMessage::Auth(_) => TangleClientMessageMetricKind::Auth,
+        RuntimeClientMessage::Close(_) => TangleClientMessageMetricKind::Close,
+        RuntimeClientMessage::NegOpen { .. }
+        | RuntimeClientMessage::NegMsg { .. }
+        | RuntimeClientMessage::NegClose(_) => TangleClientMessageMetricKind::Negentropy,
     }
 }
 
@@ -2166,7 +2279,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Event(event.clone()),
                     &mut auth,
                     UnixTimestamp::new(1_714_124_433)
@@ -2194,7 +2307,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Event(event.clone()),
                     &mut auth,
                     UnixTimestamp::new(1_714_124_434)
@@ -2245,7 +2358,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Event(event.clone()),
                     &mut auth,
                     UnixTimestamp::new(1_714_124_433)
@@ -2282,7 +2395,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Event(event.clone()),
                     &mut auth,
                     UnixTimestamp::new(1_714_124_433)
@@ -2327,7 +2440,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message_with_rate_limit_context(
+                .handle_protocol_client_message_with_rate_limit_context_for_test(
                     ClientMessage::Event(limited_event.clone()),
                     &mut auth,
                     TangleClientRateLimitContext::new(Some(saturated_peer_ip), None),
@@ -2343,7 +2456,7 @@ mod tests {
         );
         assert_eq!(
             handle
-                .handle_client_message_with_rate_limit_context(
+                .handle_protocol_client_message_with_rate_limit_context_for_test(
                     ClientMessage::Event(rotated_event.clone()),
                     &mut auth,
                     TangleClientRateLimitContext::new(Some(saturated_peer_ip), None),
@@ -2359,7 +2472,7 @@ mod tests {
         );
         assert_eq!(
             handle
-                .handle_client_message_with_rate_limit_context(
+                .handle_protocol_client_message_with_rate_limit_context_for_test(
                     ClientMessage::Event(allowed_event.clone()),
                     &mut auth,
                     TangleClientRateLimitContext::new(Some(other_peer_ip), None),
@@ -2404,7 +2517,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Auth(auth_event.clone()),
                     &mut auth,
                     UnixTimestamp::new(120)
@@ -2444,7 +2557,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message_with_rate_limit_context(
+                .handle_protocol_client_message_with_rate_limit_context_for_test(
                     ClientMessage::Auth(auth_event.clone()),
                     &mut auth,
                     TangleClientRateLimitContext::new(Some(peer_ip), None),
@@ -2485,7 +2598,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Auth(auth_event.clone()),
                     &mut auth,
                     UnixTimestamp::new(1_714_124_433)
@@ -2523,7 +2636,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message_with_rate_limit_context(
+                .handle_protocol_client_message_with_rate_limit_context_for_test(
                     ClientMessage::Auth(auth_event.clone()),
                     &mut auth,
                     TangleClientRateLimitContext::new(Some(peer_ip), None),
@@ -2579,7 +2692,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Auth(pubkey_event.clone()),
                     &mut auth,
                     UnixTimestamp::new(1_714_124_433)
@@ -2595,7 +2708,7 @@ mod tests {
         );
         assert_eq!(
             handle
-                .handle_client_message_with_rate_limit_context(
+                .handle_protocol_client_message_with_rate_limit_context_for_test(
                     ClientMessage::Auth(peer_event.clone()),
                     &mut auth,
                     TangleClientRateLimitContext::new(Some(peer_ip), None),
@@ -2649,7 +2762,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Event(event.clone()),
                     &mut auth,
                     UnixTimestamp::new(1_714_124_433)
@@ -2693,7 +2806,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message_with_rate_limit_context(
+                .handle_protocol_client_message_with_rate_limit_context_for_test(
                     ClientMessage::Event(event.clone()),
                     &mut auth,
                     TangleClientRateLimitContext::new(Some(peer_ip), None),
@@ -2740,7 +2853,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Event(event.clone()),
                     &mut auth,
                     UnixTimestamp::new(1_714_124_433)
@@ -2784,7 +2897,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Event(event.clone()),
                     &mut auth,
                     UnixTimestamp::new(1_714_124_433)
@@ -2827,7 +2940,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Event(event.clone()),
                     &mut auth,
                     UnixTimestamp::new(1_714_124_433)
@@ -2871,7 +2984,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message_with_rate_limit_context(
+                .handle_protocol_client_message_with_rate_limit_context_for_test(
                     ClientMessage::Event(event.clone()),
                     &mut auth,
                     TangleClientRateLimitContext::new(Some(peer_ip), None),
@@ -2908,7 +3021,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Auth(auth_event.clone()),
                     &mut auth,
                     UnixTimestamp::new(120)
@@ -2932,7 +3045,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Req {
                         subscription_id: subscription_id.clone(),
                         filters
@@ -2970,7 +3083,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message_with_rate_limit_context(
+                .handle_protocol_client_message_with_rate_limit_context_for_test(
                     ClientMessage::Req {
                         subscription_id: subscription_id.clone(),
                         filters
@@ -3012,7 +3125,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Req {
                         subscription_id: subscription_id.clone(),
                         filters
@@ -3136,7 +3249,7 @@ mod tests {
 
         let subscription_id = SubscriptionId::new("count-hll-runtime").expect("subscription");
         let replies = handle
-            .handle_client_message(
+            .handle_protocol_client_message_for_test(
                 ClientMessage::Count {
                     subscription_id: subscription_id.clone(),
                     filters: vec![
@@ -3211,7 +3324,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message_with_rate_limit_context(
+                .handle_protocol_client_message_with_rate_limit_context_for_test(
                     ClientMessage::Count {
                         subscription_id: subscription_id.clone(),
                         filters
@@ -3246,7 +3359,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Req {
                         subscription_id: req_id.clone(),
                         filters: vec![search.clone()]
@@ -3263,7 +3376,7 @@ mod tests {
         );
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Count {
                         subscription_id: count_id.clone(),
                         filters: vec![search]
@@ -3304,7 +3417,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Count {
                         subscription_id: subscription_id.clone(),
                         filters
@@ -3345,7 +3458,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Count {
                         subscription_id: subscription_id.clone(),
                         filters
@@ -3397,7 +3510,7 @@ mod tests {
 
             assert_eq!(
                 handle
-                    .handle_client_message(
+                    .handle_protocol_client_message_for_test(
                         ClientMessage::Count {
                             subscription_id: subscription_id.clone(),
                             filters
@@ -3451,7 +3564,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Auth(auth_event.clone()),
                     &mut auth,
                     UnixTimestamp::new(120)
@@ -3466,7 +3579,7 @@ mod tests {
         );
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Event(create.clone()),
                     &mut auth,
                     UnixTimestamp::new(121)
@@ -3491,7 +3604,7 @@ mod tests {
                 .expect("put member");
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Event(put_member.clone()),
                     &mut auth,
                     UnixTimestamp::new(122)
@@ -3963,7 +4076,7 @@ mod tests {
             .expect("owner auth event");
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Auth(owner_auth_event.clone()),
                     &mut owner_auth,
                     UnixTimestamp::new(base_time)
@@ -3985,7 +4098,7 @@ mod tests {
         .expect("create");
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Event(create.clone()),
                     &mut owner_auth,
                     UnixTimestamp::new(base_time + 1)
@@ -4007,7 +4120,7 @@ mod tests {
         .expect("put member");
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Event(put_member.clone()),
                     &mut owner_auth,
                     UnixTimestamp::new(base_time + 2)
@@ -4029,7 +4142,7 @@ mod tests {
                 .expect("member auth event");
         assert_eq!(
             handle
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Auth(member_auth_event.clone()),
                     &mut member_auth,
                     UnixTimestamp::new(base_time + 3)
@@ -4061,7 +4174,7 @@ mod tests {
                 .expect("group event");
                 assert_eq!(
                     handle
-                        .handle_client_message(
+                        .handle_protocol_client_message_for_test(
                             ClientMessage::Event(event.clone()),
                             &mut auth,
                             UnixTimestamp::new(
@@ -4093,7 +4206,7 @@ mod tests {
                 .expect("public event");
                 assert_eq!(
                     handle
-                        .handle_client_message(
+                        .handle_protocol_client_message_for_test(
                             ClientMessage::Event(event.clone()),
                             &mut auth,
                             UnixTimestamp::new(
@@ -4236,7 +4349,7 @@ mod tests {
                 let subscription_id =
                     SubscriptionId::new(&format!("member-req-{index}")).expect("subscription");
                 let replies = member_req_handle
-                    .handle_client_message(
+                    .handle_protocol_client_message_for_test(
                         ClientMessage::Req {
                             subscription_id: subscription_id.clone(),
                             filters: vec![
@@ -4277,7 +4390,7 @@ mod tests {
                 let subscription_id =
                     SubscriptionId::new(&format!("public-req-{index}")).expect("subscription");
                 let replies = public_req_handle
-                    .handle_client_message(
+                    .handle_protocol_client_message_for_test(
                         ClientMessage::Req {
                             subscription_id: subscription_id.clone(),
                             filters: vec![
@@ -4309,7 +4422,7 @@ mod tests {
                 let subscription_id =
                     SubscriptionId::new(&format!("member-count-{index}")).expect("subscription");
                 let replies = member_count_handle
-                    .handle_client_message(
+                    .handle_protocol_client_message_for_test(
                         ClientMessage::Count {
                             subscription_id: subscription_id.clone(),
                             filters: vec![
@@ -4340,7 +4453,7 @@ mod tests {
                 let subscription_id =
                     SubscriptionId::new(&format!("public-count-{index}")).expect("subscription");
                 let replies = public_count_handle
-                    .handle_client_message(
+                    .handle_protocol_client_message_for_test(
                         ClientMessage::Count {
                             subscription_id: subscription_id.clone(),
                             filters: vec![
@@ -4495,7 +4608,7 @@ mod tests {
             .expect("challenge");
         let event = tangle_v2_auth_event(key, challenge, now).expect("auth event");
         let replies = handle
-            .handle_client_message(
+            .handle_protocol_client_message_for_test(
                 ClientMessage::Auth(event.clone()),
                 &mut auth,
                 UnixTimestamp::new(now),
@@ -4521,7 +4634,11 @@ mod tests {
         now: u64,
     ) -> RelayMessage {
         let replies = handle
-            .handle_client_message(ClientMessage::Event(event), auth, UnixTimestamp::new(now))
+            .handle_protocol_client_message_for_test(
+                ClientMessage::Event(event),
+                auth,
+                UnixTimestamp::new(now),
+            )
             .await
             .expect("event message");
 
@@ -4539,7 +4656,7 @@ mod tests {
         now: u64,
     ) -> u64 {
         let replies = handle
-            .handle_client_message(
+            .handle_protocol_client_message_for_test(
                 ClientMessage::Count {
                     subscription_id: SubscriptionId::new(subscription_id).expect("subscription"),
                     filters: vec![runtime_group_filter(group_id, kind, tag_name)],

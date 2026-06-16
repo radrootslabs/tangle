@@ -5,7 +5,7 @@ use crate::{
     errors::BaseRelayError,
     event_bus::{TangleEventReceiveError, TangleEventReceiver},
     logging,
-    pocket_conversion::{pocket_event_to_tangle, pocket_filter_to_tangle},
+    pocket_conversion::pocket_filter_to_tangle,
     relay::{
         auth::{BaseAuthState, generate_auth_challenge},
         core::BaseRelay,
@@ -22,7 +22,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
-use tangle_protocol::{ClientMessage, Filter, RelayMessage, SubscriptionId, UnixTimestamp};
+use tangle_protocol::{Filter, RelayMessage, SubscriptionId, UnixTimestamp};
+use tangle_store_pocket::PocketOwnedFilter;
 use tokio::sync::{mpsc, watch};
 
 #[derive(Debug)]
@@ -265,23 +266,32 @@ impl TangleWebSocketSession {
 
     async fn handle_client_message(
         &mut self,
-        message: impl Into<SessionClientMessage>,
+        message: RuntimeClientMessage,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
-        match message.into().into_protocol_message()? {
-            ClientMessage::Req {
+        match message {
+            RuntimeClientMessage::Req {
                 subscription_id,
                 filters,
-            } => self.handle_req(subscription_id, filters).await,
-            ClientMessage::Count {
+                search_present,
+            } => {
+                self.handle_req(
+                    subscription_id,
+                    runtime_filters_to_protocol(filters, search_present)?,
+                )
+                .await
+            }
+            RuntimeClientMessage::Count {
                 subscription_id,
                 filters,
+                search_present,
             } => {
                 let context = self.client_rate_limit_context();
                 self.runtime
                     .handle_client_message_with_rate_limit_context(
-                        ClientMessage::Count {
+                        RuntimeClientMessage::Count {
                             subscription_id,
                             filters,
+                            search_present,
                         },
                         &mut self.auth,
                         context,
@@ -289,7 +299,7 @@ impl TangleWebSocketSession {
                     )
                     .await
             }
-            ClientMessage::Close(subscription_id) => {
+            RuntimeClientMessage::Close(subscription_id) => {
                 let metrics = self.runtime.metrics();
                 metrics.record_client_message(TangleClientMessageMetricKind::Close);
                 self.limits
@@ -389,83 +399,8 @@ impl TangleWebSocketSession {
     }
 }
 
-enum SessionClientMessage {
-    Runtime(RuntimeClientMessage),
-    Protocol(ClientMessage),
-}
-
-impl From<RuntimeClientMessage> for SessionClientMessage {
-    fn from(message: RuntimeClientMessage) -> Self {
-        Self::Runtime(message)
-    }
-}
-
-impl From<ClientMessage> for SessionClientMessage {
-    fn from(message: ClientMessage) -> Self {
-        Self::Protocol(message)
-    }
-}
-
-impl SessionClientMessage {
-    fn into_protocol_message(self) -> Result<ClientMessage, BaseRelayError> {
-        match self {
-            Self::Protocol(message) => Ok(message),
-            Self::Runtime(message) => runtime_message_to_protocol(message),
-        }
-    }
-}
-
-fn runtime_message_to_protocol(
-    message: RuntimeClientMessage,
-) -> Result<ClientMessage, BaseRelayError> {
-    match message {
-        RuntimeClientMessage::Event(event) => {
-            pocket_event_to_tangle(&event).map(ClientMessage::Event)
-        }
-        RuntimeClientMessage::Auth(event) => {
-            pocket_event_to_tangle(&event).map(ClientMessage::Auth)
-        }
-        RuntimeClientMessage::Req {
-            subscription_id,
-            filters,
-            search_present,
-        } => Ok(ClientMessage::Req {
-            subscription_id,
-            filters: runtime_filters_to_protocol(filters, search_present)?,
-        }),
-        RuntimeClientMessage::Count {
-            subscription_id,
-            filters,
-            search_present,
-        } => Ok(ClientMessage::Count {
-            subscription_id,
-            filters: runtime_filters_to_protocol(filters, search_present)?,
-        }),
-        RuntimeClientMessage::Close(subscription_id) => Ok(ClientMessage::Close(subscription_id)),
-        RuntimeClientMessage::NegOpen {
-            subscription_id,
-            filter,
-            message,
-        } => Ok(ClientMessage::NegOpen {
-            subscription_id,
-            filter: pocket_filter_to_tangle(&filter, None)?,
-            message,
-        }),
-        RuntimeClientMessage::NegMsg {
-            subscription_id,
-            message,
-        } => Ok(ClientMessage::NegMsg {
-            subscription_id,
-            message,
-        }),
-        RuntimeClientMessage::NegClose(subscription_id) => {
-            Ok(ClientMessage::NegClose(subscription_id))
-        }
-    }
-}
-
 fn runtime_filters_to_protocol(
-    filters: Vec<tangle_store_pocket::PocketOwnedFilter>,
+    filters: Vec<PocketOwnedFilter>,
     search_present: bool,
 ) -> Result<Vec<Filter>, BaseRelayError> {
     filters
@@ -541,6 +476,77 @@ fn current_unix_timestamp() -> UnixTimestamp {
 
 fn filters_are_complete(filters: &[Filter]) -> bool {
     !filters.is_empty() && filters.iter().all(Filter::is_complete)
+}
+
+#[cfg(test)]
+impl TangleWebSocketSession {
+    async fn handle_protocol_client_message_for_test(
+        &mut self,
+        message: tangle_protocol::ClientMessage,
+    ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+        self.handle_client_message(protocol_client_message_to_runtime_for_session_test(
+            message,
+        )?)
+        .await
+    }
+}
+
+#[cfg(test)]
+fn protocol_client_message_to_runtime_for_session_test(
+    message: tangle_protocol::ClientMessage,
+) -> Result<RuntimeClientMessage, BaseRelayError> {
+    match message {
+        tangle_protocol::ClientMessage::Event(event) => Ok(RuntimeClientMessage::Event(
+            crate::pocket_conversion::tangle_event_to_pocket(&event)?,
+        )),
+        tangle_protocol::ClientMessage::Req {
+            subscription_id,
+            filters,
+        } => Ok(RuntimeClientMessage::Req {
+            subscription_id,
+            search_present: filters.iter().any(|filter| filter.search().is_some()),
+            filters: filters
+                .iter()
+                .map(crate::pocket_conversion::tangle_filter_to_pocket)
+                .collect::<Result<Vec<_>, _>>()?,
+        }),
+        tangle_protocol::ClientMessage::Count {
+            subscription_id,
+            filters,
+        } => Ok(RuntimeClientMessage::Count {
+            subscription_id,
+            search_present: filters.iter().any(|filter| filter.search().is_some()),
+            filters: filters
+                .iter()
+                .map(crate::pocket_conversion::tangle_filter_to_pocket)
+                .collect::<Result<Vec<_>, _>>()?,
+        }),
+        tangle_protocol::ClientMessage::Close(subscription_id) => {
+            Ok(RuntimeClientMessage::Close(subscription_id))
+        }
+        tangle_protocol::ClientMessage::Auth(event) => Ok(RuntimeClientMessage::Auth(
+            crate::pocket_conversion::tangle_event_to_pocket(&event)?,
+        )),
+        tangle_protocol::ClientMessage::NegOpen {
+            subscription_id,
+            filter,
+            message,
+        } => Ok(RuntimeClientMessage::NegOpen {
+            subscription_id,
+            filter: crate::pocket_conversion::tangle_filter_to_pocket(&filter)?,
+            message,
+        }),
+        tangle_protocol::ClientMessage::NegMsg {
+            subscription_id,
+            message,
+        } => Ok(RuntimeClientMessage::NegMsg {
+            subscription_id,
+            message,
+        }),
+        tangle_protocol::ClientMessage::NegClose(subscription_id) => {
+            Ok(RuntimeClientMessage::NegClose(subscription_id))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -821,14 +827,14 @@ mod tests {
 
         assert_eq!(
             first
-                .handle_client_message(req(subscription_id.clone()))
+                .handle_protocol_client_message_for_test(req(subscription_id.clone()))
                 .await
                 .expect("first req"),
             vec![RelayMessage::Eose(subscription_id.clone())]
         );
         assert_eq!(
             second
-                .handle_client_message(req(subscription_id.clone()))
+                .handle_protocol_client_message_for_test(req(subscription_id.clone()))
                 .await
                 .expect("second req"),
             vec![RelayMessage::Eose(subscription_id.clone())]
@@ -838,7 +844,9 @@ mod tests {
 
         assert_eq!(
             first
-                .handle_client_message(ClientMessage::Close(subscription_id.clone()))
+                .handle_protocol_client_message_for_test(ClientMessage::Close(
+                    subscription_id.clone()
+                ))
                 .await
                 .expect("close first"),
             Vec::<RelayMessage>::new()
@@ -848,7 +856,7 @@ mod tests {
 
         assert_eq!(
             second
-                .handle_client_message(req(subscription_id.clone()))
+                .handle_protocol_client_message_for_test(req(subscription_id.clone()))
                 .await
                 .expect("replace second"),
             vec![RelayMessage::Eose(subscription_id.clone())]
@@ -858,7 +866,7 @@ mod tests {
 
         assert_eq!(
             second
-                .handle_client_message(ClientMessage::Close(subscription_id))
+                .handle_protocol_client_message_for_test(ClientMessage::Close(subscription_id))
                 .await
                 .expect("close second"),
             Vec::<RelayMessage>::new()
@@ -890,7 +898,7 @@ mod tests {
             tangle_v2_auth_event(FixtureKey::Owner, "owner-live", 120).expect("owner auth event");
         assert_eq!(
             runtime
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Auth(owner_auth_event.clone()),
                     &mut owner_auth,
                     UnixTimestamp::new(120)
@@ -907,7 +915,7 @@ mod tests {
             .expect("create");
         assert_eq!(
             runtime
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Event(create.clone()),
                     &mut owner_auth,
                     UnixTimestamp::new(121)
@@ -934,7 +942,7 @@ mod tests {
 
         assert_eq!(
             session
-                .handle_client_message(ClientMessage::Req {
+                .handle_protocol_client_message_for_test(ClientMessage::Req {
                     subscription_id: subscription_id.clone(),
                     filters: vec![
                         filter_from_value(&json!({"kinds":[1], "#h":["LiveFarm"]}))
@@ -952,7 +960,7 @@ mod tests {
         let before_auth_id = before_auth.id().clone();
         assert_eq!(
             runtime
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Event(before_auth),
                     &mut owner_auth,
                     UnixTimestamp::new(122)
@@ -982,7 +990,9 @@ mod tests {
                 .expect("auth event");
         assert_eq!(
             session
-                .handle_client_message(ClientMessage::Auth(session_auth_event.clone()))
+                .handle_protocol_client_message_for_test(ClientMessage::Auth(
+                    session_auth_event.clone()
+                ))
                 .await
                 .expect("session auth"),
             vec![RelayMessage::Ok {
@@ -995,7 +1005,7 @@ mod tests {
             .expect("after auth");
         assert_eq!(
             runtime
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Event(after_auth.clone()),
                     &mut owner_auth,
                     UnixTimestamp::new(132)
@@ -1047,7 +1057,7 @@ mod tests {
 
         assert_eq!(
             runtime
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Event(event.clone()),
                     &mut auth,
                     UnixTimestamp::new(1_714_124_433)
@@ -1063,7 +1073,7 @@ mod tests {
         let exact_id = SubscriptionId::new("exact-id").expect("subscription");
         assert_eq!(
             session
-                .handle_client_message(ClientMessage::Req {
+                .handle_protocol_client_message_for_test(ClientMessage::Req {
                     subscription_id: exact_id.clone(),
                     filters: vec![
                         filter_from_value(&json!({"ids":[event.id().as_str()]}))
@@ -1085,7 +1095,7 @@ mod tests {
         let open = SubscriptionId::new("open").expect("subscription");
         assert_eq!(
             session
-                .handle_client_message(ClientMessage::Req {
+                .handle_protocol_client_message_for_test(ClientMessage::Req {
                     subscription_id: open.clone(),
                     filters: vec![filter_from_value(&json!({"kinds":[1]})).expect("open filter")],
                 })
@@ -1104,7 +1114,7 @@ mod tests {
         let search = SubscriptionId::new("search").expect("subscription");
         assert_eq!(
             session
-                .handle_client_message(ClientMessage::Req {
+                .handle_protocol_client_message_for_test(ClientMessage::Req {
                     subscription_id: search.clone(),
                     filters: vec![
                         filter_from_value(&json!({"search":"carrots"})).expect("search filter")
@@ -1121,7 +1131,7 @@ mod tests {
 
         let invalid = SubscriptionId::new("invalid").expect("subscription");
         let invalid_result = session
-            .handle_client_message(ClientMessage::Req {
+            .handle_protocol_client_message_for_test(ClientMessage::Req {
                 subscription_id: invalid,
                 filters: vec![Filter::empty(); 11],
             })
@@ -1148,7 +1158,7 @@ mod tests {
             .expect("owner auth event");
         assert_eq!(
             runtime
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Auth(owner_auth_event.clone()),
                     &mut owner_auth,
                     UnixTimestamp::new(120)
@@ -1166,7 +1176,7 @@ mod tests {
                 .expect("create");
         assert_eq!(
             runtime
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Event(create.clone()),
                     &mut owner_auth,
                     UnixTimestamp::new(121)
@@ -1184,7 +1194,7 @@ mod tests {
                 .expect("public");
         assert_eq!(
             runtime
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Event(public_event.clone()),
                     &mut owner_auth,
                     UnixTimestamp::new(122)
@@ -1202,7 +1212,7 @@ mod tests {
                 .expect("private");
         assert_eq!(
             runtime
-                .handle_client_message(
+                .handle_protocol_client_message_for_test(
                     ClientMessage::Event(private_event.clone()),
                     &mut owner_auth,
                     UnixTimestamp::new(123)
@@ -1228,7 +1238,7 @@ mod tests {
         let subscription_id = SubscriptionId::new("redacted-req").expect("subscription");
         assert_eq!(
             session
-                .handle_client_message(ClientMessage::Req {
+                .handle_protocol_client_message_for_test(ClientMessage::Req {
                     subscription_id: subscription_id.clone(),
                     filters: vec![filter_from_value(&json!({"kinds":[1]})).expect("filter")],
                 })
@@ -1397,7 +1407,7 @@ mod tests {
 
         assert_eq!(
             session
-                .handle_client_message(ClientMessage::Req {
+                .handle_protocol_client_message_for_test(ClientMessage::Req {
                     subscription_id: subscription_id.clone(),
                     filters: vec![
                         filter_from_value(&json!({"kinds": [1], "limit": 1})).expect("filter")
