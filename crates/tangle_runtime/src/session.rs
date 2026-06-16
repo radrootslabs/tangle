@@ -1,10 +1,11 @@
 #![forbid(unsafe_code)]
 
 use crate::{
-    client_message::parse_runtime_client_message,
+    client_message::{RuntimeClientMessage, parse_runtime_client_message},
     errors::BaseRelayError,
     event_bus::{TangleEventReceiveError, TangleEventReceiver},
     logging,
+    pocket_conversion::{pocket_event_to_tangle, pocket_filter_to_tangle},
     relay::{
         auth::{BaseAuthState, generate_auth_challenge},
         core::BaseRelay,
@@ -264,9 +265,9 @@ impl TangleWebSocketSession {
 
     async fn handle_client_message(
         &mut self,
-        message: ClientMessage,
+        message: impl Into<SessionClientMessage>,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
-        match message {
+        match message.into().into_protocol_message()? {
             ClientMessage::Req {
                 subscription_id,
                 filters,
@@ -386,6 +387,95 @@ impl TangleWebSocketSession {
             TangleOutboundQueueError::Closed => TangleSessionControl::Stop,
         }
     }
+}
+
+enum SessionClientMessage {
+    Runtime(RuntimeClientMessage),
+    Protocol(ClientMessage),
+}
+
+impl From<RuntimeClientMessage> for SessionClientMessage {
+    fn from(message: RuntimeClientMessage) -> Self {
+        Self::Runtime(message)
+    }
+}
+
+impl From<ClientMessage> for SessionClientMessage {
+    fn from(message: ClientMessage) -> Self {
+        Self::Protocol(message)
+    }
+}
+
+impl SessionClientMessage {
+    fn into_protocol_message(self) -> Result<ClientMessage, BaseRelayError> {
+        match self {
+            Self::Protocol(message) => Ok(message),
+            Self::Runtime(message) => runtime_message_to_protocol(message),
+        }
+    }
+}
+
+fn runtime_message_to_protocol(
+    message: RuntimeClientMessage,
+) -> Result<ClientMessage, BaseRelayError> {
+    match message {
+        RuntimeClientMessage::Event(event) => {
+            pocket_event_to_tangle(&event).map(ClientMessage::Event)
+        }
+        RuntimeClientMessage::Auth(event) => {
+            pocket_event_to_tangle(&event).map(ClientMessage::Auth)
+        }
+        RuntimeClientMessage::Req {
+            subscription_id,
+            filters,
+            search_present,
+        } => Ok(ClientMessage::Req {
+            subscription_id,
+            filters: runtime_filters_to_protocol(filters, search_present)?,
+        }),
+        RuntimeClientMessage::Count {
+            subscription_id,
+            filters,
+            search_present,
+        } => Ok(ClientMessage::Count {
+            subscription_id,
+            filters: runtime_filters_to_protocol(filters, search_present)?,
+        }),
+        RuntimeClientMessage::Close(subscription_id) => Ok(ClientMessage::Close(subscription_id)),
+        RuntimeClientMessage::NegOpen {
+            subscription_id,
+            filter,
+            message,
+        } => Ok(ClientMessage::NegOpen {
+            subscription_id,
+            filter: pocket_filter_to_tangle(&filter, None)?,
+            message,
+        }),
+        RuntimeClientMessage::NegMsg {
+            subscription_id,
+            message,
+        } => Ok(ClientMessage::NegMsg {
+            subscription_id,
+            message,
+        }),
+        RuntimeClientMessage::NegClose(subscription_id) => {
+            Ok(ClientMessage::NegClose(subscription_id))
+        }
+    }
+}
+
+fn runtime_filters_to_protocol(
+    filters: Vec<tangle_store_pocket::PocketOwnedFilter>,
+    search_present: bool,
+) -> Result<Vec<Filter>, BaseRelayError> {
+    filters
+        .into_iter()
+        .enumerate()
+        .map(|(index, filter)| {
+            let search = (search_present && index == 0).then(String::new);
+            pocket_filter_to_tangle(&filter, search)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
