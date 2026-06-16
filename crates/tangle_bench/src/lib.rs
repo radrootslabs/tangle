@@ -20,7 +20,8 @@ use tangle_runtime::{
     runtime::{TangleRuntime, TangleRuntimeHandle},
 };
 use tangle_store_pocket::{
-    PocketQueryConfig, PocketStoreConfig, PocketSyncPolicy, parse_pocket_filter_json,
+    PocketQueryConfig, PocketStoreConfig, PocketSyncPolicy, parse_pocket_event_json,
+    parse_pocket_filter_json,
 };
 use tangle_test_support::{
     FixtureKey, TANGLE_V2_RELAY_URL, tangle_v2_auth_event, tangle_v2_event, tangle_v2_group_config,
@@ -1465,15 +1466,18 @@ fn materialize_dataset(
     let mut rejected = 0;
     for source in dataset.source_events() {
         let sample = Instant::now();
+        let pocket_event =
+            parse_pocket_event_json(event_to_value(source.event()).to_string().as_bytes())
+                .map_err(|error| error.to_string())?;
         let message = match source.auth() {
             BenchEventAuth::None => relay
-                .handle_event(source.event().clone())
+                .handle_pocket_event(&pocket_event)
                 .map_err(|error| error.to_string())?,
             BenchEventAuth::Owner => relay
-                .handle_event_with_auth(source.event().clone(), &owner_auth)
+                .handle_pocket_event_with_auth(&pocket_event, &owner_auth)
                 .map_err(|error| error.to_string())?,
             BenchEventAuth::Admin => relay
-                .handle_event_with_auth(source.event().clone(), &admin_auth)
+                .handle_pocket_event_with_auth(&pocket_event, &admin_auth)
                 .map_err(|error| error.to_string())?,
         };
         samples.push(elapsed_micros(sample));

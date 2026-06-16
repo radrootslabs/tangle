@@ -105,7 +105,7 @@ mod tests {
         pocket_event_pubkey, validate_pocket_event_shape, verify_pocket_event_signature,
     };
     use crate::pocket_conversion::tangle_event_to_pocket;
-    use tangle_protocol::{Event, EventId, SignatureHex, Tag, event_to_value};
+    use tangle_protocol::{Event, EventId, Tag, event_to_value};
     use tangle_store_pocket::parse_pocket_event_json;
     use tangle_test_support::{FixtureKey, tangle_v2_event};
 
@@ -117,10 +117,13 @@ mod tests {
 
         assert_eq!(verify_pocket_event_signature(&pocket), Ok(()));
 
+        let signature_source =
+            tangle_v2_event(FixtureKey::Admin, 1_714_124_433, 1, Vec::new(), "hello")
+                .expect("signature source");
         let wrong_signature = Event::new(
             event.id().clone(),
             event.unsigned().clone(),
-            SignatureHex::new(&"0".repeat(128)).expect("sig"),
+            signature_source.sig().clone(),
         );
         let wrong_pocket = tangle_event_to_pocket(&wrong_signature).expect("wrong pocket");
         assert_eq!(

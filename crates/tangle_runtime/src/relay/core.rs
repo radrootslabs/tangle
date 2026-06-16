@@ -4,12 +4,12 @@ use crate::groups::{
 };
 use crate::logging::{self, TangleModerationAuditResult};
 use crate::ops::BaseRelayReadinessState;
-use crate::pocket_conversion::{
-    pocket_event_id, pocket_event_to_tangle, pocket_pubkey, tangle_event_to_pocket,
-    tangle_filter_to_pocket,
-};
+#[cfg(test)]
+use crate::pocket_conversion::{pocket_event_id, tangle_event_to_pocket};
+use crate::pocket_conversion::{pocket_event_to_tangle, pocket_pubkey, tangle_filter_to_pocket};
 use crate::pocket_event_validation::{
-    pocket_event_id as pocket_runtime_event_id, validate_pocket_event_shape,
+    is_pocket_nip70_protected_event, pocket_event_id as pocket_runtime_event_id, pocket_event_kind,
+    pocket_event_pubkey, validate_pocket_event_shape, verify_pocket_event_signature,
 };
 use crate::relay::{
     auth::BaseAuthState,
@@ -19,12 +19,15 @@ use std::{
     cell::{Cell, RefCell},
     collections::BTreeSet,
 };
+#[cfg(test)]
 use tangle_crypto::verify_event_signature;
 use tangle_groups::{
     GroupAuthContext, GroupEventClass, GroupEventView, GroupRuntimeConfig, StoreOffset,
     classify_group_event, validate_client_group_event_structure,
 };
-use tangle_protocol::{ClientMessage, Event, Filter, RelayMessage, SubscriptionId, UnixTimestamp};
+#[cfg(test)]
+use tangle_protocol::ClientMessage;
+use tangle_protocol::{Event, Filter, RelayMessage, SubscriptionId, UnixTimestamp};
 use tangle_store_pocket::{
     PocketEvent, PocketHll8, PocketQueryConfig, PocketScreenResult, PocketStoreConfig,
     PocketStoreHandle,
@@ -234,6 +237,7 @@ enum BaseRelayFilterLimitMode {
     PreserveCountLimitless,
 }
 
+#[cfg(test)]
 fn is_nip70_protected_event(event: &Event) -> bool {
     event
         .unsigned()
@@ -591,6 +595,7 @@ impl BaseRelay {
         })
     }
 
+    #[cfg(test)]
     pub fn handle_client_message(
         &mut self,
         message: ClientMessage,
@@ -687,6 +692,7 @@ impl BaseRelay {
         )
     }
 
+    #[cfg(test)]
     fn handle_auth_message(
         &self,
         event: Event,
@@ -696,6 +702,7 @@ impl BaseRelay {
         Self::handle_auth_with_limits(self.limits, event, auth, now)
     }
 
+    #[cfg(test)]
     pub(crate) fn handle_auth_with_limits(
         limits: BaseRelayLimits,
         event: Event,
@@ -758,11 +765,13 @@ impl BaseRelay {
             })
     }
 
+    #[cfg(test)]
     pub fn handle_event(&self, event: Event) -> Result<RelayMessage, BaseRelayError> {
         self.handle_event_with_group_auth(event, &GroupAuthContext::unauthenticated())
             .map(BaseRelayEventWrite::into_message)
     }
 
+    #[cfg(test)]
     pub fn handle_event_with_auth(
         &self,
         event: Event,
@@ -772,6 +781,21 @@ impl BaseRelay {
             .map(BaseRelayEventWrite::into_message)
     }
 
+    pub fn handle_pocket_event(&self, event: &PocketEvent) -> Result<RelayMessage, BaseRelayError> {
+        self.handle_pocket_event_with_group_auth(event, &GroupAuthContext::unauthenticated())
+            .map(BaseRelayEventWrite::into_message)
+    }
+
+    pub fn handle_pocket_event_with_auth(
+        &self,
+        event: &PocketEvent,
+        auth: &BaseAuthState,
+    ) -> Result<RelayMessage, BaseRelayError> {
+        self.handle_pocket_event_with_auth_report(event, auth)
+            .map(BaseRelayEventWrite::into_message)
+    }
+
+    #[cfg(test)]
     pub(crate) fn handle_event_with_auth_report(
         &self,
         event: Event,
@@ -786,6 +810,7 @@ impl BaseRelay {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn handle_event_with_shared_services(
         store: &PocketStoreHandle,
         groups: Option<&GroupServiceHandle>,
@@ -794,6 +819,36 @@ impl BaseRelay {
         auth: &BaseAuthState,
     ) -> Result<BaseRelayEventWrite, BaseRelayError> {
         Self::handle_event_with_group_auth_and_services(
+            store,
+            groups,
+            limits,
+            event,
+            &GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned()),
+        )
+    }
+
+    pub(crate) fn handle_pocket_event_with_auth_report(
+        &self,
+        event: &PocketEvent,
+        auth: &BaseAuthState,
+    ) -> Result<BaseRelayEventWrite, BaseRelayError> {
+        Self::handle_pocket_event_with_shared_services(
+            &self.store,
+            self.groups.as_ref(),
+            self.limits,
+            event,
+            auth,
+        )
+    }
+
+    pub(crate) fn handle_pocket_event_with_shared_services(
+        store: &PocketStoreHandle,
+        groups: Option<&GroupServiceHandle>,
+        limits: BaseRelayLimits,
+        event: &PocketEvent,
+        auth: &BaseAuthState,
+    ) -> Result<BaseRelayEventWrite, BaseRelayError> {
+        Self::handle_pocket_event_with_group_auth_and_services(
             store,
             groups,
             limits,
@@ -835,6 +890,7 @@ impl BaseRelay {
         Ok(BaseRelayShutdownReport::new(closed))
     }
 
+    #[cfg(test)]
     fn handle_event_with_group_auth(
         &self,
         event: Event,
@@ -849,6 +905,7 @@ impl BaseRelay {
         )
     }
 
+    #[cfg(test)]
     fn handle_event_with_group_auth_and_services(
         store: &PocketStoreHandle,
         groups: Option<&GroupServiceHandle>,
@@ -959,6 +1016,137 @@ impl BaseRelay {
         }
         let pocket_event = tangle_event_to_pocket(&event)?;
         let store_offset = StoreOffset::new(store.store_event(&pocket_event)?);
+        Ok(BaseRelayEventWrite::stored(
+            ok_accepted(event_id, String::new()),
+            vec![store_offset],
+        ))
+    }
+
+    fn handle_pocket_event_with_group_auth(
+        &self,
+        event: &PocketEvent,
+        auth: &GroupAuthContext,
+    ) -> Result<BaseRelayEventWrite, BaseRelayError> {
+        Self::handle_pocket_event_with_group_auth_and_services(
+            &self.store,
+            self.groups.as_ref(),
+            self.limits,
+            event,
+            auth,
+        )
+    }
+
+    fn handle_pocket_event_with_group_auth_and_services(
+        store: &PocketStoreHandle,
+        groups: Option<&GroupServiceHandle>,
+        limits: BaseRelayLimits,
+        event: &PocketEvent,
+        auth: &GroupAuthContext,
+    ) -> Result<BaseRelayEventWrite, BaseRelayError> {
+        let event_id = pocket_runtime_event_id(event)?;
+        if let Err(error) = limits.validate_pocket_event(event) {
+            return Ok(BaseRelayEventWrite::unstored(ok_rejected(
+                event_id,
+                error.prefixed_message(),
+            )));
+        }
+        if let Err(error) = verify_pocket_event_signature(event) {
+            return Ok(BaseRelayEventWrite::unstored(ok_rejected(
+                event_id,
+                error.prefixed_message(),
+            )));
+        }
+        let pubkey = pocket_event_pubkey(event)?;
+        if is_pocket_nip70_protected_event(event)? && !auth.contains(&pubkey) {
+            return Ok(BaseRelayEventWrite::unstored(ok_rejected(
+                event_id,
+                BaseRelayError::auth_required(
+                    "protected event requires authenticated event author",
+                )
+                .prefixed_message(),
+            )));
+        }
+        let group_limits = groups.map(GroupServiceHandle::limits).unwrap_or_default();
+        let audit_class = classify_group_event(event, group_limits).ok();
+        let class = match validate_client_group_event_structure(event, group_limits) {
+            Ok(class) => class,
+            Err(error) => {
+                if let Some(class) = audit_class.as_ref() {
+                    log_pocket_group_moderation_audit(
+                        event,
+                        class,
+                        TangleModerationAuditResult::Rejected,
+                    )?;
+                }
+                return Ok(BaseRelayEventWrite::unstored(ok_rejected(
+                    event_id,
+                    error.prefixed_message(),
+                )));
+            }
+        };
+        if !matches!(class, GroupEventClass::NonGroup) {
+            let tangle_event = pocket_event_to_tangle(event)?;
+            let Some(groups) = groups else {
+                logging::log_group_moderation_audit(
+                    &tangle_event,
+                    &class,
+                    TangleModerationAuditResult::Rejected,
+                );
+                return Ok(BaseRelayEventWrite::unstored(ok_rejected(
+                    event_id,
+                    "blocked: NIP-29 group events are not accepted before group service".to_owned(),
+                )));
+            };
+            match groups.store_group_event(store, &tangle_event, &class, auth) {
+                Ok(GroupEventWrite::Stored(stored_offsets)) => {
+                    logging::log_group_moderation_audit(
+                        &tangle_event,
+                        &class,
+                        TangleModerationAuditResult::Accepted,
+                    );
+                    return Ok(BaseRelayEventWrite::stored(
+                        ok_accepted(event_id, String::new()),
+                        stored_offsets,
+                    ));
+                }
+                Ok(GroupEventWrite::Duplicate) => {
+                    logging::log_group_moderation_audit(
+                        &tangle_event,
+                        &class,
+                        TangleModerationAuditResult::Accepted,
+                    );
+                    return Ok(BaseRelayEventWrite::unstored(ok_accepted(
+                        event_id,
+                        "duplicate: already have this event".to_owned(),
+                    )));
+                }
+                Err(GroupEventWriteError::Rejected(error)) => {
+                    logging::log_group_moderation_audit(
+                        &tangle_event,
+                        &class,
+                        TangleModerationAuditResult::Rejected,
+                    );
+                    return Ok(BaseRelayEventWrite::unstored(ok_rejected(
+                        event_id,
+                        error.prefixed_message(),
+                    )));
+                }
+                Err(GroupEventWriteError::Storage(error)) => return Err(error),
+            }
+        }
+        if pocket_event_kind(event)?.is_ephemeral() {
+            return Ok(BaseRelayEventWrite::unstored(ok_accepted(
+                event_id,
+                String::new(),
+            )));
+        }
+        if store.event_by_id(event.id())?.is_some() {
+            return Ok(BaseRelayEventWrite::unstored(ok_accepted(
+                event_id,
+                "duplicate: already have this event".to_owned(),
+            )));
+        }
+        let store_offset = StoreOffset::new(store.store_event(event)?);
         Ok(BaseRelayEventWrite::stored(
             ok_accepted(event_id, String::new()),
             vec![store_offset],
@@ -1444,6 +1632,16 @@ impl BaseRelay {
 
 fn filters_are_complete(filters: &[Filter]) -> bool {
     !filters.is_empty() && filters.iter().all(Filter::is_complete)
+}
+
+fn log_pocket_group_moderation_audit(
+    event: &PocketEvent,
+    class: &GroupEventClass,
+    result: TangleModerationAuditResult,
+) -> Result<(), BaseRelayError> {
+    let event = pocket_event_to_tangle(event)?;
+    logging::log_group_moderation_audit(&event, class, result);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2407,6 +2605,74 @@ mod tests {
             &ephemeral,
         );
         assert_eq!(count_kind(&relay, 20_001), 0);
+    }
+
+    #[test]
+    fn base_relay_pocket_event_path_preserves_event_admission_behavior() {
+        let relay = test_relay("base-relay-pocket-event-store-path", 8);
+        let valid = signed_public_event(7, 1, Vec::new(), "valid");
+        let signature_source = signed_public_event(8, 1, Vec::new(), "signature source");
+        let invalid = Event::new(
+            valid.id().clone(),
+            valid.unsigned().clone(),
+            signature_source.sig().clone(),
+        );
+        let ephemeral = signed_public_event(7, 20_001, Vec::new(), "ephemeral");
+        let protected = signed_public_event(
+            7,
+            1,
+            vec![Tag::from_parts("-", &[]).expect("protected")],
+            "protected",
+        );
+        let valid_pocket = tangle_event_to_pocket(&valid).expect("valid pocket");
+        let invalid_pocket = tangle_event_to_pocket(&invalid).expect("invalid pocket");
+        let ephemeral_pocket = tangle_event_to_pocket(&ephemeral).expect("ephemeral pocket");
+        let protected_pocket = tangle_event_to_pocket(&protected).expect("protected pocket");
+
+        assert_eq!(
+            rejected_message(relay.handle_pocket_event(&invalid_pocket).expect("invalid")),
+            "invalid: event signature verification failed"
+        );
+        assert_eq!(count_kind(&relay, 1), 0);
+
+        assert_accepted(
+            relay
+                .handle_pocket_event(&valid_pocket)
+                .expect("valid pocket"),
+            &valid,
+        );
+        assert_eq!(
+            relay.handle_pocket_event(&valid_pocket).expect("duplicate"),
+            RelayMessage::Ok {
+                event_id: valid.id().clone(),
+                accepted: true,
+                message: "duplicate: already have this event".to_owned()
+            }
+        );
+        assert_eq!(count_kind(&relay, 1), 1);
+
+        assert_accepted(
+            relay
+                .handle_pocket_event(&ephemeral_pocket)
+                .expect("ephemeral"),
+            &ephemeral,
+        );
+        assert_eq!(count_kind(&relay, 20_001), 0);
+
+        assert_eq!(
+            rejected_message(
+                relay
+                    .handle_pocket_event(&protected_pocket)
+                    .expect("protected")
+            ),
+            "auth-required: protected event requires authenticated event author"
+        );
+        assert_accepted(
+            relay
+                .handle_pocket_event_with_auth(&protected_pocket, &authenticated_state(7))
+                .expect("protected auth"),
+            &protected,
+        );
     }
 
     #[test]

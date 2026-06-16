@@ -23,14 +23,15 @@ use tangle_protocol::{
 };
 use tangle_runtime::{
     config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
+    errors::BaseRelayError,
     nip11::BaseRelayInfoConfig,
-    relay::auth::BaseAuthState,
+    relay::{auth::BaseAuthState, core::BaseRelay},
     runtime::TangleRuntime,
     server::serve_listener_until_shutdown,
 };
 use tangle_store_pocket::{
     PocketStoreConfig, PocketStoreHandle, TANGLE_GROUP_CHECKPOINT_TABLE, TANGLE_GROUP_OUTBOX_TABLE,
-    TANGLE_GROUP_PROJECTION_TABLE,
+    TANGLE_GROUP_PROJECTION_TABLE, parse_pocket_event_json,
 };
 use tangle_test_support::{
     FixtureKey, TANGLE_V2_RELAY_SECRET_HEX, TANGLE_V2_RELAY_URL, tangle_v2_auth_event,
@@ -39,6 +40,34 @@ use tangle_test_support::{
 };
 use tokio::{net::TcpListener, time::timeout};
 use tokio_tungstenite::tungstenite::{Message as TungsteniteMessage, client::IntoClientRequest};
+
+trait BaseRelayEventTestExt {
+    fn handle_event(&self, event: Event) -> Result<RelayMessage, BaseRelayError>;
+
+    fn handle_event_with_auth(
+        &self,
+        event: Event,
+        auth: &BaseAuthState,
+    ) -> Result<RelayMessage, BaseRelayError>;
+}
+
+impl BaseRelayEventTestExt for BaseRelay {
+    fn handle_event(&self, event: Event) -> Result<RelayMessage, BaseRelayError> {
+        let raw = serde_json::to_vec(&event_to_value(&event)).expect("event JSON");
+        let pocket = parse_pocket_event_json(&raw).expect("pocket event");
+        self.handle_pocket_event(&pocket)
+    }
+
+    fn handle_event_with_auth(
+        &self,
+        event: Event,
+        auth: &BaseAuthState,
+    ) -> Result<RelayMessage, BaseRelayError> {
+        let raw = serde_json::to_vec(&event_to_value(&event)).expect("event JSON");
+        let pocket = parse_pocket_event_json(&raw).expect("pocket event");
+        self.handle_pocket_event_with_auth(&pocket, auth)
+    }
+}
 
 #[tokio::test]
 async fn tangle_run_serves_until_shutdown() {
@@ -1580,7 +1609,8 @@ fn runtime_event_handling_does_not_lock_relay_state() {
         .expect("req branch");
 
     assert!(!event_branch.contains("relay.lock().await"));
-    assert!(event_branch.contains("self.inner.handle_event_with_auth_report(event, auth)?"));
+    assert!(!event_branch.contains("pocket_event_to_tangle(&pocket_event)?"));
+    assert!(event_branch.contains("handle_pocket_event_with_auth_report(&pocket_event, auth)?"));
 }
 
 #[test]
@@ -1661,7 +1691,7 @@ fn runtime_shared_shell_does_not_keep_transitional_base_relay_mutex() {
     assert!(!runtime.contains("Mutex<BaseRelay>"));
     assert!(!runtime.contains("relay.lock().await"));
     assert!(!shared_shell.contains("relay:"));
-    assert!(handle_impl.contains("BaseRelay::handle_auth_with_limits"));
+    assert!(handle_impl.contains("BaseRelay::handle_pocket_auth_with_limits"));
     assert!(handle_impl.contains("self.inner.store.sync()?"));
 }
 

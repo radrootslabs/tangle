@@ -2,20 +2,50 @@
 
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use tangle_protocol::{RelayMessage, Tag, UnixTimestamp};
+use tangle_protocol::{Event, RelayMessage, Tag, UnixTimestamp, event_to_value};
 use tangle_runtime::{
     config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
+    errors::BaseRelayError,
     logging::{TANGLE_LOG_REDACTED, TangleLogRedactor},
     nip11::BaseRelayInfoConfig,
     ops::BaseRelayReadinessCheckStatus,
     rate_limits::{TangleRateLimitKey, TangleRateLimitScope, TangleRateLimiter},
-    relay::auth::BaseAuthState,
+    relay::{auth::BaseAuthState, core::BaseRelay},
     runtime::TangleRuntime,
 };
+use tangle_store_pocket::parse_pocket_event_json;
 use tangle_test_support::{
     FixtureKey, TANGLE_V2_RELAY_SECRET_HEX, TANGLE_V2_RELAY_URL, tangle_v2_auth_event,
     tangle_v2_event,
 };
+
+trait BaseRelayEventTestExt {
+    fn handle_event(&self, event: Event) -> Result<RelayMessage, BaseRelayError>;
+
+    fn handle_event_with_auth(
+        &self,
+        event: Event,
+        auth: &BaseAuthState,
+    ) -> Result<RelayMessage, BaseRelayError>;
+}
+
+impl BaseRelayEventTestExt for BaseRelay {
+    fn handle_event(&self, event: Event) -> Result<RelayMessage, BaseRelayError> {
+        let raw = serde_json::to_vec(&event_to_value(&event)).expect("event JSON");
+        let pocket = parse_pocket_event_json(&raw).expect("pocket event");
+        self.handle_pocket_event(&pocket)
+    }
+
+    fn handle_event_with_auth(
+        &self,
+        event: Event,
+        auth: &BaseAuthState,
+    ) -> Result<RelayMessage, BaseRelayError> {
+        let raw = serde_json::to_vec(&event_to_value(&event)).expect("event JSON");
+        let pocket = parse_pocket_event_json(&raw).expect("pocket event");
+        self.handle_pocket_event_with_auth(&pocket, auth)
+    }
+}
 
 #[test]
 fn operations_surfaces_match_enforced_runtime_contracts() {

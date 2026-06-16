@@ -9,9 +9,7 @@ use crate::{
     logging,
     ops::{BaseRelayReadinessHandle, BaseRelayReadinessState},
     pocket_conversion::{pocket_event_to_tangle, pocket_filter_to_tangle},
-    pocket_event_validation::{
-        is_pocket_nip70_protected_event, pocket_event_id, pocket_event_pubkey,
-    },
+    pocket_event_validation::{pocket_event_id, pocket_event_kind, pocket_event_pubkey},
     rate_limits::{
         TangleQueryRateLimitConfig, TangleRateLimitDecision, TangleRateLimitKey,
         TangleRateLimitQueryClass, TangleRateLimitRule, TangleRateLimitScope, TangleRateLimiter,
@@ -371,38 +369,38 @@ impl TangleRuntimeShared {
         }
     }
 
-    fn rate_limit_event(
+    fn rate_limit_event_pocket(
         &self,
-        event: &Event,
+        event: &PocketEvent,
         context: TangleClientRateLimitContext,
         now: UnixTimestamp,
-    ) -> Option<RelayMessage> {
+    ) -> Result<Option<RelayMessage>, BaseRelayError> {
         let rules = self.config.rate_limits().event();
         if let Some(peer_ip) = context.peer_ip
-            && let Some(message) = self.rate_limit_ok(
+            && let Some(message) = self.rate_limit_ok_pocket(
                 event,
                 TangleRateLimitKey::ip(TangleRateLimitScope::Event, peer_ip),
                 rules.per_ip(),
                 "event ip",
                 now,
-            )
+            )?
         {
-            return Some(message);
+            return Ok(Some(message));
         }
-        self.rate_limit_ok(
+        self.rate_limit_ok_pocket(
             event,
-            TangleRateLimitKey::pubkey(
-                TangleRateLimitScope::Event,
-                event.unsigned().pubkey().clone(),
-            ),
+            TangleRateLimitKey::pubkey(TangleRateLimitScope::Event, pocket_event_pubkey(event)?),
             rules.per_pubkey(),
             "event pubkey",
             now,
         )
-        .or_else(|| {
-            self.rate_limit_ok(
+        .and_then(|message| {
+            if message.is_some() {
+                return Ok(message);
+            }
+            self.rate_limit_ok_pocket(
                 event,
-                TangleRateLimitKey::kind(TangleRateLimitScope::Event, event.unsigned().kind()),
+                TangleRateLimitKey::kind(TangleRateLimitScope::Event, pocket_event_kind(event)?),
                 rules.per_kind(),
                 "event kind",
                 now,
@@ -464,94 +462,98 @@ impl TangleRuntimeShared {
         )
     }
 
-    fn rate_limit_group_write(
+    fn rate_limit_group_write_pocket(
         &self,
-        event: &Event,
+        event: &PocketEvent,
         context: TangleClientRateLimitContext,
         now: UnixTimestamp,
-    ) -> Option<RelayMessage> {
+    ) -> Result<Option<RelayMessage>, BaseRelayError> {
         if !self.config.groups().enabled() {
-            return None;
+            return Ok(None);
         }
         let class =
-            validate_client_group_event_structure(event, self.config.groups().limits()).ok()?;
-        let group_id = class.group_id()?.clone();
+            validate_client_group_event_structure(event, self.config.groups().limits()).ok();
+        let Some(class) = class else {
+            return Ok(None);
+        };
+        let Some(group_id) = class.group_id().cloned() else {
+            return Ok(None);
+        };
         let rules = self.config.rate_limits().group();
-        if event.unsigned().kind().as_u32() == KIND_GROUP_JOIN_REQUEST {
+        let kind = pocket_event_kind(event)?;
+        let pubkey = pocket_event_pubkey(event)?;
+        if kind.as_u32() == KIND_GROUP_JOIN_REQUEST {
             if let Some(peer_ip) = context.peer_ip
-                && let Some(message) = self.rate_limit_ok(
+                && let Some(message) = self.rate_limit_ok_pocket(
                     event,
                     TangleRateLimitKey::join_flow_ip(group_id.clone(), peer_ip),
                     rules.join_flow_per_ip(),
                     "group join ip",
                     now,
-                )
+                )?
             {
-                return Some(message);
+                return Ok(Some(message));
             }
-            if let Some(message) = self.rate_limit_ok(
+            if let Some(message) = self.rate_limit_ok_pocket(
                 event,
-                TangleRateLimitKey::join_flow(group_id.clone(), event.unsigned().pubkey().clone()),
+                TangleRateLimitKey::join_flow(group_id.clone(), pubkey.clone()),
                 rules.join_flow(),
                 "group join",
                 now,
-            ) {
-                return Some(message);
+            )? {
+                return Ok(Some(message));
             }
         }
         if let Some(peer_ip) = context.peer_ip
-            && let Some(message) = self.rate_limit_ok(
+            && let Some(message) = self.rate_limit_ok_pocket(
                 event,
                 TangleRateLimitKey::ip(TangleRateLimitScope::GroupWrite, peer_ip),
                 rules.write_per_ip(),
                 "group ip",
                 now,
-            )
+            )?
         {
-            return Some(message);
+            return Ok(Some(message));
         }
-        if let Some(message) = self.rate_limit_ok(
+        if let Some(message) = self.rate_limit_ok_pocket(
             event,
-            TangleRateLimitKey::pubkey(
-                TangleRateLimitScope::GroupWrite,
-                event.unsigned().pubkey().clone(),
-            ),
+            TangleRateLimitKey::pubkey(TangleRateLimitScope::GroupWrite, pubkey),
             rules.write_per_pubkey(),
             "group pubkey",
             now,
-        ) {
-            return Some(message);
+        )? {
+            return Ok(Some(message));
         }
-        if let Some(message) = self.rate_limit_ok(
+        if let Some(message) = self.rate_limit_ok_pocket(
             event,
             TangleRateLimitKey::group(TangleRateLimitScope::GroupWrite, group_id),
             rules.write_per_group(),
             "group write",
             now,
-        ) {
-            return Some(message);
+        )? {
+            return Ok(Some(message));
         }
-        self.rate_limit_ok(
+        self.rate_limit_ok_pocket(
             event,
-            TangleRateLimitKey::kind(TangleRateLimitScope::GroupWrite, event.unsigned().kind()),
+            TangleRateLimitKey::kind(TangleRateLimitScope::GroupWrite, kind),
             rules.write_per_kind(),
             "group kind",
             now,
         )
     }
 
-    fn is_group_event(&self, event: &Event) -> bool {
+    fn is_group_event_pocket(&self, event: &PocketEvent) -> bool {
         self.config.groups().enabled()
             && validate_client_group_event_structure(event, self.config.groups().limits())
                 .is_ok_and(|class| !matches!(class, GroupEventClass::NonGroup))
     }
 
-    fn handle_event_with_auth_report(
+    fn handle_pocket_event_with_auth_report(
         &self,
-        event: Event,
+        event: &PocketEvent,
         auth: &BaseAuthState,
     ) -> Result<BaseRelayEventWrite, BaseRelayError> {
-        BaseRelay::handle_event_with_shared_services(
+        BaseRelay::handle_pocket_event_with_shared_services(
             &self.store,
             self.groups.as_ref(),
             self.limits.base_relay_limits(),
@@ -765,31 +767,6 @@ impl TangleRuntimeShared {
         }
     }
 
-    fn rate_limit_ok(
-        &self,
-        event: &Event,
-        key: TangleRateLimitKey,
-        rule: TangleRateLimitRule,
-        label: &'static str,
-        now: UnixTimestamp,
-    ) -> Option<RelayMessage> {
-        match self.rate_limiter.record(key, rule, now) {
-            TangleRateLimitDecision::Allowed { .. } => None,
-            TangleRateLimitDecision::Rejected { reset_at } => {
-                self.metrics.record_rate_limit_rejection();
-                logging::log_rate_limit_rejected(label, "event", reset_at);
-                Some(RelayMessage::Ok {
-                    event_id: event.id().clone(),
-                    accepted: false,
-                    message: BaseRelayError::rate_limited(format!(
-                        "{label} rate limit exceeded until {reset_at}"
-                    ))
-                    .prefixed_message(),
-                })
-            }
-        }
-    }
-
     fn rate_limit_ok_pocket(
         &self,
         event: &PocketEvent,
@@ -920,31 +897,27 @@ impl TangleRuntimeHandle {
             .record_client_message(runtime_client_message_metric_kind(&message));
         match message {
             RuntimeClientMessage::Event(pocket_event) => {
-                let event = pocket_event_to_tangle(&pocket_event)?;
-                debug_assert_eq!(
-                    is_pocket_nip70_protected_event(&pocket_event)?,
-                    event
-                        .unsigned()
-                        .tags()
-                        .iter()
-                        .any(|tag| tag.name().as_str() == "-")
-                );
                 let started_at = Instant::now();
-                let event_id = event.id().clone();
-                let is_group_event = self.inner.is_group_event(&event);
-                if let Some(message) = self.inner.rate_limit_event(&event, rate_limit_context, now)
-                {
-                    record_event_metrics(&self.inner.metrics, &message, is_group_event, started_at);
-                    return Ok(vec![message]);
-                }
+                let event_id = pocket_event_id(&pocket_event)?;
+                let is_group_event = self.inner.is_group_event_pocket(&pocket_event);
                 if let Some(message) =
                     self.inner
-                        .rate_limit_group_write(&event, rate_limit_context, now)
+                        .rate_limit_event_pocket(&pocket_event, rate_limit_context, now)?
                 {
                     record_event_metrics(&self.inner.metrics, &message, is_group_event, started_at);
                     return Ok(vec![message]);
                 }
-                let result = self.inner.handle_event_with_auth_report(event, auth)?;
+                if let Some(message) = self.inner.rate_limit_group_write_pocket(
+                    &pocket_event,
+                    rate_limit_context,
+                    now,
+                )? {
+                    record_event_metrics(&self.inner.metrics, &message, is_group_event, started_at);
+                    return Ok(vec![message]);
+                }
+                let result = self
+                    .inner
+                    .handle_pocket_event_with_auth_report(&pocket_event, auth)?;
                 let group_outbox_pending_events =
                     is_group_event.then(|| self.inner.group_outbox_pending_events());
                 if is_group_event {

@@ -17,6 +17,7 @@ use tangle_protocol::{
 };
 use tangle_runtime::{
     config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
+    errors::BaseRelayError,
     groups::{GroupCheckpointStatus, validate_group_extra_tables},
     nip11::BaseRelayInfoConfig,
     relay::{
@@ -38,6 +39,34 @@ use tangle_test_support::{
     tangle_v2_leave_event, tangle_v2_pubkey_tag, tangle_v2_put_user_event,
     tangle_v2_remove_user_event, tangle_v2_tag,
 };
+
+trait BaseRelayEventTestExt {
+    fn handle_event(&self, event: Event) -> Result<RelayMessage, BaseRelayError>;
+
+    fn handle_event_with_auth(
+        &self,
+        event: Event,
+        auth: &BaseAuthState,
+    ) -> Result<RelayMessage, BaseRelayError>;
+}
+
+impl BaseRelayEventTestExt for BaseRelay {
+    fn handle_event(&self, event: Event) -> Result<RelayMessage, BaseRelayError> {
+        let raw = serde_json::to_vec(&event_to_value(&event)).expect("event JSON");
+        let pocket = parse_pocket_event_json(&raw).expect("pocket event");
+        self.handle_pocket_event(&pocket)
+    }
+
+    fn handle_event_with_auth(
+        &self,
+        event: Event,
+        auth: &BaseAuthState,
+    ) -> Result<RelayMessage, BaseRelayError> {
+        let raw = serde_json::to_vec(&event_to_value(&event)).expect("event JSON");
+        let pocket = parse_pocket_event_json(&raw).expect("pocket event");
+        self.handle_pocket_event_with_auth(&pocket, auth)
+    }
+}
 
 #[test]
 fn public_relay_smoke_stores_queries_counts_and_fans_out() {
