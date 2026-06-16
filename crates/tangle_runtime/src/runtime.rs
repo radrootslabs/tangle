@@ -2106,21 +2106,17 @@ mod tests {
     use tangle_groups::{
         CanonicalGroupEvent, GroupEventClass, GroupId, GroupProjection, KIND_GROUP_ADMINS,
         KIND_GROUP_CREATE_GROUP, KIND_GROUP_DELETE_GROUP, KIND_GROUP_JOIN_REQUEST,
-        KIND_GROUP_MEMBERS, KIND_GROUP_METADATA, KIND_GROUP_PUT_USER, MemberStatus, StoreOffset,
-        rebuild_group_projection,
+        KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA, KIND_GROUP_PUT_USER,
+        KIND_GROUP_REMOVE_USER, MemberStatus, StoreOffset, rebuild_group_projection,
     };
     use tangle_protocol::{
-        ClientMessage, Event, EventId, Filter, Kind, PublicKeyHex, RelayMessage, SubscriptionId,
-        Tag, UnixTimestamp, filter_from_value,
+        ClientMessage, Event, EventId, Filter, Kind, PublicKeyHex, RelayMessage, SignatureHex,
+        SubscriptionId, Tag, UnixTimestamp, UnsignedEvent, filter_from_value,
     };
     use tangle_store_pocket::{
         PocketEvent, PocketKind, PocketOwnedEvent, PocketOwnedTags, PocketTime,
     };
-    use tangle_test_support::{
-        FixtureKey, tangle_v2_auth_event, tangle_v2_delete_group_event, tangle_v2_event,
-        tangle_v2_group_create_event, tangle_v2_group_event, tangle_v2_join_event,
-        tangle_v2_leave_event, tangle_v2_put_user_event, tangle_v2_remove_user_event,
-    };
+    use tangle_test_support::FixtureKey;
 
     #[test]
     fn tangle_runtime_opens_owned_process_shell_from_config() {
@@ -4890,6 +4886,146 @@ mod tests {
         crate::pocket_conversion::tangle_filter_to_pocket(&filter).expect("pocket filter")
     }
 
+    fn tangle_v2_event(
+        key: FixtureKey,
+        created_at: u64,
+        kind: u64,
+        tags: Vec<Tag>,
+        content: &str,
+    ) -> Result<Event, String> {
+        let event = runtime_pocket_event(key, created_at, kind, tags, content);
+        runtime_pocket_event_to_protocol(&event)
+    }
+
+    fn tangle_v2_auth_event(
+        key: FixtureKey,
+        challenge: &str,
+        created_at: u64,
+    ) -> Result<Event, String> {
+        tangle_v2_event(
+            key,
+            created_at,
+            22_242,
+            vec![
+                Tag::from_parts("relay", &["wss://relay.radroots.test"])?,
+                Tag::from_parts("challenge", &[challenge])?,
+            ],
+            "",
+        )
+    }
+
+    fn tangle_v2_group_create_event(
+        key: FixtureKey,
+        group_id: &str,
+        created_at: u64,
+        flags: &[&str],
+    ) -> Result<Event, String> {
+        let mut tags = vec![
+            Tag::from_parts("h", &[group_id])?,
+            Tag::from_parts("name", &[group_id])?,
+        ];
+        for flag in flags {
+            tags.push(Tag::from_parts(flag, &[])?);
+        }
+        tangle_v2_event(key, created_at, KIND_GROUP_CREATE_GROUP.into(), tags, "")
+    }
+
+    fn tangle_v2_put_user_event(
+        key: FixtureKey,
+        group_id: &str,
+        target: FixtureKey,
+        created_at: u64,
+    ) -> Result<Event, String> {
+        let target_pubkey = target.public_key();
+        tangle_v2_event(
+            key,
+            created_at,
+            KIND_GROUP_PUT_USER.into(),
+            vec![
+                Tag::from_parts("h", &[group_id])?,
+                Tag::from_parts("p", &[target_pubkey.as_str()])?,
+            ],
+            "",
+        )
+    }
+
+    fn tangle_v2_remove_user_event(
+        key: FixtureKey,
+        group_id: &str,
+        target: FixtureKey,
+        created_at: u64,
+    ) -> Result<Event, String> {
+        let target_pubkey = target.public_key();
+        tangle_v2_event(
+            key,
+            created_at,
+            KIND_GROUP_REMOVE_USER.into(),
+            vec![
+                Tag::from_parts("h", &[group_id])?,
+                Tag::from_parts("p", &[target_pubkey.as_str()])?,
+            ],
+            "",
+        )
+    }
+
+    fn tangle_v2_join_event(
+        key: FixtureKey,
+        group_id: &str,
+        created_at: u64,
+    ) -> Result<Event, String> {
+        tangle_v2_group_event(
+            key,
+            group_id,
+            created_at,
+            KIND_GROUP_JOIN_REQUEST.into(),
+            "",
+        )
+    }
+
+    fn tangle_v2_leave_event(
+        key: FixtureKey,
+        group_id: &str,
+        created_at: u64,
+    ) -> Result<Event, String> {
+        tangle_v2_group_event(
+            key,
+            group_id,
+            created_at,
+            KIND_GROUP_LEAVE_REQUEST.into(),
+            "",
+        )
+    }
+
+    fn tangle_v2_delete_group_event(
+        key: FixtureKey,
+        group_id: &str,
+        created_at: u64,
+    ) -> Result<Event, String> {
+        tangle_v2_group_event(
+            key,
+            group_id,
+            created_at,
+            KIND_GROUP_DELETE_GROUP.into(),
+            "",
+        )
+    }
+
+    fn tangle_v2_group_event(
+        key: FixtureKey,
+        group_id: &str,
+        created_at: u64,
+        kind: u64,
+        content: &str,
+    ) -> Result<Event, String> {
+        tangle_v2_event(
+            key,
+            created_at,
+            kind,
+            vec![Tag::from_parts("h", &[group_id])?],
+            content,
+        )
+    }
+
     fn runtime_pocket_group_create_event(
         key: FixtureKey,
         group_id: &str,
@@ -4973,6 +5109,37 @@ mod tests {
             &tags,
             content.as_bytes(),
         )
+    }
+
+    fn runtime_pocket_event_to_protocol(event: &PocketEvent) -> Result<Event, String> {
+        let tags = event
+            .tags()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|tag| {
+                Tag::new(
+                    tag.map(|value| {
+                        std::str::from_utf8(value)
+                            .map(str::to_owned)
+                            .map_err(|error| error.to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                )
+                .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Event::new(
+            EventId::new(&event.id().as_hex_string()).map_err(|error| error.to_string())?,
+            UnsignedEvent::new(
+                PublicKeyHex::new(&event.pubkey().as_hex_string())
+                    .map_err(|error| error.to_string())?,
+                UnixTimestamp::new(event.created_at().as_u64()),
+                Kind::new(u64::from(event.kind().as_u16())).map_err(|error| error.to_string())?,
+                tags,
+                std::str::from_utf8(event.content()).map_err(|error| error.to_string())?,
+            ),
+            SignatureHex::new(&event.sig().to_string()).map_err(|error| error.to_string())?,
+        ))
     }
 
     fn pocket_tags_from_protocol(tags: &[Tag]) -> PocketOwnedTags {

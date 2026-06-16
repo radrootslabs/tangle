@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+use pocket_types::json::json_escape;
+use pocket_types::secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -7,10 +9,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
-use tangle_groups::{KIND_GROUP_ADMINS, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA, MemberStatus};
+use tangle_groups::{
+    KIND_GROUP_ADMINS, KIND_GROUP_CREATE_GROUP, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA,
+    KIND_GROUP_PUT_USER, MemberStatus,
+};
 use tangle_protocol::{
-    Event, Filter, RelayMessage, SubscriptionId, UnixTimestamp, event_to_value, filter_from_value,
-    filter_to_value,
+    Event, EventId, Filter, Kind, PublicKeyHex, RelayMessage, SignatureHex, SubscriptionId, Tag,
+    UnixTimestamp, UnsignedEvent, event_to_value, filter_from_value, filter_to_value,
 };
 use tangle_runtime::{
     config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
@@ -22,13 +27,11 @@ use tangle_runtime::{
     runtime::{TangleRuntime, TangleRuntimeHandle},
 };
 use tangle_store_pocket::{
-    PocketOwnedEvent, PocketOwnedFilter, PocketQueryConfig, PocketStoreConfig, PocketSyncPolicy,
+    PocketEventId, PocketKind, PocketOwnedEvent, PocketOwnedFilter, PocketOwnedTags, PocketPubkey,
+    PocketQueryConfig, PocketSig, PocketStoreConfig, PocketSyncPolicy, PocketTime,
     parse_pocket_event_json, parse_pocket_filter_json,
 };
-use tangle_test_support::{
-    FixtureKey, TANGLE_V2_RELAY_URL, tangle_v2_auth_event, tangle_v2_event, tangle_v2_group_config,
-    tangle_v2_group_create_event, tangle_v2_group_event, tangle_v2_put_user_event, tangle_v2_tag,
-};
+use tangle_test_support::{FixtureKey, TANGLE_V2_RELAY_URL, tangle_v2_group_config};
 
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -435,7 +438,7 @@ impl BenchDataset {
 
         for (group_index, group) in groups.iter().enumerate() {
             group_create_events.push(BenchSourceEvent {
-                event: tangle_v2_group_create_event(
+                event: pocket_protocol_group_create_event(
                     FixtureKey::Owner,
                     &group.id,
                     1_714_200_000 + u64::try_from(group_index).expect("group index fits in u64"),
@@ -460,7 +463,7 @@ impl BenchDataset {
                     + u64::try_from(group_index * 10_000 + event_index)
                         .expect("event index fits in u64");
                 group_timeline_events.push(BenchSourceEvent {
-                    event: tangle_v2_group_event(
+                    event: pocket_protocol_group_event(
                         FixtureKey::Owner,
                         &group.id,
                         created_at,
@@ -477,11 +480,14 @@ impl BenchDataset {
 
         for index in 0..config.public_note_count {
             public_note_events.push(BenchSourceEvent {
-                event: tangle_v2_event(
+                event: pocket_protocol_event(
                     FixtureKey::Outsider,
                     1_714_500_000 + u64::try_from(index).expect("note index fits in u64"),
                     1,
-                    vec![tangle_v2_tag("t", &["tangle-bench"])?],
+                    vec![
+                        Tag::from_parts("t", &["tangle-bench"])
+                            .map_err(|error| error.to_string())?,
+                    ],
                     &format!("bench public note {index:04}"),
                 )?,
                 auth: BenchEventAuth::None,
@@ -1319,14 +1325,14 @@ fn run_broadcast_lag_benchmark(dataset: &BenchDataset) -> Result<ScenarioReport,
             )
             .map_err(|error| error.to_string())?;
     }
-    let first = tangle_v2_group_event(
+    let first = pocket_protocol_group_event(
         FixtureKey::Owner,
         public_group.id(),
         1_714_600_000,
         1,
         "broadcast lag first",
     )?;
-    let second = tangle_v2_group_event(
+    let second = pocket_protocol_group_event(
         FixtureKey::Owner,
         public_group.id(),
         1_714_600_001,
@@ -1661,6 +1667,194 @@ fn pocket_event(event: &Event) -> Result<PocketOwnedEvent, String> {
     parse_pocket_event_json(&raw).map_err(|error| error.to_string())
 }
 
+fn pocket_protocol_event(
+    key: FixtureKey,
+    created_at: u64,
+    kind: u64,
+    tags: Vec<Tag>,
+    content: &str,
+) -> Result<Event, String> {
+    let tags = pocket_tags_from_protocol(&tags)?;
+    let pocket = signed_pocket_event(
+        fixture_secret_byte(key),
+        created_at,
+        u16::try_from(kind).map_err(|error| error.to_string())?,
+        &tags,
+        content.as_bytes(),
+    )?;
+    pocket_event_to_protocol(&pocket)
+}
+
+fn pocket_protocol_auth_event(
+    key: FixtureKey,
+    challenge: &str,
+    created_at: u64,
+) -> Result<Event, String> {
+    pocket_protocol_event(
+        key,
+        created_at,
+        22_242,
+        vec![
+            Tag::from_parts("relay", &[TANGLE_V2_RELAY_URL]).map_err(|error| error.to_string())?,
+            Tag::from_parts("challenge", &[challenge]).map_err(|error| error.to_string())?,
+        ],
+        "",
+    )
+}
+
+fn pocket_protocol_group_create_event(
+    key: FixtureKey,
+    group_id: &str,
+    created_at: u64,
+    flags: &[&str],
+) -> Result<Event, String> {
+    let mut tags = vec![
+        Tag::from_parts("h", &[group_id]).map_err(|error| error.to_string())?,
+        Tag::from_parts("name", &[group_id]).map_err(|error| error.to_string())?,
+    ];
+    for flag in flags {
+        tags.push(Tag::from_parts(flag, &[]).map_err(|error| error.to_string())?);
+    }
+    pocket_protocol_event(key, created_at, KIND_GROUP_CREATE_GROUP.into(), tags, "")
+}
+
+fn pocket_protocol_put_user_event(
+    key: FixtureKey,
+    group_id: &str,
+    target: FixtureKey,
+    created_at: u64,
+) -> Result<Event, String> {
+    let target_pubkey = target.public_key();
+    pocket_protocol_put_pubkey_event(key, group_id, target_pubkey.as_str(), created_at)
+}
+
+fn pocket_protocol_put_pubkey_event(
+    key: FixtureKey,
+    group_id: &str,
+    target_pubkey: &str,
+    created_at: u64,
+) -> Result<Event, String> {
+    pocket_protocol_event(
+        key,
+        created_at,
+        KIND_GROUP_PUT_USER.into(),
+        vec![
+            Tag::from_parts("h", &[group_id]).map_err(|error| error.to_string())?,
+            Tag::from_parts("p", &[target_pubkey]).map_err(|error| error.to_string())?,
+        ],
+        "",
+    )
+}
+
+fn pocket_protocol_group_event(
+    key: FixtureKey,
+    group_id: &str,
+    created_at: u64,
+    kind: u64,
+    content: &str,
+) -> Result<Event, String> {
+    pocket_protocol_event(
+        key,
+        created_at,
+        kind,
+        vec![Tag::from_parts("h", &[group_id]).map_err(|error| error.to_string())?],
+        content,
+    )
+}
+
+fn signed_pocket_event(
+    secret_byte: u8,
+    created_at: u64,
+    kind: u16,
+    tags: &PocketOwnedTags,
+    content: &[u8],
+) -> Result<PocketOwnedEvent, String> {
+    let secp = Secp256k1::new();
+    let secret_key =
+        SecretKey::from_byte_array([secret_byte; 32]).map_err(|error| error.to_string())?;
+    let keypair = Keypair::from_secret_key(&secp, &secret_key);
+    let (xonlypubkey, _) = keypair.x_only_public_key();
+    let pubkey_bytes = xonlypubkey.serialize();
+    let pubkey = PocketPubkey::from_bytes(pubkey_bytes);
+    let pocket_kind = PocketKind::from_u16(kind);
+    let pocket_time = PocketTime::from_u64(created_at);
+    let escaped_content = json_escape(content, Vec::with_capacity(content.len() * 7 / 6))
+        .map_err(|error| error.to_string())?;
+    let escaped_content =
+        std::str::from_utf8(&escaped_content).map_err(|error| error.to_string())?;
+    let tags_json = tags.as_json();
+    let tags_json = std::str::from_utf8(&tags_json).map_err(|error| error.to_string())?;
+    let signable = format!(
+        r#"[0,"{}",{},{},{},"{}"]"#,
+        pubkey, pocket_time, pocket_kind, tags_json, escaped_content
+    );
+    let digest = Sha256::digest(signable.as_bytes());
+    let digest_slice: &[u8] = digest.as_ref();
+    let event_id: [u8; 32] = digest_slice
+        .try_into()
+        .expect("sha256 digest length is 32 bytes");
+    let signature = secp.sign_schnorr_no_aux_rand(&event_id, &keypair);
+    PocketOwnedEvent::new(
+        PocketEventId::from_bytes(event_id),
+        pocket_kind,
+        pubkey,
+        PocketSig::from_bytes(signature.to_byte_array()),
+        tags,
+        pocket_time,
+        content,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn pocket_tags_from_protocol(tags: &[Tag]) -> Result<PocketOwnedTags, String> {
+    let parts = tags
+        .iter()
+        .map(|tag| tag.values().iter().map(String::as_str).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    PocketOwnedTags::new(&parts).map_err(|error| error.to_string())
+}
+
+fn pocket_event_to_protocol(event: &PocketOwnedEvent) -> Result<Event, String> {
+    let tags = event
+        .tags()
+        .map_err(|error| error.to_string())?
+        .iter()
+        .map(|tag| {
+            Tag::new(
+                tag.map(|value| {
+                    std::str::from_utf8(value)
+                        .map(str::to_owned)
+                        .map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Event::new(
+        EventId::new(&event.id().as_hex_string()).map_err(|error| error.to_string())?,
+        UnsignedEvent::new(
+            PublicKeyHex::new(&event.pubkey().as_hex_string())
+                .map_err(|error| error.to_string())?,
+            UnixTimestamp::new(event.created_at().as_u64()),
+            Kind::new(u64::from(event.kind().as_u16())).map_err(|error| error.to_string())?,
+            tags,
+            std::str::from_utf8(event.content()).map_err(|error| error.to_string())?,
+        ),
+        SignatureHex::new(&event.sig().to_string()).map_err(|error| error.to_string())?,
+    ))
+}
+
+fn fixture_secret_byte(key: FixtureKey) -> u8 {
+    match key {
+        FixtureKey::Relay => 9,
+        FixtureKey::Owner => 10,
+        FixtureKey::Admin => 11,
+        FixtureKey::Member => 12,
+        FixtureKey::Outsider => 13,
+    }
+}
+
 fn pocket_filter_from_value(value: &serde_json::Value) -> Result<PocketOwnedFilter, String> {
     let filter = filter_from_value(value)?;
     pocket_filter(&filter)
@@ -1766,7 +1960,7 @@ fn bench_member_event(
     base_created_at: u64,
 ) -> Result<Event, String> {
     if member_index == 0 {
-        return tangle_v2_put_user_event(
+        return pocket_protocol_put_user_event(
             FixtureKey::Admin,
             group_id,
             FixtureKey::Member,
@@ -1774,16 +1968,12 @@ fn bench_member_event(
         );
     }
     let pubkey = synthetic_member_pubkey(group_index, member_index);
-    tangle_v2_event(
+    pocket_protocol_put_pubkey_event(
         FixtureKey::Admin,
+        group_id,
+        &pubkey,
         base_created_at
             + u64::try_from(group_index * 10_000 + member_index).expect("member index fits in u64"),
-        9_000,
-        vec![
-            tangle_v2_tag("h", &[group_id])?,
-            tangle_v2_tag("p", &[pubkey.as_str()])?,
-        ],
-        "",
     )
 }
 
@@ -1818,7 +2008,7 @@ fn authenticated(key: FixtureKey) -> Result<BaseAuthState, String> {
         BaseAuthState::new(TANGLE_V2_RELAY_URL, 60, 600).map_err(|error| error.to_string())?;
     auth.issue_challenge("challenge-a", tangle_protocol::UnixTimestamp::new(100))
         .map_err(|error| error.to_string())?;
-    let event = tangle_v2_auth_event(key, "challenge-a", 120)?;
+    let event = pocket_protocol_auth_event(key, "challenge-a", 120)?;
     let pocket = pocket_event(&event)?;
     auth.authenticate_pocket(&pocket, tangle_protocol::UnixTimestamp::new(120))
         .map_err(|error| error.to_string())?;

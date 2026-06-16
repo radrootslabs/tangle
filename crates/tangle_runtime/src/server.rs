@@ -185,8 +185,15 @@ mod tests {
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
-    use tangle_protocol::event_to_value;
-    use tangle_test_support::{FixtureKey, tangle_v2_auth_event, tangle_v2_event};
+    use tangle_crypto::RelaySigner;
+    use tangle_protocol::{
+        Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
+        event_to_value,
+    };
+    use tangle_store_pocket::{
+        PocketEvent, PocketKind, PocketOwnedEvent, PocketOwnedTags, PocketTime,
+    };
+    use tangle_test_support::FixtureKey;
     use tokio::net::TcpListener;
     use tokio::time::{Duration, timeout};
     use tokio_tungstenite::tungstenite::{
@@ -532,6 +539,103 @@ mod tests {
             "relay information requires application/nostr+json"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn tangle_v2_event(
+        key: FixtureKey,
+        created_at: u64,
+        kind: u64,
+        tags: Vec<Tag>,
+        content: &str,
+    ) -> Result<Event, String> {
+        let event = server_pocket_event(key, created_at, kind, tags, content);
+        server_pocket_event_to_protocol(&event)
+    }
+
+    fn tangle_v2_auth_event(
+        key: FixtureKey,
+        challenge: &str,
+        created_at: u64,
+    ) -> Result<Event, String> {
+        tangle_v2_event(
+            key,
+            created_at,
+            22_242,
+            vec![
+                Tag::from_parts("relay", &["wss://relay.radroots.test"])?,
+                Tag::from_parts("challenge", &[challenge])?,
+            ],
+            "",
+        )
+    }
+
+    fn server_pocket_event(
+        key: FixtureKey,
+        created_at: u64,
+        kind: u64,
+        tags: Vec<Tag>,
+        content: &str,
+    ) -> PocketOwnedEvent {
+        let tags = server_pocket_tags_from_protocol(&tags);
+        let secret = format!("{:02x}", fixture_secret_byte(key)).repeat(32);
+        RelaySigner::from_secret_hex(&secret)
+            .expect("signer")
+            .sign_pocket_event(
+                PocketKind::from_u16(u16::try_from(kind).expect("pocket kind")),
+                &tags,
+                PocketTime::from_u64(created_at),
+                content.as_bytes(),
+            )
+            .expect("pocket event")
+    }
+
+    fn server_pocket_tags_from_protocol(tags: &[Tag]) -> PocketOwnedTags {
+        let parts = tags
+            .iter()
+            .map(|tag| tag.values().iter().map(String::as_str).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        PocketOwnedTags::new(&parts).expect("pocket tags")
+    }
+
+    fn server_pocket_event_to_protocol(event: &PocketEvent) -> Result<Event, String> {
+        let tags = event
+            .tags()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|tag| {
+                Tag::new(
+                    tag.map(|value| {
+                        std::str::from_utf8(value)
+                            .map(str::to_owned)
+                            .map_err(|error| error.to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                )
+                .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Event::new(
+            EventId::new(&event.id().as_hex_string()).map_err(|error| error.to_string())?,
+            UnsignedEvent::new(
+                PublicKeyHex::new(&event.pubkey().as_hex_string())
+                    .map_err(|error| error.to_string())?,
+                UnixTimestamp::new(event.created_at().as_u64()),
+                Kind::new(u64::from(event.kind().as_u16())).map_err(|error| error.to_string())?,
+                tags,
+                std::str::from_utf8(event.content()).map_err(|error| error.to_string())?,
+            ),
+            SignatureHex::new(&event.sig().to_string()).map_err(|error| error.to_string())?,
+        ))
+    }
+
+    fn fixture_secret_byte(key: FixtureKey) -> u8 {
+        match key {
+            FixtureKey::Relay => 9,
+            FixtureKey::Owner => 10,
+            FixtureKey::Admin => 11,
+            FixtureKey::Member => 12,
+            FixtureKey::Outsider => 13,
+        }
     }
 
     fn runtime_config(root: &Path) -> BaseRelayRuntimeConfig {

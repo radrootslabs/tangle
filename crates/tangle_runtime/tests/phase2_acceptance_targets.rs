@@ -14,9 +14,10 @@ use tangle_groups::{
     GroupAuthContext, GroupAuthority, GroupErrorKind, GroupEventClass, GroupId, GroupMetadata,
     GroupMetadataFlags, GroupMetadataText, GroupPolicyConfig, GroupProjection, GroupReadDecision,
     GroupReadGate, GroupState, GroupWriteDecision, GroupWritePolicy, KIND_GROUP_ADMINS,
-    KIND_GROUP_CREATE_GROUP, KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS,
-    KIND_GROUP_METADATA, KIND_GROUP_PUT_USER, MemberState, MemberStatus, ProjectionOrderTuple,
-    StoreOffset, SupportedKinds, parse_group_runtime_config_json,
+    KIND_GROUP_CREATE_GROUP, KIND_GROUP_EDIT_METADATA, KIND_GROUP_JOIN_REQUEST,
+    KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA, KIND_GROUP_PUT_USER,
+    MemberState, MemberStatus, ProjectionOrderTuple, StoreOffset, SupportedKinds,
+    parse_group_runtime_config_json,
 };
 use tangle_protocol::{
     Event, EventId, Filter, Kind, PublicKeyHex, RelayMessage, SignatureHex, SubscriptionId, Tag,
@@ -35,11 +36,7 @@ use tangle_store_pocket::{
     PocketTime, TANGLE_GROUP_CHECKPOINT_TABLE, TANGLE_GROUP_OUTBOX_TABLE,
     TANGLE_GROUP_PROJECTION_TABLE, parse_pocket_event_json, parse_pocket_filter_json,
 };
-use tangle_test_support::{
-    FixtureKey, TANGLE_V2_RELAY_SECRET_HEX, TANGLE_V2_RELAY_URL, tangle_v2_auth_event,
-    tangle_v2_event, tangle_v2_group_create_event, tangle_v2_group_event,
-    tangle_v2_group_metadata_event, tangle_v2_join_event, tangle_v2_put_user_event,
-};
+use tangle_test_support::{FixtureKey, TANGLE_V2_RELAY_SECRET_HEX, TANGLE_V2_RELAY_URL};
 use tokio::{net::TcpListener, time::timeout};
 use tokio_tungstenite::tungstenite::{Message as TungsteniteMessage, client::IntoClientRequest};
 
@@ -194,6 +191,93 @@ fn pocket_protocol_group_event(
         vec![Tag::from_parts("h", &[group_id]).expect("h")],
         content,
     )
+}
+
+fn tangle_v2_event(
+    key: FixtureKey,
+    created_at: u64,
+    kind: u64,
+    tags: Vec<Tag>,
+    content: &str,
+) -> Result<Event, String> {
+    Ok(pocket_protocol_event(key, created_at, kind, tags, content))
+}
+
+fn tangle_v2_auth_event(
+    key: FixtureKey,
+    challenge: &str,
+    created_at: u64,
+) -> Result<Event, String> {
+    Ok(pocket_protocol_auth_event(key, challenge, created_at))
+}
+
+fn tangle_v2_group_create_event(
+    key: FixtureKey,
+    group_id: &str,
+    created_at: u64,
+    flags: &[&str],
+) -> Result<Event, String> {
+    Ok(pocket_protocol_group_create_event(
+        key, group_id, created_at, flags,
+    ))
+}
+
+fn tangle_v2_group_metadata_event(
+    key: FixtureKey,
+    group_id: &str,
+    name: &str,
+    created_at: u64,
+    flags: &[&str],
+) -> Result<Event, String> {
+    let mut tags = vec![
+        Tag::from_parts("h", &[group_id])?,
+        Tag::from_parts("name", &[name])?,
+    ];
+    for flag in flags {
+        tags.push(Tag::from_parts(flag, &[])?);
+    }
+    tangle_v2_event(key, created_at, KIND_GROUP_EDIT_METADATA.into(), tags, "")
+}
+
+fn tangle_v2_join_event(key: FixtureKey, group_id: &str, created_at: u64) -> Result<Event, String> {
+    tangle_v2_group_event(
+        key,
+        group_id,
+        created_at,
+        KIND_GROUP_JOIN_REQUEST.into(),
+        "",
+    )
+}
+
+fn tangle_v2_put_user_event(
+    key: FixtureKey,
+    group_id: &str,
+    target: FixtureKey,
+    created_at: u64,
+) -> Result<Event, String> {
+    let target_pubkey = target.public_key();
+    tangle_v2_event(
+        key,
+        created_at,
+        KIND_GROUP_PUT_USER.into(),
+        vec![
+            Tag::from_parts("h", &[group_id])?,
+            Tag::from_parts("p", &[target_pubkey.as_str()])?,
+        ],
+        "",
+    )
+}
+
+fn tangle_v2_group_event(
+    key: FixtureKey,
+    group_id: &str,
+    created_at: u64,
+    kind: u64,
+    content: &str,
+) -> Result<Event, String> {
+    Ok(pocket_protocol_group_event(
+        key, group_id, created_at, kind, content,
+    ))
 }
 
 fn signed_pocket_event(

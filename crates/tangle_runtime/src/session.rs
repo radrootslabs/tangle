@@ -578,15 +578,16 @@ mod tests {
     use axum::extract::ws::Message;
     use serde_json::json;
     use std::path::{Path, PathBuf};
-    use tangle_groups::StoreOffset;
+    use tangle_crypto::RelaySigner;
+    use tangle_groups::{KIND_GROUP_CREATE_GROUP, StoreOffset};
     use tangle_protocol::{
-        ClientMessage, Filter, RelayMessage, SubscriptionId, UnixTimestamp, event_to_value,
-        filter_from_value,
+        ClientMessage, Event, EventId, Filter, Kind, PublicKeyHex, RelayMessage, SignatureHex,
+        SubscriptionId, Tag, UnixTimestamp, UnsignedEvent, event_to_value, filter_from_value,
     };
-    use tangle_test_support::{
-        FixtureKey, tangle_v2_auth_event, tangle_v2_event, tangle_v2_group_create_event,
-        tangle_v2_group_event,
+    use tangle_store_pocket::{
+        PocketEvent, PocketKind, PocketOwnedEvent, PocketOwnedTags, PocketTime,
     };
+    use tangle_test_support::FixtureKey;
 
     #[test]
     fn websocket_session_records_connection_time() {
@@ -1648,6 +1649,135 @@ mod tests {
             TangleSessionControl::Close(outbound_queue_full_close_message())
         );
         assert_eq!(metrics.outbound_queue_full_closes(), 1);
+    }
+
+    fn tangle_v2_event(
+        key: FixtureKey,
+        created_at: u64,
+        kind: u64,
+        tags: Vec<Tag>,
+        content: &str,
+    ) -> Result<Event, String> {
+        let event = session_pocket_event(key, created_at, kind, tags, content);
+        session_pocket_event_to_protocol(&event)
+    }
+
+    fn tangle_v2_auth_event(
+        key: FixtureKey,
+        challenge: &str,
+        created_at: u64,
+    ) -> Result<Event, String> {
+        tangle_v2_event(
+            key,
+            created_at,
+            22_242,
+            vec![
+                Tag::from_parts("relay", &["wss://relay.radroots.test"])?,
+                Tag::from_parts("challenge", &[challenge])?,
+            ],
+            "",
+        )
+    }
+
+    fn tangle_v2_group_create_event(
+        key: FixtureKey,
+        group_id: &str,
+        created_at: u64,
+        flags: &[&str],
+    ) -> Result<Event, String> {
+        let mut tags = vec![
+            Tag::from_parts("h", &[group_id])?,
+            Tag::from_parts("name", &[group_id])?,
+        ];
+        for flag in flags {
+            tags.push(Tag::from_parts(flag, &[])?);
+        }
+        tangle_v2_event(key, created_at, KIND_GROUP_CREATE_GROUP.into(), tags, "")
+    }
+
+    fn tangle_v2_group_event(
+        key: FixtureKey,
+        group_id: &str,
+        created_at: u64,
+        kind: u64,
+        content: &str,
+    ) -> Result<Event, String> {
+        tangle_v2_event(
+            key,
+            created_at,
+            kind,
+            vec![Tag::from_parts("h", &[group_id])?],
+            content,
+        )
+    }
+
+    fn session_pocket_event(
+        key: FixtureKey,
+        created_at: u64,
+        kind: u64,
+        tags: Vec<Tag>,
+        content: &str,
+    ) -> PocketOwnedEvent {
+        let tags = session_pocket_tags_from_protocol(&tags);
+        let secret = format!("{:02x}", fixture_secret_byte(key)).repeat(32);
+        RelaySigner::from_secret_hex(&secret)
+            .expect("signer")
+            .sign_pocket_event(
+                PocketKind::from_u16(u16::try_from(kind).expect("pocket kind")),
+                &tags,
+                PocketTime::from_u64(created_at),
+                content.as_bytes(),
+            )
+            .expect("pocket event")
+    }
+
+    fn session_pocket_tags_from_protocol(tags: &[Tag]) -> PocketOwnedTags {
+        let parts = tags
+            .iter()
+            .map(|tag| tag.values().iter().map(String::as_str).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        PocketOwnedTags::new(&parts).expect("pocket tags")
+    }
+
+    fn session_pocket_event_to_protocol(event: &PocketEvent) -> Result<Event, String> {
+        let tags = event
+            .tags()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|tag| {
+                Tag::new(
+                    tag.map(|value| {
+                        std::str::from_utf8(value)
+                            .map(str::to_owned)
+                            .map_err(|error| error.to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                )
+                .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Event::new(
+            EventId::new(&event.id().as_hex_string()).map_err(|error| error.to_string())?,
+            UnsignedEvent::new(
+                PublicKeyHex::new(&event.pubkey().as_hex_string())
+                    .map_err(|error| error.to_string())?,
+                UnixTimestamp::new(event.created_at().as_u64()),
+                Kind::new(u64::from(event.kind().as_u16())).map_err(|error| error.to_string())?,
+                tags,
+                std::str::from_utf8(event.content()).map_err(|error| error.to_string())?,
+            ),
+            SignatureHex::new(&event.sig().to_string()).map_err(|error| error.to_string())?,
+        ))
+    }
+
+    fn fixture_secret_byte(key: FixtureKey) -> u8 {
+        match key {
+            FixtureKey::Relay => 9,
+            FixtureKey::Owner => 10,
+            FixtureKey::Admin => 11,
+            FixtureKey::Member => 12,
+            FixtureKey::Outsider => 13,
+        }
     }
 
     fn session_runtime(

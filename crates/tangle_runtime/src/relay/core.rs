@@ -334,6 +334,24 @@ impl BaseRelayCountHll {
         }
     }
 
+    fn suppress_for_filter_targets(
+        &mut self,
+        groups: Option<&GroupServiceHandle>,
+        filters: &[PocketOwnedFilter],
+    ) {
+        if self.offset.is_none() {
+            return;
+        }
+        let [filter] = filters else {
+            return;
+        };
+        if BaseRelay::count_hll_filter_target_policy(groups, filter)
+            == BaseRelayCountHllTargetPolicy::Suppress
+        {
+            self.suppress();
+        }
+    }
+
     fn observe(
         &mut self,
         groups: Option<&GroupServiceHandle>,
@@ -1615,6 +1633,7 @@ impl BaseRelay {
         let mut query_metrics = BaseRelayQueryMetrics::default();
         let count_query = query.exact_count();
         let mut hll = BaseRelayCountHll::new(filters)?;
+        hll.suppress_for_filter_targets(groups, filters);
         for filter in filters {
             let report = Self::query_filter_events_report_with_services(
                 store,
@@ -1913,8 +1932,8 @@ fn pocket_filters_are_complete(filters: &[PocketOwnedFilter]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        BaseRelay, BaseRelayCountHllTargetPolicy, BaseRelayLimitSettings, BaseRelayLimits,
-        NEGENTROPY_DISABLED_MESSAGE,
+        BaseRelay, BaseRelayCountHll, BaseRelayCountHllTargetPolicy, BaseRelayLimitSettings,
+        BaseRelayLimits, NEGENTROPY_DISABLED_MESSAGE,
     };
     use crate::pocket_conversion::{tangle_event_to_pocket, tangle_filter_to_pocket};
     use crate::relay::auth::BaseAuthState;
@@ -1933,7 +1952,7 @@ mod tests {
         SubscriptionId, Tag, UnixTimestamp, UnsignedEvent, filter_from_value,
     };
     use tangle_store_pocket::{
-        PocketEvent, PocketKind, PocketOwnedEvent, PocketOwnedFilter, PocketOwnedTags,
+        PocketEvent, PocketHll8, PocketKind, PocketOwnedEvent, PocketOwnedFilter, PocketOwnedTags,
         PocketQueryConfig, PocketStoreConfig, PocketSyncPolicy, PocketTime,
     };
 
@@ -2886,12 +2905,45 @@ mod tests {
                 .expect("hidden reaction"),
             &hidden,
         );
+        let deleted_create = signed_pocket_group_create_event(7, "DeletedHll");
+        assert_pocket_accepted(
+            relay
+                .handle_pocket_event_with_auth(&deleted_create, &owner_auth)
+                .expect("deleted create"),
+            &deleted_create,
+        );
+        let deleted = signed_pocket_event_at_tags(
+            7,
+            7,
+            vec![h("DeletedHll"), target_tag.clone()],
+            "deleted reaction",
+            1_714_124_438,
+        );
+        assert_pocket_accepted(
+            relay
+                .handle_pocket_event_with_auth(&deleted, &owner_auth)
+                .expect("deleted reaction"),
+            &deleted,
+        );
+        let delete_group = signed_pocket_event_at_tags(
+            7,
+            KIND_GROUP_DELETE_GROUP,
+            vec![h("DeletedHll")],
+            "",
+            1_714_124_439,
+        );
+        assert_pocket_accepted(
+            relay
+                .handle_pocket_event_with_auth(&delete_group, &owner_auth)
+                .expect("delete group"),
+            &delete_group,
+        );
         let unknown = signed_pocket_event_at_tags(
             7,
             7,
             vec![h("UnknownHll"), target_tag.clone()],
             "unknown reaction",
-            1_714_124_437,
+            1_714_124_440,
         );
         relay.store.store_event(&unknown).expect("store unknown");
 
@@ -2974,6 +3026,63 @@ mod tests {
                 ..
             }
         ));
+
+        assert_count_without_hll(
+            &relay,
+            "count-hll-private-h-target",
+            serde_json::json!({"kinds":[7],"#h":["PrivateHll"]}),
+            None,
+            0,
+        );
+        assert_count_without_hll(
+            &relay,
+            "count-hll-hidden-h-target",
+            serde_json::json!({"kinds":[7],"#h":["HiddenHll"]}),
+            None,
+            0,
+        );
+        assert_count_without_hll(
+            &relay,
+            "count-hll-unknown-h-target",
+            serde_json::json!({"kinds":[7],"#h":["UnknownHll"]}),
+            None,
+            0,
+        );
+        assert_count_without_hll(
+            &relay,
+            "count-hll-deleted-h-target",
+            serde_json::json!({"kinds":[7],"#h":["DeletedHll"]}),
+            None,
+            0,
+        );
+        assert_count_without_hll(
+            &relay,
+            "count-hll-private-d-target",
+            serde_json::json!({"kinds":[KIND_GROUP_METADATA],"#d":["PrivateHll"]}),
+            None,
+            1,
+        );
+        assert_count_without_hll(
+            &relay,
+            "count-hll-hidden-d-target",
+            serde_json::json!({"kinds":[KIND_GROUP_METADATA],"#d":["HiddenHll"]}),
+            None,
+            0,
+        );
+        assert_count_without_hll(
+            &relay,
+            "count-hll-unknown-d-target",
+            serde_json::json!({"kinds":[KIND_GROUP_METADATA],"#d":["UnknownHll"]}),
+            None,
+            0,
+        );
+        assert_count_without_hll(
+            &relay,
+            "count-hll-deleted-d-target",
+            serde_json::json!({"kinds":[KIND_GROUP_METADATA],"#d":["DeletedHll"]}),
+            None,
+            0,
+        );
     }
 
     #[test]
@@ -3006,7 +3115,7 @@ mod tests {
         }
         let delete_group = signed_pocket_event_at_tags(
             7,
-            KIND_GROUP_DELETE_GROUP.into(),
+            KIND_GROUP_DELETE_GROUP,
             vec![h("DeletedHll")],
             "",
             1_714_124_436,
@@ -3077,6 +3186,20 @@ mod tests {
             ),
             BaseRelayCountHllTargetPolicy::Eligible
         );
+
+        let mut private_hll = count_hll_for_target_policy_test();
+        let private_filter = [pocket_filter_from_value(
+            serde_json::json!({"kinds":[7],"#h":["PrivateHll"]}),
+        )];
+        private_hll.suppress_for_filter_targets(relay.groups.as_ref(), &private_filter);
+        assert!(private_hll.into_hex().is_none());
+
+        let mut non_group_hll = count_hll_for_target_policy_test();
+        let non_group_filter = [pocket_filter_from_value(
+            serde_json::json!({"kinds":[30023],"#d":["PrivateHll"]}),
+        )];
+        non_group_hll.suppress_for_filter_targets(relay.groups.as_ref(), &non_group_filter);
+        assert!(non_group_hll.into_hex().is_some());
     }
 
     #[test]
@@ -4788,6 +4911,32 @@ mod tests {
         }
     }
 
+    fn assert_count_without_hll(
+        relay: &BaseRelay,
+        subscription_id: &str,
+        value: serde_json::Value,
+        auth: Option<&BaseAuthState>,
+        expected_count: u64,
+    ) {
+        let subscription_id = SubscriptionId::new(subscription_id).expect("sub");
+        let filter = filter_from_value(&value).expect("filter");
+        let message = match auth {
+            Some(auth) => {
+                relay.handle_count_with_auth_protocol(subscription_id.clone(), vec![filter], auth)
+            }
+            None => relay.handle_count_protocol(subscription_id.clone(), vec![filter]),
+        }
+        .expect("count");
+        assert_eq!(
+            message,
+            RelayMessage::Count {
+                subscription_id,
+                count: expected_count,
+                hll: None
+            }
+        );
+    }
+
     fn query_filter(relay: &mut BaseRelay, subscription_id: &str, filter: Filter) -> Vec<Event> {
         relay
             .handle_protocol_req_for_test(
@@ -4826,6 +4975,14 @@ mod tests {
     ) -> BaseRelayCountHllTargetPolicy {
         let filter = pocket_filter_from_value(value);
         BaseRelay::count_hll_filter_target_policy(relay.groups.as_ref(), &filter)
+    }
+
+    fn count_hll_for_target_policy_test() -> BaseRelayCountHll {
+        BaseRelayCountHll {
+            offset: Some(0),
+            hll: Some(PocketHll8::new()),
+            suppressed: false,
+        }
     }
 
     fn assert_accepted(message: RelayMessage, event: &Event) {

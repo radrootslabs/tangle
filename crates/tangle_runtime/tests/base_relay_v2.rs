@@ -1,13 +1,14 @@
 #![forbid(unsafe_code)]
 
 use std::{fs, panic, path::PathBuf};
-use tangle_crypto::{RelaySigner, event_id_matches, verify_event_signature};
+use tangle_crypto::RelaySigner;
 use tangle_groups::{
     GroupAuthContext, GroupAuthority, GroupGeneratedEventBuilder, GroupId, GroupLimitsConfig,
     GroupOutboxEffect, GroupOutboxKey, GroupOutboxRecord, GroupOutboxStatus, GroupProjection,
-    GroupRuntimeConfig, KIND_GROUP_ADMINS, KIND_GROUP_CREATE_GROUP, KIND_GROUP_DELETE_GROUP,
-    KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA,
-    KIND_GROUP_PUT_USER, MemberStatus, NIP29_RELAY_GENERATED_KIND_VALUES,
+    GroupRuntimeConfig, KIND_GROUP_ADMINS, KIND_GROUP_CREATE_GROUP, KIND_GROUP_DELETE_EVENT,
+    KIND_GROUP_DELETE_GROUP, KIND_GROUP_EDIT_METADATA, KIND_GROUP_JOIN_REQUEST,
+    KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA, KIND_GROUP_PUT_USER,
+    KIND_GROUP_REMOVE_USER, MemberStatus, NIP29_RELAY_GENERATED_KIND_VALUES,
     PERMANENT_RELAY_OVERRIDE_ROLE, ProjectionCheckpoint, StoreOffset, member_current_key,
     parse_group_runtime_config_json, projection_checkpoint_key,
 };
@@ -35,12 +36,8 @@ use tangle_store_pocket::{
     parse_pocket_filter_json,
 };
 use tangle_test_support::{
-    FixtureKey, TANGLE_V2_RELAY_SECRET_HEX, TANGLE_V2_RELAY_URL, tangle_v2_auth_event,
-    tangle_v2_delete_event_event, tangle_v2_delete_group_event, tangle_v2_event,
-    tangle_v2_group_config, tangle_v2_group_create_event, tangle_v2_group_event,
-    tangle_v2_group_metadata_event, tangle_v2_group_tag, tangle_v2_join_event,
-    tangle_v2_leave_event, tangle_v2_pubkey_tag, tangle_v2_put_user_event,
-    tangle_v2_remove_user_event, tangle_v2_tag,
+    FixtureKey, TANGLE_V2_RELAY_SECRET_HEX, TANGLE_V2_RELAY_URL, tangle_v2_group_config,
+    tangle_v2_group_tag, tangle_v2_pubkey_tag, tangle_v2_tag,
 };
 
 trait BaseRelayEventTestExt {
@@ -307,6 +304,150 @@ fn pocket_protocol_join_event(key: FixtureKey, group_id: &str, created_at: u64) 
         KIND_GROUP_JOIN_REQUEST.into(),
         "",
     )
+}
+
+fn tangle_v2_event(
+    key: FixtureKey,
+    created_at: u64,
+    kind: u64,
+    tags: Vec<Tag>,
+    content: &str,
+) -> Result<Event, String> {
+    Ok(pocket_protocol_event(key, created_at, kind, tags, content))
+}
+
+fn tangle_v2_auth_event(
+    key: FixtureKey,
+    challenge: &str,
+    created_at: u64,
+) -> Result<Event, String> {
+    Ok(pocket_protocol_auth_event(key, challenge, created_at))
+}
+
+fn tangle_v2_group_create_event(
+    key: FixtureKey,
+    group_id: &str,
+    created_at: u64,
+    flags: &[&str],
+) -> Result<Event, String> {
+    Ok(pocket_protocol_group_create_event(
+        key, group_id, created_at, flags,
+    ))
+}
+
+fn tangle_v2_group_metadata_event(
+    key: FixtureKey,
+    group_id: &str,
+    name: &str,
+    created_at: u64,
+    flags: &[&str],
+) -> Result<Event, String> {
+    let mut tags = vec![
+        tangle_v2_group_tag(group_id)?,
+        tangle_v2_tag("name", &[name])?,
+    ];
+    for flag in flags {
+        tags.push(tangle_v2_tag(flag, &[])?);
+    }
+    tangle_v2_event(key, created_at, KIND_GROUP_EDIT_METADATA.into(), tags, "")
+}
+
+fn tangle_v2_put_user_event(
+    key: FixtureKey,
+    group_id: &str,
+    target: FixtureKey,
+    created_at: u64,
+) -> Result<Event, String> {
+    tangle_v2_event(
+        key,
+        created_at,
+        KIND_GROUP_PUT_USER.into(),
+        vec![
+            tangle_v2_group_tag(group_id)?,
+            tangle_v2_pubkey_tag(target)?,
+        ],
+        "",
+    )
+}
+
+fn tangle_v2_remove_user_event(
+    key: FixtureKey,
+    group_id: &str,
+    target: FixtureKey,
+    created_at: u64,
+) -> Result<Event, String> {
+    tangle_v2_event(
+        key,
+        created_at,
+        KIND_GROUP_REMOVE_USER.into(),
+        vec![
+            tangle_v2_group_tag(group_id)?,
+            tangle_v2_pubkey_tag(target)?,
+        ],
+        "",
+    )
+}
+
+fn tangle_v2_join_event(key: FixtureKey, group_id: &str, created_at: u64) -> Result<Event, String> {
+    Ok(pocket_protocol_join_event(key, group_id, created_at))
+}
+
+fn tangle_v2_leave_event(
+    key: FixtureKey,
+    group_id: &str,
+    created_at: u64,
+) -> Result<Event, String> {
+    tangle_v2_group_event(
+        key,
+        group_id,
+        created_at,
+        KIND_GROUP_LEAVE_REQUEST.into(),
+        "",
+    )
+}
+
+fn tangle_v2_delete_event_event(
+    key: FixtureKey,
+    group_id: &str,
+    target: &Event,
+    created_at: u64,
+) -> Result<Event, String> {
+    tangle_v2_event(
+        key,
+        created_at,
+        KIND_GROUP_DELETE_EVENT.into(),
+        vec![
+            tangle_v2_group_tag(group_id)?,
+            tangle_v2_tag("e", &[target.id().as_str()])?,
+        ],
+        "",
+    )
+}
+
+fn tangle_v2_delete_group_event(
+    key: FixtureKey,
+    group_id: &str,
+    created_at: u64,
+) -> Result<Event, String> {
+    tangle_v2_group_event(
+        key,
+        group_id,
+        created_at,
+        KIND_GROUP_DELETE_GROUP.into(),
+        "",
+    )
+}
+
+fn tangle_v2_group_event(
+    key: FixtureKey,
+    group_id: &str,
+    created_at: u64,
+    kind: u64,
+    content: &str,
+) -> Result<Event, String> {
+    Ok(pocket_protocol_group_event(
+        key, group_id, created_at, kind, content,
+    ))
 }
 
 fn signed_pocket_event(
@@ -1266,13 +1407,9 @@ fn nip29_privacy_leak_suite_covers_relay_exposure_and_rejection_paths() {
             .expect("deleted target"),
         &deleted_target,
     );
-    let delete_target = tangle_test_support::tangle_v2_delete_event_event(
-        FixtureKey::Owner,
-        "LeakDeleted",
-        &deleted_target,
-        72,
-    )
-    .expect("delete target");
+    let delete_target =
+        tangle_v2_delete_event_event(FixtureKey::Owner, "LeakDeleted", &deleted_target, 72)
+            .expect("delete target");
     assert_accepted(
         relay
             .handle_event_with_auth(delete_target.clone(), &owner_auth)
@@ -1376,13 +1513,8 @@ fn delete_and_secondary_privacy_surfaces_are_read_gated_or_absent() {
             .expect("target"),
         &target,
     );
-    let delete = tangle_test_support::tangle_v2_delete_event_event(
-        FixtureKey::Owner,
-        "DeleteFarm",
-        &target,
-        3,
-    )
-    .expect("delete");
+    let delete =
+        tangle_v2_delete_event_event(FixtureKey::Owner, "DeleteFarm", &target, 3).expect("delete");
     assert_accepted(
         relay
             .handle_event_with_auth(delete.clone(), &owner_auth)
@@ -3078,8 +3210,9 @@ fn assert_accepted(message: RelayMessage, event: &Event) {
             message: String::new()
         }
     );
-    assert!(event_id_matches(event));
-    assert_eq!(verify_event_signature(event), Ok(()));
+    pocket_event_for_test(event)
+        .verify()
+        .expect("pocket verify");
 }
 
 fn assert_accepted_pocket(message: RelayMessage, event: &Event) {
