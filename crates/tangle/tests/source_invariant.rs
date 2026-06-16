@@ -35,6 +35,9 @@ fn scanner_removes_test_gated_items_without_removing_production_items() {
         "use tangle_protocol::{Event, Filter};\n",
         "fn production() {}\n",
         "#[cfg(test)]\n",
+        "fn verifier_test_only() { pocket_canonical_event_json(event); verify_event_signature_bytes(event); }\n",
+        "fn production_verifier() { verify_pocket_event_signature(event); }\n",
+        "#[cfg(test)]\n",
         "fn test_only() { let value = \"}\"; }\n",
         "fn production_two() {}\n",
     ]
@@ -42,7 +45,10 @@ fn scanner_removes_test_gated_items_without_removing_production_items() {
     let production = production_source(&source);
     assert!(!production.contains("Event"));
     assert!(!production.contains("test_only"));
+    assert!(!production.contains("pocket_canonical_event_json"));
+    assert!(!production.contains("verify_event_signature_bytes"));
     assert!(production.contains("production()"));
+    assert!(production.contains("verify_pocket_event_signature"));
     assert!(production.contains("production_two()"));
 }
 
@@ -103,6 +109,8 @@ fn collect_forbidden_identifiers(
     for ident in [
         "pocket_event_to_tangle",
         "tangle_event_to_pocket",
+        "pocket_canonical_event_json(",
+        "verify_event_signature_bytes(",
         "RuntimeRelayMessage::into_protocol_message",
         "protocol_messages",
     ] {
