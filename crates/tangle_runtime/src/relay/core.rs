@@ -296,6 +296,54 @@ impl BaseRelayCountEventsReport {
     }
 }
 
+struct BaseRelayCountHll {
+    offset: Option<usize>,
+    hll: Option<PocketHll8>,
+    suppressed: bool,
+}
+
+impl BaseRelayCountHll {
+    fn new(filters: &[PocketOwnedFilter]) -> Result<Self, BaseRelayError> {
+        let offset = BaseRelay::count_hll_offset(filters)?;
+        Ok(Self {
+            offset,
+            hll: offset.map(|_| PocketHll8::new()),
+            suppressed: false,
+        })
+    }
+
+    fn suppress(&mut self) {
+        if self.offset.is_some() {
+            self.suppressed = true;
+        }
+    }
+
+    fn observe(
+        &mut self,
+        groups: Option<&GroupServiceHandle>,
+        event: &PocketEvent,
+    ) -> Result<(), BaseRelayError> {
+        let Some(offset) = self.offset else {
+            return Ok(());
+        };
+        if BaseRelay::event_suppresses_count_hll(groups, event)? {
+            self.suppressed = true;
+            return Ok(());
+        }
+        if let Some(hll) = &mut self.hll {
+            hll.add_element(event.pubkey().as_bytes(), offset)
+                .map_err(|error| BaseRelayError::error(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn into_hex(self) -> Option<String> {
+        (!self.suppressed)
+            .then(|| self.hll.map(|value| value.to_hex_string()))
+            .flatten()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BaseRelayFilterLimitMode {
     ApplyDefaultLimit,
@@ -1656,8 +1704,7 @@ impl BaseRelay {
         let mut group_read_denied = false;
         let mut query_metrics = BaseRelayQueryMetrics::default();
         let count_query = query.exact_count();
-        let hll_offset = Self::count_hll_offset(filters)?;
-        let mut hll = hll_offset.map(|_| PocketHll8::new());
+        let mut hll = BaseRelayCountHll::new(filters)?;
         for filter in filters {
             let report = Self::query_filter_events_report_with_services(
                 store,
@@ -1669,21 +1716,19 @@ impl BaseRelay {
                 BaseRelayFilterLimitMode::PreserveCountLimitless,
             )?;
             group_read_denied |= report.group_read_denied;
+            if report.group_read_denied {
+                hll.suppress();
+            }
             query_metrics = query_metrics.add(report.query_metrics);
             for event in report.events {
                 let event: &PocketEvent = &event;
-                if let (Some(hll), Some(offset)) = (&mut hll, hll_offset) {
-                    hll.add_element(event.pubkey().as_bytes(), offset)
-                        .map_err(|error| BaseRelayError::error(error.to_string()))?;
-                }
+                hll.observe(groups, event)?;
                 seen.insert(event.id());
             }
         }
         let count = u64::try_from(seen.len())
             .map_err(|_| BaseRelayError::error("visible event count overflow"))?;
-        let hll = (!group_read_denied)
-            .then(|| hll.map(|value| value.to_hex_string()))
-            .flatten();
+        let hll = hll.into_hex();
         Ok(BaseRelayCountEventsReport::new(
             count,
             hll,
@@ -1699,6 +1744,26 @@ impl BaseRelay {
         filter
             .hyperloglog_offset()
             .map_err(|error| BaseRelayError::error(error.to_string()))
+    }
+
+    fn event_suppresses_count_hll(
+        groups: Option<&GroupServiceHandle>,
+        event: &PocketEvent,
+    ) -> Result<bool, BaseRelayError> {
+        let Some(groups) = groups else {
+            return Ok(false);
+        };
+        let class = classify_group_event(event, groups.limits()).map_err(BaseRelayError::from)?;
+        let Some(group_id) = class.group_id() else {
+            return Ok(false);
+        };
+        let projection = groups.projection();
+        let Some(group) = projection.group(group_id) else {
+            return Ok(true);
+        };
+        Ok(projection.tombstone(group_id).is_some()
+            || group.metadata().private()
+            || group.metadata().hidden())
     }
 
     fn query_filter_events_report_with_services(
@@ -2088,6 +2153,80 @@ mod tests {
                 )
                 .expect("neg close"),
             Vec::<RelayMessage>::new()
+        );
+    }
+
+    #[test]
+    fn base_relay_disabled_negentropy_does_not_validate_or_screen_filter() {
+        let owner = signer(7).public_key().clone();
+        let owner_auth = authenticated_state(7);
+        let mut auth =
+            BaseAuthState::new("wss://relay.radroots.test", 60, 600).expect("auth state");
+        let mut relay = test_relay_with_groups(
+            "base-relay-negentropy-disabled-no-screen",
+            4,
+            &enabled_groups_for_owner(&owner),
+        );
+        let private_create = signed_private_group_create_event(7, "PrivateNegentropy");
+        assert_accepted(
+            relay
+                .handle_event_with_auth(private_create.clone(), &owner_auth)
+                .expect("private create"),
+            &private_create,
+        );
+        let private_event = signed_event_at(
+            7,
+            1,
+            vec![h("PrivateNegentropy")],
+            "private negentropy",
+            1_714_124_434,
+        );
+        assert_accepted(
+            relay
+                .handle_event_with_auth(private_event.clone(), &owner_auth)
+                .expect("private event"),
+            &private_event,
+        );
+        let subscription_id = SubscriptionId::new("neg-noscreen").expect("sub");
+        let filter = filter_from_value(&serde_json::json!({
+            "kinds": [1],
+            "#h": ["PrivateNegentropy"],
+            "limit": 501
+        }))
+        .expect("filter");
+
+        assert_eq!(
+            relay
+                .handle_client_message(
+                    ClientMessage::NegOpen {
+                        subscription_id: subscription_id.clone(),
+                        filter,
+                        message: "00".to_owned()
+                    },
+                    &mut auth,
+                    UnixTimestamp::new(100)
+                )
+                .expect("neg open"),
+            vec![RelayMessage::NegErr {
+                subscription_id: subscription_id.clone(),
+                message: NEGENTROPY_DISABLED_MESSAGE.to_owned()
+            }]
+        );
+        assert_eq!(
+            relay
+                .handle_client_message(
+                    ClientMessage::NegMsg {
+                        subscription_id: subscription_id.clone(),
+                        message: "should-not-touch-storage".to_owned()
+                    },
+                    &mut auth,
+                    UnixTimestamp::new(101)
+                )
+                .expect("neg msg"),
+            vec![RelayMessage::NegErr {
+                subscription_id,
+                message: NEGENTROPY_DISABLED_MESSAGE.to_owned()
+            }]
         );
     }
 
@@ -2661,7 +2800,7 @@ mod tests {
     }
 
     #[test]
-    fn base_relay_count_hll_omits_for_noneligible_and_redacted_counts() {
+    fn base_relay_count_hll_omits_for_private_hidden_unknown_limited_multi_and_redacted_counts() {
         let owner = signer(7).public_key().clone();
         let owner_auth = authenticated_state(7);
         let unauth = BaseAuthState::new("wss://relay.radroots.test", 60, 600).expect("auth state");
@@ -2685,7 +2824,7 @@ mod tests {
         let private = signed_event_at(
             7,
             7,
-            vec![h("PrivateHll"), target_tag],
+            vec![h("PrivateHll"), target_tag.clone()],
             "private reaction",
             1_714_124_434,
         );
@@ -2695,6 +2834,78 @@ mod tests {
                 .expect("private reaction"),
             &private,
         );
+        let hidden_create =
+            signed_group_create_event_with_tags(7, "HiddenHll", vec![hidden()], 1_714_124_435);
+        assert_accepted(
+            relay
+                .handle_event_with_auth(hidden_create.clone(), &owner_auth)
+                .expect("hidden create"),
+            &hidden_create,
+        );
+        let hidden = signed_event_at(
+            7,
+            7,
+            vec![h("HiddenHll"), target_tag.clone()],
+            "hidden reaction",
+            1_714_124_436,
+        );
+        assert_accepted(
+            relay
+                .handle_event_with_auth(hidden.clone(), &owner_auth)
+                .expect("hidden reaction"),
+            &hidden,
+        );
+        let unknown = signed_event_at(
+            7,
+            7,
+            vec![h("UnknownHll"), target_tag.clone()],
+            "unknown reaction",
+            1_714_124_437,
+        );
+        relay
+            .store
+            .store_event(&tangle_event_to_pocket(&unknown).expect("unknown pocket"))
+            .expect("store unknown");
+
+        let authorized_private = relay
+            .handle_count_with_auth_protocol(
+                SubscriptionId::new("count-hll-authorized-private").expect("sub"),
+                vec![
+                    filter_from_value(&serde_json::json!({"kinds":[7],"#e":[target.clone()]}))
+                        .expect("filter"),
+                ],
+                &owner_auth,
+            )
+            .expect("authorized private count");
+        assert!(matches!(
+            authorized_private,
+            RelayMessage::Count {
+                count: 3,
+                hll: None,
+                ..
+            }
+        ));
+
+        let multi_filter = relay
+            .handle_count_with_auth_protocol(
+                SubscriptionId::new("count-hll-multi-filter").expect("sub"),
+                vec![
+                    filter_from_value(&serde_json::json!({"kinds":[7],"#e":[target.clone()]}))
+                        .expect("filter"),
+                    filter_from_value(&serde_json::json!({"kinds":[7],"#e":["c".repeat(64)]}))
+                        .expect("filter"),
+                ],
+                &owner_auth,
+            )
+            .expect("multi count");
+        assert!(matches!(
+            multi_filter,
+            RelayMessage::Count {
+                count: 3,
+                hll: None,
+                ..
+            }
+        ));
 
         let limited = relay
             .handle_count_with_auth_protocol(
@@ -2711,7 +2922,7 @@ mod tests {
         assert!(matches!(
             limited,
             RelayMessage::Count {
-                count: 2,
+                count: 3,
                 hll: None,
                 ..
             }
