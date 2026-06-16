@@ -3,8 +3,9 @@ use std::collections::BTreeSet;
 use crate::{
     GroupLimitsConfig,
     errors::{GroupError, GroupErrorKind},
+    event_view::{GroupEventTag, GroupEventView},
 };
-use tangle_protocol::{Kind, Tag};
+use tangle_protocol::Kind;
 
 pub const MAX_METADATA_NAME_BYTES: usize = 128;
 pub const MAX_METADATA_PICTURE_BYTES: usize = 2_048;
@@ -138,20 +139,20 @@ pub enum SupportedKinds {
 }
 
 pub fn parse_group_metadata(
-    tags: &[Tag],
+    event: &(impl GroupEventView + ?Sized),
     limits: GroupLimitsConfig,
 ) -> Result<GroupMetadata, GroupError> {
     let mut builder = MetadataBuilder::default();
-    for tag in tags {
-        let Some(name) = tag.values().first().map(String::as_str) else {
-            continue;
+    event.visit_tags(|tag| {
+        let Some(name) = tag.first_value() else {
+            return Ok(());
         };
         match name {
-            "name" => builder.name = parse_text_tag(tag, "name", MAX_METADATA_NAME_BYTES)?,
+            "name" => builder.name = parse_text_tag(&tag, "name", MAX_METADATA_NAME_BYTES)?,
             "picture" => {
-                builder.picture = parse_text_tag(tag, "picture", MAX_METADATA_PICTURE_BYTES)?
+                builder.picture = parse_text_tag(&tag, "picture", MAX_METADATA_PICTURE_BYTES)?
             }
-            "about" => builder.about = parse_text_tag(tag, "about", MAX_METADATA_ABOUT_BYTES)?,
+            "about" => builder.about = parse_text_tag(&tag, "about", MAX_METADATA_ABOUT_BYTES)?,
             "private" => builder.private = true,
             "restricted" => builder.restricted = true,
             "hidden" => builder.hidden = true,
@@ -163,11 +164,12 @@ pub fn parse_group_metadata(
                         "metadata must contain at most one supported_kinds tag",
                     ));
                 }
-                builder.supported_kinds = Some(parse_supported_kinds_tag(tag, limits)?);
+                builder.supported_kinds = Some(parse_supported_kinds_tag(&tag, limits)?);
             }
             _ => {}
         }
-    }
+        Ok(())
+    })?;
     Ok(GroupMetadata {
         name: builder.name,
         picture: builder.picture,
@@ -195,11 +197,11 @@ struct MetadataBuilder {
 }
 
 fn parse_text_tag(
-    tag: &Tag,
+    tag: &GroupEventTag<'_>,
     field: &'static str,
     max_bytes: usize,
 ) -> Result<Option<String>, GroupError> {
-    let value = tag.values().get(1).cloned();
+    let value = tag.value(1).map(str::to_owned);
     if let Some(value) = &value
         && value.len() > max_bytes
     {
@@ -212,10 +214,10 @@ fn parse_text_tag(
 }
 
 fn parse_supported_kinds_tag(
-    tag: &Tag,
+    tag: &GroupEventTag<'_>,
     limits: GroupLimitsConfig,
 ) -> Result<SupportedKinds, GroupError> {
-    let values = tag.values().iter().skip(1).collect::<Vec<_>>();
+    let values = tag.values().iter().skip(1).copied().collect::<Vec<_>>();
     if values.is_empty() {
         return Ok(SupportedKinds::None);
     }
@@ -253,12 +255,14 @@ mod tests {
 
     use super::{SupportedKinds, parse_group_metadata};
     use crate::{GroupErrorKind, GroupLimitsConfig};
-    use tangle_protocol::{Kind, Tag};
+    use tangle_protocol::{
+        Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
+    };
 
     #[test]
     fn parses_group_metadata_flags_and_fields() {
         let metadata = parse_group_metadata(
-            &[
+            &event(vec![
                 Tag::from_parts("name", &["Farmers"]).expect("name"),
                 Tag::from_parts("picture", &["https://radroots.test/group.png"]).expect("picture"),
                 Tag::from_parts("about", &["Local harvest coordination"]).expect("about"),
@@ -267,7 +271,7 @@ mod tests {
                 Tag::from_parts("hidden", &[]).expect("hidden"),
                 Tag::from_parts("closed", &[]).expect("closed"),
                 Tag::from_parts("supported_kinds", &["1", "7"]).expect("supported"),
-            ],
+            ]),
             GroupLimitsConfig::default(),
         )
         .expect("metadata");
@@ -291,14 +295,16 @@ mod tests {
     #[test]
     fn supported_kinds_absent_empty_and_list_forms_are_distinct() {
         assert_eq!(
-            parse_group_metadata(&[], GroupLimitsConfig::default())
+            parse_group_metadata(&event(Vec::new()), GroupLimitsConfig::default())
                 .expect("absent")
                 .supported_kinds(),
             &SupportedKinds::UnspecifiedAll
         );
         assert_eq!(
             parse_group_metadata(
-                &[Tag::from_parts("supported_kinds", &[]).expect("supported")],
+                &event(vec![
+                    Tag::from_parts("supported_kinds", &[]).expect("supported")
+                ]),
                 GroupLimitsConfig::default()
             )
             .expect("empty")
@@ -307,7 +313,7 @@ mod tests {
         );
         assert!(matches!(
             parse_group_metadata(
-                &[Tag::from_parts("supported_kinds", &["1"]).expect("supported")],
+                &event(vec![Tag::from_parts("supported_kinds", &["1"]).expect("supported")]),
                 GroupLimitsConfig::default()
             )
             .expect("list")
@@ -319,7 +325,9 @@ mod tests {
     #[test]
     fn metadata_parser_rejects_oversize_fields_and_kind_limits() {
         let error = parse_group_metadata(
-            &[Tag::from_parts("name", &[&"a".repeat(129)]).expect("name")],
+            &event(vec![
+                Tag::from_parts("name", &[&"a".repeat(129)]).expect("name"),
+            ]),
             GroupLimitsConfig::default(),
         )
         .expect_err("name");
@@ -327,10 +335,26 @@ mod tests {
 
         let limits = GroupLimitsConfig::new(128, 8, 1, 1, 1).expect("limits");
         let error = parse_group_metadata(
-            &[Tag::from_parts("supported_kinds", &["1", "2"]).expect("supported")],
+            &event(vec![
+                Tag::from_parts("supported_kinds", &["1", "2"]).expect("supported"),
+            ]),
             limits,
         )
         .expect_err("supported kinds");
         assert_eq!(error.kind(), GroupErrorKind::TooManySupportedKinds);
+    }
+
+    fn event(tags: Vec<Tag>) -> Event {
+        Event::new(
+            EventId::new(&"0".repeat(64)).expect("id"),
+            UnsignedEvent::new(
+                PublicKeyHex::new(&"1".repeat(64)).expect("pubkey"),
+                UnixTimestamp::new(1),
+                Kind::new(1).expect("kind"),
+                tags,
+                "",
+            ),
+            SignatureHex::new(&"2".repeat(128)).expect("sig"),
+        )
     }
 }

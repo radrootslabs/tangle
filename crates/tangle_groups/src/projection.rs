@@ -3,10 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     CapabilitySet, GroupError, GroupErrorKind, GroupEventClass, GroupId, GroupLimitsConfig,
     GroupMetadata, GroupMetadataFlags, GroupMetadataText, RoleDefinition, RoleName, SupportedKinds,
-    classify_group_event, parse_group_metadata,
+    classify_group_event, event_view::GroupEventView, parse_group_metadata,
 };
 use serde::{Deserialize, Serialize};
-use tangle_protocol::{Event, EventId, Kind, PublicKeyHex, Tag, UnixTimestamp};
+use tangle_protocol::{Event, EventId, Kind, PublicKeyHex, UnixTimestamp};
 
 pub const GROUP_PROJECTION_SCHEMA_VERSION: u32 = 1;
 pub const GROUP_POLICY_VERSION: u32 = 1;
@@ -40,12 +40,11 @@ impl ProjectionOrderTuple {
         }
     }
 
-    pub fn from_event(event: &Event, store_offset: StoreOffset) -> Self {
-        Self::new(
-            event.unsigned().created_at(),
-            event.id().clone(),
-            store_offset,
-        )
+    pub fn from_event_view(
+        event: &(impl GroupEventView + ?Sized),
+        store_offset: StoreOffset,
+    ) -> Result<Self, GroupError> {
+        Ok(Self::new(event.created_at(), event.id()?, store_offset))
     }
 
     pub fn created_at(&self) -> UnixTimestamp {
@@ -661,12 +660,12 @@ impl GroupProjection {
 
     pub fn apply_canonical_event(
         &mut self,
-        event: &Event,
+        event: &(impl GroupEventView + ?Sized),
         store_offset: StoreOffset,
         limits: GroupLimitsConfig,
     ) -> Result<ProjectionApplyOutcome, GroupError> {
         let class = classify_group_event(event, limits)?;
-        let tuple = ProjectionOrderTuple::from_event(event, store_offset);
+        let tuple = ProjectionOrderTuple::from_event_view(event, store_offset)?;
         match class {
             GroupEventClass::NonGroup => Ok(ProjectionApplyOutcome::Skipped),
             GroupEventClass::Normal { .. } => Ok(ProjectionApplyOutcome::Ignored),
@@ -682,17 +681,17 @@ impl GroupProjection {
     fn apply_moderation_event(
         &mut self,
         group_id: GroupId,
-        event: &Event,
+        event: &(impl GroupEventView + ?Sized),
         tuple: ProjectionOrderTuple,
         limits: GroupLimitsConfig,
     ) -> Result<ProjectionApplyOutcome, GroupError> {
-        match event.unsigned().kind().as_u32() {
+        match event.kind_u32() {
             crate::KIND_GROUP_CREATE_GROUP => {
                 let state = GroupState::new(
                     group_id.clone(),
-                    parse_group_metadata(event.unsigned().tags(), limits)?,
-                    event.unsigned().pubkey().clone(),
-                    event.id().clone(),
+                    parse_group_metadata(event, limits)?,
+                    event.pubkey()?,
+                    event.id()?,
                     tuple,
                 );
                 if self
@@ -709,10 +708,7 @@ impl GroupProjection {
                 let Some(group) = self.groups.get_mut(&group_id) else {
                     return Ok(ProjectionApplyOutcome::Ignored);
                 };
-                group.update_metadata(
-                    parse_group_metadata(event.unsigned().tags(), limits)?,
-                    tuple,
-                );
+                group.update_metadata(parse_group_metadata(event, limits)?, tuple);
                 Ok(ProjectionApplyOutcome::Applied)
             }
             crate::KIND_GROUP_PUT_USER => {
@@ -722,8 +718,8 @@ impl GroupProjection {
                 self.apply_member_status(group_id, event, tuple, MemberStatus::Removed)
             }
             crate::KIND_GROUP_DELETE_EVENT => {
-                let target_event_id = EventId::new(first_tag_value(event.unsigned().tags(), "e")?)
-                    .map_err(|reason| {
+                let target_event_id =
+                    EventId::new(&first_tag_value(event, "e")?).map_err(|reason| {
                         GroupError::invalid(
                             GroupErrorKind::MalformedTargetTag,
                             format!("malformed e target tag: {reason}"),
@@ -732,9 +728,9 @@ impl GroupProjection {
                 let deletion = GroupEventDeletion::new(
                     group_id,
                     target_event_id,
-                    event.id().clone(),
-                    event.unsigned().created_at(),
-                    event.unsigned().pubkey().clone(),
+                    event.id()?,
+                    event.created_at(),
+                    event.pubkey()?,
                     tuple,
                 );
                 self.put_event_deletion(deletion);
@@ -743,17 +739,13 @@ impl GroupProjection {
             crate::KIND_GROUP_DELETE_GROUP => {
                 let tombstone = GroupTombstone::new(
                     group_id.clone(),
-                    event.id().clone(),
-                    event.unsigned().created_at(),
-                    event.unsigned().pubkey().clone(),
+                    event.id()?,
+                    event.created_at(),
+                    event.pubkey()?,
                     tuple.clone(),
                 );
                 if let Some(group) = self.groups.get_mut(&group_id) {
-                    group.mark_deleted(
-                        event.unsigned().created_at(),
-                        event.id().clone(),
-                        tuple.clone(),
-                    );
+                    group.mark_deleted(event.created_at(), event.id()?, tuple.clone());
                 }
                 if self
                     .tombstones
@@ -774,28 +766,29 @@ impl GroupProjection {
         &mut self,
         group_id: GroupId,
         kind: Kind,
-        event: &Event,
+        event: &(impl GroupEventView + ?Sized),
         tuple: ProjectionOrderTuple,
         limits: GroupLimitsConfig,
     ) -> Result<ProjectionApplyOutcome, GroupError> {
         if kind.as_u32() == crate::KIND_GROUP_METADATA {
-            let metadata = parse_group_metadata(event.unsigned().tags(), limits)?;
+            let metadata = parse_group_metadata(event, limits)?;
+            let event_id = event.id()?;
             if let Some(group) = self.groups.get_mut(&group_id) {
                 group.update_metadata(metadata, tuple.clone());
-                group.snapshots.set_for_kind(kind, event.id().clone());
+                group.snapshots.set_for_kind(kind, event_id);
             } else {
                 let mut state = GroupState::new(
                     group_id.clone(),
                     metadata,
-                    event.unsigned().pubkey().clone(),
-                    event.id().clone(),
+                    event.pubkey()?,
+                    event_id.clone(),
                     tuple.clone(),
                 );
-                state.snapshots.set_for_kind(kind, event.id().clone());
+                state.snapshots.set_for_kind(kind, event_id);
                 self.put_group(state);
             }
         } else if let Some(group) = self.groups.get_mut(&group_id) {
-            group.snapshots.set_for_kind(kind, event.id().clone());
+            group.snapshots.set_for_kind(kind, event.id()?);
         }
         Ok(ProjectionApplyOutcome::Applied)
     }
@@ -803,19 +796,19 @@ impl GroupProjection {
     fn apply_member_status(
         &mut self,
         group_id: GroupId,
-        event: &Event,
+        event: &(impl GroupEventView + ?Sized),
         tuple: ProjectionOrderTuple,
         status: MemberStatus,
     ) -> Result<ProjectionApplyOutcome, GroupError> {
-        let target = first_tag_value(event.unsigned().tags(), "p")?;
-        let pubkey = PublicKeyHex::new(target).map_err(|reason| {
+        let target = first_tag_value(event, "p")?;
+        let pubkey = PublicKeyHex::new(&target).map_err(|reason| {
             GroupError::invalid(
                 GroupErrorKind::MalformedTargetTag,
                 format!("malformed p target tag: {reason}"),
             )
         })?;
-        let roles = role_tags(event.unsigned().tags())?;
-        let state = MemberState::new(pubkey, status, roles, event.id().clone(), tuple);
+        let roles = role_tags(event)?;
+        let state = MemberState::new(pubkey, status, roles, event.id()?, tuple);
         self.put_member(group_id, state);
         Ok(ProjectionApplyOutcome::Applied)
     }
@@ -851,7 +844,7 @@ impl CanonicalGroupEvent {
     }
 
     pub fn tuple(&self) -> ProjectionOrderTuple {
-        ProjectionOrderTuple::from_event(&self.event, self.store_offset)
+        ProjectionOrderTuple::from_event_view(&self.event, self.store_offset).expect("tuple")
     }
 }
 
@@ -977,10 +970,14 @@ fn prefixed_key(prefix: &str, first: &str, second: Option<&str>) -> Vec<u8> {
     key
 }
 
-fn first_tag_value<'a>(tags: &'a [Tag], name: &str) -> Result<&'a str, GroupError> {
-    for tag in tags {
-        if tag.values().first().is_none_or(|tag_name| tag_name != name) {
-            continue;
+fn first_tag_value(
+    event: &(impl GroupEventView + ?Sized),
+    name: &str,
+) -> Result<String, GroupError> {
+    let mut found = None;
+    event.visit_tags(|tag| {
+        if tag.first_value().is_none_or(|tag_name| tag_name != name) {
+            return Ok(());
         }
         let Some((_, value)) = tag.indexed_pair() else {
             return Err(GroupError::invalid(
@@ -988,23 +985,27 @@ fn first_tag_value<'a>(tags: &'a [Tag], name: &str) -> Result<&'a str, GroupErro
                 format!("malformed {name} target tag"),
             ));
         };
-        return Ok(value);
-    }
-    Err(GroupError::invalid(
-        GroupErrorKind::MissingTargetTag,
-        format!("missing {name} target tag"),
-    ))
+        found = Some(value.to_owned());
+        Ok(())
+    })?;
+    found.ok_or_else(|| {
+        GroupError::invalid(
+            GroupErrorKind::MissingTargetTag,
+            format!("missing {name} target tag"),
+        )
+    })
 }
 
-fn role_tags(tags: &[Tag]) -> Result<BTreeSet<RoleName>, GroupError> {
+fn role_tags(event: &(impl GroupEventView + ?Sized)) -> Result<BTreeSet<RoleName>, GroupError> {
     let mut roles = BTreeSet::new();
-    for tag in tags {
-        if tag.values().first().is_some_and(|name| name == "role")
-            && let Some(value) = tag.values().get(1)
+    event.visit_tags(|tag| {
+        if tag.first_value().is_some_and(|name| name == "role")
+            && let Some(value) = tag.value(1)
         {
             roles.insert(RoleName::new(value)?);
         }
-    }
+        Ok(())
+    })?;
     Ok(roles)
 }
 
@@ -1418,8 +1419,10 @@ mod tests {
         KIND_GROUP_DELETE_EVENT, KIND_GROUP_DELETE_GROUP, KIND_GROUP_EDIT_METADATA,
         KIND_GROUP_METADATA, KIND_GROUP_PUT_USER, RoleDefinition, RoleName, SupportedKinds,
     };
+    use pocket_types::{Event as PocketEvent, OwnedEvent as PocketOwnedEvent};
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
+        event_to_value,
     };
 
     #[test]
@@ -1561,6 +1564,36 @@ mod tests {
             projection
                 .event_deletion(&EventId::new(id("30")).expect("event"))
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn projection_applies_pocket_event_views_equivalent_to_protocol_events() {
+        let limits = GroupLimitsConfig::default();
+        let events = projection_event_stream();
+        let mut protocol_projection = GroupProjection::new();
+        let mut pocket_projection = GroupProjection::new();
+
+        for (event, offset) in &events {
+            protocol_projection
+                .apply_canonical_event(event, *offset, limits)
+                .expect("protocol event");
+            let pocket = pocket_event(event);
+            pocket_projection
+                .apply_canonical_event(&pocket, *offset, limits)
+                .expect("pocket event");
+        }
+
+        assert_eq!(protocol_projection.groups(), pocket_projection.groups());
+        assert_eq!(protocol_projection.members(), pocket_projection.members());
+        assert_eq!(protocol_projection.roles(), pocket_projection.roles());
+        assert_eq!(
+            protocol_projection.tombstones(),
+            pocket_projection.tombstones()
+        );
+        assert_eq!(
+            protocol_projection.event_deletions(),
+            pocket_projection.event_deletions()
         );
     }
 
@@ -1873,6 +1906,88 @@ mod tests {
             ),
             SignatureHex::new(&"2".repeat(128)).expect("sig"),
         )
+    }
+
+    fn projection_event_stream() -> Vec<(Event, StoreOffset)> {
+        vec![
+            (
+                event(
+                    KIND_GROUP_CREATE_GROUP,
+                    "10",
+                    10,
+                    vec![
+                        Tag::from_parts("h", &["Farm"]).expect("h"),
+                        Tag::from_parts("name", &["Farmers"]).expect("name"),
+                    ],
+                ),
+                StoreOffset::new(1),
+            ),
+            (
+                event(
+                    KIND_GROUP_EDIT_METADATA,
+                    "20",
+                    20,
+                    vec![
+                        Tag::from_parts("h", &["Farm"]).expect("h"),
+                        Tag::from_parts("name", &["Market"]).expect("name"),
+                    ],
+                ),
+                StoreOffset::new(2),
+            ),
+            (
+                event(
+                    KIND_GROUP_PUT_USER,
+                    "30",
+                    30,
+                    vec![
+                        Tag::from_parts("h", &["Farm"]).expect("h"),
+                        Tag::from_parts("p", &[&"8".repeat(64)]).expect("p"),
+                        Tag::from_parts("role", &["moderator"]).expect("role"),
+                    ],
+                ),
+                StoreOffset::new(3),
+            ),
+            (
+                event(
+                    KIND_GROUP_METADATA,
+                    "40",
+                    40,
+                    vec![
+                        Tag::from_parts("d", &["Farm"]).expect("d"),
+                        Tag::from_parts("name", &["Snapshot"]).expect("name"),
+                    ],
+                ),
+                StoreOffset::new(4),
+            ),
+            (
+                event(
+                    KIND_GROUP_DELETE_EVENT,
+                    "45",
+                    45,
+                    vec![
+                        Tag::from_parts("h", &["Farm"]).expect("h"),
+                        Tag::from_parts("e", &[id("30")]).expect("e"),
+                    ],
+                ),
+                StoreOffset::new(5),
+            ),
+            (
+                event(
+                    KIND_GROUP_DELETE_GROUP,
+                    "50",
+                    50,
+                    vec![Tag::from_parts("h", &["Farm"]).expect("h")],
+                ),
+                StoreOffset::new(6),
+            ),
+        ]
+    }
+
+    fn pocket_event(event: &Event) -> PocketOwnedEvent {
+        let raw = event_to_value(event).to_string();
+        let mut buffer = vec![0; 4096];
+        let (_, pocket) = PocketEvent::from_json(raw.as_bytes(), &mut buffer).expect("pocket");
+        pocket.to_owned()
     }
 
     fn id(suffix: &str) -> &'static str {
