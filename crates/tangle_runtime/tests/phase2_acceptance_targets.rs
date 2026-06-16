@@ -9,13 +9,14 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use tangle_crypto::RelaySigner;
 use tangle_groups::{
     GroupAuthContext, GroupAuthority, GroupErrorKind, GroupEventClass, GroupId, GroupMetadata,
     GroupMetadataFlags, GroupMetadataText, GroupPolicyConfig, GroupProjection, GroupReadDecision,
     GroupReadGate, GroupState, GroupWriteDecision, GroupWritePolicy, KIND_GROUP_ADMINS,
-    KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA,
-    MemberState, MemberStatus, ProjectionOrderTuple, StoreOffset, SupportedKinds,
-    parse_group_runtime_config_json,
+    KIND_GROUP_CREATE_GROUP, KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS,
+    KIND_GROUP_METADATA, KIND_GROUP_PUT_USER, MemberState, MemberStatus, ProjectionOrderTuple,
+    StoreOffset, SupportedKinds, parse_group_runtime_config_json,
 };
 use tangle_protocol::{
     Event, EventId, Filter, Kind, PublicKeyHex, RelayMessage, SignatureHex, SubscriptionId, Tag,
@@ -30,9 +31,9 @@ use tangle_runtime::{
     server::serve_listener_until_shutdown,
 };
 use tangle_store_pocket::{
-    PocketOwnedEvent, PocketStoreConfig, PocketStoreHandle, TANGLE_GROUP_CHECKPOINT_TABLE,
-    TANGLE_GROUP_OUTBOX_TABLE, TANGLE_GROUP_PROJECTION_TABLE, parse_pocket_event_json,
-    parse_pocket_filter_json,
+    PocketKind, PocketOwnedEvent, PocketOwnedTags, PocketStoreConfig, PocketStoreHandle,
+    PocketTime, TANGLE_GROUP_CHECKPOINT_TABLE, TANGLE_GROUP_OUTBOX_TABLE,
+    TANGLE_GROUP_PROJECTION_TABLE, parse_pocket_event_json, parse_pocket_filter_json,
 };
 use tangle_test_support::{
     FixtureKey, TANGLE_V2_RELAY_SECRET_HEX, TANGLE_V2_RELAY_URL, tangle_v2_auth_event,
@@ -111,6 +112,151 @@ fn authenticate_pocket_event_for_test(
 fn pocket_event_for_test(event: &Event) -> PocketOwnedEvent {
     let raw = serde_json::to_vec(&event_to_value(event)).expect("event JSON");
     parse_pocket_event_json(&raw).expect("pocket event")
+}
+
+fn pocket_protocol_event(
+    key: FixtureKey,
+    created_at: u64,
+    kind: u64,
+    tags: Vec<Tag>,
+    content: &str,
+) -> Event {
+    let tags = pocket_tags_from_protocol(&tags);
+    let pocket = signed_pocket_event(
+        fixture_secret_byte(key),
+        created_at,
+        u16::try_from(kind).expect("pocket kind"),
+        &tags,
+        content.as_bytes(),
+    );
+    pocket_event_to_protocol(&pocket)
+}
+
+fn pocket_protocol_auth_event(key: FixtureKey, challenge: &str, created_at: u64) -> Event {
+    pocket_protocol_event(
+        key,
+        created_at,
+        22_242,
+        vec![
+            Tag::from_parts("relay", &[TANGLE_V2_RELAY_URL]).expect("relay"),
+            Tag::from_parts("challenge", &[challenge]).expect("challenge"),
+        ],
+        "",
+    )
+}
+
+fn pocket_protocol_group_create_event(
+    key: FixtureKey,
+    group_id: &str,
+    created_at: u64,
+    flags: &[&str],
+) -> Event {
+    let mut tags = vec![
+        Tag::from_parts("h", &[group_id]).expect("h"),
+        Tag::from_parts("name", &[group_id]).expect("name"),
+    ];
+    for flag in flags {
+        tags.push(Tag::from_parts(flag, &[]).expect("flag"));
+    }
+    pocket_protocol_event(key, created_at, KIND_GROUP_CREATE_GROUP.into(), tags, "")
+}
+
+fn pocket_protocol_put_user_event(
+    key: FixtureKey,
+    group_id: &str,
+    target: FixtureKey,
+    created_at: u64,
+) -> Event {
+    let target_pubkey = target.public_key();
+    pocket_protocol_event(
+        key,
+        created_at,
+        KIND_GROUP_PUT_USER.into(),
+        vec![
+            Tag::from_parts("h", &[group_id]).expect("h"),
+            Tag::from_parts("p", &[target_pubkey.as_str()]).expect("p"),
+        ],
+        "",
+    )
+}
+
+fn pocket_protocol_group_event(
+    key: FixtureKey,
+    group_id: &str,
+    created_at: u64,
+    kind: u64,
+    content: &str,
+) -> Event {
+    pocket_protocol_event(
+        key,
+        created_at,
+        kind,
+        vec![Tag::from_parts("h", &[group_id]).expect("h")],
+        content,
+    )
+}
+
+fn signed_pocket_event(
+    secret_byte: u8,
+    created_at: u64,
+    kind: u16,
+    tags: &PocketOwnedTags,
+    content: &[u8],
+) -> PocketOwnedEvent {
+    let secret = format!("{secret_byte:02x}").repeat(32);
+    RelaySigner::from_secret_hex(&secret)
+        .expect("signer")
+        .sign_pocket_event(
+            PocketKind::from_u16(kind),
+            tags,
+            PocketTime::from_u64(created_at),
+            content,
+        )
+        .expect("pocket event")
+}
+
+fn pocket_tags_from_protocol(tags: &[Tag]) -> PocketOwnedTags {
+    let parts = tags
+        .iter()
+        .map(|tag| tag.values().iter().map(String::as_str).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    PocketOwnedTags::new(&parts).expect("pocket tags")
+}
+
+fn pocket_event_to_protocol(event: &PocketOwnedEvent) -> Event {
+    let tags = event
+        .tags()
+        .expect("tags")
+        .iter()
+        .map(|tag| {
+            Tag::new(
+                tag.map(|value| std::str::from_utf8(value).expect("utf8").to_owned())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("tag")
+        })
+        .collect::<Vec<_>>();
+    Event::new(
+        EventId::new(&event.id().as_hex_string()).expect("event id"),
+        UnsignedEvent::new(
+            PublicKeyHex::new(&event.pubkey().as_hex_string()).expect("pubkey"),
+            UnixTimestamp::new(event.created_at().as_u64()),
+            Kind::new(u64::from(event.kind().as_u16())).expect("kind"),
+            tags,
+            std::str::from_utf8(event.content()).expect("content"),
+        ),
+        SignatureHex::new(&event.sig().to_string()).expect("sig"),
+    )
+}
+
+fn fixture_secret_byte(key: FixtureKey) -> u8 {
+    match key {
+        FixtureKey::Relay => 9,
+        FixtureKey::Owner => 10,
+        FixtureKey::Admin => 11,
+        FixtureKey::Member => 12,
+        FixtureKey::Outsider => 13,
+    }
 }
 
 #[tokio::test]
@@ -337,46 +483,41 @@ async fn websocket_public_relay_covers_query_count_ephemeral_and_rejection_flows
     let mut subscriber = connect_nostr_socket(address).await;
     let _ = read_auth_challenge(&mut publisher).await;
     let _ = read_auth_challenge(&mut subscriber).await;
-    let first = tangle_v2_event(
+    let first = pocket_protocol_event(
         FixtureKey::Member,
         1_714_124_433,
         1,
         Vec::new(),
         "public one",
-    )
-    .expect("first event");
-    let second = tangle_v2_event(
+    );
+    let second = pocket_protocol_event(
         FixtureKey::Admin,
         1_714_124_435,
         1,
         Vec::new(),
         "public two",
-    )
-    .expect("second event");
-    let other_kind = tangle_v2_event(
+    );
+    let other_kind = pocket_protocol_event(
         FixtureKey::Owner,
         1_714_124_436,
         2,
         Vec::new(),
         "public other",
-    )
-    .expect("other event");
-    let ephemeral = tangle_v2_event(
+    );
+    let ephemeral = pocket_protocol_event(
         FixtureKey::Member,
         1_714_124_437,
         20_001,
         Vec::new(),
         "public transient",
-    )
-    .expect("ephemeral event");
-    let signature_source = tangle_v2_event(
+    );
+    let signature_source = pocket_protocol_event(
         FixtureKey::Owner,
         1_714_124_438,
         1,
         Vec::new(),
         "signature source",
-    )
-    .expect("signature source");
+    );
     let invalid = Event::new(
         first.id().clone(),
         first.unsigned().clone(),
@@ -490,14 +631,13 @@ async fn websocket_public_relay_covers_query_count_ephemeral_and_rejection_flows
     send_client_value(&mut publisher, json!(["CLOSE", "query-public"])).await;
     expect_no_relay_message(&mut publisher).await;
 
-    let after_close = tangle_v2_event(
+    let after_close = pocket_protocol_event(
         FixtureKey::Admin,
         1_714_124_439,
         1,
         Vec::new(),
         "after close",
-    )
-    .expect("after close event");
+    );
     send_client_value(
         &mut publisher,
         json!(["EVENT", event_to_value(&after_close)]),
@@ -825,13 +965,12 @@ async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_
     )
     .await;
 
-    let private_create = tangle_v2_group_create_event(
+    let private_create = pocket_protocol_group_create_event(
         FixtureKey::Owner,
         "PrivateSocket",
         1_714_124_450,
         &["private"],
-    )
-    .expect("private create");
+    );
     send_client_value(
         &mut owner_writer,
         json!(["EVENT", event_to_value(&private_create)]),
@@ -844,13 +983,12 @@ async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_
         "",
     );
 
-    let private_put = tangle_v2_put_user_event(
+    let private_put = pocket_protocol_put_user_event(
         FixtureKey::Owner,
         "PrivateSocket",
         FixtureKey::Member,
         1_714_124_451,
-    )
-    .expect("private put");
+    );
     send_client_value(
         &mut owner_writer,
         json!(["EVENT", event_to_value(&private_put)]),
@@ -944,14 +1082,13 @@ async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_
         json!(["EOSE", "private-member-live"])
     );
 
-    let private_note = tangle_v2_group_event(
+    let private_note = pocket_protocol_group_event(
         FixtureKey::Member,
         "PrivateSocket",
         1_714_124_452,
         1,
         "private harvest",
-    )
-    .expect("private note");
+    );
     send_client_value(
         &mut member_writer,
         json!(["EVENT", event_to_value(&private_note)]),
@@ -1016,13 +1153,12 @@ async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_
     )
     .await;
 
-    let hidden_create = tangle_v2_group_create_event(
+    let hidden_create = pocket_protocol_group_create_event(
         FixtureKey::Owner,
         "HiddenSocket",
         1_714_124_453,
         &["hidden"],
-    )
-    .expect("hidden create");
+    );
     send_client_value(
         &mut owner_writer,
         json!(["EVENT", event_to_value(&hidden_create)]),
@@ -1035,13 +1171,12 @@ async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_
         "",
     );
 
-    let hidden_put = tangle_v2_put_user_event(
+    let hidden_put = pocket_protocol_put_user_event(
         FixtureKey::Owner,
         "HiddenSocket",
         FixtureKey::Member,
         1_714_124_454,
-    )
-    .expect("hidden put");
+    );
     send_client_value(
         &mut owner_writer,
         json!(["EVENT", event_to_value(&hidden_put)]),
@@ -1136,14 +1271,13 @@ async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_
         json!(["EOSE", "hidden-member-live"])
     );
 
-    let hidden_note = tangle_v2_group_event(
+    let hidden_note = pocket_protocol_group_event(
         FixtureKey::Owner,
         "HiddenSocket",
         1_714_124_455,
         1,
         "hidden harvest",
-    )
-    .expect("hidden note");
+    );
     send_client_value(
         &mut owner_writer,
         json!(["EVENT", event_to_value(&hidden_note)]),
@@ -2387,7 +2521,7 @@ async fn authenticate_client(
     challenge: &str,
     created_at: u64,
 ) {
-    let auth = tangle_v2_auth_event(fixture_key, challenge, created_at).expect("auth");
+    let auth = pocket_protocol_auth_event(fixture_key, challenge, created_at);
     send_client_value(socket, json!(["AUTH", event_to_value(&auth)])).await;
     assert_ok(read_relay_value(socket).await, &auth, true, "");
 }

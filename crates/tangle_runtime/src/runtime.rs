@@ -2084,9 +2084,9 @@ impl Default for TangleShutdownSignal {
 #[cfg(test)]
 mod tests {
     use super::{
-        BROAD_QUERY_TIME_WINDOW_SECONDS, TangleBroadQueryReason, TangleClientRateLimitContext,
-        TangleQueryClassification, TangleQueryClassifier, TangleRuntime, TangleRuntimeHandle,
-        TangleRuntimeLimits,
+        BROAD_QUERY_TIME_WINDOW_SECONDS, RuntimeClientMessage, TangleBroadQueryReason,
+        TangleClientRateLimitContext, TangleQueryClassification, TangleQueryClassifier,
+        TangleRuntime, TangleRuntimeHandle, TangleRuntimeLimits,
     };
     use crate::config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json};
     use crate::event_bus::{TangleEventBus, TangleEventReceiveError, TangleEventReceiver};
@@ -2102,14 +2102,19 @@ mod tests {
         path::{Path, PathBuf},
         time::Duration,
     };
+    use tangle_crypto::RelaySigner;
     use tangle_groups::{
         CanonicalGroupEvent, GroupEventClass, GroupId, GroupProjection, KIND_GROUP_ADMINS,
-        KIND_GROUP_DELETE_GROUP, KIND_GROUP_JOIN_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA,
-        MemberStatus, StoreOffset, rebuild_group_projection,
+        KIND_GROUP_CREATE_GROUP, KIND_GROUP_DELETE_GROUP, KIND_GROUP_JOIN_REQUEST,
+        KIND_GROUP_MEMBERS, KIND_GROUP_METADATA, KIND_GROUP_PUT_USER, MemberStatus, StoreOffset,
+        rebuild_group_projection,
     };
     use tangle_protocol::{
         ClientMessage, Event, EventId, Filter, Kind, PublicKeyHex, RelayMessage, SubscriptionId,
         Tag, UnixTimestamp, filter_from_value,
+    };
+    use tangle_store_pocket::{
+        PocketEvent, PocketKind, PocketOwnedEvent, PocketOwnedTags, PocketTime,
     };
     use tangle_test_support::{
         FixtureKey, tangle_v2_auth_event, tangle_v2_delete_group_event, tangle_v2_event,
@@ -3256,29 +3261,16 @@ mod tests {
         );
         let mut auth = handle.auth_state().await.expect("auth");
         let target = "c".repeat(64);
-        let first = tangle_v2_event(
-            FixtureKey::Member,
-            1_714_124_433,
-            7,
-            vec![Tag::from_parts("e", &[&target]).expect("tag")],
-            "first reaction",
-        )
-        .expect("first");
-        let second = tangle_v2_event(
-            FixtureKey::Admin,
-            1_714_124_434,
-            7,
-            vec![Tag::from_parts("e", &[&target]).expect("tag")],
-            "second reaction",
-        )
-        .expect("second");
+        let tags = PocketOwnedTags::new(&[["e", target.as_str()]]).expect("tags");
+        let first = signed_pocket_event(12, 1_714_124_433, 7, &tags, b"first reaction");
+        let second = signed_pocket_event(11, 1_714_124_434, 7, &tags, b"second reaction");
 
-        assert_accepted_reply(
-            runtime_event_reply(&handle, first.clone(), &mut auth, 1_714_124_435).await,
+        assert_accepted_pocket_reply(
+            runtime_pocket_event_reply(&handle, &first, &mut auth),
             &first,
         );
-        assert_accepted_reply(
-            runtime_event_reply(&handle, second.clone(), &mut auth, 1_714_124_436).await,
+        assert_accepted_pocket_reply(
+            runtime_pocket_event_reply(&handle, &second, &mut auth),
             &second,
         );
 
@@ -4104,63 +4096,61 @@ mod tests {
         owner_auth
             .issue_challenge("owner-stress", UnixTimestamp::new(base_time))
             .expect("owner challenge");
-        let owner_auth_event = tangle_v2_auth_event(FixtureKey::Owner, "owner-stress", base_time)
-            .expect("owner auth event");
+        let owner_auth_event =
+            runtime_pocket_auth_event(FixtureKey::Owner, "owner-stress", base_time);
         assert_eq!(
             handle
-                .handle_protocol_client_message_for_test(
-                    ClientMessage::Auth(owner_auth_event.clone()),
+                .handle_client_message(
+                    RuntimeClientMessage::Auth(owner_auth_event.clone()),
                     &mut owner_auth,
                     UnixTimestamp::new(base_time)
                 )
                 .await
                 .expect("owner auth"),
             vec![RelayMessage::Ok {
-                event_id: owner_auth_event.id().clone(),
+                event_id: runtime_pocket_event_id(&owner_auth_event),
                 accepted: true,
                 message: String::new()
             }]
         );
-        let create = tangle_v2_group_create_event(
+        let create = runtime_pocket_group_create_event(
             FixtureKey::Owner,
             "StressPrivate",
             base_time + 1,
             &["private"],
-        )
-        .expect("create");
+        );
         assert_eq!(
             handle
-                .handle_protocol_client_message_for_test(
-                    ClientMessage::Event(create.clone()),
+                .handle_client_message(
+                    RuntimeClientMessage::Event(create.clone()),
                     &mut owner_auth,
                     UnixTimestamp::new(base_time + 1)
                 )
                 .await
                 .expect("create"),
             vec![RelayMessage::Ok {
-                event_id: create.id().clone(),
+                event_id: runtime_pocket_event_id(&create),
                 accepted: true,
                 message: String::new()
             }]
         );
-        let put_member = tangle_v2_put_user_event(
+        let put_member = runtime_pocket_put_user_event(
             FixtureKey::Owner,
             "StressPrivate",
             FixtureKey::Member,
             base_time + 2,
-        )
-        .expect("put member");
+        );
         assert_eq!(
             handle
-                .handle_protocol_client_message_for_test(
-                    ClientMessage::Event(put_member.clone()),
+                .handle_client_message(
+                    RuntimeClientMessage::Event(put_member.clone()),
                     &mut owner_auth,
                     UnixTimestamp::new(base_time + 2)
                 )
                 .await
                 .expect("put member"),
             vec![RelayMessage::Ok {
-                event_id: put_member.id().clone(),
+                event_id: runtime_pocket_event_id(&put_member),
                 accepted: true,
                 message: String::new()
             }]
@@ -4170,19 +4160,18 @@ mod tests {
             .issue_challenge("member-stress", UnixTimestamp::new(base_time + 3))
             .expect("member challenge");
         let member_auth_event =
-            tangle_v2_auth_event(FixtureKey::Member, "member-stress", base_time + 3)
-                .expect("member auth event");
+            runtime_pocket_auth_event(FixtureKey::Member, "member-stress", base_time + 3);
         assert_eq!(
             handle
-                .handle_protocol_client_message_for_test(
-                    ClientMessage::Auth(member_auth_event.clone()),
+                .handle_client_message(
+                    RuntimeClientMessage::Auth(member_auth_event.clone()),
                     &mut member_auth,
                     UnixTimestamp::new(base_time + 3)
                 )
                 .await
                 .expect("member auth"),
             vec![RelayMessage::Ok {
-                event_id: member_auth_event.id().clone(),
+                event_id: runtime_pocket_event_id(&member_auth_event),
                 accepted: true,
                 message: String::new()
             }]
@@ -4196,18 +4185,17 @@ mod tests {
             let handle = handle.clone();
             let mut auth = member_auth.clone();
             write_tasks.push(tokio::spawn(async move {
-                let event = tangle_v2_group_event(
+                let event = runtime_pocket_group_event(
                     FixtureKey::Member,
                     "StressPrivate",
                     base_time + 10 + u64::try_from(index).expect("index"),
                     1,
                     &format!("private stress {index}"),
-                )
-                .expect("group event");
+                );
                 assert_eq!(
                     handle
-                        .handle_protocol_client_message_for_test(
-                            ClientMessage::Event(event.clone()),
+                        .handle_client_message(
+                            RuntimeClientMessage::Event(event.clone()),
                             &mut auth,
                             UnixTimestamp::new(
                                 base_time + 10 + u64::try_from(index).expect("index")
@@ -4216,30 +4204,29 @@ mod tests {
                         .await
                         .expect("group write"),
                     vec![RelayMessage::Ok {
-                        event_id: event.id().clone(),
+                        event_id: runtime_pocket_event_id(&event),
                         accepted: true,
                         message: String::new()
                     }]
                 );
-                (true, event)
+                (true, runtime_pocket_event_id(&event))
             }));
         }
         for index in 0..public_write_count {
             let handle = handle.clone();
             let mut auth = public_auth.clone();
             write_tasks.push(tokio::spawn(async move {
-                let event = tangle_v2_event(
+                let event = runtime_pocket_event(
                     FixtureKey::Admin,
                     base_time + 40 + u64::try_from(index).expect("index"),
                     1,
                     Vec::new(),
                     &format!("public stress {index}"),
-                )
-                .expect("public event");
+                );
                 assert_eq!(
                     handle
-                        .handle_protocol_client_message_for_test(
-                            ClientMessage::Event(event.clone()),
+                        .handle_client_message(
+                            RuntimeClientMessage::Event(event.clone()),
                             &mut auth,
                             UnixTimestamp::new(
                                 base_time + 40 + u64::try_from(index).expect("index")
@@ -4248,12 +4235,12 @@ mod tests {
                         .await
                         .expect("public write"),
                     vec![RelayMessage::Ok {
-                        event_id: event.id().clone(),
+                        event_id: runtime_pocket_event_id(&event),
                         accepted: true,
                         message: String::new()
                     }]
                 );
-                (false, event)
+                (false, runtime_pocket_event_id(&event))
             }));
         }
         let stored_events = tokio::time::timeout(Duration::from_secs(3), async {
@@ -4282,7 +4269,7 @@ mod tests {
         let group_event_ids = stored_events
             .iter()
             .filter(|(is_group, _)| *is_group)
-            .map(|(_, event)| event.id().clone())
+            .map(|(_, event_id)| event_id.clone())
             .collect::<BTreeSet<_>>();
         let mut published_offsets = Vec::new();
         for _ in 0..stored_events.len() {
@@ -4681,6 +4668,18 @@ mod tests {
         replies.into_iter().next().expect("reply")
     }
 
+    fn runtime_pocket_event_reply(
+        handle: &TangleRuntimeHandle,
+        event: &PocketEvent,
+        auth: &mut BaseAuthState,
+    ) -> RelayMessage {
+        handle
+            .inner
+            .handle_pocket_event_with_auth_report(event, auth)
+            .expect("event message")
+            .into_message()
+    }
+
     async fn runtime_group_count(
         handle: &TangleRuntimeHandle,
         subscription_id: &str,
@@ -4771,6 +4770,21 @@ mod tests {
                 message: String::new()
             }
         );
+    }
+
+    fn assert_accepted_pocket_reply(reply: RelayMessage, event: &PocketEvent) {
+        assert_eq!(
+            reply,
+            RelayMessage::Ok {
+                event_id: runtime_pocket_event_id(event),
+                accepted: true,
+                message: String::new()
+            }
+        );
+    }
+
+    fn runtime_pocket_event_id(event: &PocketEvent) -> EventId {
+        EventId::new(&event.id().as_hex_string()).expect("event id")
     }
 
     fn assert_runtime_member_status(
@@ -4874,6 +4888,128 @@ mod tests {
     fn pocket_filter(value: serde_json::Value) -> tangle_store_pocket::PocketOwnedFilter {
         let filter = filter_from_value(&value).expect("filter");
         crate::pocket_conversion::tangle_filter_to_pocket(&filter).expect("pocket filter")
+    }
+
+    fn runtime_pocket_group_create_event(
+        key: FixtureKey,
+        group_id: &str,
+        created_at: u64,
+        flags: &[&str],
+    ) -> PocketOwnedEvent {
+        let mut tags = vec![
+            Tag::from_parts("h", &[group_id]).expect("h"),
+            Tag::from_parts("name", &[group_id]).expect("name"),
+        ];
+        for flag in flags {
+            tags.push(Tag::from_parts(flag, &[]).expect("flag"));
+        }
+        runtime_pocket_event(key, created_at, KIND_GROUP_CREATE_GROUP.into(), tags, "")
+    }
+
+    fn runtime_pocket_auth_event(
+        key: FixtureKey,
+        challenge: &str,
+        created_at: u64,
+    ) -> PocketOwnedEvent {
+        runtime_pocket_event(
+            key,
+            created_at,
+            22_242,
+            vec![
+                Tag::from_parts("relay", &["wss://relay.radroots.test"]).expect("relay"),
+                Tag::from_parts("challenge", &[challenge]).expect("challenge"),
+            ],
+            "",
+        )
+    }
+
+    fn runtime_pocket_put_user_event(
+        key: FixtureKey,
+        group_id: &str,
+        target: FixtureKey,
+        created_at: u64,
+    ) -> PocketOwnedEvent {
+        let target_pubkey = target.public_key();
+        runtime_pocket_event(
+            key,
+            created_at,
+            KIND_GROUP_PUT_USER.into(),
+            vec![
+                Tag::from_parts("h", &[group_id]).expect("h"),
+                Tag::from_parts("p", &[target_pubkey.as_str()]).expect("p"),
+            ],
+            "",
+        )
+    }
+
+    fn runtime_pocket_group_event(
+        key: FixtureKey,
+        group_id: &str,
+        created_at: u64,
+        kind: u64,
+        content: &str,
+    ) -> PocketOwnedEvent {
+        runtime_pocket_event(
+            key,
+            created_at,
+            kind,
+            vec![Tag::from_parts("h", &[group_id]).expect("h")],
+            content,
+        )
+    }
+
+    fn runtime_pocket_event(
+        key: FixtureKey,
+        created_at: u64,
+        kind: u64,
+        tags: Vec<Tag>,
+        content: &str,
+    ) -> PocketOwnedEvent {
+        let tags = pocket_tags_from_protocol(&tags);
+        signed_pocket_event(
+            fixture_secret_byte(key),
+            created_at,
+            u16::try_from(kind).expect("pocket kind"),
+            &tags,
+            content.as_bytes(),
+        )
+    }
+
+    fn pocket_tags_from_protocol(tags: &[Tag]) -> PocketOwnedTags {
+        let parts = tags
+            .iter()
+            .map(|tag| tag.values().iter().map(String::as_str).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        PocketOwnedTags::new(&parts).expect("pocket tags")
+    }
+
+    fn fixture_secret_byte(key: FixtureKey) -> u8 {
+        match key {
+            FixtureKey::Relay => 9,
+            FixtureKey::Admin => 11,
+            FixtureKey::Member => 12,
+            FixtureKey::Outsider => 13,
+            FixtureKey::Owner => 10,
+        }
+    }
+
+    fn signed_pocket_event(
+        secret_byte: u8,
+        created_at: u64,
+        kind: u16,
+        tags: &PocketOwnedTags,
+        content: &[u8],
+    ) -> PocketOwnedEvent {
+        let secret = format!("{secret_byte:02x}").repeat(32);
+        RelaySigner::from_secret_hex(&secret)
+            .expect("signer")
+            .sign_pocket_event(
+                PocketKind::from_u16(kind),
+                tags,
+                PocketTime::from_u64(created_at),
+                content,
+            )
+            .expect("pocket event")
     }
 
     fn temp_root(name: &str) -> PathBuf {

@@ -22,8 +22,9 @@ use std::{
     collections::BTreeSet,
 };
 use tangle_groups::{
-    GroupAuthContext, GroupEventClass, GroupEventView, GroupRuntimeConfig, StoreOffset,
-    classify_group_event, validate_client_group_event_structure,
+    GroupAuthContext, GroupEventClass, GroupEventView, GroupId, GroupRuntimeConfig,
+    NIP29_RELAY_GENERATED_KIND_VALUES, StoreOffset, classify_group_event,
+    validate_client_group_event_structure,
 };
 #[cfg(test)]
 use tangle_protocol::{ClientMessage, Event, Filter};
@@ -295,6 +296,26 @@ struct BaseRelayCountHll {
     offset: Option<usize>,
     hll: Option<PocketHll8>,
     suppressed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BaseRelayCountHllGroupTargets {
+    None,
+    Suppress,
+    Targets(Vec<GroupId>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseRelayCountHllTargetPolicy {
+    Eligible,
+    Suppress,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseRelayCountHllDTagMode {
+    Ignore,
+    Target,
+    Suppress,
 }
 
 impl BaseRelayCountHll {
@@ -1655,6 +1676,119 @@ impl BaseRelay {
             || group.metadata().hidden())
     }
 
+    fn count_hll_filter_target_policy(
+        groups: Option<&GroupServiceHandle>,
+        filter: &PocketFilter,
+    ) -> BaseRelayCountHllTargetPolicy {
+        let Some(groups) = groups else {
+            return if Self::count_hll_filter_has_group_target(filter) {
+                BaseRelayCountHllTargetPolicy::Suppress
+            } else {
+                BaseRelayCountHllTargetPolicy::Eligible
+            };
+        };
+        match Self::count_hll_group_targets(
+            filter,
+            usize::from(groups.limits().max_group_id_bytes()),
+        ) {
+            BaseRelayCountHllGroupTargets::None => BaseRelayCountHllTargetPolicy::Eligible,
+            BaseRelayCountHllGroupTargets::Suppress => BaseRelayCountHllTargetPolicy::Suppress,
+            BaseRelayCountHllGroupTargets::Targets(group_ids) => {
+                let projection = groups.projection();
+                if group_ids.iter().all(|group_id| {
+                    projection.group(group_id).is_some_and(|group| {
+                        projection.tombstone(group_id).is_none()
+                            && !group.metadata().private()
+                            && !group.metadata().hidden()
+                    })
+                }) {
+                    BaseRelayCountHllTargetPolicy::Eligible
+                } else {
+                    BaseRelayCountHllTargetPolicy::Suppress
+                }
+            }
+        }
+    }
+
+    fn count_hll_group_targets(
+        filter: &PocketFilter,
+        max_group_id_bytes: usize,
+    ) -> BaseRelayCountHllGroupTargets {
+        let Ok(tags) = filter.tags() else {
+            return BaseRelayCountHllGroupTargets::Suppress;
+        };
+        let d_tag_mode = Self::count_hll_filter_d_tag_mode(filter);
+        let mut group_ids = Vec::new();
+        for tag in tags.iter() {
+            let mut values = tag.into_iter();
+            let Some(name) = values.next() else {
+                continue;
+            };
+            if name == b"d" {
+                match d_tag_mode {
+                    BaseRelayCountHllDTagMode::Ignore => continue,
+                    BaseRelayCountHllDTagMode::Suppress => {
+                        return BaseRelayCountHllGroupTargets::Suppress;
+                    }
+                    BaseRelayCountHllDTagMode::Target => {}
+                }
+            } else if name != b"h" {
+                continue;
+            }
+            let mut found_value = false;
+            for value in values {
+                found_value = true;
+                let Ok(value) = std::str::from_utf8(value) else {
+                    return BaseRelayCountHllGroupTargets::Suppress;
+                };
+                let Ok(group_id) = GroupId::new_with_max_bytes(value, max_group_id_bytes) else {
+                    return BaseRelayCountHllGroupTargets::Suppress;
+                };
+                group_ids.push(group_id);
+            }
+            if !found_value {
+                return BaseRelayCountHllGroupTargets::Suppress;
+            }
+        }
+        if group_ids.is_empty() {
+            BaseRelayCountHllGroupTargets::None
+        } else {
+            group_ids.sort();
+            group_ids.dedup();
+            BaseRelayCountHllGroupTargets::Targets(group_ids)
+        }
+    }
+
+    fn count_hll_filter_has_group_target(filter: &PocketFilter) -> bool {
+        let Ok(tags) = filter.tags() else {
+            return true;
+        };
+        let d_tag_mode = Self::count_hll_filter_d_tag_mode(filter);
+        tags.iter().any(|tag| {
+            let mut values = tag.into_iter();
+            let name = values.next();
+            matches!(name, Some(b"h"))
+                || (matches!(
+                    d_tag_mode,
+                    BaseRelayCountHllDTagMode::Target | BaseRelayCountHllDTagMode::Suppress
+                ) && matches!(name, Some(b"d")))
+        })
+    }
+
+    fn count_hll_filter_d_tag_mode(filter: &PocketFilter) -> BaseRelayCountHllDTagMode {
+        if filter.num_kinds() == 0 {
+            return BaseRelayCountHllDTagMode::Suppress;
+        }
+        if filter
+            .kinds()
+            .any(|kind| NIP29_RELAY_GENERATED_KIND_VALUES.contains(&u32::from(kind.as_u16())))
+        {
+            BaseRelayCountHllDTagMode::Target
+        } else {
+            BaseRelayCountHllDTagMode::Ignore
+        }
+    }
+
     fn query_filter_events_report_with_services(
         store: &PocketStoreHandle,
         groups: Option<&GroupServiceHandle>,
@@ -1778,7 +1912,10 @@ fn pocket_filters_are_complete(filters: &[PocketOwnedFilter]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{BaseRelay, BaseRelayLimitSettings, BaseRelayLimits, NEGENTROPY_DISABLED_MESSAGE};
+    use super::{
+        BaseRelay, BaseRelayCountHllTargetPolicy, BaseRelayLimitSettings, BaseRelayLimits,
+        NEGENTROPY_DISABLED_MESSAGE,
+    };
     use crate::pocket_conversion::{tangle_event_to_pocket, tangle_filter_to_pocket};
     use crate::relay::auth::BaseAuthState;
     use crate::relay::live::CloseResult;
@@ -1792,8 +1929,8 @@ mod tests {
         parse_group_runtime_config_json,
     };
     use tangle_protocol::{
-        ClientMessage, Event, EventId, Filter, Kind, PublicKeyHex, RelayMessage, SubscriptionId,
-        Tag, UnixTimestamp, UnsignedEvent, filter_from_value,
+        ClientMessage, Event, EventId, Filter, Kind, PublicKeyHex, RelayMessage, SignatureHex,
+        SubscriptionId, Tag, UnixTimestamp, UnsignedEvent, filter_from_value,
     };
     use tangle_store_pocket::{
         PocketEvent, PocketKind, PocketOwnedEvent, PocketOwnedFilter, PocketOwnedTags,
@@ -2663,11 +2800,11 @@ mod tests {
         let relay = test_relay("base-relay-count-hll-public", 8);
         let target = "a".repeat(EventId::HEX_LENGTH);
         let target_tag = Tag::from_parts("e", &[&target]).expect("tag");
-        let first = signed_public_event(7, 7, vec![target_tag.clone()], "first reaction");
-        let second = signed_public_event(8, 7, vec![target_tag], "second reaction");
+        let first = signed_pocket_public_event(7, 7, vec![target_tag.clone()], "first reaction");
+        let second = signed_pocket_public_event(8, 7, vec![target_tag], "second reaction");
 
         for event in [&first, &second] {
-            assert_accepted(relay.handle_event(event.clone()).expect("event"), event);
+            assert_pocket_accepted(relay.handle_pocket_event(event).expect("event"), event);
         }
 
         let RelayMessage::Count { count, hll, .. } = relay
@@ -2701,61 +2838,62 @@ mod tests {
         );
         let target = "b".repeat(EventId::HEX_LENGTH);
         let target_tag = Tag::from_parts("e", &[&target]).expect("tag");
-        let public = signed_public_event(8, 7, vec![target_tag.clone()], "public reaction");
+        let public = signed_pocket_public_event(8, 7, vec![target_tag.clone()], "public reaction");
 
-        assert_accepted(relay.handle_event(public.clone()).expect("public"), &public);
-        let private_create = signed_private_group_create_event(7, "PrivateHll");
-        assert_accepted(
+        assert_pocket_accepted(relay.handle_pocket_event(&public).expect("public"), &public);
+        let private_create = signed_pocket_private_group_create_event(7, "PrivateHll");
+        assert_pocket_accepted(
             relay
-                .handle_event_with_auth(private_create.clone(), &owner_auth)
+                .handle_pocket_event_with_auth(&private_create, &owner_auth)
                 .expect("private create"),
             &private_create,
         );
-        let private = signed_event_at(
+        let private = signed_pocket_event_at_tags(
             7,
             7,
             vec![h("PrivateHll"), target_tag.clone()],
             "private reaction",
             1_714_124_434,
         );
-        assert_accepted(
+        assert_pocket_accepted(
             relay
-                .handle_event_with_auth(private.clone(), &owner_auth)
+                .handle_pocket_event_with_auth(&private, &owner_auth)
                 .expect("private reaction"),
             &private,
         );
-        let hidden_create =
-            signed_group_create_event_with_tags(7, "HiddenHll", vec![hidden()], 1_714_124_435);
-        assert_accepted(
+        let hidden_create = signed_pocket_group_create_event_with_tags(
+            7,
+            "HiddenHll",
+            vec![hidden()],
+            1_714_124_435,
+        );
+        assert_pocket_accepted(
             relay
-                .handle_event_with_auth(hidden_create.clone(), &owner_auth)
+                .handle_pocket_event_with_auth(&hidden_create, &owner_auth)
                 .expect("hidden create"),
             &hidden_create,
         );
-        let hidden = signed_event_at(
+        let hidden = signed_pocket_event_at_tags(
             7,
             7,
             vec![h("HiddenHll"), target_tag.clone()],
             "hidden reaction",
             1_714_124_436,
         );
-        assert_accepted(
+        assert_pocket_accepted(
             relay
-                .handle_event_with_auth(hidden.clone(), &owner_auth)
+                .handle_pocket_event_with_auth(&hidden, &owner_auth)
                 .expect("hidden reaction"),
             &hidden,
         );
-        let unknown = signed_event_at(
+        let unknown = signed_pocket_event_at_tags(
             7,
             7,
             vec![h("UnknownHll"), target_tag.clone()],
             "unknown reaction",
             1_714_124_437,
         );
-        relay
-            .store
-            .store_event(&tangle_event_to_pocket(&unknown).expect("unknown pocket"))
-            .expect("store unknown");
+        relay.store.store_event(&unknown).expect("store unknown");
 
         let authorized_private = relay
             .handle_count_with_auth_protocol(
@@ -2836,6 +2974,130 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn base_relay_count_hll_group_target_policy_classifies_h_and_d_targets() {
+        let owner = signer(7).public_key().clone();
+        let owner_auth = authenticated_state(7);
+        let relay = test_relay_with_groups(
+            "base-relay-count-hll-target-policy",
+            8,
+            &enabled_groups_for_owner(&owner),
+        );
+        for event in [
+            signed_pocket_group_create_event(7, "PublicHll"),
+            signed_pocket_group_create_event(7, "SecondHll"),
+            signed_pocket_private_group_create_event(7, "PrivateHll"),
+            signed_pocket_group_create_event_with_tags(
+                7,
+                "HiddenHll",
+                vec![hidden()],
+                1_714_124_435,
+            ),
+            signed_pocket_group_create_event(7, "DeletedHll"),
+        ] {
+            assert_pocket_accepted(
+                relay
+                    .handle_pocket_event_with_auth(&event, &owner_auth)
+                    .expect("group create"),
+                &event,
+            );
+        }
+        let delete_group = signed_pocket_event_at_tags(
+            7,
+            KIND_GROUP_DELETE_GROUP.into(),
+            vec![h("DeletedHll")],
+            "",
+            1_714_124_436,
+        );
+        assert_pocket_accepted(
+            relay
+                .handle_pocket_event_with_auth(&delete_group, &owner_auth)
+                .expect("delete group"),
+            &delete_group,
+        );
+
+        assert_eq!(
+            hll_target_policy(&relay, serde_json::json!({"kinds":[7],"#h":["PublicHll"]})),
+            BaseRelayCountHllTargetPolicy::Eligible
+        );
+        assert_eq!(
+            hll_target_policy(
+                &relay,
+                serde_json::json!({"kinds":[7],"#h":["PublicHll","SecondHll"]})
+            ),
+            BaseRelayCountHllTargetPolicy::Eligible
+        );
+        assert_eq!(
+            hll_target_policy(
+                &relay,
+                serde_json::json!({"kinds":[7],"#h":["PublicHll","PrivateHll"]})
+            ),
+            BaseRelayCountHllTargetPolicy::Suppress
+        );
+        assert_eq!(
+            hll_target_policy(&relay, serde_json::json!({"kinds":[7],"#h":["HiddenHll"]})),
+            BaseRelayCountHllTargetPolicy::Suppress
+        );
+        assert_eq!(
+            hll_target_policy(&relay, serde_json::json!({"kinds":[7],"#h":["DeletedHll"]})),
+            BaseRelayCountHllTargetPolicy::Suppress
+        );
+        assert_eq!(
+            hll_target_policy(&relay, serde_json::json!({"kinds":[7],"#h":["UnknownHll"]})),
+            BaseRelayCountHllTargetPolicy::Suppress
+        );
+        assert_eq!(
+            hll_target_policy(&relay, serde_json::json!({"kinds":[7],"#h":[""]})),
+            BaseRelayCountHllTargetPolicy::Suppress
+        );
+        assert_eq!(
+            hll_target_policy(
+                &relay,
+                serde_json::json!({"kinds":[KIND_GROUP_METADATA],"#d":["PublicHll"]})
+            ),
+            BaseRelayCountHllTargetPolicy::Eligible
+        );
+        assert_eq!(
+            hll_target_policy(
+                &relay,
+                serde_json::json!({"kinds":[KIND_GROUP_METADATA],"#d":["PrivateHll"]})
+            ),
+            BaseRelayCountHllTargetPolicy::Suppress
+        );
+        assert_eq!(
+            hll_target_policy(&relay, serde_json::json!({"#d":["PublicHll"]})),
+            BaseRelayCountHllTargetPolicy::Suppress
+        );
+        assert_eq!(
+            hll_target_policy(
+                &relay,
+                serde_json::json!({"kinds":[30023],"#d":["PrivateHll"]})
+            ),
+            BaseRelayCountHllTargetPolicy::Eligible
+        );
+    }
+
+    #[test]
+    fn base_relay_count_hll_group_target_policy_suppresses_unresolved_group_targets() {
+        let relay = test_relay("base-relay-count-hll-target-policy-no-groups", 8);
+
+        assert_eq!(
+            hll_target_policy(&relay, serde_json::json!({"kinds":[7],"#h":["PublicHll"]})),
+            BaseRelayCountHllTargetPolicy::Suppress
+        );
+        assert_eq!(
+            hll_target_policy(&relay, serde_json::json!({"#d":["PublicHll"]})),
+            BaseRelayCountHllTargetPolicy::Suppress
+        );
+        assert_eq!(
+            hll_target_policy(
+                &relay,
+                serde_json::json!({"kinds":[30023],"#d":["PublicHll"]})
+            ),
+            BaseRelayCountHllTargetPolicy::Eligible
+        );
     }
 
     #[test]
@@ -4257,7 +4519,7 @@ mod tests {
     }
 
     fn signed_auth_event(secret_byte: u8, challenge: &str, created_at: u64) -> Event {
-        signed_event_at(
+        signed_tangle_event_at(
             secret_byte,
             22_242,
             vec![
@@ -4301,6 +4563,68 @@ mod tests {
             .expect("pocket event")
     }
 
+    fn signed_pocket_public_event(
+        secret_byte: u8,
+        kind: u32,
+        tags: Vec<Tag>,
+        content: &str,
+    ) -> PocketOwnedEvent {
+        signed_pocket_event_at_tags(secret_byte, kind, tags, content, 1_714_124_433)
+    }
+
+    fn signed_pocket_group_create_event(secret_byte: u8, group_id: &str) -> PocketOwnedEvent {
+        signed_pocket_group_create_event_with_tags(secret_byte, group_id, Vec::new(), 1_714_124_433)
+    }
+
+    fn signed_pocket_group_create_event_with_tags(
+        secret_byte: u8,
+        group_id: &str,
+        mut extra_tags: Vec<Tag>,
+        created_at: u64,
+    ) -> PocketOwnedEvent {
+        let mut tags = vec![h(group_id), name(group_id)];
+        tags.append(&mut extra_tags);
+        signed_pocket_event_at_tags(secret_byte, KIND_GROUP_CREATE_GROUP, tags, "", created_at)
+    }
+
+    fn signed_pocket_private_group_create_event(
+        secret_byte: u8,
+        group_id: &str,
+    ) -> PocketOwnedEvent {
+        signed_pocket_event_at_tags(
+            secret_byte,
+            KIND_GROUP_CREATE_GROUP,
+            vec![h(group_id), name(group_id), private()],
+            "",
+            1_714_124_433,
+        )
+    }
+
+    fn signed_pocket_event_at_tags(
+        secret_byte: u8,
+        kind: u32,
+        tags: Vec<Tag>,
+        content: &str,
+        created_at: u64,
+    ) -> PocketOwnedEvent {
+        let tags = pocket_tags_from_protocol(&tags);
+        signed_pocket_event_at(
+            secret_byte,
+            u16::try_from(kind).expect("pocket kind"),
+            &tags,
+            content.as_bytes(),
+            created_at,
+        )
+    }
+
+    fn pocket_tags_from_protocol(tags: &[Tag]) -> PocketOwnedTags {
+        let parts = tags
+            .iter()
+            .map(|tag| tag.values().iter().map(String::as_str).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        PocketOwnedTags::new(&parts).expect("pocket tags")
+    }
+
     fn signed_group_create_event(secret_byte: u8, group_id: &str) -> Event {
         signed_group_create_event_with_tags(secret_byte, group_id, Vec::new(), 1_714_124_433)
     }
@@ -4339,7 +4663,24 @@ mod tests {
         content: &str,
         created_at: u64,
     ) -> Event {
-        let secret = format!("{:02x}", secret_byte).repeat(32);
+        let pocket = signed_pocket_event_at_tags(
+            secret_byte,
+            u32::try_from(kind).expect("kind"),
+            tags,
+            content,
+            created_at,
+        );
+        pocket_event_to_protocol(&pocket)
+    }
+
+    fn signed_tangle_event_at(
+        secret_byte: u8,
+        kind: u64,
+        tags: Vec<Tag>,
+        content: &str,
+        created_at: u64,
+    ) -> Event {
+        let secret = format!("{secret_byte:02x}").repeat(32);
         let signer = RelaySigner::from_secret_hex(&secret).expect("signer");
         let unsigned = UnsignedEvent::new(
             signer.public_key().clone(),
@@ -4353,6 +4694,32 @@ mod tests {
 
     fn pocket_event_id(event: &PocketEvent) -> EventId {
         EventId::new(&event.id().as_hex_string()).expect("event id")
+    }
+
+    fn pocket_event_to_protocol(event: &PocketEvent) -> Event {
+        let tags = event
+            .tags()
+            .expect("tags")
+            .iter()
+            .map(|tag| {
+                Tag::new(
+                    tag.map(|value| std::str::from_utf8(value).expect("utf8").to_owned())
+                        .collect::<Vec<_>>(),
+                )
+                .expect("tag")
+            })
+            .collect::<Vec<_>>();
+        Event::new(
+            pocket_event_id(event),
+            tangle_protocol::UnsignedEvent::new(
+                PublicKeyHex::new(&event.pubkey().as_hex_string()).expect("pubkey"),
+                UnixTimestamp::new(event.created_at().as_u64()),
+                tangle_protocol::Kind::new(u64::from(event.kind().as_u16())).expect("kind"),
+                tags,
+                std::str::from_utf8(event.content()).expect("content"),
+            ),
+            SignatureHex::new(&event.sig().to_string()).expect("sig"),
+        )
     }
 
     fn authenticated_state(secret_byte: u8) -> BaseAuthState {
@@ -4447,6 +4814,18 @@ mod tests {
             .expect("object")
             .insert(format!("#{tag}"), serde_json::json!([group_id]));
         filter_from_value(&value).expect("filter")
+    }
+
+    fn pocket_filter_from_value(value: serde_json::Value) -> PocketOwnedFilter {
+        tangle_filter_to_pocket(&filter_from_value(&value).expect("filter")).expect("pocket")
+    }
+
+    fn hll_target_policy(
+        relay: &BaseRelay,
+        value: serde_json::Value,
+    ) -> BaseRelayCountHllTargetPolicy {
+        let filter = pocket_filter_from_value(value);
+        BaseRelay::count_hll_filter_target_policy(relay.groups.as_ref(), &filter)
     }
 
     fn assert_accepted(message: RelayMessage, event: &Event) {
