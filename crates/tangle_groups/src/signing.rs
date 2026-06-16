@@ -10,7 +10,7 @@ use pocket_types::{
     Time as PocketTime,
 };
 use tangle_crypto::RelaySigner;
-use tangle_protocol::{Event, Kind, PublicKeyHex, Tag, UnixTimestamp, UnsignedEvent};
+use tangle_protocol::{PublicKeyHex, UnixTimestamp};
 
 pub struct GroupGeneratedEventBuilder {
     signer: RelaySigner,
@@ -118,24 +118,6 @@ impl GroupGeneratedEventBuilder {
         membership_payload(KIND_GROUP_REMOVE_USER, group_id, target_pubkey, created_at)
     }
 
-    pub fn sign_payload(&self, payload: &GroupOutboxPayload) -> Result<Event, GroupError> {
-        let tags = payload
-            .tags()
-            .iter()
-            .cloned()
-            .map(Tag::new)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(GroupError::internal)?;
-        let unsigned = UnsignedEvent::new(
-            self.signer.public_key().clone(),
-            payload.generated_created_at(),
-            Kind::new(payload.generated_kind().into()).map_err(GroupError::internal)?,
-            tags,
-            payload.content(),
-        );
-        Ok(self.signer.sign_unsigned_event(unsigned))
-    }
-
     pub fn sign_payload_pocket(
         &self,
         payload: &GroupOutboxPayload,
@@ -162,52 +144,6 @@ impl GroupGeneratedEventBuilder {
             ))
         })?;
         Ok(event)
-    }
-
-    pub fn build_metadata_snapshot(
-        &self,
-        group: &GroupState,
-        created_at: UnixTimestamp,
-    ) -> Result<Event, GroupError> {
-        self.sign_payload(&Self::metadata_snapshot_payload(group, created_at)?)
-    }
-
-    pub fn build_admin_list_snapshot(
-        &self,
-        group_id: &GroupId,
-        projection: &GroupProjection,
-        authority: &GroupAuthority,
-        created_at: UnixTimestamp,
-    ) -> Result<Event, GroupError> {
-        self.sign_payload(&Self::admin_list_snapshot_payload(
-            group_id, projection, authority, created_at,
-        )?)
-    }
-
-    pub fn build_join_accepted(
-        &self,
-        group_id: &GroupId,
-        target_pubkey: &PublicKeyHex,
-        created_at: UnixTimestamp,
-    ) -> Result<Event, GroupError> {
-        self.sign_payload(&Self::join_accepted_payload(
-            group_id,
-            target_pubkey,
-            created_at,
-        ))
-    }
-
-    pub fn build_leave_accepted(
-        &self,
-        group_id: &GroupId,
-        target_pubkey: &PublicKeyHex,
-        created_at: UnixTimestamp,
-    ) -> Result<Event, GroupError> {
-        self.sign_payload(&Self::leave_accepted_payload(
-            group_id,
-            target_pubkey,
-            created_at,
-        ))
     }
 }
 
@@ -246,10 +182,14 @@ fn metadata_tags(
             tags.push(tag);
         }
     }
-    for tag in &tags {
-        Tag::new(tag.clone()).map_err(GroupError::internal)?;
-    }
+    validate_pocket_tags(&tags)?;
     Ok(tags)
+}
+
+fn validate_pocket_tags(tags: &[Vec<String>]) -> Result<(), GroupError> {
+    PocketOwnedTags::new(tags).map(|_| ()).map_err(|error| {
+        GroupError::internal(format!("generated Pocket tags are invalid: {error}"))
+    })
 }
 
 fn membership_payload(
@@ -281,7 +221,8 @@ mod tests {
         KIND_GROUP_MEMBERS, KIND_GROUP_METADATA, KIND_GROUP_PUT_USER, KIND_GROUP_REMOVE_USER,
         MemberState, MemberStatus, ProjectionOrderTuple, StoreOffset,
     };
-    use tangle_crypto::{RelaySigner, verify_event_signature};
+    use pocket_types::Event as PocketEvent;
+    use tangle_crypto::RelaySigner;
     use tangle_protocol::{EventId, PublicKeyHex, UnixTimestamp};
 
     #[test]
@@ -289,13 +230,22 @@ mod tests {
         let builder = builder();
         let group = group_state("Farm", GroupMetadata::empty());
         let event = builder
-            .build_metadata_snapshot(&group, UnixTimestamp::new(20))
+            .sign_payload_pocket(
+                &GroupGeneratedEventBuilder::metadata_snapshot_payload(
+                    &group,
+                    UnixTimestamp::new(20),
+                )
+                .expect("payload"),
+            )
             .expect("event");
 
-        assert_eq!(event.unsigned().kind().as_u32(), KIND_GROUP_METADATA);
-        assert_eq!(event.unsigned().pubkey(), builder.relay_pubkey());
-        assert!(has_tag(&event, &["d", "Farm"]));
-        verify_event_signature(&event).expect("signature");
+        assert_eq!(u32::from(event.kind().as_u16()), KIND_GROUP_METADATA);
+        assert_eq!(
+            event.pubkey().as_hex_string(),
+            builder.relay_pubkey().as_str()
+        );
+        assert!(has_pocket_tag(&event, &["d", "Farm"]));
+        event.verify().expect("signature");
     }
 
     #[test]
@@ -319,19 +269,22 @@ mod tests {
             ),
         );
         let event = builder
-            .build_admin_list_snapshot(
-                &group_id,
-                &projection,
-                &GroupAuthority::new([owner.clone()], [admin.clone()]),
-                UnixTimestamp::new(20),
+            .sign_payload_pocket(
+                &GroupGeneratedEventBuilder::admin_list_snapshot_payload(
+                    &group_id,
+                    &projection,
+                    &GroupAuthority::new([owner.clone()], [admin.clone()]),
+                    UnixTimestamp::new(20),
+                )
+                .expect("payload"),
             )
             .expect("event");
 
-        assert_eq!(event.unsigned().kind().as_u32(), KIND_GROUP_ADMINS);
+        assert_eq!(u32::from(event.kind().as_u16()), KIND_GROUP_ADMINS);
         for pubkey in [owner, admin, override_member] {
-            assert!(has_tag(&event, &["p", pubkey.as_str()]));
+            assert!(has_pocket_tag(&event, &["p", pubkey.as_str()]));
         }
-        verify_event_signature(&event).expect("signature");
+        event.verify().expect("signature");
     }
 
     #[test]
@@ -376,18 +329,26 @@ mod tests {
         let group_id = GroupId::new("Farm").expect("group");
         let member = pubkey("4");
         let join = builder
-            .build_join_accepted(&group_id, &member, UnixTimestamp::new(20))
+            .sign_payload_pocket(&GroupGeneratedEventBuilder::join_accepted_payload(
+                &group_id,
+                &member,
+                UnixTimestamp::new(20),
+            ))
             .expect("join");
         let leave = builder
-            .build_leave_accepted(&group_id, &member, UnixTimestamp::new(21))
+            .sign_payload_pocket(&GroupGeneratedEventBuilder::leave_accepted_payload(
+                &group_id,
+                &member,
+                UnixTimestamp::new(21),
+            ))
             .expect("leave");
 
-        assert_eq!(join.unsigned().kind().as_u32(), KIND_GROUP_PUT_USER);
-        assert_eq!(leave.unsigned().kind().as_u32(), KIND_GROUP_REMOVE_USER);
-        for event in [join, leave] {
-            assert!(has_tag(&event, &["h", "Farm"]));
-            assert!(has_tag(&event, &["p", member.as_str()]));
-            verify_event_signature(&event).expect("signature");
+        assert_eq!(u32::from(join.kind().as_u16()), KIND_GROUP_PUT_USER);
+        assert_eq!(u32::from(leave.kind().as_u16()), KIND_GROUP_REMOVE_USER);
+        for event in [&join, &leave] {
+            assert!(has_pocket_tag(event, &["h", "Farm"]));
+            assert!(has_pocket_tag(event, &["p", member.as_str()]));
+            event.verify().expect("signature");
         }
     }
 
@@ -507,16 +468,7 @@ mod tests {
         }
     }
 
-    fn has_tag(event: &tangle_protocol::Event, expected: &[&str]) -> bool {
-        event.unsigned().tags().iter().any(|tag| {
-            tag.values()
-                .iter()
-                .map(String::as_str)
-                .eq(expected.iter().copied())
-        })
-    }
-
-    fn has_pocket_tag(event: &pocket_types::Event, expected: &[&str]) -> bool {
+    fn has_pocket_tag(event: &PocketEvent, expected: &[&str]) -> bool {
         event.tags().expect("tags").iter().any(|tag| {
             tag.map(|value| std::str::from_utf8(value).expect("tag"))
                 .eq(expected.iter().copied())

@@ -3,6 +3,7 @@
 use core::fmt;
 use k256::schnorr::signature::Signer;
 use k256::schnorr::{Signature, SigningKey};
+use pocket_types::OwnedEvent as PocketOwnedEvent;
 use tangle_crypto::{RelaySigner, compute_event_id};
 use tangle_groups::{
     CanonicalRelayUrl, GroupGeneratedEventBuilder, GroupLimitsConfig, GroupOutboxPayload,
@@ -98,9 +99,11 @@ pub fn tangle_v2_relay_signer() -> Result<RelaySigner, String> {
     RelaySigner::from_secret_hex(TANGLE_V2_RELAY_SECRET_HEX).map_err(|error| error.to_string())
 }
 
-pub fn tangle_v2_generated_event(payload: &GroupOutboxPayload) -> Result<Event, String> {
+pub fn tangle_v2_generated_pocket_event(
+    payload: &GroupOutboxPayload,
+) -> Result<PocketOwnedEvent, String> {
     GroupGeneratedEventBuilder::new(tangle_v2_relay_signer()?)
-        .sign_payload(payload)
+        .sign_payload_pocket(payload)
         .map_err(|error| error.to_string())
 }
 
@@ -370,7 +373,7 @@ fn lower_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         FixtureKey, build_fixture_event_from_parts, fixed_hex_bytes, fixture_event_json,
-        tangle_v2_auth_event, tangle_v2_generated_event, tangle_v2_group_config,
+        tangle_v2_auth_event, tangle_v2_generated_pocket_event, tangle_v2_group_config,
         tangle_v2_group_create_event, tangle_v2_group_event, tangle_v2_group_metadata_event,
         tangle_v2_join_event, tangle_v2_put_user_event,
     };
@@ -438,7 +441,7 @@ mod tests {
             vec![vec!["d".to_owned(), "Farm".to_owned()]],
             "",
         );
-        let generated = tangle_v2_generated_event(&payload).expect("generated");
+        let generated = tangle_v2_generated_pocket_event(&payload).expect("generated");
 
         assert!(config.enabled());
         assert_eq!(config.owner_pubkeys(), &[FixtureKey::Owner.public_key()]);
@@ -447,8 +450,8 @@ mod tests {
         assert_eq!(verify_event_signature(&put), Ok(()));
         assert_eq!(verify_event_signature(&join), Ok(()));
         assert_eq!(verify_event_signature(&normal), Ok(()));
-        assert_eq!(verify_event_signature(&generated), Ok(()));
-        assert_eq!(generated.unsigned().kind().as_u32(), KIND_GROUP_METADATA);
+        generated.verify().expect("generated signature");
+        assert_eq!(u32::from(generated.kind().as_u16()), KIND_GROUP_METADATA);
     }
 
     #[test]

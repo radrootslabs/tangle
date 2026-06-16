@@ -2431,11 +2431,9 @@ fn store_generated_events_for_pending_outbox_records(
     let builder = GroupGeneratedEventBuilder::new(signer);
     for record in records {
         let event = builder
-            .sign_payload(record.payload())
+            .sign_payload_pocket(record.payload())
             .expect("generated event");
-        let raw = serde_json::to_vec(&event_to_value(&event)).expect("event JSON");
-        let pocket = parse_pocket_event_json(&raw).expect("pocket event");
-        store.store_event(&pocket).expect("store generated");
+        store.store_event(&event).expect("store generated");
     }
     store.sync().expect("sync");
 }

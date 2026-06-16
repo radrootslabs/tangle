@@ -7,13 +7,14 @@ use tangle_protocol::Filter;
 use tangle_protocol::{
     Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
 };
+use tangle_store_pocket::{PocketEvent, PocketEventId};
 #[cfg(test)]
-use tangle_store_pocket::PocketOwnedFilter;
 use tangle_store_pocket::{
-    PocketEvent, PocketEventId, PocketKind, PocketOwnedEvent, PocketOwnedTags, PocketPubkey,
-    PocketSig, PocketTags, PocketTime,
+    PocketKind, PocketOwnedEvent, PocketOwnedFilter, PocketOwnedTags, PocketPubkey, PocketSig,
+    PocketTags, PocketTime,
 };
 
+#[cfg(test)]
 pub(crate) fn tangle_event_to_pocket(event: &Event) -> Result<PocketOwnedEvent, BaseRelayError> {
     let tags = tangle_tags_to_pocket(event.unsigned().tags())?;
     ensure_event_size(tags.as_bytes().len(), event.unsigned().content().len())?;
@@ -123,16 +124,19 @@ pub(crate) fn pocket_event_id(event_id: &EventId) -> Result<PocketEventId, BaseR
         .map_err(|error| BaseRelayError::error(error.to_string()))
 }
 
+#[cfg(test)]
 pub(crate) fn pocket_pubkey(pubkey: &PublicKeyHex) -> Result<PocketPubkey, BaseRelayError> {
     PocketPubkey::read_hex(pubkey.as_str().as_bytes())
         .map_err(|error| BaseRelayError::error(error.to_string()))
 }
 
+#[cfg(test)]
 fn pocket_sig(sig: &SignatureHex) -> Result<PocketSig, BaseRelayError> {
     PocketSig::read_hex(sig.as_str().as_bytes())
         .map_err(|error| BaseRelayError::error(error.to_string()))
 }
 
+#[cfg(test)]
 fn tangle_kind_to_pocket(kind: Kind) -> Result<PocketKind, BaseRelayError> {
     u16::try_from(kind.as_u32())
         .map(PocketKind::from_u16)
@@ -144,6 +148,7 @@ fn tangle_kind_to_pocket(kind: Kind) -> Result<PocketKind, BaseRelayError> {
         })
 }
 
+#[cfg(test)]
 fn tangle_tags_to_pocket(tags: &[Tag]) -> Result<PocketOwnedTags, BaseRelayError> {
     let parts = tags
         .iter()
@@ -153,6 +158,7 @@ fn tangle_tags_to_pocket(tags: &[Tag]) -> Result<PocketOwnedTags, BaseRelayError
     PocketOwnedTags::new(&parts).map_err(|error| BaseRelayError::error(error.to_string()))
 }
 
+#[cfg(test)]
 fn ensure_tag_size(size: usize) -> Result<(), BaseRelayError> {
     if size > usize::from(u16::MAX) {
         return Err(BaseRelayError::invalid(format!(
@@ -188,6 +194,7 @@ fn ensure_filter_size(
     Ok(())
 }
 
+#[cfg(test)]
 fn ensure_event_size(tags_len: usize, content_len: usize) -> Result<(), BaseRelayError> {
     if content_len > usize::try_from(u32::MAX).expect("u32 max fits usize") {
         return Err(BaseRelayError::invalid(format!(
