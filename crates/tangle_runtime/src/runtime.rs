@@ -8,7 +8,7 @@ use crate::{
     groups::GroupServiceHandle,
     logging,
     ops::{BaseRelayReadinessHandle, BaseRelayReadinessState},
-    pocket_conversion::{pocket_event_to_tangle, pocket_filter_to_tangle},
+    pocket_conversion::pocket_filter_to_tangle,
     pocket_event_validation::{pocket_event_id, pocket_event_kind, pocket_event_pubkey},
     rate_limits::{
         TangleQueryRateLimitConfig, TangleRateLimitDecision, TangleRateLimitKey,
@@ -1199,19 +1199,15 @@ impl TangleRuntimeHandle {
         auth: &BaseAuthState,
     ) -> Result<Vec<RuntimeRelayMessage>, BaseRelayError> {
         let pocket_event = self.inner.store.event_by_offset(offset.as_u64())?;
-        let event = pocket_event_to_tangle(&pocket_event)?;
         let group_auth = GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned());
-        let messages = subscriptions.fanout(&event, &group_auth, |event, auth| {
+        let subscriptions = subscriptions.fanout(&pocket_event, &group_auth, |event, auth| {
             BaseRelay::group_read_gate_visible_to_auth(self.inner.groups.as_ref(), event, auth)
                 .unwrap_or(false)
-        });
-        Ok(messages
+        })?;
+        Ok(subscriptions
             .into_iter()
-            .map(|message| match message {
-                RelayMessage::Event {
-                    subscription_id, ..
-                } => RuntimeRelayMessage::event(subscription_id, pocket_event.clone()),
-                message => message.into(),
+            .map(|subscription_id| {
+                RuntimeRelayMessage::event(subscription_id, pocket_event.clone())
             })
             .collect())
     }
@@ -2319,7 +2315,7 @@ mod tests {
         subscriptions
             .subscribe(
                 subscription_id.clone(),
-                vec![filter_from_value(&json!({"kinds":[1]})).expect("filter")],
+                vec![pocket_filter(json!({"kinds":[1]}))],
             )
             .expect("subscribe");
         let event = tangle_v2_event(FixtureKey::Member, 1_714_124_433, 1, Vec::new(), "live")
@@ -3600,13 +3596,10 @@ mod tests {
         subscriptions
             .subscribe(
                 subscription_id.clone(),
-                vec![
-                    filter_from_value(&json!({
-                        "kinds":[KIND_GROUP_METADATA, KIND_GROUP_ADMINS, KIND_GROUP_MEMBERS],
-                        "#d":["RuntimeFarm"]
-                    }))
-                    .expect("filter"),
-                ],
+                vec![pocket_filter(json!({
+                    "kinds":[KIND_GROUP_METADATA, KIND_GROUP_ADMINS, KIND_GROUP_MEMBERS],
+                    "#d":["RuntimeFarm"]
+                }))],
             )
             .expect("subscribe");
 
@@ -4356,8 +4349,7 @@ mod tests {
         let public_subscription = SubscriptionId::new("public-stress-live").expect("subscription");
         let mut member_subscriptions = LiveSubscriptionSet::new(32, 64).expect("member live set");
         let mut public_subscriptions = LiveSubscriptionSet::new(32, 64).expect("public live set");
-        let stress_filter =
-            filter_from_value(&json!({"kinds":[1], "#h":["StressPrivate"]})).expect("filter");
+        let stress_filter = pocket_filter(json!({"kinds":[1], "#h":["StressPrivate"]}));
         member_subscriptions
             .subscribe(member_subscription.clone(), vec![stress_filter.clone()])
             .expect("member subscribe");
@@ -4888,6 +4880,11 @@ mod tests {
             default_limit: 100,
         })
         .expect("limits")
+    }
+
+    fn pocket_filter(value: serde_json::Value) -> tangle_store_pocket::PocketOwnedFilter {
+        let filter = filter_from_value(&value).expect("filter");
+        crate::pocket_conversion::tangle_filter_to_pocket(&filter).expect("pocket filter")
     }
 
     fn temp_root(name: &str) -> PathBuf {

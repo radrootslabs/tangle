@@ -5,8 +5,10 @@ use crate::groups::{
 use crate::logging::{self, TangleModerationAuditResult};
 use crate::ops::BaseRelayReadinessState;
 #[cfg(test)]
-use crate::pocket_conversion::{pocket_event_id, tangle_event_to_pocket};
-use crate::pocket_conversion::{pocket_event_to_tangle, tangle_filter_to_pocket};
+use crate::pocket_conversion::pocket_event_id;
+use crate::pocket_conversion::{
+    pocket_event_to_tangle, tangle_event_to_pocket, tangle_filter_to_pocket,
+};
 use crate::pocket_event_validation::{
     is_pocket_nip70_protected_event, pocket_event_id as pocket_runtime_event_id, pocket_event_kind,
     pocket_event_pubkey, validate_pocket_event_shape, verify_pocket_event_signature,
@@ -1210,15 +1212,21 @@ impl BaseRelay {
         }
         let should_subscribe = !filters_are_complete(&filters);
         if should_subscribe {
+            let pocket_filters = filters
+                .iter()
+                .map(tangle_filter_to_pocket)
+                .collect::<Result<Vec<_>, _>>()?;
             self.subscriptions
-                .ensure_can_subscribe(&subscription_id, &filters)?;
+                .ensure_can_subscribe(&subscription_id, &pocket_filters)?;
+            let report =
+                self.query_req_with_group_auth_report(subscription_id.clone(), filters, auth)?;
+            if !report.group_read_denied() {
+                self.subscriptions
+                    .subscribe(subscription_id, pocket_filters)?;
+            }
+            return Ok(report);
         }
-        let report =
-            self.query_req_with_group_auth_report(subscription_id.clone(), filters.clone(), auth)?;
-        if should_subscribe && !report.group_read_denied() {
-            self.subscriptions.subscribe(subscription_id, filters)?;
-        }
-        Ok(report)
+        self.query_req_with_group_auth_report(subscription_id, filters, auth)
     }
 
     fn query_req_with_group_auth_report(
@@ -1408,9 +1416,18 @@ impl BaseRelay {
         auth: &GroupAuthContext,
     ) -> Vec<RelayMessage> {
         let groups = self.groups.as_ref();
-        self.subscriptions.fanout(event, auth, |event, auth| {
-            Self::group_read_gate_visible_to_auth(groups, event, auth).unwrap_or(false)
-        })
+        let pocket_event = tangle_event_to_pocket(event).expect("event must convert to Pocket");
+        self.subscriptions
+            .fanout(&pocket_event, auth, |event, auth| {
+                Self::group_read_gate_visible_to_auth(groups, event, auth).unwrap_or(false)
+            })
+            .expect("Pocket live fanout must match")
+            .into_iter()
+            .map(|subscription_id| RelayMessage::Event {
+                subscription_id,
+                event: event.clone(),
+            })
+            .collect()
     }
 
     pub fn active_subscription_count(&self) -> usize {

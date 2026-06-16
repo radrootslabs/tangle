@@ -279,11 +279,10 @@ impl TangleWebSocketSession {
                 filters,
                 search_present,
             } => {
-                self.handle_req(
-                    subscription_id,
-                    runtime_filters_to_protocol(filters, search_present)?,
-                )
-                .await
+                let protocol_filters =
+                    runtime_filters_to_protocol(filters.clone(), search_present)?;
+                self.handle_req(subscription_id, protocol_filters, filters)
+                    .await
             }
             RuntimeClientMessage::Count {
                 subscription_id,
@@ -333,6 +332,7 @@ impl TangleWebSocketSession {
         &mut self,
         subscription_id: SubscriptionId,
         filters: Vec<Filter>,
+        pocket_filters: Vec<PocketOwnedFilter>,
     ) -> Result<Vec<RuntimeRelayMessage>, BaseRelayError> {
         let metrics = self.runtime.metrics();
         metrics.record_client_message(TangleClientMessageMetricKind::Req);
@@ -359,7 +359,7 @@ impl TangleWebSocketSession {
         let should_subscribe = !filters_are_complete(&filters);
         if should_subscribe {
             self.subscriptions
-                .ensure_can_subscribe(&subscription_id, &filters)?;
+                .ensure_can_subscribe(&subscription_id, &pocket_filters)?;
         }
         let report = self
             .runtime
@@ -369,7 +369,7 @@ impl TangleWebSocketSession {
         let replies = report.into_messages();
         if should_subscribe && !closes_subscription {
             self.subscriptions
-                .subscribe(subscription_id.clone(), filters)?;
+                .subscribe(subscription_id.clone(), pocket_filters)?;
             metrics.record_subscription_opened();
             logging::log_subscription_opened(self.connection_id, &subscription_id);
         }
@@ -1043,13 +1043,12 @@ mod tests {
             session.handle_event_receive_result(offset).await,
             TangleSessionControl::Continue
         );
-        assert_eq!(
-            take_outbound_text(&mut session),
+        assert_relay_message_text(
+            &take_outbound_text(&mut session),
             RelayMessage::Event {
                 subscription_id,
-                event: after_auth
-            }
-            .encode()
+                event: after_auth,
+            },
         );
 
         let _ = std::fs::remove_dir_all(root);
@@ -1547,13 +1546,12 @@ mod tests {
                 session.handle_event_receive_result(offset).await,
                 TangleSessionControl::Continue
             );
-            assert_eq!(
-                take_outbound_text(&mut session),
+            assert_relay_message_text(
+                &take_outbound_text(&mut session),
                 RelayMessage::Event {
                     subscription_id: subscription_id.clone(),
-                    event
-                }
-                .encode()
+                    event,
+                },
             );
             assert_eq!(session.active_subscription_count(), 1);
         }
@@ -1689,6 +1687,14 @@ mod tests {
             panic!("expected text message")
         };
         text.to_string()
+    }
+
+    fn assert_relay_message_text(actual: &str, expected: RelayMessage) {
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(actual).expect("actual relay JSON"),
+            serde_json::from_str::<serde_json::Value>(&expected.encode())
+                .expect("expected relay JSON")
+        );
     }
 
     fn runtime_config(root: &Path) -> BaseRelayRuntimeConfig {
