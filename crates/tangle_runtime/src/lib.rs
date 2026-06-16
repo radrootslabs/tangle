@@ -9,6 +9,7 @@ pub mod logging;
 pub mod nip11;
 pub mod ops;
 pub(crate) mod pocket_conversion;
+pub(crate) mod pocket_event_validation;
 pub mod rate_limits;
 pub mod relay;
 pub mod runtime;

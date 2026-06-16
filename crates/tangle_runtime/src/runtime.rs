@@ -9,6 +9,9 @@ use crate::{
     logging,
     ops::{BaseRelayReadinessHandle, BaseRelayReadinessState},
     pocket_conversion::{pocket_event_to_tangle, pocket_filter_to_tangle},
+    pocket_event_validation::{
+        is_pocket_nip70_protected_event, pocket_event_id, pocket_event_pubkey,
+    },
     rate_limits::{
         TangleQueryRateLimitConfig, TangleRateLimitDecision, TangleRateLimitKey,
         TangleRateLimitQueryClass, TangleRateLimitRule, TangleRateLimitScope, TangleRateLimiter,
@@ -41,7 +44,7 @@ use tangle_groups::{
 use tangle_protocol::{
     Event, EventId, Filter, Kind, PublicKeyHex, RelayMessage, SubscriptionId, UnixTimestamp,
 };
-use tangle_store_pocket::PocketStoreHandle;
+use tangle_store_pocket::{PocketEvent, PocketOwnedFilter, PocketStoreHandle};
 use tokio::sync::watch;
 
 pub struct TangleRuntime {
@@ -407,57 +410,54 @@ impl TangleRuntimeShared {
         })
     }
 
-    fn rate_limit_auth_attempt(
+    fn rate_limit_auth_attempt_pocket(
         &self,
-        event: &Event,
+        event: &PocketEvent,
         context: TangleClientRateLimitContext,
         now: UnixTimestamp,
-    ) -> Option<RelayMessage> {
+    ) -> Result<Option<RelayMessage>, BaseRelayError> {
         let rules = self.config.rate_limits().auth();
         if let Some(peer_ip) = context.peer_ip
-            && let Some(message) = self.rate_limit_ok(
+            && let Some(message) = self.rate_limit_ok_pocket(
                 event,
                 TangleRateLimitKey::ip(TangleRateLimitScope::Auth, peer_ip),
                 rules.per_ip(),
                 "auth ip",
                 now,
-            )
+            )?
         {
-            return Some(message);
+            return Ok(Some(message));
         }
-        self.rate_limit_ok(
+        self.rate_limit_ok_pocket(
             event,
-            TangleRateLimitKey::pubkey(
-                TangleRateLimitScope::Auth,
-                event.unsigned().pubkey().clone(),
-            ),
+            TangleRateLimitKey::pubkey(TangleRateLimitScope::Auth, pocket_event_pubkey(event)?),
             rules.per_pubkey(),
             "auth pubkey",
             now,
         )
     }
 
-    fn rate_limit_auth_failure(
+    fn rate_limit_auth_failure_pocket(
         &self,
-        event: &Event,
+        event: &PocketEvent,
         context: TangleClientRateLimitContext,
         now: UnixTimestamp,
-    ) -> Option<RelayMessage> {
+    ) -> Result<Option<RelayMessage>, BaseRelayError> {
         let rules = self.config.rate_limits().auth();
         if let Some(peer_ip) = context.peer_ip
-            && let Some(message) = self.rate_limit_ok(
+            && let Some(message) = self.rate_limit_ok_pocket(
                 event,
                 TangleRateLimitKey::auth_failure(Some(peer_ip), None),
                 rules.failures_per_ip(),
                 "auth failure ip",
                 now,
-            )
+            )?
         {
-            return Some(message);
+            return Ok(Some(message));
         }
-        self.rate_limit_ok(
+        self.rate_limit_ok_pocket(
             event,
-            TangleRateLimitKey::auth_failure(None, Some(event.unsigned().pubkey().clone())),
+            TangleRateLimitKey::auth_failure(None, Some(pocket_event_pubkey(event)?)),
             rules.failures(),
             "auth failure",
             now,
@@ -789,6 +789,31 @@ impl TangleRuntimeShared {
             }
         }
     }
+
+    fn rate_limit_ok_pocket(
+        &self,
+        event: &PocketEvent,
+        key: TangleRateLimitKey,
+        rule: TangleRateLimitRule,
+        label: &'static str,
+        now: UnixTimestamp,
+    ) -> Result<Option<RelayMessage>, BaseRelayError> {
+        Ok(match self.rate_limiter.record(key, rule, now) {
+            TangleRateLimitDecision::Allowed { .. } => None,
+            TangleRateLimitDecision::Rejected { reset_at } => {
+                self.metrics.record_rate_limit_rejection();
+                logging::log_rate_limit_rejected(label, "event", reset_at);
+                Some(RelayMessage::Ok {
+                    event_id: pocket_event_id(event)?,
+                    accepted: false,
+                    message: BaseRelayError::rate_limited(format!(
+                        "{label} rate limit exceeded until {reset_at}"
+                    ))
+                    .prefixed_message(),
+                })
+            }
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -813,6 +838,26 @@ impl TangleRuntimeHandle {
 
     pub async fn auth_state(&self) -> Result<BaseAuthState, BaseRelayError> {
         self.inner.config.auth_state()
+    }
+
+    pub async fn handle_count_pocket(
+        &self,
+        subscription_id: SubscriptionId,
+        filters: Vec<PocketOwnedFilter>,
+        auth: &mut BaseAuthState,
+        now: UnixTimestamp,
+    ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+        self.handle_client_message_with_rate_limit_context(
+            RuntimeClientMessage::Count {
+                subscription_id,
+                filters,
+                search_present: false,
+            },
+            auth,
+            TangleClientRateLimitContext::default(),
+            now,
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -876,6 +921,14 @@ impl TangleRuntimeHandle {
         match message {
             RuntimeClientMessage::Event(pocket_event) => {
                 let event = pocket_event_to_tangle(&pocket_event)?;
+                debug_assert_eq!(
+                    is_pocket_nip70_protected_event(&pocket_event)?,
+                    event
+                        .unsigned()
+                        .tags()
+                        .iter()
+                        .any(|tag| tag.name().as_str() == "-")
+                );
                 let started_at = Instant::now();
                 let event_id = event.id().clone();
                 let is_group_event = self.inner.is_group_event(&event);
@@ -1023,36 +1076,42 @@ impl TangleRuntimeHandle {
                 Ok(vec![report.into_message()])
             }
             RuntimeClientMessage::Auth(pocket_event) => {
-                let event = pocket_event_to_tangle(&pocket_event)?;
-                if let Err(error) = self.inner.limits.base_relay_limits().validate_event(&event) {
+                let event_id = pocket_event_id(&pocket_event)?;
+                if let Err(error) = self
+                    .inner
+                    .limits
+                    .base_relay_limits()
+                    .validate_pocket_event(&pocket_event)
+                {
                     self.inner.metrics.record_auth_failure();
                     return Ok(vec![RelayMessage::Ok {
-                        event_id: event.id().clone(),
+                        event_id,
                         accepted: false,
                         message: error.prefixed_message(),
                     }]);
                 }
-                if let Some(message) =
-                    self.inner
-                        .rate_limit_auth_attempt(&event, rate_limit_context, now)
-                {
+                if let Some(message) = self.inner.rate_limit_auth_attempt_pocket(
+                    &pocket_event,
+                    rate_limit_context,
+                    now,
+                )? {
                     self.inner.metrics.record_auth_failure();
                     return Ok(vec![message]);
                 }
-                let event_for_failure = event.clone();
-                let replies = BaseRelay::handle_auth_with_limits(
+                let event_for_failure = pocket_event.clone();
+                let replies = BaseRelay::handle_pocket_auth_with_limits(
                     self.inner.limits.base_relay_limits(),
-                    event,
+                    &pocket_event,
                     auth,
                     now,
                 );
                 if auth_response_failed(&replies) {
                     self.inner.metrics.record_auth_failure();
-                    if let Some(message) = self.inner.rate_limit_auth_failure(
+                    if let Some(message) = self.inner.rate_limit_auth_failure_pocket(
                         &event_for_failure,
                         rate_limit_context,
                         now,
-                    ) {
+                    )? {
                         return Ok(vec![message]);
                     }
                 } else {

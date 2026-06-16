@@ -1,9 +1,17 @@
 #![forbid(unsafe_code)]
 
-use crate::errors::BaseRelayError;
+use crate::{
+    errors::BaseRelayError,
+    pocket_event_validation::{
+        pocket_event_created_at, pocket_event_kind, pocket_event_pubkey,
+        verify_pocket_event_signature,
+    },
+};
 use std::collections::BTreeSet;
+use std::str;
 use tangle_crypto::verify_event_signature;
 use tangle_protocol::{Event, PublicKeyHex, RelayMessage, UnixTimestamp};
+use tangle_store_pocket::PocketEvent;
 
 pub fn generate_auth_challenge() -> Result<String, BaseRelayError> {
     let mut bytes = [0_u8; 32];
@@ -115,6 +123,54 @@ impl BaseAuthState {
         Ok(pubkey)
     }
 
+    pub(crate) fn authenticate_pocket(
+        &mut self,
+        event: &PocketEvent,
+        now: UnixTimestamp,
+    ) -> Result<PublicKeyHex, BaseRelayError> {
+        verify_pocket_event_signature(event)?;
+        let auth = parse_base_relay_pocket_auth_event(event)
+            .map_err(BaseRelayError::invalid)?
+            .ok_or_else(|| BaseRelayError::invalid("AUTH message must contain kind 22242"))?;
+        let challenge = self
+            .challenge
+            .as_ref()
+            .ok_or_else(|| BaseRelayError::auth_required("auth challenge is missing"))?;
+        if auth.relay() != self.relay_url {
+            return Err(BaseRelayError::auth_required(
+                "auth relay does not match canonical relay URL",
+            ));
+        }
+        if auth.challenge() != challenge.value {
+            return Err(BaseRelayError::auth_required(
+                "auth challenge does not match",
+            ));
+        }
+        if now.as_u64()
+            > challenge
+                .issued_at
+                .as_u64()
+                .saturating_add(self.challenge_ttl_seconds)
+        {
+            return Err(BaseRelayError::auth_required("auth challenge expired"));
+        }
+        if auth
+            .created_at()
+            .as_u64()
+            .saturating_add(self.created_at_skew_seconds)
+            < now.as_u64()
+            || auth.created_at().as_u64()
+                > now.as_u64().saturating_add(self.created_at_skew_seconds)
+        {
+            return Err(BaseRelayError::auth_required(
+                "auth event created_at is outside configured skew",
+            ));
+        }
+        let pubkey = auth.pubkey().clone();
+        self.authenticated_pubkeys.insert(pubkey.clone());
+        Ok(pubkey)
+    }
+
     pub fn authenticated_pubkeys(&self) -> &BTreeSet<PublicKeyHex> {
         &self.authenticated_pubkeys
     }
@@ -172,6 +228,32 @@ fn parse_base_relay_auth_event(event: &Event) -> Result<Option<BaseRelayAuthEven
     }))
 }
 
+fn parse_base_relay_pocket_auth_event(
+    event: &PocketEvent,
+) -> Result<Option<BaseRelayAuthEvent>, String> {
+    if pocket_event_kind(event)
+        .map_err(|error| error.message().to_owned())?
+        .as_u32()
+        != 22_242
+    {
+        return Ok(None);
+    }
+    let relay = required_single_pocket_tag_value(event, "relay")?;
+    let challenge = required_single_pocket_tag_value(event, "challenge")?;
+    if relay.is_empty() {
+        return Err("relay auth relay tag must not be empty".to_owned());
+    }
+    if challenge.is_empty() {
+        return Err("relay auth challenge tag must not be empty".to_owned());
+    }
+    Ok(Some(BaseRelayAuthEvent {
+        pubkey: pocket_event_pubkey(event).map_err(|error| error.message().to_owned())?,
+        created_at: pocket_event_created_at(event),
+        relay,
+        challenge,
+    }))
+}
+
 fn required_single_tag_value(event: &Event, name: &str) -> Result<String, String> {
     let mut matches = event
         .unsigned()
@@ -190,6 +272,31 @@ fn required_single_tag_value(event: &Event, name: &str) -> Result<String, String
         .ok_or_else(|| format!("tag `{name}` must include a value"))
 }
 
+fn required_single_pocket_tag_value(event: &PocketEvent, name: &str) -> Result<String, String> {
+    let tags = event
+        .tags()
+        .map_err(|error| format!("malformed Pocket event tags: {error}"))?;
+    let mut matched = None;
+    for mut tag in tags.iter() {
+        let Some(tag_name) = tag.next() else {
+            continue;
+        };
+        let tag_name = str::from_utf8(tag_name).map_err(|error| error.to_string())?;
+        if tag_name != name {
+            continue;
+        }
+        if matched.is_some() {
+            return Err(format!("tag `{name}` must not be repeated"));
+        }
+        let value = tag
+            .next()
+            .ok_or_else(|| format!("tag `{name}` must include a value"))
+            .and_then(|value| str::from_utf8(value).map_err(|error| error.to_string()))?;
+        matched = Some(value.to_owned());
+    }
+    matched.ok_or_else(|| format!("tag `{name}` is required"))
+}
+
 fn lower_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -203,6 +310,7 @@ fn lower_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{BaseAuthState, generate_auth_challenge};
+    use crate::pocket_conversion::tangle_event_to_pocket;
     use tangle_crypto::RelaySigner;
     use tangle_protocol::{Event, EventId, Kind, RelayMessage, Tag, UnixTimestamp, UnsignedEvent};
 
@@ -476,6 +584,110 @@ mod tests {
             .prefixed_message(),
             "auth-required: auth event created_at is outside configured skew"
         );
+    }
+
+    #[test]
+    fn auth_state_authenticates_pocket_events_without_protocol_conversion() {
+        let mut auth = BaseAuthState::new("wss://relay.radroots.test", 20, 10).expect("auth state");
+        auth.issue_challenge("challenge-a", UnixTimestamp::new(100))
+            .expect("challenge");
+        let owner = signed_auth_event(7, "challenge-a", 105);
+        let admin = signed_auth_event(8, "challenge-a", 106);
+        let owner_pocket = tangle_event_to_pocket(&owner).expect("owner pocket");
+        let admin_pocket = tangle_event_to_pocket(&admin).expect("admin pocket");
+
+        let owner_pubkey = auth
+            .authenticate_pocket(&owner_pocket, UnixTimestamp::new(105))
+            .expect("owner");
+        let admin_pubkey = auth
+            .authenticate_pocket(&admin_pocket, UnixTimestamp::new(106))
+            .expect("admin");
+
+        assert_ne!(owner_pubkey, admin_pubkey);
+        assert!(auth.authenticated_pubkeys().contains(&owner_pubkey));
+        assert!(auth.authenticated_pubkeys().contains(&admin_pubkey));
+        assert_eq!(auth.authenticated_pubkeys().len(), 2);
+    }
+
+    #[test]
+    fn auth_state_rejects_invalid_pocket_auth_events_with_existing_semantics() {
+        let mut auth = BaseAuthState::new("wss://relay.radroots.test", 20, 10).expect("auth state");
+        auth.issue_challenge("challenge-a", UnixTimestamp::new(100))
+            .expect("challenge");
+        let owner = signed_auth_event(7, "challenge-a", 105);
+        let admin = signed_auth_event(8, "challenge-a", 106);
+
+        let wrong_id = tangle_event_to_pocket(&Event::new(
+            EventId::new(&"0".repeat(EventId::HEX_LENGTH)).expect("id"),
+            owner.unsigned().clone(),
+            owner.sig().clone(),
+        ))
+        .expect("wrong id pocket");
+        assert!(
+            auth.authenticate_pocket(&wrong_id, UnixTimestamp::new(105))
+                .expect_err("id")
+                .prefixed_message()
+                .starts_with("invalid: event id mismatch:")
+        );
+
+        let wrong_signature = tangle_event_to_pocket(&Event::new(
+            owner.id().clone(),
+            owner.unsigned().clone(),
+            admin.sig().clone(),
+        ))
+        .expect("wrong signature pocket");
+        assert_eq!(
+            auth.authenticate_pocket(&wrong_signature, UnixTimestamp::new(105))
+                .expect_err("signature")
+                .prefixed_message(),
+            "invalid: event signature verification failed"
+        );
+
+        for (event, now, expected) in [
+            (
+                signed_event(9, 1, auth_tags("challenge-a"), 105),
+                105,
+                "invalid: AUTH message must contain kind 22242",
+            ),
+            (
+                signed_event(
+                    9,
+                    22_242,
+                    auth_tags_for("wss://other.radroots.test", "challenge-a"),
+                    105,
+                ),
+                105,
+                "auth-required: auth relay does not match canonical relay URL",
+            ),
+            (
+                signed_auth_event(9, "wrong", 105),
+                105,
+                "auth-required: auth challenge does not match",
+            ),
+            (
+                signed_auth_event(9, "challenge-a", 121),
+                121,
+                "auth-required: auth challenge expired",
+            ),
+            (
+                signed_auth_event(9, "challenge-a", 94),
+                105,
+                "auth-required: auth event created_at is outside configured skew",
+            ),
+            (
+                signed_auth_event(9, "challenge-a", 116),
+                105,
+                "auth-required: auth event created_at is outside configured skew",
+            ),
+        ] {
+            let pocket = tangle_event_to_pocket(&event).expect("pocket");
+            assert_eq!(
+                auth.authenticate_pocket(&pocket, UnixTimestamp::new(now))
+                    .expect_err("invalid")
+                    .prefixed_message(),
+                expected
+            );
+        }
     }
 
     #[test]

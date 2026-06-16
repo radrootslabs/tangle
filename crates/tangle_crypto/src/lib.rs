@@ -60,6 +60,35 @@ pub fn verify_event_signature(event: &Event) -> Result<(), String> {
         .map_err(|_| "event signature verification failed".to_owned())
 }
 
+pub fn compute_event_id_hex_from_canonical_json(canonical: &str) -> String {
+    let digest = Sha256::digest(canonical.as_bytes());
+    lower_hex(&digest)
+}
+
+pub fn verify_event_signature_bytes(
+    canonical: &str,
+    event_id: &[u8; 32],
+    pubkey: &[u8; 32],
+    signature: &[u8; 64],
+) -> Result<(), String> {
+    let expected_id = Sha256::digest(canonical.as_bytes());
+    let expected_id_bytes: &[u8] = expected_id.as_ref();
+    if expected_id_bytes != event_id {
+        return Err(format!(
+            "event id mismatch: expected {}, got {}",
+            lower_hex(&expected_id),
+            lower_hex(event_id)
+        ));
+    }
+    let verifying_key = VerifyingKey::from_bytes(pubkey)
+        .map_err(|_| "event public key is not a valid secp256k1 x-only key".to_owned())?;
+    let signature = Signature::try_from(signature.as_slice())
+        .map_err(|_| "event signature is not a valid schnorr signature".to_owned())?;
+    verifying_key
+        .verify(event_id, &signature)
+        .map_err(|_| "event signature verification failed".to_owned())
+}
+
 pub struct RelaySigner {
     signing_key: SigningKey,
     public_key: PublicKeyHex,

@@ -9,8 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tangle_groups::{KIND_GROUP_ADMINS, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA, MemberStatus};
 use tangle_protocol::{
-    ClientMessage, Event, Filter, RelayMessage, SubscriptionId, UnixTimestamp, event_to_value,
-    filter_from_value,
+    Event, Filter, RelayMessage, SubscriptionId, UnixTimestamp, event_to_value, filter_from_value,
 };
 use tangle_runtime::{
     config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
@@ -20,7 +19,9 @@ use tangle_runtime::{
     },
     runtime::{TangleRuntime, TangleRuntimeHandle},
 };
-use tangle_store_pocket::{PocketQueryConfig, PocketStoreConfig, PocketSyncPolicy};
+use tangle_store_pocket::{
+    PocketQueryConfig, PocketStoreConfig, PocketSyncPolicy, parse_pocket_filter_json,
+};
 use tangle_test_support::{
     FixtureKey, TANGLE_V2_RELAY_URL, tangle_v2_auth_event, tangle_v2_event, tangle_v2_group_config,
     tangle_v2_group_create_event, tangle_v2_group_event, tangle_v2_put_user_event, tangle_v2_tag,
@@ -1408,12 +1409,12 @@ async fn runtime_count_resource_control_probe() -> Result<CountResourceControlPr
     for (name, filter) in cases {
         let sample = Instant::now();
         let subscription_id = subscription(name)?;
+        let pocket_filter = parse_pocket_filter_json(filter.to_string().as_bytes())
+            .map_err(|error| error.to_string())?;
         let replies = handle
-            .handle_client_message(
-                ClientMessage::Count {
-                    subscription_id: subscription_id.clone(),
-                    filters: vec![filter_from_value(&filter)?],
-                },
+            .handle_count_pocket(
+                subscription_id.clone(),
+                vec![pocket_filter],
                 &mut auth,
                 UnixTimestamp::new(1_714_700_000),
             )

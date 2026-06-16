@@ -8,6 +8,9 @@ use crate::pocket_conversion::{
     pocket_event_id, pocket_event_to_tangle, pocket_pubkey, tangle_event_to_pocket,
     tangle_filter_to_pocket,
 };
+use crate::pocket_event_validation::{
+    pocket_event_id as pocket_runtime_event_id, validate_pocket_event_shape,
+};
 use crate::relay::{
     auth::BaseAuthState,
     live::{CloseResult, LiveSubscriptionSet},
@@ -23,7 +26,8 @@ use tangle_groups::{
 };
 use tangle_protocol::{ClientMessage, Event, Filter, RelayMessage, SubscriptionId, UnixTimestamp};
 use tangle_store_pocket::{
-    PocketHll8, PocketQueryConfig, PocketScreenResult, PocketStoreConfig, PocketStoreHandle,
+    PocketEvent, PocketHll8, PocketQueryConfig, PocketScreenResult, PocketStoreConfig,
+    PocketStoreHandle,
 };
 
 pub(crate) const NEGENTROPY_DISABLED_MESSAGE: &str = "blocked: Negentropy sync is disabled";
@@ -425,6 +429,10 @@ impl BaseRelayLimits {
         Ok(())
     }
 
+    pub(crate) fn validate_pocket_event(&self, event: &PocketEvent) -> Result<(), BaseRelayError> {
+        validate_pocket_event_shape(event, self.max_event_tags, self.max_content_length)
+    }
+
     pub fn validate_subscription_id(
         &self,
         subscription_id: &SubscriptionId,
@@ -712,6 +720,38 @@ impl BaseRelay {
             .unwrap_or_else(|error| {
                 vec![RelayMessage::Ok {
                     event_id: event.id().clone(),
+                    accepted: false,
+                    message: error.prefixed_message(),
+                }]
+            })
+    }
+
+    pub(crate) fn handle_pocket_auth_with_limits(
+        limits: BaseRelayLimits,
+        event: &PocketEvent,
+        auth: &mut BaseAuthState,
+        now: UnixTimestamp,
+    ) -> Vec<RelayMessage> {
+        let event_id =
+            pocket_runtime_event_id(event).expect("Pocket event id is valid hex by construction");
+        if let Err(error) = limits.validate_pocket_event(event) {
+            return vec![RelayMessage::Ok {
+                event_id,
+                accepted: false,
+                message: error.prefixed_message(),
+            }];
+        }
+        auth.authenticate_pocket(event, now)
+            .map(|_| {
+                vec![RelayMessage::Ok {
+                    event_id: event_id.clone(),
+                    accepted: true,
+                    message: String::new(),
+                }]
+            })
+            .unwrap_or_else(|error| {
+                vec![RelayMessage::Ok {
+                    event_id,
                     accepted: false,
                     message: error.prefixed_message(),
                 }]
