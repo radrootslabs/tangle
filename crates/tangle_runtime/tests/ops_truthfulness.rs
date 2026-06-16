@@ -47,6 +47,16 @@ impl BaseRelayEventTestExt for BaseRelay {
     }
 }
 
+fn authenticate_pocket_event_for_test(
+    auth: &mut BaseAuthState,
+    event: &Event,
+    now: UnixTimestamp,
+) -> Result<(), BaseRelayError> {
+    let raw = serde_json::to_vec(&event_to_value(event)).expect("event JSON");
+    let pocket = parse_pocket_event_json(&raw).expect("pocket event");
+    auth.authenticate_pocket(&pocket, now).map(|_| ())
+}
+
 #[test]
 fn operations_surfaces_match_enforced_runtime_contracts() {
     let root = temp_root("ops-truthfulness");
@@ -138,7 +148,8 @@ fn operations_surfaces_match_enforced_runtime_contracts() {
     let mut auth = BaseAuthState::new(TANGLE_V2_RELAY_URL, 300, 600).expect("auth");
     auth.issue_challenge("challenge-a", UnixTimestamp::new(1_714_124_433))
         .expect("challenge");
-    auth.authenticate(
+    authenticate_pocket_event_for_test(
+        &mut auth,
         &tangle_v2_auth_event(FixtureKey::Member, "challenge-a", 1_714_124_433).expect("auth"),
         UnixTimestamp::new(1_714_124_433),
     )

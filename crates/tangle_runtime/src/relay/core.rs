@@ -4,24 +4,23 @@ use crate::groups::{
 };
 use crate::logging::{self, TangleModerationAuditResult};
 use crate::ops::BaseRelayReadinessState;
-use crate::pocket_conversion::pocket_event_to_tangle;
 #[cfg(test)]
-use crate::pocket_conversion::{pocket_event_id, tangle_event_to_pocket, tangle_filter_to_pocket};
+use crate::pocket_conversion::{tangle_event_to_pocket, tangle_filter_to_pocket};
 use crate::pocket_event_validation::{
     is_pocket_nip70_protected_event, pocket_event_id as pocket_runtime_event_id, pocket_event_kind,
     pocket_event_pubkey, validate_pocket_event_shape, verify_pocket_event_signature,
 };
+#[cfg(test)]
+use crate::relay::outbound::protocol_messages_for_test;
 use crate::relay::{
     auth::BaseAuthState,
     live::{CloseResult, LiveSubscriptionSet},
-    outbound::{RuntimeRelayMessage, protocol_messages},
+    outbound::RuntimeRelayMessage,
 };
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeSet,
 };
-#[cfg(test)]
-use tangle_crypto::verify_event_signature;
 use tangle_groups::{
     GroupAuthContext, GroupEventClass, GroupEventView, GroupRuntimeConfig, StoreOffset,
     classify_group_event, validate_client_group_event_structure,
@@ -165,10 +164,6 @@ impl BaseRelayQueryReport {
 
     pub(crate) fn into_messages(self) -> Vec<RuntimeRelayMessage> {
         self.messages
-    }
-
-    pub(crate) fn into_protocol_messages(self) -> Result<Vec<RelayMessage>, BaseRelayError> {
-        protocol_messages(self.messages)
     }
 }
 
@@ -348,15 +343,6 @@ impl BaseRelayCountHll {
 enum BaseRelayFilterLimitMode {
     ApplyDefaultLimit,
     PreserveCountLimitless,
-}
-
-#[cfg(test)]
-fn is_nip70_protected_event(event: &Event) -> bool {
-    event
-        .unsigned()
-        .tags()
-        .iter()
-        .any(|tag| tag.name().as_str() == "-")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1048,113 +1034,14 @@ impl BaseRelay {
         event: Event,
         auth: &GroupAuthContext,
     ) -> Result<BaseRelayEventWrite, BaseRelayError> {
-        let event_id = event.id().clone();
-        if let Err(error) = limits.validate_protocol_event_for_test(&event) {
-            return Ok(BaseRelayEventWrite::unstored(ok_rejected(
-                event_id,
-                error.prefixed_message(),
-            )));
-        }
-        if let Err(error) = verify_event_signature(&event) {
-            return Ok(BaseRelayEventWrite::unstored(ok_rejected(
-                event_id,
-                format!("invalid: {error}"),
-            )));
-        }
-        if is_nip70_protected_event(&event) && !auth.contains(event.unsigned().pubkey()) {
-            return Ok(BaseRelayEventWrite::unstored(ok_rejected(
-                event_id,
-                BaseRelayError::auth_required(
-                    "protected event requires authenticated event author",
-                )
-                .prefixed_message(),
-            )));
-        }
-        let group_limits = groups.map(GroupServiceHandle::limits).unwrap_or_default();
-        let audit_class = classify_group_event(&event, group_limits).ok();
-        let class = match validate_client_group_event_structure(&event, group_limits) {
-            Ok(class) => class,
-            Err(error) => {
-                if let Some(class) = audit_class.as_ref() {
-                    logging::log_group_moderation_audit(
-                        &event,
-                        class,
-                        TangleModerationAuditResult::Rejected,
-                    );
-                }
-                return Ok(BaseRelayEventWrite::unstored(ok_rejected(
-                    event_id,
-                    error.prefixed_message(),
-                )));
-            }
-        };
-        if !matches!(class, GroupEventClass::NonGroup) {
-            let Some(groups) = groups else {
-                logging::log_group_moderation_audit(
-                    &event,
-                    &class,
-                    TangleModerationAuditResult::Rejected,
-                );
-                return Ok(BaseRelayEventWrite::unstored(ok_rejected(
-                    event_id,
-                    "blocked: NIP-29 group events are not accepted before group service".to_owned(),
-                )));
-            };
-            match groups.store_group_event(store, &event, &class, auth) {
-                Ok(GroupEventWrite::Stored(stored_offsets)) => {
-                    logging::log_group_moderation_audit(
-                        &event,
-                        &class,
-                        TangleModerationAuditResult::Accepted,
-                    );
-                    return Ok(BaseRelayEventWrite::stored(
-                        ok_accepted(event_id, String::new()),
-                        stored_offsets,
-                    ));
-                }
-                Ok(GroupEventWrite::Duplicate) => {
-                    logging::log_group_moderation_audit(
-                        &event,
-                        &class,
-                        TangleModerationAuditResult::Accepted,
-                    );
-                    return Ok(BaseRelayEventWrite::unstored(ok_accepted(
-                        event_id,
-                        "duplicate: already have this event".to_owned(),
-                    )));
-                }
-                Err(GroupEventWriteError::Rejected(error)) => {
-                    logging::log_group_moderation_audit(
-                        &event,
-                        &class,
-                        TangleModerationAuditResult::Rejected,
-                    );
-                    return Ok(BaseRelayEventWrite::unstored(ok_rejected(
-                        event_id,
-                        error.prefixed_message(),
-                    )));
-                }
-                Err(GroupEventWriteError::Storage(error)) => return Err(error),
-            }
-        }
-        if event.unsigned().kind().is_ephemeral() {
-            return Ok(BaseRelayEventWrite::unstored(ok_accepted(
-                event_id,
-                String::new(),
-            )));
-        }
-        if store.event_by_id(pocket_event_id(&event_id)?)?.is_some() {
-            return Ok(BaseRelayEventWrite::unstored(ok_accepted(
-                event_id,
-                "duplicate: already have this event".to_owned(),
-            )));
-        }
         let pocket_event = tangle_event_to_pocket(&event)?;
-        let store_offset = StoreOffset::new(store.store_event(&pocket_event)?);
-        Ok(BaseRelayEventWrite::stored(
-            ok_accepted(event_id, String::new()),
-            vec![store_offset],
-        ))
+        Self::handle_pocket_event_with_group_auth_and_services(
+            store,
+            groups,
+            limits,
+            &pocket_event,
+            auth,
+        )
     }
 
     fn handle_pocket_event_with_group_auth(
@@ -1291,7 +1178,7 @@ impl BaseRelay {
         &mut self,
         subscription_id: SubscriptionId,
         filters: Vec<PocketOwnedFilter>,
-    ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+    ) -> Result<Vec<RuntimeRelayMessage>, BaseRelayError> {
         self.handle_pocket_req_with_group_auth(
             subscription_id,
             filters,
@@ -1334,7 +1221,8 @@ impl BaseRelay {
         auth: &GroupAuthContext,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
         self.handle_protocol_req_with_group_auth_report_for_test(subscription_id, filters, auth)
-            .and_then(BaseRelayQueryReport::into_protocol_messages)
+            .map(BaseRelayQueryReport::into_messages)
+            .and_then(protocol_messages_for_test)
     }
 
     pub fn handle_pocket_req_with_auth(
@@ -1342,7 +1230,7 @@ impl BaseRelay {
         subscription_id: SubscriptionId,
         filters: Vec<PocketOwnedFilter>,
         auth: &BaseAuthState,
-    ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+    ) -> Result<Vec<RuntimeRelayMessage>, BaseRelayError> {
         self.handle_pocket_req_with_group_auth(
             subscription_id,
             filters,
@@ -1355,9 +1243,9 @@ impl BaseRelay {
         subscription_id: SubscriptionId,
         filters: Vec<PocketOwnedFilter>,
         auth: &GroupAuthContext,
-    ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+    ) -> Result<Vec<RuntimeRelayMessage>, BaseRelayError> {
         self.handle_pocket_req_with_group_auth_report(subscription_id, filters, false, auth)
-            .and_then(BaseRelayQueryReport::into_protocol_messages)
+            .map(BaseRelayQueryReport::into_messages)
     }
 
     #[cfg(test)]
@@ -1614,7 +1502,7 @@ impl BaseRelay {
         self.subscriptions.close(subscription_id)
     }
 
-    pub fn fanout_pocket(&mut self, event: &PocketEvent) -> Vec<RelayMessage> {
+    pub fn fanout_pocket(&mut self, event: &PocketEvent) -> Vec<RuntimeRelayMessage> {
         self.fanout_pocket_with_group_auth(event, &GroupAuthContext::unauthenticated())
     }
 
@@ -1622,7 +1510,7 @@ impl BaseRelay {
         &mut self,
         event: &PocketEvent,
         auth: &GroupAuthContext,
-    ) -> Vec<RelayMessage> {
+    ) -> Vec<RuntimeRelayMessage> {
         let groups = self.groups.as_ref();
         self.subscriptions
             .fanout(event, auth, |event, auth| {
@@ -1630,9 +1518,9 @@ impl BaseRelay {
             })
             .expect("Pocket live fanout must match")
             .into_iter()
-            .map(|subscription_id| RelayMessage::Event {
+            .map(|subscription_id| RuntimeRelayMessage::Event {
                 subscription_id,
-                event: pocket_event_to_tangle(event).expect("Pocket fanout event must convert"),
+                event: event.to_owned(),
             })
             .collect()
     }
@@ -1649,7 +1537,8 @@ impl BaseRelay {
         auth: &GroupAuthContext,
     ) -> Vec<RelayMessage> {
         let pocket_event = tangle_event_to_pocket(event).expect("event must convert to Pocket");
-        self.fanout_pocket_with_group_auth(&pocket_event, auth)
+        protocol_messages_for_test(self.fanout_pocket_with_group_auth(&pocket_event, auth))
+            .expect("test protocol fanout must convert")
     }
 
     pub fn active_subscription_count(&self) -> usize {

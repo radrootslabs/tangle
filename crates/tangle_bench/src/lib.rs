@@ -17,6 +17,7 @@ use tangle_runtime::{
     relay::{
         auth::BaseAuthState,
         core::{BaseRelay, BaseRelayLimitSettings, BaseRelayLimits},
+        outbound::RuntimeRelayMessage,
     },
     runtime::{TangleRuntime, TangleRuntimeHandle},
 };
@@ -1340,11 +1341,11 @@ fn run_broadcast_lag_benchmark(dataset: &BenchDataset) -> Result<ScenarioReport,
     let elapsed = elapsed_micros(started);
     let first_events = first_messages
         .iter()
-        .filter(|message| matches!(message, RelayMessage::Event { .. }))
+        .filter(|message| matches!(message, RuntimeRelayMessage::Event { .. }))
         .count();
     let second_events = second_messages
         .iter()
-        .filter(|message| matches!(message, RelayMessage::Event { .. }))
+        .filter(|message| matches!(message, RuntimeRelayMessage::Event { .. }))
         .count();
     let accepted = if first_events == subscriber_count
         && second_events == subscriber_count
@@ -1593,7 +1594,7 @@ fn query_for_operation(
     relay.handle_close(&subscription_id);
     Ok(messages
         .iter()
-        .filter(|message| matches!(message, RelayMessage::Event { .. }))
+        .filter(|message| matches!(message, RuntimeRelayMessage::Event { .. }))
         .count()
         .try_into()
         .expect("message count fits in u64"))
@@ -1818,7 +1819,8 @@ fn authenticated(key: FixtureKey) -> Result<BaseAuthState, String> {
     auth.issue_challenge("challenge-a", tangle_protocol::UnixTimestamp::new(100))
         .map_err(|error| error.to_string())?;
     let event = tangle_v2_auth_event(key, "challenge-a", 120)?;
-    auth.authenticate(&event, tangle_protocol::UnixTimestamp::new(120))
+    let pocket = pocket_event(&event)?;
+    auth.authenticate_pocket(&pocket, tangle_protocol::UnixTimestamp::new(120))
         .map_err(|error| error.to_string())?;
     Ok(auth)
 }

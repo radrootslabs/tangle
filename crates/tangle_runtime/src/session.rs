@@ -499,7 +499,7 @@ impl TangleWebSocketSession {
                 message,
             )?)
             .await?;
-        crate::relay::outbound::protocol_messages(messages)
+        crate::relay::outbound::protocol_messages_for_test(messages)
     }
 }
 

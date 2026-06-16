@@ -1,13 +1,16 @@
 #![forbid(unsafe_code)]
 
 use crate::errors::BaseRelayError;
+#[cfg(test)]
 use std::str;
+use tangle_protocol::EventId;
 #[cfg(test)]
 use tangle_protocol::Filter;
-use tangle_protocol::{
-    Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
-};
-use tangle_store_pocket::{PocketEvent, PocketEventId};
+#[cfg(test)]
+use tangle_protocol::{Event, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent};
+#[cfg(test)]
+use tangle_store_pocket::PocketEvent;
+use tangle_store_pocket::PocketEventId;
 #[cfg(test)]
 use tangle_store_pocket::{
     PocketKind, PocketOwnedEvent, PocketOwnedFilter, PocketOwnedTags, PocketPubkey, PocketSig,
@@ -89,6 +92,7 @@ pub(crate) fn tangle_filter_to_pocket(
     .map_err(|error| BaseRelayError::error(error.to_string()))
 }
 
+#[cfg(test)]
 pub(crate) fn pocket_event_to_tangle(event: &PocketEvent) -> Result<Event, BaseRelayError> {
     let tags = event
         .tags()

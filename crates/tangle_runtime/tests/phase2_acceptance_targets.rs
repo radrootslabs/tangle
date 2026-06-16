@@ -30,8 +30,9 @@ use tangle_runtime::{
     server::serve_listener_until_shutdown,
 };
 use tangle_store_pocket::{
-    PocketStoreConfig, PocketStoreHandle, TANGLE_GROUP_CHECKPOINT_TABLE, TANGLE_GROUP_OUTBOX_TABLE,
-    TANGLE_GROUP_PROJECTION_TABLE, parse_pocket_event_json, parse_pocket_filter_json,
+    PocketOwnedEvent, PocketStoreConfig, PocketStoreHandle, TANGLE_GROUP_CHECKPOINT_TABLE,
+    TANGLE_GROUP_OUTBOX_TABLE, TANGLE_GROUP_PROJECTION_TABLE, parse_pocket_event_json,
+    parse_pocket_filter_json,
 };
 use tangle_test_support::{
     FixtureKey, TANGLE_V2_RELAY_SECRET_HEX, TANGLE_V2_RELAY_URL, tangle_v2_auth_event,
@@ -95,6 +96,21 @@ fn pocket_filters(filters: Vec<Filter>) -> Vec<tangle_store_pocket::PocketOwnedF
             parse_pocket_filter_json(&raw).expect("pocket filter")
         })
         .collect()
+}
+
+fn authenticate_pocket_event_for_test(
+    auth: &mut BaseAuthState,
+    event: &Event,
+    now: UnixTimestamp,
+) -> Result<(), BaseRelayError> {
+    let raw = serde_json::to_vec(&event_to_value(event)).expect("event JSON");
+    let pocket = parse_pocket_event_json(&raw).expect("pocket event");
+    auth.authenticate_pocket(&pocket, now).map(|_| ())
+}
+
+fn pocket_event_for_test(event: &Event) -> PocketOwnedEvent {
+    let raw = serde_json::to_vec(&event_to_value(event)).expect("event JSON");
+    parse_pocket_event_json(&raw).expect("pocket event")
 }
 
 #[tokio::test]
@@ -1304,14 +1320,16 @@ fn auth_rejects_events_outside_created_at_skew() {
         RelayMessage::Auth("challenge-a".to_owned())
     );
 
-    auth.authenticate(
+    authenticate_pocket_event_for_test(
+        &mut auth,
         &tangle_v2_auth_event(FixtureKey::Owner, "challenge-a", 100).expect("fresh"),
         UnixTimestamp::new(100),
     )
     .expect("fresh");
 
     assert_eq!(
-        auth.authenticate(
+        authenticate_pocket_event_for_test(
+            &mut auth,
             &tangle_v2_auth_event(FixtureKey::Admin, "challenge-a", 89).expect("auth"),
             UnixTimestamp::new(100),
         )
@@ -1320,7 +1338,8 @@ fn auth_rejects_events_outside_created_at_skew() {
         "auth-required: auth event created_at is outside configured skew"
     );
     assert_eq!(
-        auth.authenticate(
+        authenticate_pocket_event_for_test(
+            &mut auth,
             &tangle_v2_auth_event(FixtureKey::Member, "challenge-a", 111).expect("auth"),
             UnixTimestamp::new(100),
         )
@@ -1351,7 +1370,8 @@ fn protected_events_require_author_auth_before_nip70_is_advertised() {
     let mut auth = BaseAuthState::new(TANGLE_V2_RELAY_URL, 300, 10).expect("auth");
     auth.issue_challenge("challenge-a", UnixTimestamp::new(1_714_124_433))
         .expect("challenge");
-    auth.authenticate(
+    authenticate_pocket_event_for_test(
+        &mut auth,
         &tangle_v2_auth_event(FixtureKey::Member, "challenge-a", 1_714_124_433).expect("auth"),
         UnixTimestamp::new(1_714_124_433),
     )
@@ -1420,7 +1440,7 @@ fn private_but_not_hidden_group_metadata_remains_visible() {
 
     assert_eq!(
         gate.screen_event(
-            &phase2_snapshot_event(KIND_GROUP_METADATA, "Farm"),
+            &pocket_event_for_test(&phase2_snapshot_event(KIND_GROUP_METADATA, "Farm")),
             None,
             Default::default()
         )
@@ -1429,7 +1449,7 @@ fn private_but_not_hidden_group_metadata_remains_visible() {
     );
     assert_eq!(
         gate.screen_event(
-            &phase2_snapshot_event(KIND_GROUP_ADMINS, "Farm"),
+            &pocket_event_for_test(&phase2_snapshot_event(KIND_GROUP_ADMINS, "Farm")),
             None,
             Default::default()
         )
@@ -1438,7 +1458,7 @@ fn private_but_not_hidden_group_metadata_remains_visible() {
     );
     assert_eq!(
         gate.screen_event(
-            &phase2_snapshot_event(KIND_GROUP_MEMBERS, "Farm"),
+            &pocket_event_for_test(&phase2_snapshot_event(KIND_GROUP_MEMBERS, "Farm")),
             None,
             Default::default()
         )
@@ -1452,7 +1472,7 @@ fn private_but_not_hidden_group_metadata_remains_visible() {
     assert_eq!(
         hidden_gate
             .screen_event(
-                &phase2_snapshot_event(KIND_GROUP_METADATA, "Hidden"),
+                &pocket_event_for_test(&phase2_snapshot_event(KIND_GROUP_METADATA, "Hidden")),
                 None,
                 Default::default()
             )
@@ -1473,9 +1493,10 @@ fn public_join_defaults_false() {
     let authority = GroupAuthority::new([owner], Vec::<PublicKeyHex>::new());
     let policy = GroupWritePolicy::new(&projection, &authority, GroupPolicyConfig::strict());
     let join = phase2_group_event(KIND_GROUP_JOIN_REQUEST, "Farm", joiner.clone());
+    let join_pocket = pocket_event_for_test(&join);
     let error = policy
         .check_event(
-            &join,
+            &join_pocket,
             &GroupEventClass::Normal {
                 group_id: GroupId::new("Farm").expect("group"),
             },
@@ -1516,7 +1537,11 @@ fn duplicate_join_and_leave_use_duplicate_prefix() {
 
     let duplicate_join = policy
         .check_event(
-            &phase2_group_event(KIND_GROUP_JOIN_REQUEST, "Farm", member.clone()),
+            &pocket_event_for_test(&phase2_group_event(
+                KIND_GROUP_JOIN_REQUEST,
+                "Farm",
+                member.clone(),
+            )),
             &GroupEventClass::Normal {
                 group_id: GroupId::new("Farm").expect("group"),
             },
@@ -1530,7 +1555,11 @@ fn duplicate_join_and_leave_use_duplicate_prefix() {
 
     let duplicate_leave = policy
         .check_event(
-            &phase2_group_event(KIND_GROUP_LEAVE_REQUEST, "Farm", outsider.clone()),
+            &pocket_event_for_test(&phase2_group_event(
+                KIND_GROUP_LEAVE_REQUEST,
+                "Farm",
+                outsider.clone(),
+            )),
             &GroupEventClass::Normal {
                 group_id: GroupId::new("Farm").expect("group"),
             },
@@ -1561,7 +1590,11 @@ fn closed_groups_use_strict_nip29_semantics_without_compatibility_flag() {
 
     let join_error = policy
         .check_event(
-            &phase2_group_event(KIND_GROUP_JOIN_REQUEST, "Closed", outsider.clone()),
+            &pocket_event_for_test(&phase2_group_event(
+                KIND_GROUP_JOIN_REQUEST,
+                "Closed",
+                outsider.clone(),
+            )),
             &GroupEventClass::Normal {
                 group_id: GroupId::new("Closed").expect("group"),
             },
@@ -1577,7 +1610,7 @@ fn closed_groups_use_strict_nip29_semantics_without_compatibility_flag() {
     assert_eq!(
         policy
             .check_event(
-                &phase2_group_event(1, "Closed", outsider.clone()),
+                &pocket_event_for_test(&phase2_group_event(1, "Closed", outsider.clone())),
                 &GroupEventClass::Normal {
                     group_id: GroupId::new("Closed").expect("group"),
                 },
@@ -1779,9 +1812,9 @@ fn projection_and_outbox_recover_from_canonical_pocket_events() {
         .expect("owner auth");
     let member_auth = tangle_v2_auth_event(FixtureKey::Member, "recovery-challenge", 1_714_124_471)
         .expect("member auth");
-    auth.authenticate(&owner_auth, UnixTimestamp::new(1_714_124_470))
+    authenticate_pocket_event_for_test(&mut auth, &owner_auth, UnixTimestamp::new(1_714_124_470))
         .expect("owner");
-    auth.authenticate(&member_auth, UnixTimestamp::new(1_714_124_471))
+    authenticate_pocket_event_for_test(&mut auth, &member_auth, UnixTimestamp::new(1_714_124_471))
         .expect("member");
     let create =
         tangle_v2_group_create_event(FixtureKey::Owner, "RecoverSocket", 1_714_124_472, &[])

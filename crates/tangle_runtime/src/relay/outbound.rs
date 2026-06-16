@@ -1,12 +1,12 @@
 #![forbid(unsafe_code)]
 
-use crate::{errors::BaseRelayError, pocket_conversion::pocket_event_to_tangle};
+use crate::errors::BaseRelayError;
 use std::str;
 use tangle_protocol::{RelayMessage, SubscriptionId};
 use tangle_store_pocket::PocketOwnedEvent;
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum RuntimeRelayMessage {
+pub enum RuntimeRelayMessage {
     Event {
         subscription_id: SubscriptionId,
         event: PocketOwnedEvent,
@@ -22,7 +22,7 @@ impl RuntimeRelayMessage {
         }
     }
 
-    pub(crate) fn encode(&self) -> Result<String, BaseRelayError> {
+    pub fn encode(&self) -> Result<String, BaseRelayError> {
         match self {
             Self::Event {
                 subscription_id,
@@ -32,15 +32,11 @@ impl RuntimeRelayMessage {
         }
     }
 
-    pub(crate) fn into_protocol_message(self) -> Result<RelayMessage, BaseRelayError> {
+    pub(crate) fn into_protocol_control_message(self) -> Result<RelayMessage, BaseRelayError> {
         match self {
-            Self::Event {
-                subscription_id,
-                event,
-            } => Ok(RelayMessage::Event {
-                subscription_id,
-                event: pocket_event_to_tangle(&event)?,
-            }),
+            Self::Event { .. } => Err(BaseRelayError::error(
+                "event-bearing runtime messages must be encoded from Pocket events",
+            )),
             Self::Protocol(message) => Ok(message),
         }
     }
@@ -52,12 +48,31 @@ impl From<RelayMessage> for RuntimeRelayMessage {
     }
 }
 
-pub(crate) fn protocol_messages(
+pub(crate) fn protocol_control_messages(
     messages: Vec<RuntimeRelayMessage>,
 ) -> Result<Vec<RelayMessage>, BaseRelayError> {
     messages
         .into_iter()
-        .map(RuntimeRelayMessage::into_protocol_message)
+        .map(RuntimeRelayMessage::into_protocol_control_message)
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn protocol_messages_for_test(
+    messages: Vec<RuntimeRelayMessage>,
+) -> Result<Vec<RelayMessage>, BaseRelayError> {
+    messages
+        .into_iter()
+        .map(|message| match message {
+            RuntimeRelayMessage::Event {
+                subscription_id,
+                event,
+            } => Ok(RelayMessage::Event {
+                subscription_id,
+                event: crate::pocket_conversion::pocket_event_to_tangle(&event)?,
+            }),
+            RuntimeRelayMessage::Protocol(message) => Ok(message),
+        })
         .collect()
 }
 

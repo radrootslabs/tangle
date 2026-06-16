@@ -20,8 +20,6 @@ use tangle_groups::{
     event_view::GroupEventView, group_current_key, member_current_key, projection_checkpoint_key,
     rebuild_group_projection, role_current_key, tombstone_key,
 };
-#[cfg(test)]
-use tangle_protocol::Event;
 use tangle_protocol::{EventId, PublicKeyHex, UnixTimestamp};
 use tangle_store_pocket::{
     PocketEvent, PocketEventId, PocketOwnedEvent, PocketStoreHandle, TANGLE_GROUP_CHECKPOINT_TABLE,
@@ -152,20 +150,6 @@ impl GroupServiceHandle {
             .map_err(|_| BaseRelayError::error("group service state lock is poisoned"))?
             .store_group_pocket_event(store, event, class, auth)
     }
-
-    #[cfg(test)]
-    pub(crate) fn store_group_event(
-        &self,
-        store: &PocketStoreHandle,
-        event: &Event,
-        class: &GroupEventClass,
-        auth: &GroupAuthContext,
-    ) -> Result<GroupEventWrite, GroupEventWriteError> {
-        self.state
-            .write()
-            .map_err(|_| BaseRelayError::error("group service state lock is poisoned"))?
-            .store_group_event(store, event, class, auth)
-    }
 }
 
 impl GroupServiceState {
@@ -282,34 +266,6 @@ impl GroupServiceState {
         }
         let store_offset =
             StoreOffset::new(store.store_event(event).map_err(BaseRelayError::from)?);
-        let mut stored_offsets = vec![store_offset];
-        stored_offsets.extend(self.after_source_event_stored(store, event, class, store_offset)?);
-        Ok(GroupEventWrite::Stored(stored_offsets))
-    }
-
-    #[cfg(test)]
-    fn store_group_event(
-        &mut self,
-        store: &PocketStoreHandle,
-        event: &Event,
-        class: &GroupEventClass,
-        auth: &GroupAuthContext,
-    ) -> Result<GroupEventWrite, GroupEventWriteError> {
-        self.check_event(store, event, class, auth)
-            .map_err(GroupEventWriteError::Rejected)?;
-        if store
-            .event_by_id(pocket_event_id(event.id())?)
-            .map_err(BaseRelayError::from)?
-            .is_some()
-        {
-            return Ok(GroupEventWrite::Duplicate);
-        }
-        let pocket_event = crate::pocket_conversion::tangle_event_to_pocket(event)?;
-        let store_offset = StoreOffset::new(
-            store
-                .store_event(&pocket_event)
-                .map_err(BaseRelayError::from)?,
-        );
         let mut stored_offsets = vec![store_offset];
         stored_offsets.extend(self.after_source_event_stored(store, event, class, store_offset)?);
         Ok(GroupEventWrite::Stored(stored_offsets))

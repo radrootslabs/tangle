@@ -400,6 +400,7 @@ mod tests {
         log_runtime_config_loaded, sanitize_error_message,
     };
     use crate::config::parse_base_relay_runtime_config_json;
+    use crate::pocket_conversion::tangle_event_to_pocket;
     use std::{
         io,
         sync::{Arc, Mutex},
@@ -576,14 +577,15 @@ mod tests {
         ];
 
         for (event, action_family, target_count, generated_state_rejection) in cases {
-            let class = classify_group_event(&event, GroupLimitsConfig::default()).expect("class");
+            let pocket = tangle_event_to_pocket(&event).expect("pocket");
+            let class = classify_group_event(&pocket, GroupLimitsConfig::default()).expect("class");
             let result = if matches!(class, GroupEventClass::RelayGeneratedSnapshot { .. }) {
                 TangleModerationAuditResult::Rejected
             } else {
                 TangleModerationAuditResult::Accepted
             };
             let entry =
-                TangleModerationAuditEntry::new(&event, &class, result).expect("audit entry");
+                TangleModerationAuditEntry::new(&pocket, &class, result).expect("audit entry");
 
             assert_eq!(entry.action_family, action_family);
             assert_eq!(entry.target_count, target_count);
@@ -606,7 +608,8 @@ mod tests {
             "secret-content",
         )
         .expect("join");
-        let class = classify_group_event(&event, GroupLimitsConfig::default()).expect("class");
+        let pocket = tangle_event_to_pocket(&event).expect("pocket");
+        let class = classify_group_event(&pocket, GroupLimitsConfig::default()).expect("class");
         let writer = CapturedWriter::default();
         let subscriber = tracing_subscriber::fmt()
             .json()
@@ -615,7 +618,7 @@ mod tests {
             .finish();
 
         tracing::subscriber::with_default(subscriber, || {
-            log_group_moderation_audit(&event, &class, TangleModerationAuditResult::Rejected);
+            log_group_moderation_audit(&pocket, &class, TangleModerationAuditResult::Rejected);
         });
 
         let output = writer.output();
@@ -641,10 +644,11 @@ mod tests {
     fn group_moderation_audit_ignores_non_requested_group_event_kinds() {
         let event =
             tangle_v2_group_event(FixtureKey::Member, "AuditFarm", 41, 1, "normal").expect("event");
-        let class = classify_group_event(&event, GroupLimitsConfig::default()).expect("class");
+        let pocket = tangle_event_to_pocket(&event).expect("pocket");
+        let class = classify_group_event(&pocket, GroupLimitsConfig::default()).expect("class");
 
         assert!(
-            TangleModerationAuditEntry::new(&event, &class, TangleModerationAuditResult::Accepted)
+            TangleModerationAuditEntry::new(&pocket, &class, TangleModerationAuditResult::Accepted)
                 .is_none()
         );
     }

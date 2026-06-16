@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+use crate::relay::outbound::protocol_messages_for_test;
 use crate::{
     client_message::RuntimeClientMessage,
     config::BaseRelayRuntimeConfig,
@@ -21,7 +23,7 @@ use crate::{
             BaseRelayShutdownReport,
         },
         live::LiveSubscriptionSet,
-        outbound::{RuntimeRelayMessage, protocol_messages},
+        outbound::{RuntimeRelayMessage, protocol_control_messages},
     },
 };
 use serde::{Deserialize, Serialize};
@@ -830,7 +832,7 @@ impl TangleRuntimeHandle {
                 now,
             )
             .await?;
-        protocol_messages(messages)
+        protocol_control_messages(messages)
     }
 
     #[cfg(test)]
@@ -848,7 +850,7 @@ impl TangleRuntimeHandle {
                 now,
             )
             .await?;
-        protocol_messages(messages)
+        protocol_messages_for_test(messages)
     }
 
     #[cfg(test)]
@@ -882,7 +884,7 @@ impl TangleRuntimeHandle {
                 now,
             )
             .await?;
-        protocol_messages(messages)
+        protocol_messages_for_test(messages)
     }
 
     pub(crate) async fn handle_client_message_with_rate_limit_context(

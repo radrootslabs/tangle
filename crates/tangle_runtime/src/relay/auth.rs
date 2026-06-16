@@ -9,8 +9,11 @@ use crate::{
 };
 use std::collections::BTreeSet;
 use std::str;
+#[cfg(test)]
 use tangle_crypto::verify_event_signature;
-use tangle_protocol::{Event, PublicKeyHex, RelayMessage, UnixTimestamp};
+#[cfg(test)]
+use tangle_protocol::Event;
+use tangle_protocol::{PublicKeyHex, RelayMessage, UnixTimestamp};
 use tangle_store_pocket::PocketEvent;
 
 pub fn generate_auth_challenge() -> Result<String, BaseRelayError> {
@@ -75,6 +78,7 @@ impl BaseAuthState {
         Ok(RelayMessage::Auth(challenge))
     }
 
+    #[cfg(test)]
     pub fn authenticate(
         &mut self,
         event: &Event,
@@ -123,7 +127,7 @@ impl BaseAuthState {
         Ok(pubkey)
     }
 
-    pub(crate) fn authenticate_pocket(
+    pub fn authenticate_pocket(
         &mut self,
         event: &PocketEvent,
         now: UnixTimestamp,
@@ -208,6 +212,7 @@ impl BaseRelayAuthEvent {
     }
 }
 
+#[cfg(test)]
 fn parse_base_relay_auth_event(event: &Event) -> Result<Option<BaseRelayAuthEvent>, String> {
     if event.unsigned().kind().as_u32() != 22_242 {
         return Ok(None);
@@ -254,6 +259,7 @@ fn parse_base_relay_pocket_auth_event(
     }))
 }
 
+#[cfg(test)]
 fn required_single_tag_value(event: &Event, name: &str) -> Result<String, String> {
     let mut matches = event
         .unsigned()

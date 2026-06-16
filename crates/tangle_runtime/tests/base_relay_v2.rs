@@ -12,8 +12,9 @@ use tangle_groups::{
     projection_checkpoint_key,
 };
 use tangle_protocol::{
-    Event, Filter, RawEventJson, RelayMessage, SubscriptionId, Tag, UnixTimestamp, event_to_value,
-    filter_from_value, filter_to_value, parse_client_message, parse_event_json,
+    Event, Filter, PublicKeyHex, RawEventJson, RelayMessage, SubscriptionId, Tag, UnixTimestamp,
+    event_from_value, event_to_value, filter_from_value, filter_to_value, parse_client_message,
+    parse_event_json,
 };
 use tangle_runtime::{
     config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
@@ -24,10 +25,11 @@ use tangle_runtime::{
         auth::BaseAuthState,
         core::{BaseRelay, BaseRelayLimitSettings, BaseRelayLimits},
         live::CloseResult,
+        outbound::RuntimeRelayMessage,
     },
 };
 use tangle_store_pocket::{
-    PocketQueryConfig, PocketStoreConfig, PocketStoreHandle, PocketSyncPolicy,
+    PocketOwnedEvent, PocketQueryConfig, PocketStoreConfig, PocketStoreHandle, PocketSyncPolicy,
     TANGLE_GROUP_CHECKPOINT_TABLE, TANGLE_GROUP_OUTBOX_TABLE, TANGLE_GROUP_PROJECTION_TABLE,
     parse_pocket_event_json, parse_pocket_filter_json,
 };
@@ -78,7 +80,7 @@ impl BaseRelayEventTestExt for BaseRelay {
     fn fanout(&mut self, event: &Event) -> Vec<RelayMessage> {
         let raw = serde_json::to_vec(&event_to_value(event)).expect("event JSON");
         let pocket = parse_pocket_event_json(&raw).expect("pocket event");
-        self.fanout_pocket(&pocket)
+        runtime_messages_to_protocol(self.fanout_pocket(&pocket)).expect("protocol fanout")
     }
 
     fn fanout_with_group_auth(
@@ -88,7 +90,8 @@ impl BaseRelayEventTestExt for BaseRelay {
     ) -> Vec<RelayMessage> {
         let raw = serde_json::to_vec(&event_to_value(event)).expect("event JSON");
         let pocket = parse_pocket_event_json(&raw).expect("pocket event");
-        self.fanout_pocket_with_group_auth(&pocket, auth)
+        runtime_messages_to_protocol(self.fanout_pocket_with_group_auth(&pocket, auth))
+            .expect("protocol fanout")
     }
 }
 
@@ -113,7 +116,9 @@ impl BaseRelayReqTestExt for BaseRelay {
         subscription_id: SubscriptionId,
         filters: Vec<Filter>,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
-        self.handle_pocket_req(subscription_id, pocket_filters(filters))
+        runtime_messages_to_protocol(
+            self.handle_pocket_req(subscription_id, pocket_filters(filters))?,
+        )
     }
 
     fn handle_req_with_auth(
@@ -122,7 +127,52 @@ impl BaseRelayReqTestExt for BaseRelay {
         filters: Vec<Filter>,
         auth: &BaseAuthState,
     ) -> Result<Vec<RelayMessage>, BaseRelayError> {
-        self.handle_pocket_req_with_auth(subscription_id, pocket_filters(filters), auth)
+        runtime_messages_to_protocol(self.handle_pocket_req_with_auth(
+            subscription_id,
+            pocket_filters(filters),
+            auth,
+        )?)
+    }
+}
+
+fn runtime_messages_to_protocol(
+    messages: Vec<RuntimeRelayMessage>,
+) -> Result<Vec<RelayMessage>, BaseRelayError> {
+    messages
+        .into_iter()
+        .map(runtime_message_to_protocol)
+        .collect()
+}
+
+fn runtime_message_to_protocol(
+    message: RuntimeRelayMessage,
+) -> Result<RelayMessage, BaseRelayError> {
+    match message {
+        RuntimeRelayMessage::Protocol(message) => Ok(message),
+        RuntimeRelayMessage::Event {
+            subscription_id,
+            event,
+        } => {
+            let encoded = RuntimeRelayMessage::Event {
+                subscription_id: subscription_id.clone(),
+                event,
+            }
+            .encode()?;
+            let value = serde_json::from_str::<serde_json::Value>(&encoded)
+                .map_err(|error| BaseRelayError::error(error.to_string()))?;
+            let event = value
+                .as_array()
+                .and_then(|items| items.get(2))
+                .ok_or_else(|| BaseRelayError::error("encoded EVENT frame is malformed"))
+                .and_then(|value| {
+                    event_from_value(value)
+                        .map_err(|error| BaseRelayError::error(error.to_string()))
+                })?;
+            Ok(RelayMessage::Event {
+                subscription_id,
+                event,
+            })
+        }
     }
 }
 
@@ -168,6 +218,21 @@ fn pocket_filters(filters: Vec<Filter>) -> Vec<tangle_store_pocket::PocketOwnedF
             parse_pocket_filter_json(&raw).expect("pocket filter")
         })
         .collect()
+}
+
+fn authenticate_pocket_event_for_test(
+    auth: &mut BaseAuthState,
+    event: &Event,
+    now: UnixTimestamp,
+) -> Result<PublicKeyHex, BaseRelayError> {
+    let raw = serde_json::to_vec(&event_to_value(event)).expect("event JSON");
+    let pocket = parse_pocket_event_json(&raw).expect("pocket event");
+    auth.authenticate_pocket(&pocket, now)
+}
+
+fn pocket_event_for_test(event: &Event) -> PocketOwnedEvent {
+    let raw = serde_json::to_vec(&event_to_value(event)).expect("event JSON");
+    parse_pocket_event_json(&raw).expect("pocket event")
 }
 
 #[test]
@@ -261,18 +326,19 @@ fn auth_integration_covers_challenge_edges() {
     let owner_event = tangle_v2_auth_event(FixtureKey::Owner, "challenge-a", 105).expect("owner");
     let admin_event = tangle_v2_auth_event(FixtureKey::Admin, "challenge-a", 110).expect("admin");
 
-    let owner = auth
-        .authenticate(&owner_event, UnixTimestamp::new(105))
-        .expect("owner");
-    let admin = auth
-        .authenticate(&admin_event, UnixTimestamp::new(110))
-        .expect("admin");
+    let owner =
+        authenticate_pocket_event_for_test(&mut auth, &owner_event, UnixTimestamp::new(105))
+            .expect("owner");
+    let admin =
+        authenticate_pocket_event_for_test(&mut auth, &admin_event, UnixTimestamp::new(110))
+            .expect("admin");
 
     assert_ne!(owner, admin);
     assert!(auth.authenticated_pubkeys().contains(&owner));
     assert!(auth.authenticated_pubkeys().contains(&admin));
     assert_eq!(
-        auth.authenticate(
+        authenticate_pocket_event_for_test(
+            &mut auth,
             &tangle_v2_auth_event(FixtureKey::Member, "wrong", 111).expect("wrong"),
             UnixTimestamp::new(111),
         )
@@ -284,13 +350,13 @@ fn auth_integration_covers_challenge_edges() {
     let expired = BaseAuthState::new(TANGLE_V2_RELAY_URL, 1, 600).expect("expired");
     let mut expired = issue_challenge(expired, "challenge-b", 100);
     assert_eq!(
-        expired
-            .authenticate(
-                &tangle_v2_auth_event(FixtureKey::Owner, "challenge-b", 101).expect("expired"),
-                UnixTimestamp::new(102),
-            )
-            .expect_err("expired")
-            .prefixed_message(),
+        authenticate_pocket_event_for_test(
+            &mut expired,
+            &tangle_v2_auth_event(FixtureKey::Owner, "challenge-b", 101).expect("expired"),
+            UnixTimestamp::new(102),
+        )
+        .expect_err("expired")
+        .prefixed_message(),
         "auth-required: auth challenge expired"
     );
 
@@ -299,10 +365,13 @@ fn auth_integration_covers_challenge_edges() {
         .issue_challenge("challenge-a", UnixTimestamp::new(100))
         .expect("challenge");
     assert_eq!(
-        wrong_relay
-            .authenticate(&owner_event, UnixTimestamp::new(105))
-            .expect_err("relay")
-            .prefixed_message(),
+        authenticate_pocket_event_for_test(
+            &mut wrong_relay,
+            &owner_event,
+            UnixTimestamp::new(105),
+        )
+        .expect_err("relay")
+        .prefixed_message(),
         "auth-required: auth relay does not match canonical relay URL"
     );
 }
@@ -2232,8 +2301,7 @@ fn store_source_events(config: &PocketStoreConfig, events: &[Event]) -> Vec<Stor
     let store = PocketStoreHandle::open(config).expect("store");
     let mut offsets = Vec::new();
     for event in events {
-        let raw = serde_json::to_vec(&event_to_value(event)).expect("event JSON");
-        let pocket = parse_pocket_event_json(&raw).expect("pocket event");
+        let pocket = pocket_event_for_test(event);
         offsets.push(StoreOffset::new(store.store_event(&pocket).expect("store")));
     }
     store.sync().expect("sync");
@@ -2248,8 +2316,9 @@ fn seed_pending_create_outbox_records(
     let store = PocketStoreHandle::open(config).expect("store");
     let group_id = group("CrashFarm");
     let mut projection = GroupProjection::new();
+    let create_pocket = pocket_event_for_test(create);
     projection
-        .apply_canonical_event(create, create_offset, GroupLimitsConfig::default())
+        .apply_canonical_event(&create_pocket, create_offset, GroupLimitsConfig::default())
         .expect("projection");
     let authority = GroupAuthority::new(
         [FixtureKey::Owner.public_key()],
@@ -2331,10 +2400,11 @@ fn pending_recovery_outbox_records(
         [FixtureKey::Admin.public_key()],
     );
     let mut projection = GroupProjection::new();
+    let pocket_events = events.iter().map(pocket_event_for_test).collect::<Vec<_>>();
     let mut records = Vec::new();
 
     projection
-        .apply_canonical_event(&events[0], offsets[0], limits)
+        .apply_canonical_event(&pocket_events[0], offsets[0], limits)
         .expect("create projection");
     let create_group = projection.group(&group_id).expect("create group");
     records.push(GroupOutboxRecord::pending(
@@ -2367,7 +2437,7 @@ fn pending_recovery_outbox_records(
     ));
 
     projection
-        .apply_canonical_event(&events[1], offsets[1], limits)
+        .apply_canonical_event(&pocket_events[1], offsets[1], limits)
         .expect("put projection");
     records.push(GroupOutboxRecord::pending(
         GroupOutboxKey::new(
@@ -2402,7 +2472,7 @@ fn pending_recovery_outbox_records(
     ));
 
     projection
-        .apply_canonical_event(&events[2], offsets[2], limits)
+        .apply_canonical_event(&pocket_events[2], offsets[2], limits)
         .expect("metadata projection");
     let metadata_group = projection.group(&group_id).expect("metadata group");
     records.push(GroupOutboxRecord::pending(
@@ -2851,7 +2921,7 @@ fn authenticated(key: FixtureKey) -> BaseAuthState {
     let auth = BaseAuthState::new(TANGLE_V2_RELAY_URL, 60, 600).expect("auth");
     let mut auth = issue_challenge(auth, "challenge-a", 100);
     let event = tangle_v2_auth_event(key, "challenge-a", 120).expect("auth event");
-    auth.authenticate(&event, UnixTimestamp::new(120))
+    authenticate_pocket_event_for_test(&mut auth, &event, UnixTimestamp::new(120))
         .expect("authenticate");
     auth
 }

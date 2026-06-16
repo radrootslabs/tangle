@@ -1,7 +1,9 @@
 use crate::errors::{GroupError, GroupErrorKind};
 use pocket_types::{Event as PocketEvent, OwnedEvent as PocketOwnedEvent, TagsStringIter};
 use std::str;
-use tangle_protocol::{Event, EventId, Kind, PublicKeyHex, Tag, TagName, UnixTimestamp};
+#[cfg(test)]
+use tangle_protocol::{Event, Tag};
+use tangle_protocol::{EventId, Kind, PublicKeyHex, UnixTimestamp};
 
 pub trait GroupEventView {
     fn id_hex(&self) -> String;
@@ -53,12 +55,13 @@ impl<'a> GroupEventTag<'a> {
 
     pub fn indexed_pair(&self) -> Option<(&'a str, &'a str)> {
         let name = self.first_value()?;
-        if !TagName::is_indexable_name(name) {
+        if !is_indexable_tag_name(name) {
             return None;
         }
         self.value(1).map(|value| (name, value))
     }
 
+    #[cfg(test)]
     fn from_tangle(tag: &'a Tag) -> Self {
         Self {
             values: tag.values().iter().map(String::as_str).collect(),
@@ -74,6 +77,7 @@ impl<'a> GroupEventTag<'a> {
     }
 }
 
+#[cfg(test)]
 impl GroupEventView for Event {
     fn id_hex(&self) -> String {
         self.id().as_str().to_owned()
@@ -159,6 +163,14 @@ impl GroupEventView for PocketOwnedEvent {
         let event: &PocketEvent = self;
         event.visit_tags(visitor)
     }
+}
+
+fn is_indexable_tag_name(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    let Some(byte) = bytes.next() else {
+        return false;
+    };
+    bytes.next().is_none() && byte.is_ascii_alphabetic()
 }
 
 fn tag_value_utf8(value: &[u8]) -> Result<&str, GroupError> {
