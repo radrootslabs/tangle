@@ -1796,7 +1796,8 @@ mod tests {
         Tag, UnixTimestamp, UnsignedEvent, filter_from_value,
     };
     use tangle_store_pocket::{
-        PocketEvent, PocketOwnedFilter, PocketQueryConfig, PocketStoreConfig, PocketSyncPolicy,
+        PocketEvent, PocketKind, PocketOwnedEvent, PocketOwnedFilter, PocketOwnedTags,
+        PocketQueryConfig, PocketStoreConfig, PocketSyncPolicy, PocketTime,
     };
 
     trait BaseRelayCountTestExt {
@@ -2950,24 +2951,22 @@ mod tests {
     #[test]
     fn base_relay_pocket_event_path_preserves_event_admission_behavior() {
         let relay = test_relay("base-relay-pocket-event-store-path", 8);
-        let valid = signed_public_event(7, 1, Vec::new(), "valid");
-        let signature_source = signed_public_event(8, 1, Vec::new(), "signature source");
-        let invalid = Event::new(
-            valid.id().clone(),
-            valid.unsigned().clone(),
-            signature_source.sig().clone(),
-        );
-        let ephemeral = signed_public_event(7, 20_001, Vec::new(), "ephemeral");
-        let protected = signed_public_event(
-            7,
-            1,
-            vec![Tag::from_parts("-", &[]).expect("protected")],
-            "protected",
-        );
-        let valid_pocket = tangle_event_to_pocket(&valid).expect("valid pocket");
-        let invalid_pocket = tangle_event_to_pocket(&invalid).expect("invalid pocket");
-        let ephemeral_pocket = tangle_event_to_pocket(&ephemeral).expect("ephemeral pocket");
-        let protected_pocket = tangle_event_to_pocket(&protected).expect("protected pocket");
+        let tags = PocketOwnedTags::empty();
+        let protected_tags = PocketOwnedTags::new(&[["-"]]).expect("protected tags");
+        let valid_pocket = signed_pocket_event(7, 1, &tags, b"valid");
+        let signature_source = signed_pocket_event(8, 1, &tags, b"valid");
+        let invalid_pocket = PocketOwnedEvent::new(
+            valid_pocket.id(),
+            valid_pocket.kind(),
+            valid_pocket.pubkey(),
+            signature_source.sig(),
+            valid_pocket.tags().expect("tags"),
+            valid_pocket.created_at(),
+            valid_pocket.content(),
+        )
+        .expect("invalid pocket");
+        let ephemeral_pocket = signed_pocket_event(7, 20_001, &tags, b"ephemeral");
+        let protected_pocket = signed_pocket_event(7, 1, &protected_tags, b"protected");
 
         assert!(
             rejected_message(relay.handle_pocket_event(&invalid_pocket).expect("invalid"))
@@ -2975,27 +2974,27 @@ mod tests {
         );
         assert_eq!(count_kind(&relay, 1), 0);
 
-        assert_accepted(
+        assert_pocket_accepted(
             relay
                 .handle_pocket_event(&valid_pocket)
                 .expect("valid pocket"),
-            &valid,
+            &valid_pocket,
         );
         assert_eq!(
             relay.handle_pocket_event(&valid_pocket).expect("duplicate"),
             RelayMessage::Ok {
-                event_id: valid.id().clone(),
+                event_id: pocket_event_id(&valid_pocket),
                 accepted: true,
                 message: "duplicate: already have this event".to_owned()
             }
         );
         assert_eq!(count_kind(&relay, 1), 1);
 
-        assert_accepted(
+        assert_pocket_accepted(
             relay
                 .handle_pocket_event(&ephemeral_pocket)
                 .expect("ephemeral"),
-            &ephemeral,
+            &ephemeral_pocket,
         );
         assert_eq!(count_kind(&relay, 20_001), 0);
 
@@ -3007,11 +3006,11 @@ mod tests {
             ),
             "auth-required: protected event requires authenticated event author"
         );
-        assert_accepted(
+        assert_pocket_accepted(
             relay
                 .handle_pocket_event_with_auth(&protected_pocket, &authenticated_state(7))
                 .expect("protected auth"),
-            &protected,
+            &protected_pocket,
         );
     }
 
@@ -4274,6 +4273,34 @@ mod tests {
         signed_event_at(secret_byte, kind, tags, content, 1_714_124_433)
     }
 
+    fn signed_pocket_event(
+        secret_byte: u8,
+        kind: u16,
+        tags: &PocketOwnedTags,
+        content: &[u8],
+    ) -> PocketOwnedEvent {
+        signed_pocket_event_at(secret_byte, kind, tags, content, 1_714_124_433)
+    }
+
+    fn signed_pocket_event_at(
+        secret_byte: u8,
+        kind: u16,
+        tags: &PocketOwnedTags,
+        content: &[u8],
+        created_at: u64,
+    ) -> PocketOwnedEvent {
+        let secret = format!("{secret_byte:02x}").repeat(32);
+        RelaySigner::from_secret_hex(&secret)
+            .expect("signer")
+            .sign_pocket_event(
+                PocketKind::from_u16(kind),
+                tags,
+                PocketTime::from_u64(created_at),
+                content,
+            )
+            .expect("pocket event")
+    }
+
     fn signed_group_create_event(secret_byte: u8, group_id: &str) -> Event {
         signed_group_create_event_with_tags(secret_byte, group_id, Vec::new(), 1_714_124_433)
     }
@@ -4322,6 +4349,10 @@ mod tests {
             content,
         );
         signer.sign_unsigned_event(unsigned)
+    }
+
+    fn pocket_event_id(event: &PocketEvent) -> EventId {
+        EventId::new(&event.id().as_hex_string()).expect("event id")
     }
 
     fn authenticated_state(secret_byte: u8) -> BaseAuthState {
@@ -4423,6 +4454,17 @@ mod tests {
             message,
             RelayMessage::Ok {
                 event_id: event.id().clone(),
+                accepted: true,
+                message: String::new()
+            }
+        );
+    }
+
+    fn assert_pocket_accepted(message: RelayMessage, event: &PocketEvent) {
+        assert_eq!(
+            message,
+            RelayMessage::Ok {
+                event_id: pocket_event_id(event),
                 accepted: true,
                 message: String::new()
             }

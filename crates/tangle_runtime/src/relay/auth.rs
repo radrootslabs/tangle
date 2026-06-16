@@ -316,9 +316,9 @@ fn lower_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{BaseAuthState, generate_auth_challenge};
-    use crate::pocket_conversion::tangle_event_to_pocket;
     use tangle_crypto::RelaySigner;
     use tangle_protocol::{Event, EventId, Kind, RelayMessage, Tag, UnixTimestamp, UnsignedEvent};
+    use tangle_store_pocket::{PocketKind, PocketOwnedEvent, PocketOwnedTags, PocketTime};
 
     #[test]
     fn auth_state_issues_challenges_and_accepts_multiple_pubkeys() {
@@ -597,16 +597,14 @@ mod tests {
         let mut auth = BaseAuthState::new("wss://relay.radroots.test", 20, 10).expect("auth state");
         auth.issue_challenge("challenge-a", UnixTimestamp::new(100))
             .expect("challenge");
-        let owner = signed_auth_event(7, "challenge-a", 105);
-        let admin = signed_auth_event(8, "challenge-a", 106);
-        let owner_pocket = tangle_event_to_pocket(&owner).expect("owner pocket");
-        let admin_pocket = tangle_event_to_pocket(&admin).expect("admin pocket");
+        let owner = signed_pocket_auth_event(7, "challenge-a", 105);
+        let admin = signed_pocket_auth_event(8, "challenge-a", 106);
 
         let owner_pubkey = auth
-            .authenticate_pocket(&owner_pocket, UnixTimestamp::new(105))
+            .authenticate_pocket(&owner, UnixTimestamp::new(105))
             .expect("owner");
         let admin_pubkey = auth
-            .authenticate_pocket(&admin_pocket, UnixTimestamp::new(106))
+            .authenticate_pocket(&admin, UnixTimestamp::new(106))
             .expect("admin");
 
         assert_ne!(owner_pubkey, admin_pubkey);
@@ -620,27 +618,36 @@ mod tests {
         let mut auth = BaseAuthState::new("wss://relay.radroots.test", 20, 10).expect("auth state");
         auth.issue_challenge("challenge-a", UnixTimestamp::new(100))
             .expect("challenge");
-        let owner = signed_auth_event(7, "challenge-a", 105);
-        let admin = signed_auth_event(8, "challenge-a", 106);
+        let owner = signed_pocket_auth_event(7, "challenge-a", 105);
+        let admin = signed_pocket_auth_event(8, "challenge-a", 105);
 
-        let wrong_id = tangle_event_to_pocket(&Event::new(
-            EventId::new(&"0".repeat(EventId::HEX_LENGTH)).expect("id"),
-            owner.unsigned().clone(),
-            owner.sig().clone(),
-        ))
+        let id_source = signed_pocket_auth_event(7, "challenge-a", 106);
+        let wrong_id = PocketOwnedEvent::new(
+            id_source.id(),
+            owner.kind(),
+            owner.pubkey(),
+            owner.sig(),
+            owner.tags().expect("tags"),
+            owner.created_at(),
+            owner.content(),
+        )
         .expect("wrong id pocket");
         assert!(
             auth.authenticate_pocket(&wrong_id, UnixTimestamp::new(105))
                 .expect_err("id")
                 .prefixed_message()
-                .starts_with("invalid: event id mismatch:")
+                .starts_with("invalid:")
         );
 
-        let wrong_signature = tangle_event_to_pocket(&Event::new(
-            owner.id().clone(),
-            owner.unsigned().clone(),
-            admin.sig().clone(),
-        ))
+        let wrong_signature = PocketOwnedEvent::new(
+            owner.id(),
+            owner.kind(),
+            owner.pubkey(),
+            admin.sig(),
+            owner.tags().expect("tags"),
+            owner.created_at(),
+            owner.content(),
+        )
         .expect("wrong signature pocket");
         assert!(
             auth.authenticate_pocket(&wrong_signature, UnixTimestamp::new(105))
@@ -651,44 +658,43 @@ mod tests {
 
         for (event, now, expected) in [
             (
-                signed_event(9, 1, auth_tags("challenge-a"), 105),
+                signed_pocket_event(9, 1, pocket_auth_tags("challenge-a"), 105),
                 105,
                 "invalid: AUTH message must contain kind 22242",
             ),
             (
-                signed_event(
+                signed_pocket_event(
                     9,
                     22_242,
-                    auth_tags_for("wss://other.radroots.test", "challenge-a"),
+                    pocket_auth_tags_for("wss://other.radroots.test", "challenge-a"),
                     105,
                 ),
                 105,
                 "auth-required: auth relay does not match canonical relay URL",
             ),
             (
-                signed_auth_event(9, "wrong", 105),
+                signed_pocket_auth_event(9, "wrong", 105),
                 105,
                 "auth-required: auth challenge does not match",
             ),
             (
-                signed_auth_event(9, "challenge-a", 121),
+                signed_pocket_auth_event(9, "challenge-a", 121),
                 121,
                 "auth-required: auth challenge expired",
             ),
             (
-                signed_auth_event(9, "challenge-a", 94),
+                signed_pocket_auth_event(9, "challenge-a", 94),
                 105,
                 "auth-required: auth event created_at is outside configured skew",
             ),
             (
-                signed_auth_event(9, "challenge-a", 116),
+                signed_pocket_auth_event(9, "challenge-a", 116),
                 105,
                 "auth-required: auth event created_at is outside configured skew",
             ),
         ] {
-            let pocket = tangle_event_to_pocket(&event).expect("pocket");
             assert_eq!(
-                auth.authenticate_pocket(&pocket, UnixTimestamp::new(now))
+                auth.authenticate_pocket(&event, UnixTimestamp::new(now))
                     .expect_err("invalid")
                     .prefixed_message(),
                 expected
@@ -711,6 +717,14 @@ mod tests {
         signed_event(secret_byte, 22_242, auth_tags(challenge), created_at)
     }
 
+    fn signed_pocket_auth_event(
+        secret_byte: u8,
+        challenge: &str,
+        created_at: u64,
+    ) -> PocketOwnedEvent {
+        signed_pocket_event(secret_byte, 22_242, pocket_auth_tags(challenge), created_at)
+    }
+
     fn signed_event(secret_byte: u8, kind: u64, tags: Vec<Tag>, created_at: u64) -> Event {
         let secret = format!("{:02x}", secret_byte).repeat(32);
         let signer = RelaySigner::from_secret_hex(&secret).expect("signer");
@@ -724,6 +738,24 @@ mod tests {
         signer.sign_unsigned_event(unsigned)
     }
 
+    fn signed_pocket_event(
+        secret_byte: u8,
+        kind: u16,
+        tags: PocketOwnedTags,
+        created_at: u64,
+    ) -> PocketOwnedEvent {
+        let secret = format!("{secret_byte:02x}").repeat(32);
+        RelaySigner::from_secret_hex(&secret)
+            .expect("signer")
+            .sign_pocket_event(
+                PocketKind::from_u16(kind),
+                &tags,
+                PocketTime::from_u64(created_at),
+                b"",
+            )
+            .expect("pocket event")
+    }
+
     fn auth_tags(challenge: &str) -> Vec<Tag> {
         auth_tags_for("wss://relay.radroots.test", challenge)
     }
@@ -733,5 +765,13 @@ mod tests {
             Tag::from_parts("relay", &[relay]).expect("relay"),
             Tag::from_parts("challenge", &[challenge]).expect("challenge"),
         ]
+    }
+
+    fn pocket_auth_tags(challenge: &str) -> PocketOwnedTags {
+        pocket_auth_tags_for("wss://relay.radroots.test", challenge)
+    }
+
+    fn pocket_auth_tags_for(relay: &str, challenge: &str) -> PocketOwnedTags {
+        PocketOwnedTags::new(&[["relay", relay], ["challenge", challenge]]).expect("tags")
     }
 }

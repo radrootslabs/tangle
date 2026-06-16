@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 use crate::errors::BaseRelayError;
-use std::str;
 use tangle_protocol::{EventId, Kind, PublicKeyHex, UnixTimestamp};
 use tangle_store_pocket::PocketEvent;
 
@@ -60,17 +59,15 @@ pub(crate) fn is_pocket_nip70_protected_event(event: &PocketEvent) -> Result<boo
 }
 
 pub(crate) fn verify_pocket_event_signature(event: &PocketEvent) -> Result<(), BaseRelayError> {
-    let canonical = pocket_canonical_event_json(event)?;
-    tangle_crypto::verify_event_signature_bytes(
-        &canonical,
-        &event.id().into_inner(),
-        event.pubkey().as_bytes(),
-        &event.sig().into_inner(),
-    )
-    .map_err(BaseRelayError::invalid)
+    event
+        .verify()
+        .map_err(|error| BaseRelayError::invalid(error.to_string()))
 }
 
+#[cfg(test)]
 pub(crate) fn pocket_canonical_event_json(event: &PocketEvent) -> Result<String, BaseRelayError> {
+    use std::str;
+
     let tags = event
         .tags()
         .map_err(|error| BaseRelayError::invalid(format!("malformed Pocket event tags: {error}")))?
@@ -105,45 +102,54 @@ mod tests {
         pocket_event_pubkey, validate_pocket_event_shape, verify_pocket_event_signature,
     };
     use crate::pocket_conversion::tangle_event_to_pocket;
-    use tangle_protocol::{Event, EventId, Tag, event_to_value};
-    use tangle_store_pocket::parse_pocket_event_json;
+    use tangle_crypto::RelaySigner;
+    use tangle_protocol::{Tag, event_to_value};
+    use tangle_store_pocket::{
+        PocketKind, PocketOwnedEvent, PocketOwnedTags, PocketTime, parse_pocket_event_json,
+    };
     use tangle_test_support::{FixtureKey, tangle_v2_event};
 
     #[test]
     fn pocket_event_validation_verifies_valid_and_invalid_signatures() {
-        let event = tangle_v2_event(FixtureKey::Member, 1_714_124_433, 1, Vec::new(), "hello")
-            .expect("event");
-        let pocket = tangle_event_to_pocket(&event).expect("pocket");
+        let tags = PocketOwnedTags::empty();
+        let pocket = pocket_event(12, 1_714_124_433, 1, &tags, b"hello");
 
         assert_eq!(verify_pocket_event_signature(&pocket), Ok(()));
 
-        let signature_source =
-            tangle_v2_event(FixtureKey::Admin, 1_714_124_433, 1, Vec::new(), "hello")
-                .expect("signature source");
-        let wrong_signature = Event::new(
-            event.id().clone(),
-            event.unsigned().clone(),
-            signature_source.sig().clone(),
-        );
-        let wrong_pocket = tangle_event_to_pocket(&wrong_signature).expect("wrong pocket");
+        let signature_source = pocket_event(11, 1_714_124_433, 1, &tags, b"hello");
+        let wrong_signature = PocketOwnedEvent::new(
+            pocket.id(),
+            pocket.kind(),
+            pocket.pubkey(),
+            signature_source.sig(),
+            pocket.tags().expect("tags"),
+            pocket.created_at(),
+            pocket.content(),
+        )
+        .expect("wrong signature");
         assert!(
-            verify_pocket_event_signature(&wrong_pocket)
+            verify_pocket_event_signature(&wrong_signature)
                 .expect_err("signature")
                 .prefixed_message()
                 .starts_with("invalid:")
         );
 
-        let wrong_id = Event::new(
-            EventId::new(&"0".repeat(64)).expect("id"),
-            event.unsigned().clone(),
-            event.sig().clone(),
-        );
-        let wrong_id_pocket = tangle_event_to_pocket(&wrong_id).expect("wrong id pocket");
+        let id_source = pocket_event(12, 1_714_124_433, 1, &tags, b"other");
+        let wrong_id = PocketOwnedEvent::new(
+            id_source.id(),
+            pocket.kind(),
+            pocket.pubkey(),
+            pocket.sig(),
+            pocket.tags().expect("tags"),
+            pocket.created_at(),
+            pocket.content(),
+        )
+        .expect("wrong id");
         assert!(
-            verify_pocket_event_signature(&wrong_id_pocket)
+            verify_pocket_event_signature(&wrong_id)
                 .expect_err("id")
                 .prefixed_message()
-                .starts_with("invalid: event id mismatch:")
+                .starts_with("invalid:")
         );
     }
 
@@ -197,5 +203,24 @@ mod tests {
             pocket_canonical_event_json(&pocket).expect("canonical"),
             event.unsigned().canonical_json()
         );
+    }
+
+    fn pocket_event(
+        secret_byte: u8,
+        created_at: u64,
+        kind: u16,
+        tags: &PocketOwnedTags,
+        content: &[u8],
+    ) -> PocketOwnedEvent {
+        let secret = format!("{secret_byte:02x}").repeat(32);
+        RelaySigner::from_secret_hex(&secret)
+            .expect("signer")
+            .sign_pocket_event(
+                PocketKind::from_u16(kind),
+                tags,
+                PocketTime::from_u64(created_at),
+                content,
+            )
+            .expect("pocket event")
     }
 }
