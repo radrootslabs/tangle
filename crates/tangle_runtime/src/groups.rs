@@ -25,7 +25,7 @@ use tangle_groups::{
 };
 use tangle_protocol::{Event, EventId, PublicKeyHex, UnixTimestamp};
 use tangle_store_pocket::{
-    PocketStoreHandle, TANGLE_GROUP_CHECKPOINT_TABLE, TANGLE_GROUP_OUTBOX_TABLE,
+    PocketEvent, PocketStoreHandle, TANGLE_GROUP_CHECKPOINT_TABLE, TANGLE_GROUP_OUTBOX_TABLE,
     TANGLE_GROUP_PROJECTION_TABLE,
 };
 
@@ -119,6 +119,20 @@ impl GroupServiceHandle {
             .event_visible_to_auth(event, auth)
     }
 
+    pub(crate) fn store_group_pocket_event(
+        &self,
+        store: &PocketStoreHandle,
+        event: &PocketEvent,
+        class: &GroupEventClass,
+        auth: &GroupAuthContext,
+    ) -> Result<GroupEventWrite, GroupEventWriteError> {
+        self.state
+            .write()
+            .map_err(|_| BaseRelayError::error("group service state lock is poisoned"))?
+            .store_group_pocket_event(store, event, class, auth)
+    }
+
+    #[cfg(test)]
     pub(crate) fn store_group_event(
         &self,
         store: &PocketStoreHandle,
@@ -176,7 +190,7 @@ impl GroupServiceState {
     fn check_event(
         &self,
         store: &PocketStoreHandle,
-        event: &Event,
+        event: &(impl GroupEventView + ?Sized),
         class: &GroupEventClass,
         auth: &GroupAuthContext,
     ) -> Result<(), GroupError> {
@@ -189,7 +203,7 @@ impl GroupServiceState {
     fn check_runtime_write_constraints(
         &self,
         store: &PocketStoreHandle,
-        event: &Event,
+        event: &(impl GroupEventView + ?Sized),
         class: &GroupEventClass,
     ) -> Result<(), GroupError> {
         if let GroupEventClass::Moderation { kind, group_id } = class
@@ -203,7 +217,7 @@ impl GroupServiceState {
     fn check_delete_event_target(
         &self,
         store: &PocketStoreHandle,
-        event: &Event,
+        event: &(impl GroupEventView + ?Sized),
         group_id: &GroupId,
     ) -> Result<(), GroupError> {
         let target_id = delete_target_event_id(event)?;
@@ -229,6 +243,36 @@ impl GroupServiceState {
         Ok(())
     }
 
+    fn store_group_pocket_event(
+        &mut self,
+        store: &PocketStoreHandle,
+        event: &PocketEvent,
+        class: &GroupEventClass,
+        auth: &GroupAuthContext,
+    ) -> Result<GroupEventWrite, GroupEventWriteError> {
+        self.check_event(store, event, class, auth)
+            .map_err(GroupEventWriteError::Rejected)?;
+        if store
+            .event_by_id(event.id())
+            .map_err(BaseRelayError::from)?
+            .is_some()
+        {
+            return Ok(GroupEventWrite::Duplicate);
+        }
+        let projection_event = pocket_event_to_tangle(event)?;
+        let store_offset =
+            StoreOffset::new(store.store_event(event).map_err(BaseRelayError::from)?);
+        let mut stored_offsets = vec![store_offset];
+        stored_offsets.extend(self.after_source_event_stored(
+            store,
+            &projection_event,
+            class,
+            store_offset,
+        )?);
+        Ok(GroupEventWrite::Stored(stored_offsets))
+    }
+
+    #[cfg(test)]
     fn store_group_event(
         &mut self,
         store: &PocketStoreHandle,
@@ -695,10 +739,13 @@ fn member_is_relay_override_admin(
         })
 }
 
-fn membership_target_pubkey(event: &Event) -> Result<PublicKeyHex, GroupError> {
-    for tag in event.unsigned().tags() {
-        if tag.values().first().is_none_or(|name| name != "p") {
-            continue;
+fn membership_target_pubkey(
+    event: &(impl GroupEventView + ?Sized),
+) -> Result<PublicKeyHex, GroupError> {
+    let mut target = None;
+    event.visit_tags(|tag| {
+        if tag.first_value().is_none_or(|name| name != "p") {
+            return Ok(());
         }
         let Some((_, value)) = tag.indexed_pair() else {
             return Err(GroupError::invalid(
@@ -706,17 +753,17 @@ fn membership_target_pubkey(event: &Event) -> Result<PublicKeyHex, GroupError> {
                 "malformed p target tag",
             ));
         };
-        return PublicKeyHex::new(value).map_err(|reason| {
+        target = Some(PublicKeyHex::new(value).map_err(|reason| {
             GroupError::invalid(
                 GroupErrorKind::MalformedTargetTag,
                 format!("malformed p target tag: {reason}"),
             )
-        });
-    }
-    Err(GroupError::invalid(
-        GroupErrorKind::MissingTargetTag,
-        "missing p target tag",
-    ))
+        })?);
+        Ok(())
+    })?;
+    target.ok_or_else(|| {
+        GroupError::invalid(GroupErrorKind::MissingTargetTag, "missing p target tag")
+    })
 }
 
 fn pending_record(
@@ -1137,10 +1184,11 @@ fn class_group_id(class: &GroupEventClass) -> Option<&GroupId> {
     }
 }
 
-fn delete_target_event_id(event: &Event) -> Result<EventId, GroupError> {
-    for tag in event.unsigned().tags() {
-        if tag.values().first().is_none_or(|name| name != "e") {
-            continue;
+fn delete_target_event_id(event: &(impl GroupEventView + ?Sized)) -> Result<EventId, GroupError> {
+    let mut target = None;
+    event.visit_tags(|tag| {
+        if tag.first_value().is_none_or(|name| name != "e") {
+            return Ok(());
         }
         let Some((_, value)) = tag.indexed_pair() else {
             return Err(GroupError::invalid(
@@ -1148,17 +1196,17 @@ fn delete_target_event_id(event: &Event) -> Result<EventId, GroupError> {
                 "malformed e target tag",
             ));
         };
-        return EventId::new(value).map_err(|reason| {
+        target = Some(EventId::new(value).map_err(|reason| {
             GroupError::invalid(
                 GroupErrorKind::MalformedTargetTag,
                 format!("malformed e target tag: {reason}"),
             )
-        });
-    }
-    Err(GroupError::invalid(
-        GroupErrorKind::MissingTargetTag,
-        "missing e target tag",
-    ))
+        })?);
+        Ok(())
+    })?;
+    target.ok_or_else(|| {
+        GroupError::invalid(GroupErrorKind::MissingTargetTag, "missing e target tag")
+    })
 }
 
 #[cfg(test)]

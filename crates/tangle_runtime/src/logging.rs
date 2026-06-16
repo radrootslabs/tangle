@@ -6,12 +6,12 @@ use crate::{
 };
 use std::{fmt, net::IpAddr, net::SocketAddr};
 use tangle_groups::{
-    GroupEventClass, KIND_GROUP_ADMINS, KIND_GROUP_CREATE_GROUP, KIND_GROUP_DELETE_EVENT,
-    KIND_GROUP_DELETE_GROUP, KIND_GROUP_EDIT_METADATA, KIND_GROUP_JOIN_REQUEST,
-    KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA, KIND_GROUP_PUT_USER,
-    KIND_GROUP_REMOVE_USER,
+    GroupEventClass, GroupEventView, KIND_GROUP_ADMINS, KIND_GROUP_CREATE_GROUP,
+    KIND_GROUP_DELETE_EVENT, KIND_GROUP_DELETE_GROUP, KIND_GROUP_EDIT_METADATA,
+    KIND_GROUP_JOIN_REQUEST, KIND_GROUP_LEAVE_REQUEST, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA,
+    KIND_GROUP_PUT_USER, KIND_GROUP_REMOVE_USER,
 };
-use tangle_protocol::{Event, EventId, SubscriptionId, UnixTimestamp};
+use tangle_protocol::{EventId, SubscriptionId, UnixTimestamp};
 use tracing_subscriber::EnvFilter;
 
 pub const TANGLE_LOG_REDACTED: &str = "<redacted>";
@@ -269,11 +269,13 @@ pub(crate) struct TangleModerationAuditEntry {
 
 impl TangleModerationAuditEntry {
     pub(crate) fn new(
-        event: &Event,
+        event: &(impl GroupEventView + ?Sized),
         class: &GroupEventClass,
         result: TangleModerationAuditResult,
     ) -> Option<Self> {
         let action_family = moderation_audit_action_family(event, class)?;
+        let event_id = event.id().ok()?;
+        let actor_pubkey = event.pubkey().ok()?;
         let generated_state_rejection = matches!(
             (class, result),
             (
@@ -284,9 +286,9 @@ impl TangleModerationAuditEntry {
         Some(Self {
             action_family,
             result: result.as_str(),
-            event_id: event.id().as_str().to_owned(),
-            actor_pubkey: event.unsigned().pubkey().as_str().to_owned(),
-            event_kind: event.unsigned().kind().as_u32(),
+            event_id: event_id.as_str().to_owned(),
+            actor_pubkey: actor_pubkey.as_str().to_owned(),
+            event_kind: event.kind_u32(),
             target_count: moderation_target_count(event, action_family),
             generated_state_rejection,
         })
@@ -294,7 +296,7 @@ impl TangleModerationAuditEntry {
 }
 
 pub(crate) fn log_group_moderation_audit(
-    event: &Event,
+    event: &(impl GroupEventView + ?Sized),
     class: &GroupEventClass,
     result: TangleModerationAuditResult,
 ) {
@@ -320,7 +322,10 @@ pub fn sanitize_error_message(config: &BaseRelayRuntimeConfig, message: impl AsR
     TangleLogRedactor::from_runtime_config(config).redact(message)
 }
 
-fn moderation_audit_action_family(event: &Event, class: &GroupEventClass) -> Option<&'static str> {
+fn moderation_audit_action_family(
+    event: &(impl GroupEventView + ?Sized),
+    class: &GroupEventClass,
+) -> Option<&'static str> {
     match class {
         GroupEventClass::Moderation { kind, .. } => match kind.as_u32() {
             KIND_GROUP_CREATE_GROUP => Some("group_create"),
@@ -331,7 +336,7 @@ fn moderation_audit_action_family(event: &Event, class: &GroupEventClass) -> Opt
             KIND_GROUP_REMOVE_USER => Some("remove_user"),
             _ => None,
         },
-        GroupEventClass::Normal { .. } => match event.unsigned().kind().as_u32() {
+        GroupEventClass::Normal { .. } => match event.kind_u32() {
             KIND_GROUP_JOIN_REQUEST => Some("join"),
             KIND_GROUP_LEAVE_REQUEST => Some("leave"),
             _ => None,
@@ -346,7 +351,7 @@ fn moderation_audit_action_family(event: &Event, class: &GroupEventClass) -> Opt
     }
 }
 
-fn moderation_target_count(event: &Event, action_family: &str) -> usize {
+fn moderation_target_count(event: &(impl GroupEventView + ?Sized), action_family: &str) -> usize {
     let target_tag = match action_family {
         "put_user" | "remove_user" | "members" => Some("p"),
         "delete_event" => Some("e"),
@@ -355,15 +360,22 @@ fn moderation_target_count(event: &Event, action_family: &str) -> usize {
     let Some(target_tag) = target_tag else {
         return 0;
     };
-    event
-        .unsigned()
-        .tags()
-        .iter()
-        .filter(|tag| {
-            tag.indexed_pair()
+    let mut count = 0;
+    if event
+        .visit_tags(|tag| {
+            if tag
+                .indexed_pair()
                 .is_some_and(|(name, _)| name == target_tag)
+            {
+                count += 1;
+            }
+            Ok(())
         })
-        .count()
+        .is_err()
+    {
+        return 0;
+    }
+    count
 }
 
 fn relay_secret_log_value(config: &BaseRelayRuntimeConfig) -> &'static str {

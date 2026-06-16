@@ -1072,11 +1072,11 @@ impl BaseRelay {
             Ok(class) => class,
             Err(error) => {
                 if let Some(class) = audit_class.as_ref() {
-                    log_pocket_group_moderation_audit(
+                    logging::log_group_moderation_audit(
                         event,
                         class,
                         TangleModerationAuditResult::Rejected,
-                    )?;
+                    );
                 }
                 return Ok(BaseRelayEventWrite::unstored(ok_rejected(
                     event_id,
@@ -1085,10 +1085,9 @@ impl BaseRelay {
             }
         };
         if !matches!(class, GroupEventClass::NonGroup) {
-            let tangle_event = pocket_event_to_tangle(event)?;
             let Some(groups) = groups else {
                 logging::log_group_moderation_audit(
-                    &tangle_event,
+                    event,
                     &class,
                     TangleModerationAuditResult::Rejected,
                 );
@@ -1097,10 +1096,10 @@ impl BaseRelay {
                     "blocked: NIP-29 group events are not accepted before group service".to_owned(),
                 )));
             };
-            match groups.store_group_event(store, &tangle_event, &class, auth) {
+            match groups.store_group_pocket_event(store, event, &class, auth) {
                 Ok(GroupEventWrite::Stored(stored_offsets)) => {
                     logging::log_group_moderation_audit(
-                        &tangle_event,
+                        event,
                         &class,
                         TangleModerationAuditResult::Accepted,
                     );
@@ -1111,7 +1110,7 @@ impl BaseRelay {
                 }
                 Ok(GroupEventWrite::Duplicate) => {
                     logging::log_group_moderation_audit(
-                        &tangle_event,
+                        event,
                         &class,
                         TangleModerationAuditResult::Accepted,
                     );
@@ -1122,7 +1121,7 @@ impl BaseRelay {
                 }
                 Err(GroupEventWriteError::Rejected(error)) => {
                     logging::log_group_moderation_audit(
-                        &tangle_event,
+                        event,
                         &class,
                         TangleModerationAuditResult::Rejected,
                     );
@@ -1632,16 +1631,6 @@ impl BaseRelay {
 
 fn filters_are_complete(filters: &[Filter]) -> bool {
     !filters.is_empty() && filters.iter().all(Filter::is_complete)
-}
-
-fn log_pocket_group_moderation_audit(
-    event: &PocketEvent,
-    class: &GroupEventClass,
-    result: TangleModerationAuditResult,
-) -> Result<(), BaseRelayError> {
-    let event = pocket_event_to_tangle(event)?;
-    logging::log_group_moderation_audit(&event, class, result);
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2680,9 +2669,13 @@ mod tests {
         let core_source = include_str!("core.rs");
         let group_source = include_str!("../groups.rs");
 
-        assert!(core_source.contains("groups.store_group_event"));
+        assert!(core_source.contains("groups.store_group_pocket_event"));
         assert!(!core_source.contains(concat!("groups.", "check_event")));
         assert!(!core_source.contains(concat!("groups.", "after_source_event_stored")));
+        assert!(!core_source.contains(concat!(
+            "let tangle_event = ",
+            "pocket_event_to_tangle(event)?;"
+        )));
         assert!(!group_source.contains("pub(crate) fn check_event("));
         assert!(!group_source.contains("pub(crate) fn after_source_event_stored("));
     }
