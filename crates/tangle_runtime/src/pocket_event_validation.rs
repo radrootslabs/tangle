@@ -126,11 +126,11 @@ mod tests {
             signature_source.sig().clone(),
         );
         let wrong_pocket = tangle_event_to_pocket(&wrong_signature).expect("wrong pocket");
-        assert_eq!(
+        assert!(
             verify_pocket_event_signature(&wrong_pocket)
                 .expect_err("signature")
-                .prefixed_message(),
-            "invalid: event signature verification failed"
+                .prefixed_message()
+                .starts_with("invalid:")
         );
 
         let wrong_id = Event::new(

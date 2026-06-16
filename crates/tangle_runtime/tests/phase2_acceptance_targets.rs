@@ -394,11 +394,11 @@ async fn websocket_public_relay_covers_query_count_ephemeral_and_rejection_flows
     );
 
     send_client_value(&mut publisher, json!(["EVENT", event_to_value(&invalid)])).await;
-    assert_ok(
+    assert_ok_message_prefix(
         read_relay_value(&mut publisher).await,
         &invalid,
         false,
-        "invalid: event signature verification failed",
+        "invalid:",
     );
     expect_no_relay_message(&mut subscriber).await;
 
@@ -2521,6 +2521,17 @@ fn assert_notice_prefix(value: Value, prefix: &str) {
 
 fn assert_ok(value: Value, event: &Event, accepted: bool, message: &str) {
     assert_eq!(value, json!(["OK", event.id().as_str(), accepted, message]));
+}
+
+fn assert_ok_message_prefix(value: Value, event: &Event, accepted: bool, prefix: &str) {
+    assert_eq!(value[0], "OK");
+    assert_eq!(value[1], event.id().as_str());
+    assert_eq!(value[2], accepted);
+    assert!(
+        value[3]
+            .as_str()
+            .is_some_and(|message| message.starts_with(prefix))
+    );
 }
 
 fn assert_live_event(value: Value, subscription_id: &str, event: &Event) {

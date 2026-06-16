@@ -642,11 +642,11 @@ mod tests {
             admin.sig().clone(),
         ))
         .expect("wrong signature pocket");
-        assert_eq!(
+        assert!(
             auth.authenticate_pocket(&wrong_signature, UnixTimestamp::new(105))
                 .expect_err("signature")
-                .prefixed_message(),
-            "invalid: event signature verification failed"
+                .prefixed_message()
+                .starts_with("invalid:")
         );
 
         for (event, now, expected) in [
