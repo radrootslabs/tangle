@@ -48,6 +48,14 @@ trait BaseRelayEventTestExt {
         event: Event,
         auth: &BaseAuthState,
     ) -> Result<RelayMessage, BaseRelayError>;
+
+    fn fanout(&mut self, event: &Event) -> Vec<RelayMessage>;
+
+    fn fanout_with_group_auth(
+        &mut self,
+        event: &Event,
+        auth: &GroupAuthContext,
+    ) -> Vec<RelayMessage>;
 }
 
 impl BaseRelayEventTestExt for BaseRelay {
@@ -65,6 +73,56 @@ impl BaseRelayEventTestExt for BaseRelay {
         let raw = serde_json::to_vec(&event_to_value(&event)).expect("event JSON");
         let pocket = parse_pocket_event_json(&raw).expect("pocket event");
         self.handle_pocket_event_with_auth(&pocket, auth)
+    }
+
+    fn fanout(&mut self, event: &Event) -> Vec<RelayMessage> {
+        let raw = serde_json::to_vec(&event_to_value(event)).expect("event JSON");
+        let pocket = parse_pocket_event_json(&raw).expect("pocket event");
+        self.fanout_pocket(&pocket)
+    }
+
+    fn fanout_with_group_auth(
+        &mut self,
+        event: &Event,
+        auth: &GroupAuthContext,
+    ) -> Vec<RelayMessage> {
+        let raw = serde_json::to_vec(&event_to_value(event)).expect("event JSON");
+        let pocket = parse_pocket_event_json(&raw).expect("pocket event");
+        self.fanout_pocket_with_group_auth(&pocket, auth)
+    }
+}
+
+trait BaseRelayReqTestExt {
+    fn handle_req(
+        &mut self,
+        subscription_id: SubscriptionId,
+        filters: Vec<Filter>,
+    ) -> Result<Vec<RelayMessage>, BaseRelayError>;
+
+    fn handle_req_with_auth(
+        &mut self,
+        subscription_id: SubscriptionId,
+        filters: Vec<Filter>,
+        auth: &BaseAuthState,
+    ) -> Result<Vec<RelayMessage>, BaseRelayError>;
+}
+
+impl BaseRelayReqTestExt for BaseRelay {
+    fn handle_req(
+        &mut self,
+        subscription_id: SubscriptionId,
+        filters: Vec<Filter>,
+    ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+        self.handle_pocket_req(subscription_id, pocket_filters(filters))
+    }
+
+    fn handle_req_with_auth(
+        &mut self,
+        subscription_id: SubscriptionId,
+        filters: Vec<Filter>,
+        auth: &BaseAuthState,
+    ) -> Result<Vec<RelayMessage>, BaseRelayError> {
+        self.handle_pocket_req_with_auth(subscription_id, pocket_filters(filters), auth)
     }
 }
 

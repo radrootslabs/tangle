@@ -21,7 +21,7 @@ use tangle_runtime::{
     runtime::{TangleRuntime, TangleRuntimeHandle},
 };
 use tangle_store_pocket::{
-    PocketOwnedFilter, PocketQueryConfig, PocketStoreConfig, PocketSyncPolicy,
+    PocketOwnedEvent, PocketOwnedFilter, PocketQueryConfig, PocketStoreConfig, PocketSyncPolicy,
     parse_pocket_event_json, parse_pocket_filter_json,
 };
 use tangle_test_support::{
@@ -1308,12 +1308,13 @@ fn run_broadcast_lag_benchmark(dataset: &BenchDataset) -> Result<ScenarioReport,
     let public_group = dataset.first_group(BenchGroupVisibility::Public)?;
     let subscriber_count = dataset.config.group_count.max(4);
     let filter = filter_from_value(&json!({"kinds": [1], "#h": [public_group.id()]}))?;
+    let pocket_filter = pocket_filter(&filter)?;
     for index in 0..subscriber_count {
         materialized
             .relay
-            .handle_req(
+            .handle_pocket_req(
                 subscription(&format!("lag-{index:04}"))?,
-                vec![filter.clone()],
+                vec![pocket_filter.clone()],
             )
             .map_err(|error| error.to_string())?;
     }
@@ -1332,8 +1333,10 @@ fn run_broadcast_lag_benchmark(dataset: &BenchDataset) -> Result<ScenarioReport,
         "broadcast lag second",
     )?;
     let started = Instant::now();
-    let first_messages = materialized.relay.fanout(&first);
-    let second_messages = materialized.relay.fanout(&second);
+    let first_pocket = pocket_event(&first)?;
+    let second_pocket = pocket_event(&second)?;
+    let first_messages = materialized.relay.fanout_pocket(&first_pocket);
+    let second_messages = materialized.relay.fanout_pocket(&second_pocket);
     let elapsed = elapsed_micros(started);
     let first_events = first_messages
         .iter()
@@ -1574,12 +1577,15 @@ fn query_for_operation(
     let subscription_id = subscription(operation.name)?;
     let messages = match operation.auth {
         QueryAuth::None => relay
-            .handle_req(subscription_id.clone(), vec![operation.filter.clone()])
+            .handle_pocket_req(
+                subscription_id.clone(),
+                vec![pocket_filter(&operation.filter)?],
+            )
             .map_err(|error| error.to_string())?,
         QueryAuth::Owner => relay
-            .handle_req_with_auth(
+            .handle_pocket_req_with_auth(
                 subscription_id.clone(),
-                vec![operation.filter.clone()],
+                vec![pocket_filter(&operation.filter)?],
                 owner_auth,
             )
             .map_err(|error| error.to_string())?,
@@ -1647,6 +1653,11 @@ fn count_kind(relay: &BaseRelay, kind: u32) -> Result<u64, String> {
 fn pocket_filter(filter: &Filter) -> Result<PocketOwnedFilter, String> {
     let raw = serde_json::to_vec(&filter_to_value(filter)).map_err(|error| error.to_string())?;
     parse_pocket_filter_json(&raw).map_err(|error| error.to_string())
+}
+
+fn pocket_event(event: &Event) -> Result<PocketOwnedEvent, String> {
+    let raw = serde_json::to_vec(&event_to_value(event)).map_err(|error| error.to_string())?;
+    parse_pocket_event_json(&raw).map_err(|error| error.to_string())
 }
 
 fn pocket_filter_from_value(value: &serde_json::Value) -> Result<PocketOwnedFilter, String> {

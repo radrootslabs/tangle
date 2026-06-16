@@ -1690,6 +1690,25 @@ fn runtime_count_handling_does_not_lock_relay_state() {
 }
 
 #[test]
+fn relay_core_exposes_pocket_native_req_and_fanout_boundaries() {
+    let relay_core = include_str!("../src/relay/core.rs");
+
+    assert!(relay_core.contains("pub fn handle_pocket_req("));
+    assert!(relay_core.contains("pub fn handle_pocket_req_with_auth("));
+    assert!(relay_core.contains("pub fn fanout_pocket("));
+    assert!(relay_core.contains("pub fn fanout_pocket_with_group_auth("));
+    assert!(!relay_core.contains("pub fn handle_req("));
+    assert!(!relay_core.contains("pub fn handle_req_with_auth("));
+    assert!(!relay_core.contains("pub fn fanout("));
+    assert!(!relay_core.contains("pub fn fanout_with_group_auth("));
+    assert!(!relay_core.contains("pub fn query_events_with_auth("));
+    assert!(!relay_core.contains("pub fn validate_event("));
+    assert!(!relay_core.contains("pub fn validate_filters("));
+    assert!(relay_core.contains("handle_protocol_req_for_test"));
+    assert!(relay_core.contains("fanout_protocol_for_test"));
+}
+
+#[test]
 fn runtime_live_fanout_offset_lookup_does_not_lock_relay_state() {
     let runtime = include_str!("../src/runtime.rs");
     let fanout_helper = runtime

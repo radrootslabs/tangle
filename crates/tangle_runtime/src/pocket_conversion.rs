@@ -2,12 +2,16 @@
 
 use crate::errors::BaseRelayError;
 use std::str;
+#[cfg(test)]
+use tangle_protocol::Filter;
 use tangle_protocol::{
-    Event, EventId, Filter, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
+    Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
 };
+#[cfg(test)]
+use tangle_store_pocket::PocketOwnedFilter;
 use tangle_store_pocket::{
-    PocketEvent, PocketEventId, PocketKind, PocketOwnedEvent, PocketOwnedFilter, PocketOwnedTags,
-    PocketPubkey, PocketSig, PocketTags, PocketTime,
+    PocketEvent, PocketEventId, PocketKind, PocketOwnedEvent, PocketOwnedTags, PocketPubkey,
+    PocketSig, PocketTags, PocketTime,
 };
 
 pub(crate) fn tangle_event_to_pocket(event: &Event) -> Result<PocketOwnedEvent, BaseRelayError> {
@@ -25,6 +29,7 @@ pub(crate) fn tangle_event_to_pocket(event: &Event) -> Result<PocketOwnedEvent, 
     .map_err(|error| BaseRelayError::error(error.to_string()))
 }
 
+#[cfg(test)]
 pub(crate) fn tangle_filter_to_pocket(
     filter: &Filter,
 ) -> Result<PocketOwnedFilter, BaseRelayError> {
@@ -157,6 +162,7 @@ fn ensure_tag_size(size: usize) -> Result<(), BaseRelayError> {
     Ok(())
 }
 
+#[cfg(test)]
 fn ensure_filter_array_len(name: &str, len: usize) -> Result<(), BaseRelayError> {
     if len > usize::from(u16::MAX) {
         return Err(BaseRelayError::invalid(format!(
@@ -166,6 +172,7 @@ fn ensure_filter_array_len(name: &str, len: usize) -> Result<(), BaseRelayError>
     Ok(())
 }
 
+#[cfg(test)]
 fn ensure_filter_size(
     ids: &[PocketEventId],
     authors: &[PocketPubkey],

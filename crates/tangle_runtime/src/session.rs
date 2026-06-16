@@ -1371,13 +1371,12 @@ mod tests {
             second.handle_event_receive_result(second_offset).await,
             TangleSessionControl::Continue
         );
-        assert_eq!(
-            take_outbound_text(&mut second),
+        assert_relay_message_text(
+            &take_outbound_text(&mut second),
             RelayMessage::Event {
                 subscription_id: subscription_id.clone(),
-                event
-            }
-            .encode()
+                event,
+            },
         );
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.client_messages(), 5);
