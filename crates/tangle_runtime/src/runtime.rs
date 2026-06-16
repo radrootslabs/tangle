@@ -2088,7 +2088,6 @@ mod tests {
     };
     use crate::config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json};
     use crate::event_bus::{TangleEventBus, TangleEventReceiveError, TangleEventReceiver};
-    use crate::pocket_conversion::pocket_event_to_tangle;
     use crate::rate_limits::{TangleRateLimitKey, TangleRateLimitQueryClass, TangleRateLimitScope};
     use crate::relay::auth::BaseAuthState;
     use crate::relay::core::{BaseRelayLimitSettings, BaseRelayLimits, BaseRelayQueryMetrics};
@@ -4828,13 +4827,11 @@ mod tests {
             .expect("scan")
             .into_iter()
             .filter_map(|stored| {
-                let event = pocket_event_to_tangle(stored.event()).expect("event");
-                match tangle_groups::classify_group_event(&event, limits).expect("classify") {
+                let store_offset = StoreOffset::new(stored.store_offset());
+                match tangle_groups::classify_group_event(stored.event(), limits).expect("classify")
+                {
                     GroupEventClass::NonGroup => None,
-                    _ => Some(CanonicalGroupEvent::new(
-                        event,
-                        StoreOffset::new(stored.store_offset()),
-                    )),
+                    _ => Some(CanonicalGroupEvent::new(stored.into_event(), store_offset)),
                 }
             })
             .collect::<Vec<_>>();

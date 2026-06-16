@@ -5,8 +5,9 @@ use crate::{
     GroupMetadata, GroupMetadataFlags, GroupMetadataText, RoleDefinition, RoleName, SupportedKinds,
     classify_group_event, event_view::GroupEventView, parse_group_metadata,
 };
+use pocket_types::{Event as PocketEvent, OwnedEvent as PocketOwnedEvent};
 use serde::{Deserialize, Serialize};
-use tangle_protocol::{Event, EventId, Kind, PublicKeyHex, UnixTimestamp};
+use tangle_protocol::{EventId, Kind, PublicKeyHex, UnixTimestamp};
 
 pub const GROUP_PROJECTION_SCHEMA_VERSION: u32 = 1;
 pub const GROUP_POLICY_VERSION: u32 = 1;
@@ -823,19 +824,19 @@ pub enum ProjectionApplyOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalGroupEvent {
-    event: Event,
+    event: PocketOwnedEvent,
     store_offset: StoreOffset,
 }
 
 impl CanonicalGroupEvent {
-    pub fn new(event: Event, store_offset: StoreOffset) -> Self {
+    pub fn new(event: PocketOwnedEvent, store_offset: StoreOffset) -> Self {
         Self {
             event,
             store_offset,
         }
     }
 
-    pub fn event(&self) -> &Event {
+    pub fn event(&self) -> &PocketEvent {
         &self.event
     }
 
@@ -1601,47 +1602,39 @@ mod tests {
     fn projection_rebuild_sorts_before_applying_last_tuple_wins() {
         let report = rebuild_group_projection(
             [
-                CanonicalGroupEvent::new(
-                    event(
-                        KIND_GROUP_EDIT_METADATA,
-                        "30",
-                        30,
-                        vec![
-                            Tag::from_parts("h", &["Farm"]).expect("h"),
-                            Tag::from_parts("name", &["New"]).expect("name"),
-                        ],
-                    ),
-                    StoreOffset::new(3),
+                canonical_event(
+                    KIND_GROUP_EDIT_METADATA,
+                    "30",
+                    30,
+                    vec![
+                        Tag::from_parts("h", &["Farm"]).expect("h"),
+                        Tag::from_parts("name", &["New"]).expect("name"),
+                    ],
+                    3,
                 ),
-                CanonicalGroupEvent::new(
-                    event(
-                        1,
-                        "40",
-                        5,
-                        vec![Tag::from_parts("h", &["Farm"]).expect("h")],
-                    ),
-                    StoreOffset::new(99),
+                canonical_event(
+                    1,
+                    "40",
+                    5,
+                    vec![Tag::from_parts("h", &["Farm"]).expect("h")],
+                    99,
                 ),
-                CanonicalGroupEvent::new(
-                    event(
-                        KIND_GROUP_CREATE_GROUP,
-                        "10",
-                        10,
-                        vec![Tag::from_parts("h", &["Farm"]).expect("h")],
-                    ),
-                    StoreOffset::new(1),
+                canonical_event(
+                    KIND_GROUP_CREATE_GROUP,
+                    "10",
+                    10,
+                    vec![Tag::from_parts("h", &["Farm"]).expect("h")],
+                    1,
                 ),
-                CanonicalGroupEvent::new(
-                    event(
-                        KIND_GROUP_EDIT_METADATA,
-                        "20",
-                        20,
-                        vec![
-                            Tag::from_parts("h", &["Farm"]).expect("h"),
-                            Tag::from_parts("name", &["Old"]).expect("name"),
-                        ],
-                    ),
-                    StoreOffset::new(2),
+                canonical_event(
+                    KIND_GROUP_EDIT_METADATA,
+                    "20",
+                    20,
+                    vec![
+                        Tag::from_parts("h", &["Farm"]).expect("h"),
+                        Tag::from_parts("name", &["Old"]).expect("name"),
+                    ],
+                    2,
                 ),
             ],
             GroupLimitsConfig::default(),
@@ -1671,85 +1664,71 @@ mod tests {
     fn projection_rebuild_matches_incremental_projection_for_full_event_stream() {
         let limits = GroupLimitsConfig::default();
         let events = vec![
-            CanonicalGroupEvent::new(
-                event(
-                    KIND_GROUP_EDIT_METADATA,
-                    "20",
-                    20,
-                    vec![
-                        Tag::from_parts("h", &["Farm"]).expect("h"),
-                        Tag::from_parts("name", &["Market"]).expect("name"),
-                    ],
-                ),
-                StoreOffset::new(2),
+            canonical_event(
+                KIND_GROUP_EDIT_METADATA,
+                "20",
+                20,
+                vec![
+                    Tag::from_parts("h", &["Farm"]).expect("h"),
+                    Tag::from_parts("name", &["Market"]).expect("name"),
+                ],
+                2,
             ),
-            CanonicalGroupEvent::new(
-                event(
-                    1,
-                    "b",
-                    15,
-                    vec![Tag::from_parts("h", &["Farm"]).expect("h")],
-                ),
-                StoreOffset::new(7),
+            canonical_event(
+                1,
+                "b",
+                15,
+                vec![Tag::from_parts("h", &["Farm"]).expect("h")],
+                7,
             ),
-            CanonicalGroupEvent::new(
-                event(
-                    KIND_GROUP_DELETE_GROUP,
-                    "50",
-                    50,
-                    vec![Tag::from_parts("h", &["Farm"]).expect("h")],
-                ),
-                StoreOffset::new(6),
+            canonical_event(
+                KIND_GROUP_DELETE_GROUP,
+                "50",
+                50,
+                vec![Tag::from_parts("h", &["Farm"]).expect("h")],
+                6,
             ),
-            CanonicalGroupEvent::new(
-                event(
-                    KIND_GROUP_CREATE_GROUP,
-                    "10",
-                    10,
-                    vec![
-                        Tag::from_parts("h", &["Farm"]).expect("h"),
-                        Tag::from_parts("name", &["Farmers"]).expect("name"),
-                    ],
-                ),
-                StoreOffset::new(1),
+            canonical_event(
+                KIND_GROUP_CREATE_GROUP,
+                "10",
+                10,
+                vec![
+                    Tag::from_parts("h", &["Farm"]).expect("h"),
+                    Tag::from_parts("name", &["Farmers"]).expect("name"),
+                ],
+                1,
             ),
-            CanonicalGroupEvent::new(
-                event(
-                    KIND_GROUP_PUT_USER,
-                    "30",
-                    30,
-                    vec![
-                        Tag::from_parts("h", &["Farm"]).expect("h"),
-                        Tag::from_parts("p", &[&"8".repeat(64)]).expect("p"),
-                        Tag::from_parts("role", &["moderator"]).expect("role"),
-                    ],
-                ),
-                StoreOffset::new(3),
+            canonical_event(
+                KIND_GROUP_PUT_USER,
+                "30",
+                30,
+                vec![
+                    Tag::from_parts("h", &["Farm"]).expect("h"),
+                    Tag::from_parts("p", &[&"8".repeat(64)]).expect("p"),
+                    Tag::from_parts("role", &["moderator"]).expect("role"),
+                ],
+                3,
             ),
-            CanonicalGroupEvent::new(event(1, "a", 5, Vec::new()), StoreOffset::new(8)),
-            CanonicalGroupEvent::new(
-                event(
-                    KIND_GROUP_METADATA,
-                    "40",
-                    40,
-                    vec![
-                        Tag::from_parts("d", &["Farm"]).expect("d"),
-                        Tag::from_parts("name", &["Snapshot"]).expect("name"),
-                    ],
-                ),
-                StoreOffset::new(4),
+            canonical_event(1, "a", 5, Vec::new(), 8),
+            canonical_event(
+                KIND_GROUP_METADATA,
+                "40",
+                40,
+                vec![
+                    Tag::from_parts("d", &["Farm"]).expect("d"),
+                    Tag::from_parts("name", &["Snapshot"]).expect("name"),
+                ],
+                4,
             ),
-            CanonicalGroupEvent::new(
-                event(
-                    KIND_GROUP_DELETE_EVENT,
-                    "45",
-                    45,
-                    vec![
-                        Tag::from_parts("h", &["Farm"]).expect("h"),
-                        Tag::from_parts("e", &[id("30")]).expect("e"),
-                    ],
-                ),
-                StoreOffset::new(5),
+            canonical_event(
+                KIND_GROUP_DELETE_EVENT,
+                "45",
+                45,
+                vec![
+                    Tag::from_parts("h", &["Farm"]).expect("h"),
+                    Tag::from_parts("e", &[id("30")]).expect("e"),
+                ],
+                5,
             ),
         ];
         let mut incremental_events = events.clone();
@@ -1981,6 +1960,17 @@ mod tests {
                 StoreOffset::new(6),
             ),
         ]
+    }
+
+    fn canonical_event(
+        kind: u32,
+        suffix: &str,
+        created_at: u64,
+        tags: Vec<Tag>,
+        offset: u64,
+    ) -> CanonicalGroupEvent {
+        let event = event(kind, suffix, created_at, tags);
+        CanonicalGroupEvent::new(pocket_event(&event), StoreOffset::new(offset))
     }
 
     fn pocket_event(event: &Event) -> PocketOwnedEvent {

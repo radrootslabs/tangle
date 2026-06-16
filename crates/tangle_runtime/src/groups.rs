@@ -2,7 +2,7 @@
 
 use crate::{
     errors::BaseRelayError,
-    pocket_conversion::{pocket_event_id, pocket_event_to_tangle, tangle_event_to_pocket},
+    pocket_conversion::{pocket_event_id, tangle_event_to_pocket},
 };
 use std::{
     ops::Deref,
@@ -396,7 +396,7 @@ impl GroupServiceState {
             let before_membership_admin =
                 membership_admin_snapshot_state(&projection, item.event(), &class)?;
             projection.apply_canonical_event(item.event(), item.store_offset(), self.limits)?;
-            if item.event().unsigned().pubkey() == &relay_pubkey {
+            if item.event().pubkey().as_hex_string() == relay_pubkey.as_str() {
                 continue;
             }
             for record in plan_group_outbox_records(
@@ -1145,10 +1145,8 @@ pub fn scan_canonical_group_events_after(
             GroupEventClass::Normal { .. }
             | GroupEventClass::Moderation { .. }
             | GroupEventClass::RelayGeneratedSnapshot { .. } => {
-                events.push(CanonicalGroupEvent::new(
-                    pocket_event_to_tangle(stored.event())?,
-                    StoreOffset::new(stored.store_offset()),
-                ));
+                let store_offset = StoreOffset::new(stored.store_offset());
+                events.push(CanonicalGroupEvent::new(stored.into_event(), store_offset));
             }
         }
     }
@@ -1357,9 +1355,13 @@ mod tests {
         assert_eq!(
             scan.events()
                 .iter()
-                .map(|event| event.event().id())
+                .map(|event| event.event().id().as_hex_string())
                 .collect::<Vec<_>>(),
-            vec![normal.id(), group.id(), generated.id()]
+            vec![
+                normal.id().as_str().to_owned(),
+                group.id().as_str().to_owned(),
+                generated.id().as_str().to_owned(),
+            ]
         );
         assert_eq!(
             scan.events()
@@ -1378,9 +1380,13 @@ mod tests {
             after_public
                 .events()
                 .iter()
-                .map(|event| event.event().id())
+                .map(|event| event.event().id().as_hex_string())
                 .collect::<Vec<_>>(),
-            vec![normal.id(), group.id(), generated.id()]
+            vec![
+                normal.id().as_str().to_owned(),
+                group.id().as_str().to_owned(),
+                generated.id().as_str().to_owned(),
+            ]
         );
 
         let _ = std::fs::remove_dir_all(root);
