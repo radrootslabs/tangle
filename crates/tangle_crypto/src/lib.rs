@@ -5,6 +5,10 @@ use std::sync::Arc;
 
 use k256::schnorr::signature::{Signer, Verifier};
 use k256::schnorr::{Signature, SigningKey, VerifyingKey};
+use pocket_types::{
+    Kind as PocketKind, OwnedEvent as PocketOwnedEvent, Tags as PocketTags, Time as PocketTime,
+};
+use secp256k1::{Keypair, Secp256k1, SecretKey};
 use sha2::{Digest, Sha256};
 use tangle_protocol::{
     Event, EventId, PublicKeyHex, SignatureHex, UnsignedEvent, canonical_event_json,
@@ -92,6 +96,7 @@ pub fn verify_event_signature_bytes(
 pub struct RelaySigner {
     signing_key: SigningKey,
     public_key: PublicKeyHex,
+    secret_bytes: [u8; 32],
 }
 
 impl RelaySigner {
@@ -108,6 +113,7 @@ impl RelaySigner {
         Ok(Self {
             signing_key,
             public_key,
+            secret_bytes: bytes,
         })
     }
 
@@ -123,6 +129,21 @@ impl RelaySigner {
         let signature = SignatureHex::new(&lower_hex(signature.to_bytes().as_ref()))
             .expect("schnorr signature emits valid hex");
         Event::new(event_id, unsigned, signature)
+    }
+
+    pub fn sign_pocket_event(
+        &self,
+        kind: PocketKind,
+        tags: &PocketTags,
+        created_at: PocketTime,
+        content: &[u8],
+    ) -> Result<PocketOwnedEvent, String> {
+        let secp = Secp256k1::new();
+        let secret_key = SecretKey::from_byte_array(self.secret_bytes)
+            .map_err(|_| "relay secret is not a valid secp256k1 signing key".to_owned())?;
+        let keypair = Keypair::from_secret_key(&secp, &secret_key);
+        PocketOwnedEvent::sign_new(&keypair, kind, tags, created_at, content)
+            .map_err(|error| format!("Pocket event signing failed: {error}"))
     }
 }
 
@@ -236,6 +257,7 @@ mod tests {
     };
     use k256::schnorr::signature::Signer;
     use k256::schnorr::{Signature, SigningKey};
+    use pocket_types::{Kind as PocketKind, OwnedTags as PocketOwnedTags, Time as PocketTime};
     use std::time::Duration;
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -318,6 +340,29 @@ mod tests {
             )
         );
         assert!(!format!("{signer:?}").contains(&secret));
+    }
+
+    #[test]
+    fn relay_signer_signs_pocket_events() {
+        let secret = "7".repeat(64);
+        let signer = RelaySigner::from_secret_hex(&secret).expect("signer");
+        let tags = PocketOwnedTags::new(&[["d", "Farm"]]).expect("tags");
+        let event = signer
+            .sign_pocket_event(
+                PocketKind::from_u16(39_000),
+                &tags,
+                PocketTime::from_u64(20),
+                b"",
+            )
+            .expect("event");
+
+        event.verify().expect("verify");
+        assert_eq!(event.pubkey().as_hex_string(), signer.public_key().as_str());
+        assert_eq!(event.kind().as_u16(), 39_000);
+        assert_eq!(
+            event.id().as_hex_string(),
+            "b107997a285780bc383ee5aadc0a0eefc46734914103d80f765a46543622782a"
+        );
     }
 
     #[test]

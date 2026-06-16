@@ -5,6 +5,10 @@ use crate::{
     GroupState, KIND_GROUP_ADMINS, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA, KIND_GROUP_PUT_USER,
     KIND_GROUP_REMOVE_USER, MemberStatus, RoleName, SupportedKinds,
 };
+use pocket_types::{
+    Kind as PocketKind, OwnedEvent as PocketOwnedEvent, OwnedTags as PocketOwnedTags,
+    Time as PocketTime,
+};
 use tangle_crypto::RelaySigner;
 use tangle_protocol::{Event, Kind, PublicKeyHex, Tag, UnixTimestamp, UnsignedEvent};
 
@@ -130,6 +134,34 @@ impl GroupGeneratedEventBuilder {
             payload.content(),
         );
         Ok(self.signer.sign_unsigned_event(unsigned))
+    }
+
+    pub fn sign_payload_pocket(
+        &self,
+        payload: &GroupOutboxPayload,
+    ) -> Result<PocketOwnedEvent, GroupError> {
+        let kind = PocketKind::from_u16(
+            u16::try_from(payload.generated_kind())
+                .map_err(|_| GroupError::internal("generated event kind exceeds Pocket kind"))?,
+        );
+        let tags = PocketOwnedTags::new(payload.tags()).map_err(|error| {
+            GroupError::internal(format!("generated Pocket tags are invalid: {error}"))
+        })?;
+        let event = self
+            .signer
+            .sign_pocket_event(
+                kind,
+                &tags,
+                PocketTime::from_u64(payload.generated_created_at().as_u64()),
+                payload.content().as_bytes(),
+            )
+            .map_err(GroupError::internal)?;
+        event.verify().map_err(|error| {
+            GroupError::internal(format!(
+                "generated Pocket event failed verification: {error}"
+            ))
+        })?;
+        Ok(event)
     }
 
     pub fn build_metadata_snapshot(
@@ -359,11 +391,134 @@ mod tests {
         }
     }
 
+    #[test]
+    fn generated_pocket_events_have_stable_ids_and_verify() {
+        let builder = builder();
+        let group_id = GroupId::new("Farm").expect("group");
+        let group = group_state("Farm", GroupMetadata::empty());
+        let member = pubkey("4");
+        let owner = pubkey("1");
+        let admin = pubkey("2");
+        let metadata = builder
+            .sign_payload_pocket(
+                &GroupGeneratedEventBuilder::metadata_snapshot_payload(
+                    &group,
+                    UnixTimestamp::new(20),
+                )
+                .expect("payload"),
+            )
+            .expect("metadata");
+        let admins = builder
+            .sign_payload_pocket(
+                &GroupGeneratedEventBuilder::admin_list_snapshot_payload(
+                    &group_id,
+                    &GroupProjection::new(),
+                    &GroupAuthority::new([owner.clone()], [admin.clone()]),
+                    UnixTimestamp::new(20),
+                )
+                .expect("payload"),
+            )
+            .expect("admins");
+        let mut projection = GroupProjection::new();
+        projection.put_member(
+            group_id.clone(),
+            MemberState::new(
+                member.clone(),
+                MemberStatus::Member,
+                Default::default(),
+                event_id("30"),
+                tuple(30, "30", 3),
+            ),
+        );
+        let members = builder
+            .sign_payload_pocket(
+                &GroupGeneratedEventBuilder::member_list_snapshot_payload(
+                    &group_id,
+                    &projection,
+                    UnixTimestamp::new(20),
+                    1,
+                )
+                .expect("payload")
+                .expect("members"),
+            )
+            .expect("members");
+        let join = builder
+            .sign_payload_pocket(&GroupGeneratedEventBuilder::join_accepted_payload(
+                &group_id,
+                &member,
+                UnixTimestamp::new(20),
+            ))
+            .expect("join");
+        let leave = builder
+            .sign_payload_pocket(&GroupGeneratedEventBuilder::leave_accepted_payload(
+                &group_id,
+                &member,
+                UnixTimestamp::new(21),
+            ))
+            .expect("leave");
+
+        for (event, kind, event_id, expected_tags) in [
+            (
+                metadata,
+                KIND_GROUP_METADATA,
+                "b107997a285780bc383ee5aadc0a0eefc46734914103d80f765a46543622782a",
+                vec![vec!["d", "Farm"]],
+            ),
+            (
+                admins,
+                KIND_GROUP_ADMINS,
+                "f7a2e2a721877794dbd367208eec08bd487cf1955ad60cb615ad77e67b0f66e3",
+                vec![
+                    vec!["d", "Farm"],
+                    vec!["p", owner.as_str()],
+                    vec!["p", admin.as_str()],
+                ],
+            ),
+            (
+                members,
+                KIND_GROUP_MEMBERS,
+                "19aa593a5e6e34cda72286e75aef520c05b56eed07fdee71f0d63b3efee3f814",
+                vec![vec!["d", "Farm"], vec!["p", member.as_str()]],
+            ),
+            (
+                join,
+                KIND_GROUP_PUT_USER,
+                "fcea9360ebfcae11580ce179bffd235dbcdf8093c223986780c0635c9fd720e3",
+                vec![vec!["h", "Farm"], vec!["p", member.as_str()]],
+            ),
+            (
+                leave,
+                KIND_GROUP_REMOVE_USER,
+                "bcba4eb36d55752f9274bf8a3118822a5ac3479fdd23b86b592514c945bd7ee8",
+                vec![vec!["h", "Farm"], vec!["p", member.as_str()]],
+            ),
+        ] {
+            event.verify().expect("verify");
+            assert_eq!(event.id().as_hex_string(), event_id);
+            assert_eq!(u32::from(event.kind().as_u16()), kind);
+            assert_eq!(
+                event.pubkey().as_hex_string(),
+                builder.relay_pubkey().as_str()
+            );
+            assert_eq!(event.content(), b"");
+            for expected in expected_tags {
+                assert!(has_pocket_tag(&event, &expected));
+            }
+        }
+    }
+
     fn has_tag(event: &tangle_protocol::Event, expected: &[&str]) -> bool {
         event.unsigned().tags().iter().any(|tag| {
             tag.values()
                 .iter()
                 .map(String::as_str)
+                .eq(expected.iter().copied())
+        })
+    }
+
+    fn has_pocket_tag(event: &pocket_types::Event, expected: &[&str]) -> bool {
+        event.tags().expect("tags").iter().any(|tag| {
+            tag.map(|value| std::str::from_utf8(value).expect("tag"))
                 .eq(expected.iter().copied())
         })
     }

@@ -9,6 +9,8 @@ description = "Cryptographic verification utilities for Tangle"
 
 [dependencies]
 k256 = { version = "0.13", features = ["schnorr"] }
+pocket-types = { git = "https://github.com/triesap/pocket", rev = "329334f20948c796c6016b673b92551ac4855ad7" }
+secp256k1 = "0.31"
 sha2 = "0.10"
 tangle_protocol = { path = "../tangle_protocol" }
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }

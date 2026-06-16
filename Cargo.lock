@@ -1291,6 +1291,8 @@ name = "tangle_crypto"
 version = "0.1.0"
 dependencies = [
  "k256",
+ "pocket-types",
+ "secp256k1",
  "sha2",
  "tangle_protocol",
  "tokio",
