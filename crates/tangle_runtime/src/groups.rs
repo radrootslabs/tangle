@@ -286,16 +286,10 @@ impl GroupServiceState {
         {
             return Ok(GroupEventWrite::Duplicate);
         }
-        let projection_event = pocket_event_to_tangle(event)?;
         let store_offset =
             StoreOffset::new(store.store_event(event).map_err(BaseRelayError::from)?);
         let mut stored_offsets = vec![store_offset];
-        stored_offsets.extend(self.after_source_event_stored(
-            store,
-            &projection_event,
-            class,
-            store_offset,
-        )?);
+        stored_offsets.extend(self.after_source_event_stored(store, event, class, store_offset)?);
         Ok(GroupEventWrite::Stored(stored_offsets))
     }
 
@@ -349,7 +343,7 @@ impl GroupServiceState {
     fn after_source_event_stored(
         &mut self,
         store: &PocketStoreHandle,
-        event: &Event,
+        event: &(impl GroupEventView + ?Sized),
         class: &GroupEventClass,
         store_offset: StoreOffset,
     ) -> Result<Vec<StoreOffset>, BaseRelayError> {
@@ -374,7 +368,7 @@ impl GroupServiceState {
 
     fn plan_outbox_records(
         &self,
-        event: &Event,
+        event: &(impl GroupEventView + ?Sized),
         class: &GroupEventClass,
         before_membership_admin: Option<bool>,
     ) -> Result<Vec<GroupOutboxRecord>, GroupError> {
@@ -583,14 +577,14 @@ impl GroupServiceState {
 }
 
 fn plan_group_outbox_records(
-    event: &Event,
+    event: &(impl GroupEventView + ?Sized),
     class: &GroupEventClass,
     projection: &GroupProjection,
     authority: &GroupAuthority,
     member_snapshot_cap: u32,
     before_membership_admin: Option<bool>,
 ) -> Result<Vec<GroupOutboxRecord>, GroupError> {
-    let created_at = event.unsigned().created_at();
+    let created_at = event.created_at();
     match class {
         GroupEventClass::Moderation { kind, group_id } => match kind.as_u32() {
             KIND_GROUP_CREATE_GROUP => {
@@ -602,7 +596,7 @@ fn plan_group_outbox_records(
                         group_id,
                         None,
                         GroupGeneratedEventBuilder::metadata_snapshot_payload(group, created_at)?,
-                    ),
+                    )?,
                     pending_record(
                         event,
                         GroupOutboxEffect::AdminListSnapshot,
@@ -611,7 +605,7 @@ fn plan_group_outbox_records(
                         GroupGeneratedEventBuilder::admin_list_snapshot_payload(
                             group_id, projection, authority, created_at,
                         )?,
-                    ),
+                    )?,
                 ])
             }
             KIND_GROUP_EDIT_METADATA => {
@@ -622,7 +616,7 @@ fn plan_group_outbox_records(
                     group_id,
                     None,
                     GroupGeneratedEventBuilder::metadata_snapshot_payload(group, created_at)?,
-                )])
+                )?])
             }
             KIND_GROUP_PUT_USER | KIND_GROUP_REMOVE_USER => member_snapshot_records(
                 event,
@@ -635,29 +629,29 @@ fn plan_group_outbox_records(
             ),
             _ => Ok(Vec::new()),
         },
-        GroupEventClass::Normal { group_id } => match event.unsigned().kind().as_u32() {
+        GroupEventClass::Normal { group_id } => match event.kind_u32() {
             KIND_GROUP_JOIN_REQUEST => Ok(vec![pending_record(
                 event,
                 GroupOutboxEffect::JoinAccepted,
                 group_id,
-                Some(event.unsigned().pubkey().clone()),
+                Some(event.pubkey()?),
                 GroupGeneratedEventBuilder::join_accepted_payload(
                     group_id,
-                    event.unsigned().pubkey(),
+                    &event.pubkey()?,
                     created_at,
                 ),
-            )]),
+            )?]),
             KIND_GROUP_LEAVE_REQUEST => Ok(vec![pending_record(
                 event,
                 GroupOutboxEffect::LeaveAccepted,
                 group_id,
-                Some(event.unsigned().pubkey().clone()),
+                Some(event.pubkey()?),
                 GroupGeneratedEventBuilder::leave_accepted_payload(
                     group_id,
-                    event.unsigned().pubkey(),
+                    &event.pubkey()?,
                     created_at,
                 ),
-            )]),
+            )?]),
             _ => Ok(Vec::new()),
         },
         GroupEventClass::NonGroup | GroupEventClass::RelayGeneratedSnapshot { .. } => {
@@ -667,7 +661,7 @@ fn plan_group_outbox_records(
 }
 
 fn member_snapshot_records(
-    event: &Event,
+    event: &(impl GroupEventView + ?Sized),
     group_id: &GroupId,
     projection: &GroupProjection,
     authority: &GroupAuthority,
@@ -689,21 +683,21 @@ fn member_snapshot_records(
                 GroupGeneratedEventBuilder::admin_list_snapshot_payload(
                     group_id, projection, authority, created_at,
                 )?,
-            ));
+            )?);
         }
     }
     Ok(records)
 }
 
 fn member_snapshot_record(
-    event: &Event,
+    event: &(impl GroupEventView + ?Sized),
     group_id: &GroupId,
     projection: &GroupProjection,
     created_at: UnixTimestamp,
     member_snapshot_cap: u32,
 ) -> Result<Vec<GroupOutboxRecord>, GroupError> {
     let key = GroupOutboxKey::new(
-        event.id().clone(),
+        event.id()?,
         GroupOutboxEffect::MemberListSnapshot,
         group_id.clone(),
         None,
@@ -734,7 +728,7 @@ fn member_snapshot_record(
 
 fn membership_admin_snapshot_state(
     projection: &GroupProjection,
-    event: &Event,
+    event: &(impl GroupEventView + ?Sized),
     class: &GroupEventClass,
 ) -> Result<Option<bool>, GroupError> {
     match class {
@@ -793,16 +787,16 @@ fn membership_target_pubkey(
 }
 
 fn pending_record(
-    event: &Event,
+    event: &(impl GroupEventView + ?Sized),
     effect: GroupOutboxEffect,
     group_id: &GroupId,
     target_pubkey: Option<PublicKeyHex>,
     payload: GroupOutboxPayload,
-) -> GroupOutboxRecord {
-    GroupOutboxRecord::pending(
-        GroupOutboxKey::new(event.id().clone(), effect, group_id.clone(), target_pubkey),
+) -> Result<GroupOutboxRecord, GroupError> {
+    Ok(GroupOutboxRecord::pending(
+        GroupOutboxKey::new(event.id()?, effect, group_id.clone(), target_pubkey),
         payload,
-    )
+    ))
 }
 
 fn require_projected_group<'a>(
