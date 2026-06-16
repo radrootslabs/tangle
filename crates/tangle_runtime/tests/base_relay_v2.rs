@@ -13,7 +13,7 @@ use tangle_groups::{
 };
 use tangle_protocol::{
     Event, Filter, RawEventJson, RelayMessage, SubscriptionId, Tag, UnixTimestamp, event_to_value,
-    filter_from_value, parse_client_message, parse_event_json,
+    filter_from_value, filter_to_value, parse_client_message, parse_event_json,
 };
 use tangle_runtime::{
     config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
@@ -29,7 +29,7 @@ use tangle_runtime::{
 use tangle_store_pocket::{
     PocketQueryConfig, PocketStoreConfig, PocketStoreHandle, PocketSyncPolicy,
     TANGLE_GROUP_CHECKPOINT_TABLE, TANGLE_GROUP_OUTBOX_TABLE, TANGLE_GROUP_PROJECTION_TABLE,
-    parse_pocket_event_json,
+    parse_pocket_event_json, parse_pocket_filter_json,
 };
 use tangle_test_support::{
     FixtureKey, TANGLE_V2_RELAY_SECRET_HEX, TANGLE_V2_RELAY_URL, tangle_v2_auth_event,
@@ -68,6 +68,50 @@ impl BaseRelayEventTestExt for BaseRelay {
     }
 }
 
+trait BaseRelayCountTestExt {
+    fn handle_count_protocol(
+        &self,
+        subscription_id: SubscriptionId,
+        filters: Vec<Filter>,
+    ) -> Result<RelayMessage, BaseRelayError>;
+
+    fn handle_count_with_auth_protocol(
+        &self,
+        subscription_id: SubscriptionId,
+        filters: Vec<Filter>,
+        auth: &BaseAuthState,
+    ) -> Result<RelayMessage, BaseRelayError>;
+}
+
+impl BaseRelayCountTestExt for BaseRelay {
+    fn handle_count_protocol(
+        &self,
+        subscription_id: SubscriptionId,
+        filters: Vec<Filter>,
+    ) -> Result<RelayMessage, BaseRelayError> {
+        BaseRelay::handle_count(self, subscription_id, pocket_filters(filters))
+    }
+
+    fn handle_count_with_auth_protocol(
+        &self,
+        subscription_id: SubscriptionId,
+        filters: Vec<Filter>,
+        auth: &BaseAuthState,
+    ) -> Result<RelayMessage, BaseRelayError> {
+        BaseRelay::handle_count_with_auth(self, subscription_id, pocket_filters(filters), auth)
+    }
+}
+
+fn pocket_filters(filters: Vec<Filter>) -> Vec<tangle_store_pocket::PocketOwnedFilter> {
+    filters
+        .iter()
+        .map(|filter| {
+            let raw = serde_json::to_vec(&filter_to_value(filter)).expect("filter JSON");
+            parse_pocket_filter_json(&raw).expect("pocket filter")
+        })
+        .collect()
+}
+
 #[test]
 fn public_relay_smoke_stores_queries_counts_and_fans_out() {
     let config = test_store_config("public-smoke");
@@ -86,7 +130,7 @@ fn public_relay_smoke_stores_queries_counts_and_fans_out() {
         &[&first],
     );
     assert_count(
-        relay.handle_count(subscription("public-count"), vec![filter_kind(1)]),
+        relay.handle_count_protocol(subscription("public-count"), vec![filter_kind(1)]),
         1,
     );
     assert_eq!(relay.handle_close(&query_id), CloseResult::Closed);
@@ -327,7 +371,7 @@ fn group_auth_lifecycle_membership_and_flag_flows_pass_in_process() {
         &remove,
     );
     assert_count(
-        relay.handle_count(
+        relay.handle_count_protocol(
             subscription("members"),
             vec![filter_kind(KIND_GROUP_MEMBERS)],
         ),
@@ -492,28 +536,28 @@ fn metadata_flags_and_read_privacy_cover_req_count_and_fanout() {
     );
     assert_eq!(relay.active_subscription_count(), 0);
     assert_count(
-        relay.handle_count(
+        relay.handle_count_protocol(
             subscription("private-count-unauth"),
             vec![filter_group_tag(1, "h", "PrivateFarm")],
         ),
         0,
     );
     assert_count(
-        relay.handle_count(
+        relay.handle_count_protocol(
             subscription("private-metadata-unauth"),
             vec![filter_group_tag(KIND_GROUP_METADATA, "d", "PrivateFarm")],
         ),
         1,
     );
     assert_count(
-        relay.handle_count(
+        relay.handle_count_protocol(
             subscription("private-admins-unauth"),
             vec![filter_group_tag(KIND_GROUP_ADMINS, "d", "PrivateFarm")],
         ),
         1,
     );
     assert_count(
-        relay.handle_count(
+        relay.handle_count_protocol(
             subscription("private-members-unauth"),
             vec![filter_kind(KIND_GROUP_MEMBERS)],
         ),
@@ -533,7 +577,7 @@ fn metadata_flags_and_read_privacy_cover_req_count_and_fanout() {
     );
     assert_eq!(relay.handle_close(&owner_query_id), CloseResult::Closed);
     assert_count(
-        relay.handle_count_with_auth(
+        relay.handle_count_with_auth_protocol(
             subscription("private-count-owner"),
             vec![filter_group_tag(1, "h", "PrivateFarm")],
             &owner_auth,
@@ -585,14 +629,14 @@ fn metadata_flags_and_read_privacy_cover_req_count_and_fanout() {
 
     accept_group_create(&mut relay, "HiddenFarm", &["hidden"], 10, &owner_auth);
     assert_count(
-        relay.handle_count(
+        relay.handle_count_protocol(
             subscription("hidden-unauth"),
             vec![filter_group_tag(KIND_GROUP_METADATA, "d", "HiddenFarm")],
         ),
         0,
     );
     assert_count(
-        relay.handle_count_with_auth(
+        relay.handle_count_with_auth_protocol(
             subscription("hidden-owner"),
             vec![filter_group_tag(KIND_GROUP_METADATA, "d", "HiddenFarm")],
             &owner_auth,
@@ -678,7 +722,7 @@ fn nip29_privacy_leak_suite_covers_relay_exposure_and_rejection_paths() {
         "auth-required: group event author must authenticate with AUTH"
     );
     assert_count(
-        relay.handle_count(
+        relay.handle_count_protocol(
             subscription("unauthorized-generated"),
             vec![filter_group_tag(
                 KIND_GROUP_METADATA,
@@ -722,7 +766,7 @@ fn nip29_privacy_leak_suite_covers_relay_exposure_and_rejection_paths() {
         }]
     );
     assert_count(
-        relay.handle_count(
+        relay.handle_count_protocol(
             subscription("private-count-unauth"),
             vec![filter_group_tag(1, "h", "LeakPrivate")],
         ),
@@ -783,14 +827,14 @@ fn nip29_privacy_leak_suite_covers_relay_exposure_and_rejection_paths() {
     )));
 
     assert_count(
-        relay.handle_count(
+        relay.handle_count_protocol(
             subscription("private-metadata-public"),
             vec![filter_group_tag(KIND_GROUP_METADATA, "d", "LeakPrivate")],
         ),
         1,
     );
     assert_count(
-        relay.handle_count(
+        relay.handle_count_protocol(
             subscription("private-members-public"),
             vec![filter_group_tag(KIND_GROUP_MEMBERS, "d", "LeakPrivate")],
         ),
@@ -799,14 +843,14 @@ fn nip29_privacy_leak_suite_covers_relay_exposure_and_rejection_paths() {
 
     accept_group_create(&mut relay, "LeakHidden", &["hidden"], 20, &owner_auth);
     assert_count(
-        relay.handle_count(
+        relay.handle_count_protocol(
             subscription("hidden-metadata-public"),
             vec![filter_group_tag(KIND_GROUP_METADATA, "d", "LeakHidden")],
         ),
         0,
     );
     assert_count(
-        relay.handle_count_with_auth(
+        relay.handle_count_with_auth_protocol(
             subscription("hidden-metadata-owner"),
             vec![filter_group_tag(KIND_GROUP_METADATA, "d", "LeakHidden")],
             &owner_auth,
@@ -833,7 +877,7 @@ fn nip29_privacy_leak_suite_covers_relay_exposure_and_rejection_paths() {
         "restricted: group is unavailable"
     );
     assert_count(
-        relay.handle_count(
+        relay.handle_count_protocol(
             subscription("restricted-count"),
             vec![filter_group_tag(1, "h", "LeakRestricted")],
         ),
@@ -852,7 +896,7 @@ fn nip29_privacy_leak_suite_covers_relay_exposure_and_rejection_paths() {
         "restricted: group is unavailable"
     );
     assert_count(
-        relay.handle_count(
+        relay.handle_count_protocol(
             subscription("closed-join-count"),
             vec![filter_group_tag(KIND_GROUP_JOIN_REQUEST, "h", "LeakClosed")],
         ),
@@ -868,7 +912,7 @@ fn nip29_privacy_leak_suite_covers_relay_exposure_and_rejection_paths() {
         &closed_normal,
     );
     assert_count(
-        relay.handle_count(
+        relay.handle_count_protocol(
             subscription("closed-normal-count"),
             vec![filter_group_tag(1, "h", "LeakClosed")],
         ),
@@ -886,7 +930,7 @@ fn nip29_privacy_leak_suite_covers_relay_exposure_and_rejection_paths() {
         "duplicate: group member already exists"
     );
     assert_count(
-        relay.handle_count(
+        relay.handle_count_protocol(
             subscription("duplicate-join-count"),
             vec![filter_group_tag(
                 KIND_GROUP_JOIN_REQUEST,
@@ -907,7 +951,7 @@ fn nip29_privacy_leak_suite_covers_relay_exposure_and_rejection_paths() {
         "duplicate: group member does not exist"
     );
     assert_count(
-        relay.handle_count(
+        relay.handle_count_protocol(
             subscription("duplicate-leave-count"),
             vec![filter_group_tag(
                 KIND_GROUP_LEAVE_REQUEST,
@@ -940,7 +984,7 @@ fn nip29_privacy_leak_suite_covers_relay_exposure_and_rejection_paths() {
             "blocked: relay-generated group state events cannot be submitted by clients"
         );
         assert_count(
-            relay.handle_count(
+            relay.handle_count_protocol(
                 subscription("client-generated-count"),
                 vec![filter_group_tag(kind, "d", "ClientGenerated")],
             ),
@@ -971,7 +1015,7 @@ fn nip29_privacy_leak_suite_covers_relay_exposure_and_rejection_paths() {
         &delete_target,
     );
     assert_count(
-        relay.handle_count(
+        relay.handle_count_protocol(
             subscription("deleted-target-count"),
             vec![filter_group_tag(1, "h", "LeakDeleted")],
         ),
@@ -1034,7 +1078,7 @@ fn nip29_privacy_leak_suite_covers_relay_exposure_and_rejection_paths() {
         "restricted: missing group capability manage_members"
     );
     assert_count(
-        relay.handle_count(
+        relay.handle_count_protocol(
             subscription("unauthorized-put-count"),
             vec![filter_group_tag(
                 KIND_GROUP_PUT_USER,
@@ -1082,14 +1126,14 @@ fn delete_and_secondary_privacy_surfaces_are_read_gated_or_absent() {
     );
 
     assert_count(
-        relay.handle_count(
+        relay.handle_count_protocol(
             subscription("deleted-target"),
             vec![filter_group_tag(1, "h", "DeleteFarm")],
         ),
         0,
     );
     assert_count(
-        relay.handle_count(
+        relay.handle_count_protocol(
             subscription("delete-marker"),
             vec![filter_group_tag(KIND_GROUP_DELETE_GROUP, "h", "DeleteFarm")],
         ),
@@ -1116,7 +1160,7 @@ fn delete_and_secondary_privacy_surfaces_are_read_gated_or_absent() {
         "blocked: group is deleted"
     );
     assert_count(
-        relay.handle_count(
+        relay.handle_count_protocol(
             subscription("group-marker"),
             vec![filter_group_tag(KIND_GROUP_DELETE_GROUP, "h", "DeleteFarm")],
         ),
@@ -1166,7 +1210,7 @@ fn group_tombstone_hides_prior_events_and_generated_snapshots() {
     );
 
     assert_count(
-        relay.handle_count(
+        relay.handle_count_protocol(
             subscription("tombstone-note-before"),
             vec![filter_group_tag(1, "h", "TombstoneFarm")],
         ),
@@ -1178,7 +1222,7 @@ fn group_tombstone_hides_prior_events_and_generated_snapshots() {
         ("tombstone-members-before", KIND_GROUP_MEMBERS),
     ] {
         assert_count(
-            relay.handle_count(
+            relay.handle_count_protocol(
                 subscription(subscription_id),
                 vec![filter_group_tag(kind, "d", "TombstoneFarm")],
             ),
@@ -1196,7 +1240,7 @@ fn group_tombstone_hides_prior_events_and_generated_snapshots() {
     );
 
     assert_count(
-        relay.handle_count(
+        relay.handle_count_protocol(
             subscription("tombstone-note-after"),
             vec![filter_group_tag(1, "h", "TombstoneFarm")],
         ),
@@ -1225,7 +1269,7 @@ fn group_tombstone_hides_prior_events_and_generated_snapshots() {
         ),
     ] {
         assert_count(
-            relay.handle_count(
+            relay.handle_count_protocol(
                 subscription(subscription_id),
                 vec![filter_group_tag(kind, "d", "TombstoneFarm")],
             ),
@@ -1238,7 +1282,7 @@ fn group_tombstone_hides_prior_events_and_generated_snapshots() {
         );
     }
     assert_count(
-        relay.handle_count(
+        relay.handle_count_protocol(
             subscription("tombstone-marker-after"),
             vec![filter_group_tag(
                 KIND_GROUP_DELETE_GROUP,
@@ -2822,7 +2866,7 @@ fn assert_count(
 
 fn count_kind(relay: &BaseRelay, kind: u32) -> u64 {
     let RelayMessage::Count { count, .. } = relay
-        .handle_count(subscription("count-kind"), vec![filter_kind(kind)])
+        .handle_count_protocol(subscription("count-kind"), vec![filter_kind(kind)])
         .expect("count")
     else {
         panic!("expected count")

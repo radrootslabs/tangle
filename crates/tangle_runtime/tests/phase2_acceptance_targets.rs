@@ -19,7 +19,7 @@ use tangle_groups::{
 };
 use tangle_protocol::{
     Event, EventId, Filter, Kind, PublicKeyHex, RelayMessage, SignatureHex, SubscriptionId, Tag,
-    UnixTimestamp, UnsignedEvent, event_to_value, filter_from_value,
+    UnixTimestamp, UnsignedEvent, event_to_value, filter_from_value, filter_to_value,
 };
 use tangle_runtime::{
     config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
@@ -31,7 +31,7 @@ use tangle_runtime::{
 };
 use tangle_store_pocket::{
     PocketStoreConfig, PocketStoreHandle, TANGLE_GROUP_CHECKPOINT_TABLE, TANGLE_GROUP_OUTBOX_TABLE,
-    TANGLE_GROUP_PROJECTION_TABLE, parse_pocket_event_json,
+    TANGLE_GROUP_PROJECTION_TABLE, parse_pocket_event_json, parse_pocket_filter_json,
 };
 use tangle_test_support::{
     FixtureKey, TANGLE_V2_RELAY_SECRET_HEX, TANGLE_V2_RELAY_URL, tangle_v2_auth_event,
@@ -67,6 +67,34 @@ impl BaseRelayEventTestExt for BaseRelay {
         let pocket = parse_pocket_event_json(&raw).expect("pocket event");
         self.handle_pocket_event_with_auth(&pocket, auth)
     }
+}
+
+trait BaseRelayCountTestExt {
+    fn handle_count_protocol(
+        &self,
+        subscription_id: SubscriptionId,
+        filters: Vec<Filter>,
+    ) -> Result<RelayMessage, BaseRelayError>;
+}
+
+impl BaseRelayCountTestExt for BaseRelay {
+    fn handle_count_protocol(
+        &self,
+        subscription_id: SubscriptionId,
+        filters: Vec<Filter>,
+    ) -> Result<RelayMessage, BaseRelayError> {
+        BaseRelay::handle_count(self, subscription_id, pocket_filters(filters))
+    }
+}
+
+fn pocket_filters(filters: Vec<Filter>) -> Vec<tangle_store_pocket::PocketOwnedFilter> {
+    filters
+        .iter()
+        .map(|filter| {
+            let raw = serde_json::to_vec(&filter_to_value(filter)).expect("filter JSON");
+            parse_pocket_filter_json(&raw).expect("pocket filter")
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -1644,7 +1672,9 @@ fn runtime_req_handling_does_not_lock_relay_state() {
 fn runtime_count_handling_does_not_lock_relay_state() {
     let runtime = include_str!("../src/runtime.rs");
     let count_branch = runtime
-        .split("RuntimeClientMessage::Count {")
+        .split(
+            "            RuntimeClientMessage::Count {\n                subscription_id,\n                filters,\n                search_present,\n            } => {",
+        )
         .nth(1)
         .expect("count branch")
         .split("RuntimeClientMessage::Auth")
@@ -1652,9 +1682,11 @@ fn runtime_count_handling_does_not_lock_relay_state() {
         .expect("auth branch");
 
     assert!(!count_branch.contains("relay.lock().await"));
-    assert!(
-        count_branch.contains("handle_count_with_auth_report(subscription_id, filters, auth)?")
-    );
+    assert!(!count_branch.contains("runtime_filters_to_protocol("));
+    assert!(count_branch.contains("validate_pocket_filters(&filters)?"));
+    assert!(count_branch.contains("rate_limit_count_pocket("));
+    assert!(count_branch.contains("handle_count_with_auth_report("));
+    assert!(count_branch.contains("search_present"));
 }
 
 #[test]
@@ -1783,7 +1815,7 @@ fn projection_and_outbox_recover_from_canonical_pocket_events() {
         assert_relay_count(
             runtime
                 .relay()
-                .handle_count(
+                .handle_count_protocol(
                     subscription_id("pre-recovery-members"),
                     vec![relay_filter(
                         json!({"kinds":[KIND_GROUP_MEMBERS], "#d":["RecoverSocket"]}),
@@ -1814,7 +1846,7 @@ fn projection_and_outbox_recover_from_canonical_pocket_events() {
     assert_relay_count(
         recovered
             .relay()
-            .handle_count(
+            .handle_count_protocol(
                 subscription_id("recovered-metadata"),
                 vec![relay_filter(
                     json!({"kinds":[KIND_GROUP_METADATA], "#d":["RecoverSocket"]}),
@@ -1827,7 +1859,7 @@ fn projection_and_outbox_recover_from_canonical_pocket_events() {
     assert_relay_count(
         recovered
             .relay()
-            .handle_count(
+            .handle_count_protocol(
                 subscription_id("recovered-admins"),
                 vec![relay_filter(
                     json!({"kinds":[KIND_GROUP_ADMINS], "#d":["RecoverSocket"]}),
@@ -1840,7 +1872,7 @@ fn projection_and_outbox_recover_from_canonical_pocket_events() {
     assert_relay_count(
         recovered
             .relay()
-            .handle_count(
+            .handle_count_protocol(
                 subscription_id("recovered-members"),
                 vec![relay_filter(
                     json!({"kinds":[KIND_GROUP_MEMBERS], "#d":["RecoverSocket"]}),
@@ -1853,7 +1885,7 @@ fn projection_and_outbox_recover_from_canonical_pocket_events() {
     assert_relay_count(
         recovered
             .relay()
-            .handle_count(
+            .handle_count_protocol(
                 subscription_id("recovered-note"),
                 vec![relay_filter(json!({"kinds":[1], "#h":["RecoverSocket"]}))],
             )

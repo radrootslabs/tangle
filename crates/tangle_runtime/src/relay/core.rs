@@ -114,6 +114,36 @@ struct BaseRelayGroupReqQuery<'a> {
     auth: &'a GroupAuthContext,
 }
 
+pub(crate) struct BaseRelayCountQuery<'a> {
+    subscription_id: SubscriptionId,
+    filters: Vec<PocketOwnedFilter>,
+    search_present: bool,
+    auth: &'a BaseAuthState,
+}
+
+impl<'a> BaseRelayCountQuery<'a> {
+    pub(crate) fn new(
+        subscription_id: SubscriptionId,
+        filters: Vec<PocketOwnedFilter>,
+        search_present: bool,
+        auth: &'a BaseAuthState,
+    ) -> Self {
+        Self {
+            subscription_id,
+            filters,
+            search_present,
+            auth,
+        }
+    }
+}
+
+struct BaseRelayGroupCountQuery<'a> {
+    subscription_id: SubscriptionId,
+    filters: Vec<PocketOwnedFilter>,
+    search_present: bool,
+    auth: &'a GroupAuthContext,
+}
+
 impl BaseRelayQueryReport {
     fn new(
         messages: Vec<RuntimeRelayMessage>,
@@ -643,19 +673,6 @@ impl BaseRelayLimits {
 }
 
 impl BaseRelay {
-    pub(crate) fn unsupported_search_closed(
-        subscription_id: &SubscriptionId,
-        filters: &[Filter],
-    ) -> Option<RelayMessage> {
-        filters
-            .iter()
-            .any(|filter| filter.search().is_some())
-            .then(|| RelayMessage::Closed {
-                subscription_id: subscription_id.clone(),
-                message: "unsupported: search filters are not supported".to_owned(),
-            })
-    }
-
     pub(crate) fn unsupported_search_present_closed(
         subscription_id: &SubscriptionId,
         search_present: bool,
@@ -747,9 +764,20 @@ impl BaseRelay {
             ClientMessage::Count {
                 subscription_id,
                 filters,
-            } => self
-                .handle_count_with_auth(subscription_id, filters, auth)
-                .map(|message| vec![message]),
+            } => {
+                let search_present = filters.iter().any(|filter| filter.search().is_some());
+                let filters = filters
+                    .iter()
+                    .map(tangle_filter_to_pocket)
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.handle_count_with_group_auth_report(
+                    subscription_id,
+                    filters,
+                    search_present,
+                    &GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned()),
+                )
+                .map(|report| vec![report.into_message()])
+            }
             ClientMessage::Close(subscription_id) => {
                 self.handle_close(&subscription_id);
                 Ok(Vec::new())
@@ -1449,7 +1477,7 @@ impl BaseRelay {
     pub fn handle_count(
         &self,
         subscription_id: SubscriptionId,
-        filters: Vec<Filter>,
+        filters: Vec<PocketOwnedFilter>,
     ) -> Result<RelayMessage, BaseRelayError> {
         self.handle_count_with_group_auth(
             subscription_id,
@@ -1461,7 +1489,7 @@ impl BaseRelay {
     pub fn handle_count_with_auth(
         &self,
         subscription_id: SubscriptionId,
-        filters: Vec<Filter>,
+        filters: Vec<PocketOwnedFilter>,
         auth: &BaseAuthState,
     ) -> Result<RelayMessage, BaseRelayError> {
         self.handle_count_with_auth_report(subscription_id, filters, auth)
@@ -1471,7 +1499,7 @@ impl BaseRelay {
     pub(crate) fn handle_count_with_auth_report(
         &self,
         subscription_id: SubscriptionId,
-        filters: Vec<Filter>,
+        filters: Vec<PocketOwnedFilter>,
         auth: &BaseAuthState,
     ) -> Result<BaseRelayCountReport, BaseRelayError> {
         Self::handle_count_with_shared_services(
@@ -1479,9 +1507,7 @@ impl BaseRelay {
             self.groups.as_ref(),
             self.limits,
             self.query,
-            subscription_id,
-            filters,
-            auth,
+            BaseRelayCountQuery::new(subscription_id, filters, false, auth),
         )
     }
 
@@ -1490,35 +1516,39 @@ impl BaseRelay {
         groups: Option<&GroupServiceHandle>,
         limits: BaseRelayLimits,
         query: PocketQueryConfig,
-        subscription_id: SubscriptionId,
-        filters: Vec<Filter>,
-        auth: &BaseAuthState,
+        request: BaseRelayCountQuery<'_>,
     ) -> Result<BaseRelayCountReport, BaseRelayError> {
+        let group_auth =
+            GroupAuthContext::new(request.auth.authenticated_pubkeys().iter().cloned());
         Self::handle_count_with_group_auth_shared_services(
             store,
             groups,
             limits,
             query,
-            subscription_id,
-            filters,
-            &GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned()),
+            BaseRelayGroupCountQuery {
+                subscription_id: request.subscription_id,
+                filters: request.filters,
+                search_present: request.search_present,
+                auth: &group_auth,
+            },
         )
     }
 
     fn handle_count_with_group_auth(
         &self,
         subscription_id: SubscriptionId,
-        filters: Vec<Filter>,
+        filters: Vec<PocketOwnedFilter>,
         auth: &GroupAuthContext,
     ) -> Result<RelayMessage, BaseRelayError> {
-        self.handle_count_with_group_auth_report(subscription_id, filters, auth)
+        self.handle_count_with_group_auth_report(subscription_id, filters, false, auth)
             .map(BaseRelayCountReport::into_message)
     }
 
     fn handle_count_with_group_auth_report(
         &self,
         subscription_id: SubscriptionId,
-        filters: Vec<Filter>,
+        filters: Vec<PocketOwnedFilter>,
+        search_present: bool,
         auth: &GroupAuthContext,
     ) -> Result<BaseRelayCountReport, BaseRelayError> {
         Self::handle_count_with_group_auth_shared_services(
@@ -1526,9 +1556,12 @@ impl BaseRelay {
             self.groups.as_ref(),
             self.limits,
             self.query,
-            subscription_id,
-            filters,
-            auth,
+            BaseRelayGroupCountQuery {
+                subscription_id,
+                filters,
+                search_present,
+                auth,
+            },
         )
     }
 
@@ -1537,13 +1570,19 @@ impl BaseRelay {
         groups: Option<&GroupServiceHandle>,
         limits: BaseRelayLimits,
         query: PocketQueryConfig,
-        subscription_id: SubscriptionId,
-        filters: Vec<Filter>,
-        auth: &GroupAuthContext,
+        request: BaseRelayGroupCountQuery<'_>,
     ) -> Result<BaseRelayCountReport, BaseRelayError> {
+        let BaseRelayGroupCountQuery {
+            subscription_id,
+            filters,
+            search_present,
+            auth,
+        } = request;
         limits.validate_subscription_id(&subscription_id)?;
-        limits.validate_filters(&filters)?;
-        if let Some(message) = Self::unsupported_search_closed(&subscription_id, &filters) {
+        limits.validate_pocket_filters(&filters)?;
+        if let Some(message) =
+            Self::unsupported_search_present_closed(&subscription_id, search_present)
+        {
             return Ok(BaseRelayCountReport::new(
                 message,
                 false,
@@ -1670,7 +1709,7 @@ impl BaseRelay {
         groups: Option<&GroupServiceHandle>,
         limits: BaseRelayLimits,
         query: PocketQueryConfig,
-        filters: &[Filter],
+        filters: &[PocketOwnedFilter],
         auth: &GroupAuthContext,
     ) -> Result<BaseRelayCountEventsReport, BaseRelayError> {
         let mut seen = BTreeSet::new();
@@ -1680,14 +1719,12 @@ impl BaseRelay {
         let hll_offset = Self::count_hll_offset(filters)?;
         let mut hll = hll_offset.map(|_| PocketHll8::new());
         for filter in filters {
-            let filter = filter.without_limit();
-            let filter = tangle_filter_to_pocket(&filter)?;
             let report = Self::query_filter_events_report_with_services(
                 store,
                 groups,
                 limits,
                 count_query,
-                &filter,
+                filter,
                 auth,
                 BaseRelayFilterLimitMode::PreserveCountLimitless,
             )?;
@@ -1715,12 +1752,11 @@ impl BaseRelay {
         ))
     }
 
-    fn count_hll_offset(filters: &[Filter]) -> Result<Option<usize>, BaseRelayError> {
+    fn count_hll_offset(filters: &[PocketOwnedFilter]) -> Result<Option<usize>, BaseRelayError> {
         let [filter] = filters else {
             return Ok(None);
         };
-        let pocket_filter = tangle_filter_to_pocket(filter)?;
-        pocket_filter
+        filter
             .hyperloglog_offset()
             .map_err(|error| BaseRelayError::error(error.to_string()))
     }
@@ -1786,6 +1822,7 @@ impl BaseRelay {
                 u32::try_from(limits.default_limit)
                     .map_err(|_| BaseRelayError::invalid("default filter limit exceeds u32"))?
             }
+            (BaseRelayFilterLimitMode::PreserveCountLimitless, _) => u32::MAX,
             (_, limit) => limit,
         };
         let ids = filter.ids().collect::<Vec<_>>();
@@ -1848,7 +1885,7 @@ fn pocket_filters_are_complete(filters: &[PocketOwnedFilter]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{BaseRelay, BaseRelayLimitSettings, BaseRelayLimits, NEGENTROPY_DISABLED_MESSAGE};
-    use crate::pocket_conversion::tangle_event_to_pocket;
+    use crate::pocket_conversion::{tangle_event_to_pocket, tangle_filter_to_pocket};
     use crate::relay::auth::BaseAuthState;
     use crate::relay::live::CloseResult;
     use tangle_crypto::RelaySigner;
@@ -1865,8 +1902,66 @@ mod tests {
         Tag, UnixTimestamp, UnsignedEvent, filter_from_value,
     };
     use tangle_store_pocket::{
-        PocketEvent, PocketQueryConfig, PocketStoreConfig, PocketSyncPolicy,
+        PocketEvent, PocketOwnedFilter, PocketQueryConfig, PocketStoreConfig, PocketSyncPolicy,
     };
+
+    trait BaseRelayCountTestExt {
+        fn handle_count_protocol(
+            &self,
+            subscription_id: SubscriptionId,
+            filters: Vec<Filter>,
+        ) -> Result<RelayMessage, crate::errors::BaseRelayError>;
+
+        fn handle_count_with_auth_protocol(
+            &self,
+            subscription_id: SubscriptionId,
+            filters: Vec<Filter>,
+            auth: &BaseAuthState,
+        ) -> Result<RelayMessage, crate::errors::BaseRelayError>;
+    }
+
+    impl BaseRelayCountTestExt for BaseRelay {
+        fn handle_count_protocol(
+            &self,
+            subscription_id: SubscriptionId,
+            filters: Vec<Filter>,
+        ) -> Result<RelayMessage, crate::errors::BaseRelayError> {
+            let search_present = filters.iter().any(|filter| filter.search().is_some());
+            let filters = pocket_filters(filters)?;
+            self.handle_count_with_group_auth_report(
+                subscription_id,
+                filters,
+                search_present,
+                &GroupAuthContext::unauthenticated(),
+            )
+            .map(|report| report.into_message())
+        }
+
+        fn handle_count_with_auth_protocol(
+            &self,
+            subscription_id: SubscriptionId,
+            filters: Vec<Filter>,
+            auth: &BaseAuthState,
+        ) -> Result<RelayMessage, crate::errors::BaseRelayError> {
+            let search_present = filters.iter().any(|filter| filter.search().is_some());
+            let filters = pocket_filters(filters)?;
+            let group_auth = GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned());
+            self.handle_count_with_group_auth_report(
+                subscription_id,
+                filters,
+                search_present,
+                &group_auth,
+            )
+            .map(|report| report.into_message())
+        }
+    }
+
+    fn pocket_filters(
+        filters: Vec<Filter>,
+    ) -> Result<Vec<PocketOwnedFilter>, crate::errors::BaseRelayError> {
+        filters.iter().map(tangle_filter_to_pocket).collect()
+    }
+
     #[test]
     fn base_relay_stores_queries_counts_closes_and_fans_out_public_events() {
         let mut relay = test_relay("base-relay-public", 4);
@@ -1900,7 +1995,7 @@ mod tests {
         assert_eq!(messages[1], RelayMessage::Eose(subscription_id.clone()));
         assert_eq!(
             relay
-                .handle_count(subscription_id.clone(), vec![filter])
+                .handle_count_protocol(subscription_id.clone(), vec![filter])
                 .expect("count"),
             RelayMessage::Count {
                 subscription_id: subscription_id.clone(),
@@ -1995,7 +2090,7 @@ mod tests {
         assert_eq!(relay.active_subscription_count(), 0);
         assert_eq!(
             relay
-                .handle_count(count_id.clone(), vec![search])
+                .handle_count_protocol(count_id.clone(), vec![search])
                 .expect("count"),
             RelayMessage::Closed {
                 subscription_id: count_id,
@@ -2306,7 +2401,7 @@ mod tests {
         .expect("author count filter");
         assert_eq!(
             relay
-                .handle_count(
+                .handle_count_protocol(
                     SubscriptionId::new("count-visible").expect("sub"),
                     vec![market_notes.clone(), author_events.clone()]
                 )
@@ -2319,7 +2414,7 @@ mod tests {
         );
         assert_eq!(
             relay
-                .handle_count_with_auth(
+                .handle_count_with_auth_protocol(
                     SubscriptionId::new("count-auth").expect("sub"),
                     vec![market_notes, author_events],
                     &auth
@@ -2346,7 +2441,7 @@ mod tests {
         );
         assert!(
             relay
-                .handle_count(
+                .handle_count_protocol(
                     SubscriptionId::new("limit-count").expect("sub"),
                     vec![too_large_limit]
                 )
@@ -2370,7 +2465,7 @@ mod tests {
         let search_count = SubscriptionId::new("search-count").expect("sub");
         assert_eq!(
             relay
-                .handle_count(search_count.clone(), vec![search])
+                .handle_count_protocol(search_count.clone(), vec![search])
                 .expect("search count"),
             RelayMessage::Closed {
                 subscription_id: search_count,
@@ -2436,7 +2531,7 @@ mod tests {
         );
         assert!(
             relay
-                .handle_count(
+                .handle_count_protocol(
                     SubscriptionId::new("cnt").expect("sub"),
                     vec![Filter::empty(), Filter::empty()]
                 )
@@ -2446,7 +2541,7 @@ mod tests {
         );
         assert!(
             relay
-                .handle_count(
+                .handle_count_protocol(
                     SubscriptionId::new("tag").expect("sub"),
                     vec![
                         filter_from_value(&serde_json::json!({"#t":["one", "two"]}))
@@ -2459,7 +2554,7 @@ mod tests {
         );
         assert!(
             relay
-                .handle_count(
+                .handle_count_protocol(
                     SubscriptionId::new("max").expect("sub"),
                     vec![filter_from_value(&serde_json::json!({"limit":3})).expect("filter")]
                 )
@@ -2533,7 +2628,7 @@ mod tests {
         assert_eq!(relay.active_subscription_count(), 0);
         assert!(
             relay
-                .handle_count(SubscriptionId::new("cnt").expect("sub"), vec![complex])
+                .handle_count_protocol(SubscriptionId::new("cnt").expect("sub"), vec![complex])
                 .expect_err("count complexity")
                 .prefixed_message()
                 .contains("max_query_complexity 4")
@@ -2567,7 +2662,7 @@ mod tests {
 
         assert_eq!(
             relay
-                .handle_count(
+                .handle_count_protocol(
                     SubscriptionId::new("count-limit").expect("sub"),
                     vec![limited_market]
                 )
@@ -2581,7 +2676,7 @@ mod tests {
 
         assert_eq!(
             relay
-                .handle_count(
+                .handle_count_protocol(
                     SubscriptionId::new("count-dedupe").expect("sub"),
                     vec![market_notes, author_events]
                 )
@@ -2607,7 +2702,7 @@ mod tests {
         }
 
         let RelayMessage::Count { count, hll, .. } = relay
-            .handle_count(
+            .handle_count_protocol(
                 SubscriptionId::new("count-hll-public").expect("sub"),
                 vec![
                     filter_from_value(&serde_json::json!({"kinds":[7],"#e":[target]}))
@@ -2662,7 +2757,7 @@ mod tests {
         );
 
         let limited = relay
-            .handle_count_with_auth(
+            .handle_count_with_auth_protocol(
                 SubscriptionId::new("count-hll-limited").expect("sub"),
                 vec![
                     filter_from_value(
@@ -2683,7 +2778,7 @@ mod tests {
         ));
 
         let redacted = relay
-            .handle_count_with_auth(
+            .handle_count_with_auth_protocol(
                 SubscriptionId::new("count-hll-redacted").expect("sub"),
                 vec![
                     filter_from_value(&serde_json::json!({"kinds":[7],"#e":[target]}))
@@ -2745,7 +2840,7 @@ mod tests {
 
         assert_eq!(
             relay
-                .handle_count(
+                .handle_count_protocol(
                     SubscriptionId::new("count-unbounded").expect("sub"),
                     vec![unbounded]
                 )
@@ -2758,7 +2853,7 @@ mod tests {
         );
         assert_eq!(
             relay
-                .handle_count(
+                .handle_count_protocol(
                     SubscriptionId::new("count-client-limited").expect("sub"),
                     vec![client_limited]
                 )
@@ -3959,7 +4054,7 @@ mod tests {
         );
         assert!(
             relay
-                .handle_count(
+                .handle_count_protocol(
                     SubscriptionId::new("a").expect("sub"),
                     vec![
                         filter_from_value(&serde_json::json!({"#t":["one", "two"]}))
@@ -4204,7 +4299,7 @@ mod tests {
         let subscription_id = SubscriptionId::new(&format!("count-{kind}")).expect("sub");
         let filter = filter_kind(kind);
         match relay
-            .handle_count(subscription_id, vec![filter])
+            .handle_count_protocol(subscription_id, vec![filter])
             .expect("count")
         {
             RelayMessage::Count { count, .. } => count,
@@ -4215,7 +4310,7 @@ mod tests {
     fn count_kind_with_auth(relay: &BaseRelay, kind: u32, auth: &BaseAuthState) -> u64 {
         let subscription_id = SubscriptionId::new(&format!("count-auth-{kind}")).expect("sub");
         match relay
-            .handle_count_with_auth(subscription_id, vec![filter_kind(kind)], auth)
+            .handle_count_with_auth_protocol(subscription_id, vec![filter_kind(kind)], auth)
             .expect("count")
         {
             RelayMessage::Count { count, .. } => count,
@@ -4225,7 +4320,7 @@ mod tests {
 
     fn count_filter(relay: &BaseRelay, subscription_id: &str, filter: Filter) -> u64 {
         match relay
-            .handle_count(
+            .handle_count_protocol(
                 SubscriptionId::new(subscription_id).expect("sub"),
                 vec![filter],
             )
@@ -4243,7 +4338,7 @@ mod tests {
         auth: &BaseAuthState,
     ) -> u64 {
         match relay
-            .handle_count_with_auth(
+            .handle_count_with_auth_protocol(
                 SubscriptionId::new(subscription_id).expect("sub"),
                 vec![filter],
                 auth,

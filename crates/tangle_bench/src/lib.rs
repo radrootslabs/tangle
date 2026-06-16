@@ -10,6 +10,7 @@ use std::time::Instant;
 use tangle_groups::{KIND_GROUP_ADMINS, KIND_GROUP_MEMBERS, KIND_GROUP_METADATA, MemberStatus};
 use tangle_protocol::{
     Event, Filter, RelayMessage, SubscriptionId, UnixTimestamp, event_to_value, filter_from_value,
+    filter_to_value,
 };
 use tangle_runtime::{
     config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
@@ -20,8 +21,8 @@ use tangle_runtime::{
     runtime::{TangleRuntime, TangleRuntimeHandle},
 };
 use tangle_store_pocket::{
-    PocketQueryConfig, PocketStoreConfig, PocketSyncPolicy, parse_pocket_event_json,
-    parse_pocket_filter_json,
+    PocketOwnedFilter, PocketQueryConfig, PocketStoreConfig, PocketSyncPolicy,
+    parse_pocket_event_json, parse_pocket_filter_json,
 };
 use tangle_test_support::{
     FixtureKey, TANGLE_V2_RELAY_URL, tangle_v2_auth_event, tangle_v2_event, tangle_v2_group_config,
@@ -1598,12 +1599,13 @@ fn count_for_operation(
     owner_auth: &BaseAuthState,
 ) -> Result<u64, String> {
     let subscription_id = subscription(operation.name)?;
+    let filter = pocket_filter(&operation.filter)?;
     let message = match operation.auth {
         QueryAuth::None => relay
-            .handle_count(subscription_id, vec![operation.filter.clone()])
+            .handle_count(subscription_id, vec![filter])
             .map_err(|error| error.to_string())?,
         QueryAuth::Owner => relay
-            .handle_count_with_auth(subscription_id, vec![operation.filter.clone()], owner_auth)
+            .handle_count_with_auth(subscription_id, vec![filter], owner_auth)
             .map_err(|error| error.to_string())?,
     };
     match message {
@@ -1632,7 +1634,7 @@ fn count_kind(relay: &BaseRelay, kind: u32) -> Result<u64, String> {
     let message = relay
         .handle_count_with_auth(
             subscription(&format!("count-{kind}"))?,
-            vec![filter_from_value(&json!({"kinds": [kind]}))?],
+            vec![pocket_filter_from_value(&json!({"kinds": [kind]}))?],
             &owner_auth,
         )
         .map_err(|error| error.to_string())?;
@@ -1640,6 +1642,16 @@ fn count_kind(relay: &BaseRelay, kind: u32) -> Result<u64, String> {
         RelayMessage::Count { count, .. } => Ok(count),
         value => Err(format!("expected COUNT message, got {value:?}")),
     }
+}
+
+fn pocket_filter(filter: &Filter) -> Result<PocketOwnedFilter, String> {
+    let raw = serde_json::to_vec(&filter_to_value(filter)).map_err(|error| error.to_string())?;
+    parse_pocket_filter_json(&raw).map_err(|error| error.to_string())
+}
+
+fn pocket_filter_from_value(value: &serde_json::Value) -> Result<PocketOwnedFilter, String> {
+    let filter = filter_from_value(value)?;
+    pocket_filter(&filter)
 }
 
 fn validation_summary(

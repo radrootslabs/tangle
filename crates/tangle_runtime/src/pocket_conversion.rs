@@ -1,15 +1,13 @@
 #![forbid(unsafe_code)]
 
 use crate::errors::BaseRelayError;
-use std::collections::BTreeMap;
 use std::str;
 use tangle_protocol::{
-    Event, EventId, Filter, Kind, PublicKeyHex, SignatureHex, Tag, TagName, TagValue,
-    UnixTimestamp, UnsignedEvent,
+    Event, EventId, Filter, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
 };
 use tangle_store_pocket::{
-    PocketEvent, PocketEventId, PocketFilter, PocketKind, PocketOwnedEvent, PocketOwnedFilter,
-    PocketOwnedTags, PocketPubkey, PocketSig, PocketTags, PocketTime,
+    PocketEvent, PocketEventId, PocketKind, PocketOwnedEvent, PocketOwnedFilter, PocketOwnedTags,
+    PocketPubkey, PocketSig, PocketTags, PocketTime,
 };
 
 pub(crate) fn tangle_event_to_pocket(event: &Event) -> Result<PocketOwnedEvent, BaseRelayError> {
@@ -115,41 +113,6 @@ pub(crate) fn pocket_event_to_tangle(event: &PocketEvent) -> Result<Event, BaseR
     ))
 }
 
-pub(crate) fn pocket_filter_to_tangle(
-    filter: &PocketFilter,
-    search: Option<String>,
-) -> Result<Filter, BaseRelayError> {
-    let ids = filter
-        .ids()
-        .map(|id| EventId::new(&id.as_hex_string()).map_err(BaseRelayError::error))
-        .collect::<Result<Vec<_>, _>>()?;
-    let authors = filter
-        .authors()
-        .map(|author| PublicKeyHex::new(&author.as_hex_string()).map_err(BaseRelayError::error))
-        .collect::<Result<Vec<_>, _>>()?;
-    let kinds = filter
-        .kinds()
-        .map(|kind| Kind::new(u64::from(kind.as_u16())).map_err(BaseRelayError::error))
-        .collect::<Result<Vec<_>, _>>()?;
-    let tag_filters = pocket_filter_tags_to_tangle(filter)?;
-    let since =
-        (filter.since() != PocketTime::min()).then(|| UnixTimestamp::new(filter.since().as_u64()));
-    let until =
-        (filter.until() != PocketTime::max()).then(|| UnixTimestamp::new(filter.until().as_u64()));
-    let limit = (filter.limit() != u32::MAX).then(|| u64::from(filter.limit()));
-    Filter::from_parts(
-        ids,
-        authors,
-        kinds,
-        tag_filters,
-        since,
-        until,
-        limit,
-        search,
-    )
-    .map_err(BaseRelayError::error)
-}
-
 pub(crate) fn pocket_event_id(event_id: &EventId) -> Result<PocketEventId, BaseRelayError> {
     PocketEventId::read_hex(event_id.as_str().as_bytes())
         .map_err(|error| BaseRelayError::error(error.to_string()))
@@ -183,43 +146,6 @@ fn tangle_tags_to_pocket(tags: &[Tag]) -> Result<PocketOwnedTags, BaseRelayError
         .collect::<Vec<_>>();
     ensure_tag_size(PocketTags::output_size_needed(&parts))?;
     PocketOwnedTags::new(&parts).map_err(|error| BaseRelayError::error(error.to_string()))
-}
-
-fn pocket_filter_tags_to_tangle(
-    filter: &PocketFilter,
-) -> Result<BTreeMap<TagName, Vec<TagValue>>, BaseRelayError> {
-    let tags = filter
-        .tags()
-        .map_err(|error| BaseRelayError::error(error.to_string()))?;
-    let mut tag_filters = BTreeMap::new();
-    for mut tag in tags.iter() {
-        let name = tag
-            .next()
-            .ok_or_else(|| BaseRelayError::invalid("filter tag must include a name"))
-            .and_then(tag_name_from_bytes)?;
-        let values = tag
-            .map(tag_value_from_bytes)
-            .collect::<Result<Vec<_>, _>>()?;
-        if values.is_empty() {
-            return Err(BaseRelayError::invalid(format!(
-                "filter field `#{}` must be a non-empty array",
-                name.as_str()
-            )));
-        }
-        tag_filters.insert(name, values);
-    }
-    Ok(tag_filters)
-}
-
-fn tag_name_from_bytes(bytes: &[u8]) -> Result<TagName, BaseRelayError> {
-    let name = str::from_utf8(bytes).map_err(|error| BaseRelayError::error(error.to_string()))?;
-    TagName::new(name).map_err(BaseRelayError::error)
-}
-
-fn tag_value_from_bytes(bytes: &[u8]) -> Result<TagValue, BaseRelayError> {
-    str::from_utf8(bytes)
-        .map(TagValue::new)
-        .map_err(|error| BaseRelayError::error(error.to_string()))
 }
 
 fn ensure_tag_size(size: usize) -> Result<(), BaseRelayError> {
@@ -273,8 +199,7 @@ fn ensure_event_size(tags_len: usize, content_len: usize) -> Result<(), BaseRela
 #[cfg(test)]
 mod tests {
     use super::{
-        pocket_event_id, pocket_event_to_tangle, pocket_filter_to_tangle, tangle_event_to_pocket,
-        tangle_filter_to_pocket,
+        pocket_event_id, pocket_event_to_tangle, tangle_event_to_pocket, tangle_filter_to_pocket,
     };
     use tangle_protocol::{
         Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
@@ -375,31 +300,5 @@ mod tests {
                 filter.matches(&event)
             );
         }
-    }
-
-    #[test]
-    fn pocket_filter_conversion_builds_tangle_filter_with_search_marker() {
-        let value = serde_json::json!({
-            "ids": ["a".repeat(64)],
-            "authors": ["b".repeat(64)],
-            "kinds": [1],
-            "#t": ["market"],
-            "since": 10,
-            "until": 20,
-            "limit": 30
-        });
-        let filter = filter_from_value(&value).expect("filter");
-        let pocket_filter = tangle_filter_to_pocket(&filter).expect("pocket");
-        let converted =
-            pocket_filter_to_tangle(&pocket_filter, Some("carrots".to_owned())).expect("tangle");
-
-        assert_eq!(converted.ids(), filter.ids());
-        assert_eq!(converted.authors(), filter.authors());
-        assert_eq!(converted.kinds(), filter.kinds());
-        assert_eq!(converted.tag_filters(), filter.tag_filters());
-        assert_eq!(converted.since(), filter.since());
-        assert_eq!(converted.until(), filter.until());
-        assert_eq!(converted.limit(), filter.limit());
-        assert_eq!(converted.search(), Some("carrots"));
     }
 }

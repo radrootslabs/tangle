@@ -8,7 +8,6 @@ use crate::{
     groups::GroupServiceHandle,
     logging,
     ops::{BaseRelayReadinessHandle, BaseRelayReadinessState},
-    pocket_conversion::pocket_filter_to_tangle,
     pocket_event_validation::{pocket_event_id, pocket_event_kind, pocket_event_pubkey},
     rate_limits::{
         TangleQueryRateLimitConfig, TangleRateLimitDecision, TangleRateLimitKey,
@@ -17,8 +16,8 @@ use crate::{
     relay::{
         auth::BaseAuthState,
         core::{
-            BaseRelay, BaseRelayCountReport, BaseRelayEventWrite, BaseRelayLimits,
-            BaseRelayQueryMetrics, BaseRelayQueryReport, BaseRelayReqQuery,
+            BaseRelay, BaseRelayCountQuery, BaseRelayCountReport, BaseRelayEventWrite,
+            BaseRelayLimits, BaseRelayQueryMetrics, BaseRelayQueryReport, BaseRelayReqQuery,
             BaseRelayShutdownReport,
         },
         live::LiveSubscriptionSet,
@@ -41,9 +40,7 @@ use tangle_groups::{
     GroupAuthContext, GroupEventClass, GroupId, KIND_GROUP_JOIN_REQUEST, StoreOffset,
     validate_client_group_event_structure,
 };
-use tangle_protocol::{
-    EventId, Filter, Kind, PublicKeyHex, RelayMessage, SubscriptionId, UnixTimestamp,
-};
+use tangle_protocol::{Kind, RelayMessage, SubscriptionId, UnixTimestamp};
 use tangle_store_pocket::{
     PocketEvent, PocketFilter, PocketOwnedEvent, PocketOwnedFilter, PocketStoreHandle, PocketTime,
 };
@@ -73,17 +70,6 @@ impl TangleClientRateLimitContext {
             connection_id,
         }
     }
-}
-
-struct TangleQueryRateLimitRequest<'a> {
-    scope: TangleRateLimitScope,
-    rules: TangleQueryRateLimitConfig,
-    label: &'static str,
-    subscription_id: &'a SubscriptionId,
-    filters: &'a [Filter],
-    auth: &'a BaseAuthState,
-    context: TangleClientRateLimitContext,
-    now: UnixTimestamp,
 }
 
 struct TanglePocketQueryRateLimitRequest<'a> {
@@ -130,28 +116,6 @@ impl TangleQueryClassifier {
         Self { limits }
     }
 
-    fn classify(
-        self,
-        scope: TangleRateLimitScope,
-        filters: &[Filter],
-    ) -> TangleQueryClassification {
-        match scope {
-            TangleRateLimitScope::Req => self.classify_query(filters),
-            TangleRateLimitScope::Count => self.classify_count(filters),
-            TangleRateLimitScope::Auth
-            | TangleRateLimitScope::Event
-            | TangleRateLimitScope::GroupWrite => self.classify_query(filters),
-        }
-    }
-
-    fn classify_query(self, filters: &[Filter]) -> TangleQueryClassification {
-        self.classify_filters(filters, Self::classify_query_filter)
-    }
-
-    fn classify_count(self, filters: &[Filter]) -> TangleQueryClassification {
-        self.classify_filters(filters, Self::classify_count_filter)
-    }
-
     fn classify_pocket_query(self, filters: &[PocketOwnedFilter]) -> TangleQueryClassification {
         if filters.is_empty() {
             return TangleQueryClassification::Broad(TangleBroadQueryReason::EmptyFilters);
@@ -163,54 +127,15 @@ impl TangleQueryClassifier {
             .unwrap_or(TangleQueryClassification::Bounded)
     }
 
-    fn classify_filters(
-        self,
-        filters: &[Filter],
-        classify_filter: fn(Self, &Filter) -> TangleQueryClassification,
-    ) -> TangleQueryClassification {
+    fn classify_pocket_count(self, filters: &[PocketOwnedFilter]) -> TangleQueryClassification {
         if filters.is_empty() {
             return TangleQueryClassification::Broad(TangleBroadQueryReason::EmptyFilters);
         }
         filters
             .iter()
-            .map(|filter| classify_filter(self, filter))
+            .map(|filter| self.classify_pocket_count_filter(filter))
             .find(|classification| classification.is_broad())
             .unwrap_or(TangleQueryClassification::Bounded)
-    }
-
-    fn classify_query_filter(self, filter: &Filter) -> TangleQueryClassification {
-        if !self.has_primary_constraint(filter) {
-            return TangleQueryClassification::Broad(
-                TangleBroadQueryReason::MissingPrimaryConstraint,
-            );
-        }
-        if self.has_high_limit(filter) {
-            return TangleQueryClassification::Broad(TangleBroadQueryReason::HighLimit);
-        }
-        if self.has_broad_time_window(filter) && !self.has_strong_constraint(filter) {
-            return TangleQueryClassification::Broad(TangleBroadQueryReason::BroadTimeWindow);
-        }
-        TangleQueryClassification::Bounded
-    }
-
-    fn classify_count_filter(self, filter: &Filter) -> TangleQueryClassification {
-        if !self.has_primary_constraint(filter) {
-            return TangleQueryClassification::Broad(
-                TangleBroadQueryReason::MissingPrimaryConstraint,
-            );
-        }
-        if self.has_high_limit(filter) {
-            return TangleQueryClassification::Broad(TangleBroadQueryReason::HighLimit);
-        }
-        if self.has_broad_time_window(filter) {
-            return TangleQueryClassification::Broad(TangleBroadQueryReason::BroadTimeWindow);
-        }
-        if !self.has_count_bounded_selector(filter) {
-            return TangleQueryClassification::Broad(
-                TangleBroadQueryReason::MissingBoundedSelector,
-            );
-        }
-        TangleQueryClassification::Bounded
     }
 
     fn classify_pocket_query_filter(self, filter: &PocketFilter) -> TangleQueryClassification {
@@ -228,70 +153,24 @@ impl TangleQueryClassifier {
         TangleQueryClassification::Bounded
     }
 
-    fn has_primary_constraint(self, filter: &Filter) -> bool {
-        !filter.ids().is_empty()
-            || !filter.authors().is_empty()
-            || !filter.kinds().is_empty()
-            || self.has_group_constraint(filter)
-    }
-
-    fn has_strong_constraint(self, filter: &Filter) -> bool {
-        !filter.ids().is_empty()
-            || !filter.authors().is_empty()
-            || self.has_group_constraint(filter)
-    }
-
-    fn has_count_bounded_selector(self, filter: &Filter) -> bool {
-        self.has_strong_constraint(filter)
-            || (!filter.kinds().is_empty() && self.has_bounded_time_window(filter))
-            || self.has_hll_count_selector(filter)
-    }
-
-    fn has_hll_count_selector(self, filter: &Filter) -> bool {
-        let [kind] = filter.kinds() else {
-            return false;
-        };
-        let mut tags = filter.tag_filters().iter();
-        let Some((name, values)) = tags.next() else {
-            return false;
-        };
-        if tags.next().is_some() || values.len() != 1 {
-            return false;
+    fn classify_pocket_count_filter(self, filter: &PocketFilter) -> TangleQueryClassification {
+        if !self.has_pocket_primary_constraint(filter) {
+            return TangleQueryClassification::Broad(
+                TangleBroadQueryReason::MissingPrimaryConstraint,
+            );
         }
-        match (kind.as_u32(), name.as_str()) {
-            (3, "p") => PublicKeyHex::new(values[0].as_str()).is_ok(),
-            (7, "e") => EventId::new(values[0].as_str()).is_ok(),
-            _ => false,
+        if self.has_pocket_high_limit(filter) {
+            return TangleQueryClassification::Broad(TangleBroadQueryReason::HighLimit);
         }
-    }
-
-    fn has_group_constraint(self, filter: &Filter) -> bool {
-        filter
-            .tag_filters()
-            .iter()
-            .any(|(name, values)| matches!(name.as_str(), "h" | "d") && !values.is_empty())
-    }
-
-    fn has_high_limit(self, filter: &Filter) -> bool {
-        filter.limit().unwrap_or(self.limits.default_limit()) >= self.limits.max_limit()
-    }
-
-    fn has_bounded_time_window(self, filter: &Filter) -> bool {
-        match (filter.since(), filter.until()) {
-            (Some(since), Some(until)) => {
-                until.as_u64().saturating_sub(since.as_u64()) <= BROAD_QUERY_TIME_WINDOW_SECONDS
-            }
-            _ => false,
+        if self.has_pocket_broad_time_window(filter) {
+            return TangleQueryClassification::Broad(TangleBroadQueryReason::BroadTimeWindow);
         }
-    }
-
-    fn has_broad_time_window(self, filter: &Filter) -> bool {
-        match (filter.since(), filter.until()) {
-            (Some(since), Some(until)) => {
-                until.as_u64().saturating_sub(since.as_u64()) > BROAD_QUERY_TIME_WINDOW_SECONDS
-            }
-            _ => false,
+        if !self.has_pocket_count_bounded_selector(filter) {
+            return TangleQueryClassification::Broad(
+                TangleBroadQueryReason::MissingBoundedSelector,
+            );
         }
+        TangleQueryClassification::Bounded
     }
 
     fn has_pocket_primary_constraint(self, filter: &PocketFilter) -> bool {
@@ -303,6 +182,18 @@ impl TangleQueryClassifier {
 
     fn has_pocket_strong_constraint(self, filter: &PocketFilter) -> bool {
         filter.num_ids() > 0 || filter.num_authors() > 0 || self.has_pocket_group_constraint(filter)
+    }
+
+    fn has_pocket_count_bounded_selector(self, filter: &PocketFilter) -> bool {
+        self.has_pocket_strong_constraint(filter)
+            || (filter.num_kinds() > 0 && self.has_pocket_bounded_time_window(filter))
+            || self.has_pocket_hll_count_selector(filter)
+    }
+
+    fn has_pocket_hll_count_selector(self, filter: &PocketFilter) -> bool {
+        filter
+            .hyperloglog_offset()
+            .is_ok_and(|offset| offset.is_some())
     }
 
     fn has_pocket_group_constraint(self, filter: &PocketFilter) -> bool {
@@ -325,6 +216,17 @@ impl TangleQueryClassifier {
             u64::from(filter.limit())
         };
         limit >= self.limits.max_limit()
+    }
+
+    fn has_pocket_bounded_time_window(self, filter: &PocketFilter) -> bool {
+        if filter.since() == PocketTime::min() || filter.until() == PocketTime::max() {
+            return false;
+        }
+        filter
+            .until()
+            .as_ref()
+            .saturating_sub(*filter.since().as_ref())
+            <= BROAD_QUERY_TIME_WINDOW_SECONDS
     }
 
     fn has_pocket_broad_time_window(self, filter: &PocketFilter) -> bool {
@@ -673,7 +575,8 @@ impl TangleRuntimeShared {
     fn handle_count_with_auth_report(
         &self,
         subscription_id: SubscriptionId,
-        filters: Vec<Filter>,
+        filters: Vec<PocketOwnedFilter>,
+        search_present: bool,
         auth: &BaseAuthState,
     ) -> Result<BaseRelayCountReport, BaseRelayError> {
         BaseRelay::handle_count_with_shared_services(
@@ -681,30 +584,8 @@ impl TangleRuntimeShared {
             self.groups.as_ref(),
             self.limits.base_relay_limits(),
             self.config.pocket_query_config(),
-            subscription_id,
-            filters,
-            auth,
+            BaseRelayCountQuery::new(subscription_id, filters, search_present, auth),
         )
-    }
-
-    fn rate_limit_req(
-        &self,
-        subscription_id: &SubscriptionId,
-        filters: &[Filter],
-        auth: &BaseAuthState,
-        context: TangleClientRateLimitContext,
-        now: UnixTimestamp,
-    ) -> Option<RelayMessage> {
-        self.rate_limit_query(TangleQueryRateLimitRequest {
-            scope: TangleRateLimitScope::Req,
-            rules: self.config.rate_limits().req(),
-            label: "req",
-            subscription_id,
-            filters,
-            auth,
-            context,
-            now,
-        })
     }
 
     fn rate_limit_req_pocket(
@@ -727,15 +608,15 @@ impl TangleRuntimeShared {
         })
     }
 
-    fn rate_limit_count(
+    fn rate_limit_count_pocket(
         &self,
         subscription_id: &SubscriptionId,
-        filters: &[Filter],
+        filters: &[PocketOwnedFilter],
         auth: &BaseAuthState,
         context: TangleClientRateLimitContext,
         now: UnixTimestamp,
     ) -> Option<RelayMessage> {
-        self.rate_limit_query(TangleQueryRateLimitRequest {
+        self.rate_limit_pocket_query(TanglePocketQueryRateLimitRequest {
             scope: TangleRateLimitScope::Count,
             rules: self.config.rate_limits().count(),
             label: "count",
@@ -750,10 +631,10 @@ impl TangleRuntimeShared {
     fn refuse_broad_count(
         &self,
         subscription_id: &SubscriptionId,
-        filters: &[Filter],
+        filters: &[PocketOwnedFilter],
     ) -> Option<RelayMessage> {
         if TangleQueryClassifier::new(self.limits.base_relay_limits())
-            .classify_count(filters)
+            .classify_pocket_count(filters)
             .is_broad()
         {
             self.metrics.record_count_refusal();
@@ -763,85 +644,6 @@ impl TangleRuntimeShared {
                 message: BaseRelayError::restricted("count filters are too broad or expensive")
                     .prefixed_message(),
             });
-        }
-        None
-    }
-
-    fn rate_limit_query(&self, request: TangleQueryRateLimitRequest<'_>) -> Option<RelayMessage> {
-        if let Some(peer_ip) = request.context.peer_ip
-            && let Some(message) = self.rate_limit_closed(
-                request.subscription_id,
-                TangleRateLimitKey::ip(request.scope, peer_ip),
-                request.rules.per_ip(),
-                request.label,
-                "ip",
-                request.now,
-            )
-        {
-            return Some(message);
-        }
-        if let Some(connection_id) = request.context.connection_id
-            && let Some(message) = self.rate_limit_closed(
-                request.subscription_id,
-                TangleRateLimitKey::connection(request.scope, connection_id),
-                request.rules.per_connection(),
-                request.label,
-                "connection",
-                request.now,
-            )
-        {
-            return Some(message);
-        }
-        for pubkey in request.auth.authenticated_pubkeys() {
-            if let Some(message) = self.rate_limit_closed(
-                request.subscription_id,
-                TangleRateLimitKey::pubkey(request.scope, pubkey.clone()),
-                request.rules.per_pubkey(),
-                request.label,
-                "pubkey",
-                request.now,
-            ) {
-                return Some(message);
-            }
-        }
-        for group_id in filter_group_ids(request.filters) {
-            if let Some(message) = self.rate_limit_closed(
-                request.subscription_id,
-                TangleRateLimitKey::group(request.scope, group_id),
-                request.rules.per_group(),
-                request.label,
-                "group",
-                request.now,
-            ) {
-                return Some(message);
-            }
-        }
-        for kind in filter_kinds(request.filters) {
-            if let Some(message) = self.rate_limit_closed(
-                request.subscription_id,
-                TangleRateLimitKey::kind(request.scope, kind),
-                request.rules.per_kind(),
-                request.label,
-                "kind",
-                request.now,
-            ) {
-                return Some(message);
-            }
-        }
-        let query_classification = TangleQueryClassifier::new(self.limits.base_relay_limits())
-            .classify(request.scope, request.filters);
-        if query_classification.is_broad()
-            && let Some(message) = self.rate_limit_closed(
-                request.subscription_id,
-                TangleRateLimitKey::query_class(request.scope, TangleRateLimitQueryClass::Broad),
-                request.rules.broad(),
-                request.label,
-                "broad",
-                request.now,
-            )
-        {
-            self.metrics.record_broad_query_rejection();
-            return Some(message);
         }
         None
     }
@@ -910,8 +712,14 @@ impl TangleRuntimeShared {
                 return Some(message);
             }
         }
-        let query_classification = TangleQueryClassifier::new(self.limits.base_relay_limits())
-            .classify_pocket_query(request.filters);
+        let classifier = TangleQueryClassifier::new(self.limits.base_relay_limits());
+        let query_classification = match request.scope {
+            TangleRateLimitScope::Req => classifier.classify_pocket_query(request.filters),
+            TangleRateLimitScope::Count => classifier.classify_pocket_count(request.filters),
+            TangleRateLimitScope::Auth
+            | TangleRateLimitScope::Event
+            | TangleRateLimitScope::GroupWrite => classifier.classify_pocket_query(request.filters),
+        };
         if query_classification.is_broad()
             && let Some(message) = self.rate_limit_closed(
                 request.subscription_id,
@@ -1192,7 +1000,6 @@ impl TangleRuntimeHandle {
                 filters,
                 search_present,
             } => {
-                let filters = runtime_filters_to_protocol(filters, search_present)?;
                 let started_at = Instant::now();
                 self.inner
                     .limits
@@ -1201,9 +1008,9 @@ impl TangleRuntimeHandle {
                 self.inner
                     .limits
                     .base_relay_limits()
-                    .validate_filters(&filters)?;
+                    .validate_pocket_filters(&filters)?;
                 if let Some(message) =
-                    BaseRelay::unsupported_search_closed(&subscription_id, &filters)
+                    BaseRelay::unsupported_search_present_closed(&subscription_id, search_present)
                 {
                     self.inner
                         .metrics
@@ -1216,7 +1023,7 @@ impl TangleRuntimeHandle {
                         .record_query_latency(elapsed_micros(started_at));
                     return Ok(vec![message.into()]);
                 }
-                if let Some(message) = self.inner.rate_limit_count(
+                if let Some(message) = self.inner.rate_limit_count_pocket(
                     &subscription_id,
                     &filters,
                     auth,
@@ -1228,9 +1035,12 @@ impl TangleRuntimeHandle {
                         .record_query_latency(elapsed_micros(started_at));
                     return Ok(vec![message.into()]);
                 }
-                let report =
-                    self.inner
-                        .handle_count_with_auth_report(subscription_id, filters, auth)?;
+                let report = self.inner.handle_count_with_auth_report(
+                    subscription_id,
+                    filters,
+                    search_present,
+                    auth,
+                )?;
                 self.inner
                     .metrics
                     .record_query_metrics(report.query_metrics());
@@ -1327,18 +1137,6 @@ impl TangleRuntimeHandle {
 
     pub async fn rate_limiter(&self) -> TangleRateLimiter {
         self.inner.rate_limiter.clone()
-    }
-
-    pub async fn rate_limit_req(
-        &self,
-        subscription_id: &SubscriptionId,
-        filters: &[Filter],
-        auth: &BaseAuthState,
-        rate_limit_context: TangleClientRateLimitContext,
-        now: UnixTimestamp,
-    ) -> Option<RelayMessage> {
-        self.inner
-            .rate_limit_req(subscription_id, filters, auth, rate_limit_context, now)
     }
 
     pub(crate) async fn rate_limit_req_pocket(
@@ -1476,20 +1274,6 @@ fn directory_size_bytes(path: &Path) -> u64 {
         .sum()
 }
 
-fn runtime_filters_to_protocol(
-    filters: Vec<tangle_store_pocket::PocketOwnedFilter>,
-    search_present: bool,
-) -> Result<Vec<Filter>, BaseRelayError> {
-    filters
-        .into_iter()
-        .enumerate()
-        .map(|(index, filter)| {
-            let search = (search_present && index == 0).then(String::new);
-            pocket_filter_to_tangle(&filter, search)
-        })
-        .collect()
-}
-
 #[cfg(test)]
 fn protocol_client_message_to_runtime_for_test(
     message: tangle_protocol::ClientMessage,
@@ -1561,28 +1345,6 @@ fn runtime_client_message_metric_kind(
         | RuntimeClientMessage::NegMsg { .. }
         | RuntimeClientMessage::NegClose(_) => TangleClientMessageMetricKind::Negentropy,
     }
-}
-
-fn filter_group_ids(filters: &[Filter]) -> Vec<GroupId> {
-    filters
-        .iter()
-        .flat_map(|filter| filter.tag_filters())
-        .filter(|(name, _)| matches!(name.as_str(), "h" | "d"))
-        .flat_map(|(_, values)| values)
-        .filter_map(|value| GroupId::new(value.as_str()).ok())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-fn filter_kinds(filters: &[Filter]) -> Vec<Kind> {
-    filters
-        .iter()
-        .flat_map(Filter::kinds)
-        .copied()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
 }
 
 fn pocket_filter_group_ids(filters: &[PocketOwnedFilter]) -> Vec<GroupId> {
@@ -3427,67 +3189,59 @@ mod tests {
     #[test]
     fn query_classifier_identifies_broad_count_shapes() {
         let classifier = TangleQueryClassifier::new(runtime_relay_limits(8));
-        let empty_filter = filter_from_value(&json!({})).expect("filter");
-        let tag_only_filter =
-            filter_from_value(&json!({"#t": ["market"], "limit": 1})).expect("filter");
-        let kind_only_filter =
-            filter_from_value(&json!({"kinds": [1], "limit": 1})).expect("filter");
-        let high_limit_filter =
-            filter_from_value(&json!({"kinds": [1], "#h": ["Farm"], "limit": 500}))
-                .expect("filter");
-        let broad_time_filter = filter_from_value(&json!({
+        let empty_filter = pocket_filter(json!({}));
+        let tag_only_filter = pocket_filter(json!({"#t": ["market"], "limit": 1}));
+        let kind_only_filter = pocket_filter(json!({"kinds": [1], "limit": 1}));
+        let high_limit_filter = pocket_filter(json!({"kinds": [1], "#h": ["Farm"], "limit": 500}));
+        let broad_time_filter = pocket_filter(json!({
             "kinds": [1],
             "since": 1,
             "until": BROAD_QUERY_TIME_WINDOW_SECONDS + 2,
             "limit": 1
-        }))
-        .expect("filter");
-        let bounded_group_filter =
-            filter_from_value(&json!({"kinds": [1], "#h": ["Farm"], "limit": 1})).expect("filter");
-        let bounded_time_filter = filter_from_value(&json!({
+        }));
+        let bounded_group_filter = pocket_filter(json!({"kinds": [1], "#h": ["Farm"], "limit": 1}));
+        let bounded_time_filter = pocket_filter(json!({
             "kinds": [1],
             "since": 1,
             "until": BROAD_QUERY_TIME_WINDOW_SECONDS,
             "limit": 1
-        }))
-        .expect("filter");
-        let hll_reaction_filter =
-            filter_from_value(&json!({"kinds": [7], "#e": ["a".repeat(64)]})).expect("filter");
+        }));
+        let hll_reaction_filter = pocket_filter(json!({"kinds": [7], "#e": ["a".repeat(64)]}));
 
         assert_eq!(
-            classifier.classify_count(&[]),
+            classifier.classify_pocket_count(&[]),
             TangleQueryClassification::Broad(TangleBroadQueryReason::EmptyFilters)
         );
         assert_eq!(
-            classifier.classify_count(&[empty_filter]),
+            classifier.classify_pocket_count(&[empty_filter]),
             TangleQueryClassification::Broad(TangleBroadQueryReason::MissingPrimaryConstraint)
         );
         assert_eq!(
-            classifier.classify_count(&[tag_only_filter]),
+            classifier.classify_pocket_count(&[tag_only_filter]),
             TangleQueryClassification::Broad(TangleBroadQueryReason::MissingPrimaryConstraint)
         );
         assert_eq!(
-            classifier.classify_count(&[kind_only_filter]),
+            classifier.classify_pocket_count(&[kind_only_filter]),
             TangleQueryClassification::Broad(TangleBroadQueryReason::MissingBoundedSelector)
         );
         assert_eq!(
-            classifier.classify_count(&[high_limit_filter]),
+            classifier.classify_pocket_count(&[high_limit_filter]),
             TangleQueryClassification::Broad(TangleBroadQueryReason::HighLimit)
         );
         assert_eq!(
-            classifier.classify_count(&[broad_time_filter]),
+            classifier.classify_pocket_count(&[broad_time_filter]),
             TangleQueryClassification::Broad(TangleBroadQueryReason::BroadTimeWindow)
         );
         assert_eq!(
-            classifier.classify_count(&[bounded_group_filter]),
+            classifier.classify_pocket_count(&[bounded_group_filter]),
             TangleQueryClassification::Bounded
         );
         assert_eq!(
-            classifier.classify_count(&[bounded_time_filter]),
+            classifier.classify_pocket_count(&[bounded_time_filter]),
             TangleQueryClassification::Bounded
         );
         assert_eq!(
-            classifier.classify_count(&[hll_reaction_filter]),
+            classifier.classify_pocket_count(&[hll_reaction_filter]),
             TangleQueryClassification::Bounded
         );
     }
