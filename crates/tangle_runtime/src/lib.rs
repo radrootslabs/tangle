@@ -15,6 +15,7 @@ pub mod relay;
 pub mod runtime;
 pub mod server;
 pub mod session;
+pub mod tenant;
 
 use std::{fmt, fs, path::Path, path::PathBuf};
 

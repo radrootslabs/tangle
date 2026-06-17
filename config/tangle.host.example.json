@@ -1,0 +1,24 @@
+{
+  "listen_addr": "0.0.0.0:7000",
+  "tenant_config_dir": "config/tenants",
+  "limits": {
+    "max_total_connections": 10000,
+    "max_total_subscriptions": 25000,
+    "tenant_startup_concurrency": 4
+  },
+  "ops": {
+    "enabled": true,
+    "expose_tenant_inventory": true
+  },
+  "trusted_proxy": {
+    "enabled": false,
+    "trusted_peers": []
+  },
+  "observability": {
+    "tracing": {
+      "enabled": true,
+      "filter": "info,tangle=info,tangle_runtime=info,tangle_groups=info,tangle_store_pocket=info",
+      "format": "json"
+    }
+  }
+}

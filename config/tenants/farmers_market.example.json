@@ -1,0 +1,178 @@
+{
+  "tenant_id": "farmers-market",
+  "tenant_schema": "farmers_market",
+  "host": "relay.radroots.test",
+  "relay_url": "wss://relay.radroots.test",
+  "inactive": false,
+  "info": {
+    "name": "Radroots Farmers Market",
+    "description": "Tangle virtual relay tenant for the Radroots farmers market",
+    "contact": "mailto:operators@radroots.test",
+    "icon": "https://radroots.test/icon.png"
+  },
+  "pocket": {
+    "data_directory": "runtime/tenants/farmers_market/pocket",
+    "sync_policy": "flush_on_shutdown"
+  },
+  "pocket_query": {
+    "allow_scraping": false,
+    "allow_scrape_if_limited_to": 100,
+    "allow_scrape_if_max_seconds": 3600
+  },
+  "groups": {
+    "enabled": true,
+    "canonical_relay_url": "wss://relay.radroots.test",
+    "relay_secret": "7777777777777777777777777777777777777777777777777777777777777777",
+    "owner_pubkeys": [
+      "0000000000000000000000000000000000000000000000000000000000000001"
+    ],
+    "admin_pubkeys": [
+      "0000000000000000000000000000000000000000000000000000000000000002"
+    ],
+    "policy": {
+      "public_join": false,
+      "invites_enabled": false
+    },
+    "limits": {
+      "max_group_id_bytes": 128,
+      "max_group_tags_per_event": 8,
+      "max_supported_kinds": 512,
+      "max_member_list_pubkeys": 100000,
+      "max_outbox_replay_batch": 1000
+    }
+  },
+  "auth": {
+    "challenge_ttl_seconds": 300,
+    "created_at_skew_seconds": 600
+  },
+  "limits": {
+    "max_message_length": 1048576,
+    "max_subid_length": 64,
+    "max_subscriptions_per_connection": 64,
+    "max_filters_per_request": 10,
+    "max_tag_values_per_filter": 100,
+    "max_query_complexity": 2048,
+    "max_limit": 500,
+    "default_limit": 100,
+    "max_event_tags": 200,
+    "max_content_length": 65536,
+    "broadcast_channel_capacity": 4096,
+    "per_connection_outbound_queue": 256
+  },
+  "rate_limits": {
+    "auth": {
+      "per_ip": {
+        "window_seconds": 60,
+        "max_hits": 120
+      },
+      "per_pubkey": {
+        "window_seconds": 60,
+        "max_hits": 30
+      },
+      "failures": {
+        "window_seconds": 300,
+        "max_hits": 5
+      },
+      "failures_per_ip": {
+        "window_seconds": 300,
+        "max_hits": 20
+      }
+    },
+    "event": {
+      "per_ip": {
+        "window_seconds": 60,
+        "max_hits": 600
+      },
+      "per_pubkey": {
+        "window_seconds": 60,
+        "max_hits": 120
+      },
+      "per_kind": {
+        "window_seconds": 60,
+        "max_hits": 1000
+      }
+    },
+    "group": {
+      "write_per_ip": {
+        "window_seconds": 60,
+        "max_hits": 300
+      },
+      "write_per_pubkey": {
+        "window_seconds": 60,
+        "max_hits": 60
+      },
+      "write_per_group": {
+        "window_seconds": 60,
+        "max_hits": 90
+      },
+      "write_per_kind": {
+        "window_seconds": 60,
+        "max_hits": 300
+      },
+      "join_flow": {
+        "window_seconds": 300,
+        "max_hits": 10
+      },
+      "join_flow_per_ip": {
+        "window_seconds": 300,
+        "max_hits": 30
+      }
+    },
+    "req": {
+      "per_ip": {
+        "window_seconds": 60,
+        "max_hits": 600
+      },
+      "per_connection": {
+        "window_seconds": 60,
+        "max_hits": 120
+      },
+      "per_pubkey": {
+        "window_seconds": 60,
+        "max_hits": 240
+      },
+      "per_group": {
+        "window_seconds": 60,
+        "max_hits": 240
+      },
+      "per_kind": {
+        "window_seconds": 60,
+        "max_hits": 500
+      },
+      "broad": {
+        "window_seconds": 60,
+        "max_hits": 30
+      }
+    },
+    "count": {
+      "per_ip": {
+        "window_seconds": 60,
+        "max_hits": 300
+      },
+      "per_connection": {
+        "window_seconds": 60,
+        "max_hits": 60
+      },
+      "per_pubkey": {
+        "window_seconds": 60,
+        "max_hits": 120
+      },
+      "per_group": {
+        "window_seconds": 60,
+        "max_hits": 120
+      },
+      "per_kind": {
+        "window_seconds": 60,
+        "max_hits": 240
+      },
+      "broad": {
+        "window_seconds": 60,
+        "max_hits": 20
+      }
+    }
+  },
+  "backup_export": {
+    "backup_enabled": true,
+    "export_enabled": true
+  }
+}

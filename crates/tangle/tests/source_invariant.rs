@@ -29,6 +29,20 @@ fn production_runtime_and_group_source_keeps_pocket_native_boundary() {
 }
 
 #[test]
+fn tangle_v1_mvp_authority_requires_virtual_relay_tenancy() {
+    let workspace_root = workspace_root();
+    let agents = fs::read_to_string(workspace_root.join("AGENTS.md")).expect("AGENTS.md");
+    assert!(
+        agents.contains("virtual relay tenancy is required for `tangle_v1_mvp`"),
+        "AGENTS.md must state the approved tangle_v1_mvp virtual relay tenancy requirement"
+    );
+    assert!(
+        !agents.contains("no multi-tenancy"),
+        "AGENTS.md must not keep the stale no multi-tenancy directive"
+    );
+}
+
+#[test]
 fn scanner_removes_test_gated_items_without_removing_production_items() {
     let source = [
         "#[cfg(test)]\n",
