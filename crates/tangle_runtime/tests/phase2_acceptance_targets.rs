@@ -28,7 +28,7 @@ use tangle_runtime::{
     errors::BaseRelayError,
     nip11::BaseRelayInfoConfig,
     relay::{auth::BaseAuthState, core::BaseRelay},
-    runtime::TangleRuntime,
+    runtime::TenantRuntime,
     server::serve_listener_until_shutdown,
 };
 use tangle_store_pocket::{
@@ -349,7 +349,7 @@ async fn tangle_run_serves_until_shutdown() {
     let _ = std::fs::remove_dir_all(&root);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
-    let runtime = TangleRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let runtime = TenantRuntime::open(runtime_config(&root, address)).expect("runtime");
     let shutdown = runtime.shutdown_signal().clone();
     let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
 
@@ -391,7 +391,7 @@ async fn websocket_clients_use_nip01_nip42_and_nip45_flows() {
     let _ = std::fs::remove_dir_all(&root);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
-    let runtime = TangleRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let runtime = TenantRuntime::open(runtime_config(&root, address)).expect("runtime");
     let shutdown = runtime.shutdown_signal().clone();
     let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
     let mut first = connect_nostr_socket(address).await;
@@ -560,7 +560,7 @@ async fn websocket_public_relay_covers_query_count_ephemeral_and_rejection_flows
     let _ = std::fs::remove_dir_all(&root);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
-    let runtime = TangleRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let runtime = TenantRuntime::open(runtime_config(&root, address)).expect("runtime");
     let shutdown = runtime.shutdown_signal().clone();
     let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
     let mut publisher = connect_nostr_socket(address).await;
@@ -754,7 +754,7 @@ async fn websocket_healthy_subscriber_receives_more_than_outbound_capacity() {
     let _ = std::fs::remove_dir_all(&root);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
-    let runtime = TangleRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let runtime = TenantRuntime::open(runtime_config(&root, address)).expect("runtime");
     let shutdown = runtime.shutdown_signal().clone();
     let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
     let mut publisher = connect_nostr_socket(address).await;
@@ -817,7 +817,7 @@ async fn websocket_nip29_group_lifecycle_state_and_live_paths_are_integrated() {
     let _ = std::fs::remove_dir_all(&root);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
-    let runtime = TangleRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let runtime = TenantRuntime::open(runtime_config(&root, address)).expect("runtime");
     let shutdown = runtime.shutdown_signal().clone();
     let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
     let mut owner = connect_nostr_socket(address).await;
@@ -1005,7 +1005,7 @@ async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_
     let _ = std::fs::remove_dir_all(&root);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
-    let runtime = TangleRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let runtime = TenantRuntime::open(runtime_config(&root, address)).expect("runtime");
     let shutdown = runtime.shutdown_signal().clone();
     let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
     let mut owner_writer = connect_nostr_socket(address).await;
@@ -1485,7 +1485,7 @@ async fn nip11_includes_cors_headers_and_truthful_supported_nips() {
     let _ = std::fs::remove_dir_all(&root);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
-    let runtime = TangleRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let runtime = TenantRuntime::open(runtime_config(&root, address)).expect("runtime");
     let shutdown = runtime.shutdown_signal().clone();
     let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
 
@@ -1979,14 +1979,14 @@ fn runtime_live_fanout_offset_lookup_does_not_lock_relay_state() {
 fn runtime_shared_shell_does_not_keep_transitional_base_relay_mutex() {
     let runtime = include_str!("../src/runtime.rs");
     let shared_shell = runtime
-        .split("struct TangleRuntimeShared {")
+        .split("struct TenantRuntimeShared {")
         .nth(1)
         .expect("shared shell")
-        .split("impl TangleRuntimeShared")
+        .split("impl TenantRuntimeShared")
         .next()
         .expect("shared shell fields");
     let handle_impl = runtime
-        .split("impl TangleRuntimeHandle")
+        .split("impl TenantRuntimeHandle")
         .nth(1)
         .expect("runtime handle")
         .split("fn auth_response_failed")
@@ -2054,7 +2054,7 @@ fn projection_and_outbox_recover_from_canonical_pocket_events() {
     .expect("note");
 
     {
-        let mut runtime = TangleRuntime::open(config.clone()).expect("runtime");
+        let mut runtime = TenantRuntime::open(config.clone()).expect("runtime");
         assert_relay_ok(
             runtime
                 .relay_mut()
@@ -2100,7 +2100,7 @@ fn projection_and_outbox_recover_from_canonical_pocket_events() {
 
     delete_group_extra_records(config.pocket_config());
 
-    let recovered = TangleRuntime::open(config.clone()).expect("recovered");
+    let recovered = TenantRuntime::open(config.clone()).expect("recovered");
     let readiness = recovered.readiness_state().response();
     assert_eq!(readiness.checks.group_projection, "ready");
     assert_eq!(readiness.checks.group_outbox_replay, "ready");
@@ -2173,7 +2173,7 @@ async fn relay_generated_events_are_stored_projected_and_broadcast_to_websocket_
     let _ = std::fs::remove_dir_all(&root);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
-    let runtime = TangleRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let runtime = TenantRuntime::open(runtime_config(&root, address)).expect("runtime");
     let shutdown = runtime.shutdown_signal().clone();
     let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
     let mut owner = connect_nostr_socket(address).await;
@@ -2283,7 +2283,7 @@ async fn private_relay_generated_events_reach_authorized_websocket_subscribers()
     let _ = std::fs::remove_dir_all(&root);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
-    let runtime = TangleRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let runtime = TenantRuntime::open(runtime_config(&root, address)).expect("runtime");
     let shutdown = runtime.shutdown_signal().clone();
     let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
     let mut owner_writer = connect_nostr_socket(address).await;

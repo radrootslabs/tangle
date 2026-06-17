@@ -48,7 +48,7 @@ use tangle_store_pocket::{
 };
 use tokio::sync::watch;
 
-pub struct TangleRuntime {
+pub struct TenantRuntime {
     config: BaseRelayRuntimeConfig,
     relay: BaseRelay,
     readiness: BaseRelayReadinessHandle,
@@ -243,7 +243,7 @@ impl TangleQueryClassifier {
     }
 }
 
-impl TangleRuntime {
+impl TenantRuntime {
     pub fn open(config: BaseRelayRuntimeConfig) -> Result<Self, BaseRelayError> {
         let limits = TangleRuntimeLimits::from_config(&config)?;
         let relay = config.open_relay()?;
@@ -319,7 +319,7 @@ impl TangleRuntime {
     }
 }
 
-struct TangleRuntimeShared {
+struct TenantRuntimeShared {
     config: Arc<BaseRelayRuntimeConfig>,
     store: PocketStoreHandle,
     groups: Option<GroupServiceHandle>,
@@ -331,9 +331,9 @@ struct TangleRuntimeShared {
     shutdown: TangleShutdownSignal,
 }
 
-impl TangleRuntimeShared {
-    fn from_runtime(runtime: TangleRuntime) -> Self {
-        let TangleRuntime {
+impl TenantRuntimeShared {
+    fn from_runtime(runtime: TenantRuntime) -> Self {
+        let TenantRuntime {
             config,
             relay,
             readiness,
@@ -790,14 +790,14 @@ impl TangleRuntimeShared {
 }
 
 #[derive(Clone)]
-pub struct TangleRuntimeHandle {
-    inner: Arc<TangleRuntimeShared>,
+pub struct TenantRuntimeHandle {
+    inner: Arc<TenantRuntimeShared>,
 }
 
-impl TangleRuntimeHandle {
-    pub fn new(runtime: TangleRuntime) -> Self {
+impl TenantRuntimeHandle {
+    pub fn new(runtime: TenantRuntime) -> Self {
         Self {
-            inner: Arc::new(TangleRuntimeShared::from_runtime(runtime)),
+            inner: Arc::new(TenantRuntimeShared::from_runtime(runtime)),
         }
     }
 
@@ -1382,9 +1382,9 @@ fn pocket_filter_kinds(filters: &[PocketOwnedFilter]) -> Vec<Kind> {
         .collect()
 }
 
-impl fmt::Debug for TangleRuntimeHandle {
+impl fmt::Debug for TenantRuntimeHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("TangleRuntimeHandle")
+        formatter.write_str("TenantRuntimeHandle")
     }
 }
 
@@ -2086,7 +2086,7 @@ mod tests {
     use super::{
         BROAD_QUERY_TIME_WINDOW_SECONDS, RuntimeClientMessage, TangleBroadQueryReason,
         TangleClientRateLimitContext, TangleQueryClassification, TangleQueryClassifier,
-        TangleRuntime, TangleRuntimeHandle, TangleRuntimeLimits,
+        TangleRuntimeLimits, TenantRuntime, TenantRuntimeHandle,
     };
     use crate::config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json};
     use crate::event_bus::{TangleEventBus, TangleEventReceiveError, TangleEventReceiver};
@@ -2124,7 +2124,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let config = runtime_config(&root, 8);
 
-        let mut runtime = TangleRuntime::open(config).expect("runtime");
+        let mut runtime = TenantRuntime::open(config).expect("runtime");
         let mut offsets = runtime.event_bus().subscribe();
         let shutdown = runtime.shutdown_signal().subscribe();
 
@@ -2305,8 +2305,8 @@ mod tests {
     async fn runtime_publishes_stored_event_offsets_for_live_fanout() {
         let root = temp_root("runtime-offset-fanout");
         let _ = std::fs::remove_dir_all(&root);
-        let handle = TangleRuntimeHandle::new(
-            TangleRuntime::open(runtime_config(&root, 8)).expect("runtime"),
+        let handle = TenantRuntimeHandle::new(
+            TenantRuntime::open(runtime_config(&root, 8)).expect("runtime"),
         );
         let mut offsets = handle.subscribe_events().await;
         let mut auth = handle.auth_state().await.expect("auth");
@@ -2384,7 +2384,7 @@ mod tests {
     async fn runtime_rate_limits_event_pubkeys_before_storage() {
         let root = temp_root("runtime-event-rate-limit");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root, 8)).expect("runtime");
         let event = tangle_v2_event(FixtureKey::Member, 1_714_124_433, 1, Vec::new(), "limited")
             .expect("event");
         let rule = runtime.config().rate_limits().event().per_pubkey();
@@ -2397,7 +2397,7 @@ mod tests {
                 .rate_limiter()
                 .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
         }
-        let handle = TangleRuntimeHandle::new(runtime);
+        let handle = TenantRuntimeHandle::new(runtime);
         let mut auth = handle.auth_state().await.expect("auth");
 
         assert_eq!(
@@ -2424,7 +2424,7 @@ mod tests {
     async fn runtime_rate_limits_event_kinds_before_storage() {
         let root = temp_root("runtime-event-kind-rate-limit");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root, 8)).expect("runtime");
         let event = tangle_v2_event(FixtureKey::Admin, 1_714_124_433, 1, Vec::new(), "limited")
             .expect("event");
         let rule = runtime.config().rate_limits().event().per_kind();
@@ -2434,7 +2434,7 @@ mod tests {
                 .rate_limiter()
                 .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
         }
-        let handle = TangleRuntimeHandle::new(runtime);
+        let handle = TenantRuntimeHandle::new(runtime);
         let mut auth = handle.auth_state().await.expect("auth");
 
         assert_eq!(
@@ -2460,7 +2460,7 @@ mod tests {
     async fn runtime_rate_limits_event_peer_ips_partition_peers_and_precede_identity_keys() {
         let root = temp_root("runtime-event-ip-rate-limit");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root, 8)).expect("runtime");
         let rule = runtime.config().rate_limits().event().per_ip();
         let saturated_peer_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 20));
         let other_peer_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 21));
@@ -2479,7 +2479,7 @@ mod tests {
         let allowed_event =
             tangle_v2_event(FixtureKey::Owner, 1_714_124_435, 2, Vec::new(), "allowed")
                 .expect("allowed event");
-        let handle = TangleRuntimeHandle::new(runtime);
+        let handle = TenantRuntimeHandle::new(runtime);
         let mut auth = handle.auth_state().await.expect("auth");
 
         assert_eq!(
@@ -2541,7 +2541,7 @@ mod tests {
     async fn runtime_rate_limits_auth_pubkeys_before_authentication() {
         let root = temp_root("runtime-auth-pubkey-rate-limit");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root, 8)).expect("runtime");
         let auth_event =
             tangle_v2_auth_event(FixtureKey::Member, "challenge-a", 120).expect("auth event");
         let rule = runtime.config().rate_limits().auth().per_pubkey();
@@ -2554,7 +2554,7 @@ mod tests {
                 .rate_limiter()
                 .record(key.clone(), rule, UnixTimestamp::new(120));
         }
-        let handle = TangleRuntimeHandle::new(runtime);
+        let handle = TenantRuntimeHandle::new(runtime);
         let mut auth = handle.auth_state().await.expect("auth");
         auth.issue_challenge("challenge-a", UnixTimestamp::new(100))
             .expect("challenge");
@@ -2583,7 +2583,7 @@ mod tests {
     async fn runtime_rate_limits_auth_peer_ips_before_authentication() {
         let root = temp_root("runtime-auth-ip-rate-limit");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root, 8)).expect("runtime");
         let auth_event =
             tangle_v2_auth_event(FixtureKey::Member, "challenge-a", 120).expect("auth event");
         let rule = runtime.config().rate_limits().auth().per_ip();
@@ -2594,7 +2594,7 @@ mod tests {
                 .rate_limiter()
                 .record(key.clone(), rule, UnixTimestamp::new(120));
         }
-        let handle = TangleRuntimeHandle::new(runtime);
+        let handle = TenantRuntimeHandle::new(runtime);
         let mut auth = handle.auth_state().await.expect("auth");
         auth.issue_challenge("challenge-a", UnixTimestamp::new(100))
             .expect("challenge");
@@ -2626,7 +2626,7 @@ mod tests {
     async fn runtime_rate_limits_auth_failures() {
         let root = temp_root("runtime-auth-failure-rate-limit");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root, 8)).expect("runtime");
         let auth_event = tangle_v2_event(FixtureKey::Member, 1_714_124_433, 22_242, Vec::new(), "")
             .expect("auth event");
         let key =
@@ -2637,7 +2637,7 @@ mod tests {
                 .rate_limiter()
                 .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
         }
-        let handle = TangleRuntimeHandle::new(runtime);
+        let handle = TenantRuntimeHandle::new(runtime);
         let mut auth = handle.auth_state().await.expect("auth");
 
         assert_eq!(
@@ -2664,7 +2664,7 @@ mod tests {
     async fn runtime_rate_limits_auth_failures_by_peer_ip() {
         let root = temp_root("runtime-auth-failure-ip-rate-limit");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root, 8)).expect("runtime");
         let auth_event = tangle_v2_event(FixtureKey::Admin, 1_714_124_433, 22_242, Vec::new(), "")
             .expect("auth event");
         let peer_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 31));
@@ -2675,7 +2675,7 @@ mod tests {
                 .rate_limiter()
                 .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
         }
-        let handle = TangleRuntimeHandle::new(runtime);
+        let handle = TenantRuntimeHandle::new(runtime);
         let mut auth = handle.auth_state().await.expect("auth");
 
         assert_eq!(
@@ -2705,7 +2705,7 @@ mod tests {
     async fn runtime_preserves_chorus_auth_failure_rate_limit_parity() {
         let root = temp_root("runtime-chorus-auth-rate-limit-parity");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root, 8)).expect("runtime");
         let pubkey_event =
             tangle_v2_event(FixtureKey::Member, 1_714_124_433, 22_242, Vec::new(), "")
                 .expect("pubkey auth event");
@@ -2731,7 +2731,7 @@ mod tests {
                 UnixTimestamp::new(1_714_124_434),
             );
         }
-        let handle = TangleRuntimeHandle::new(runtime);
+        let handle = TenantRuntimeHandle::new(runtime);
         let mut auth = handle.auth_state().await.expect("auth");
 
         assert_eq!(
@@ -2782,7 +2782,7 @@ mod tests {
     async fn runtime_rate_limits_group_writes_by_pubkey() {
         let root = temp_root("runtime-group-pubkey-rate-limit");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root, 8)).expect("runtime");
         let event = tangle_v2_event(
             FixtureKey::Member,
             1_714_124_433,
@@ -2801,7 +2801,7 @@ mod tests {
                 .rate_limiter()
                 .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
         }
-        let handle = TangleRuntimeHandle::new(runtime);
+        let handle = TenantRuntimeHandle::new(runtime);
         let mut auth = handle.auth_state().await.expect("auth");
 
         assert_eq!(
@@ -2828,7 +2828,7 @@ mod tests {
     async fn runtime_rate_limits_group_writes_by_peer_ip() {
         let root = temp_root("runtime-group-ip-rate-limit");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root, 8)).expect("runtime");
         let event = tangle_v2_event(
             FixtureKey::Member,
             1_714_124_433,
@@ -2845,7 +2845,7 @@ mod tests {
                 .rate_limiter()
                 .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
         }
-        let handle = TangleRuntimeHandle::new(runtime);
+        let handle = TenantRuntimeHandle::new(runtime);
         let mut auth = handle.auth_state().await.expect("auth");
 
         assert_eq!(
@@ -2875,7 +2875,7 @@ mod tests {
     async fn runtime_rate_limits_group_writes_by_group_id() {
         let root = temp_root("runtime-group-write-rate-limit");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root, 8)).expect("runtime");
         let group_id = GroupId::new("Farm").expect("group");
         let event = tangle_v2_event(
             FixtureKey::Member,
@@ -2892,7 +2892,7 @@ mod tests {
                 .rate_limiter()
                 .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
         }
-        let handle = TangleRuntimeHandle::new(runtime);
+        let handle = TenantRuntimeHandle::new(runtime);
         let mut auth = handle.auth_state().await.expect("auth");
 
         assert_eq!(
@@ -2919,7 +2919,7 @@ mod tests {
     async fn runtime_rate_limits_group_writes_by_kind() {
         let root = temp_root("runtime-group-kind-rate-limit");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root, 8)).expect("runtime");
         let event = tangle_v2_event(
             FixtureKey::Member,
             1_714_124_433,
@@ -2936,7 +2936,7 @@ mod tests {
                 .rate_limiter()
                 .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
         }
-        let handle = TangleRuntimeHandle::new(runtime);
+        let handle = TenantRuntimeHandle::new(runtime);
         let mut auth = handle.auth_state().await.expect("auth");
 
         assert_eq!(
@@ -2962,7 +2962,7 @@ mod tests {
     async fn runtime_rate_limits_group_join_flows() {
         let root = temp_root("runtime-group-join-rate-limit");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root, 8)).expect("runtime");
         let group_id = GroupId::new("Farm").expect("group");
         let event = tangle_v2_event(
             FixtureKey::Member,
@@ -2979,7 +2979,7 @@ mod tests {
                 .rate_limiter()
                 .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
         }
-        let handle = TangleRuntimeHandle::new(runtime);
+        let handle = TenantRuntimeHandle::new(runtime);
         let mut auth = handle.auth_state().await.expect("auth");
 
         assert_eq!(
@@ -3005,7 +3005,7 @@ mod tests {
     async fn runtime_rate_limits_group_join_flows_by_peer_ip() {
         let root = temp_root("runtime-group-join-ip-rate-limit");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root, 8)).expect("runtime");
         let group_id = GroupId::new("Farm").expect("group");
         let event = tangle_v2_event(
             FixtureKey::Member,
@@ -3023,7 +3023,7 @@ mod tests {
                 .rate_limiter()
                 .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
         }
-        let handle = TangleRuntimeHandle::new(runtime);
+        let handle = TenantRuntimeHandle::new(runtime);
         let mut auth = handle.auth_state().await.expect("auth");
 
         assert_eq!(
@@ -3054,9 +3054,9 @@ mod tests {
     async fn runtime_rate_limits_req_authenticated_pubkeys() {
         let root = temp_root("runtime-req-pubkey-rate-limit");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root, 8)).expect("runtime");
         let rule = runtime.config().rate_limits().req().per_pubkey();
-        let handle = TangleRuntimeHandle::new(runtime);
+        let handle = TenantRuntimeHandle::new(runtime);
         let mut auth = handle.auth_state().await.expect("auth");
         auth.issue_challenge("challenge-a", UnixTimestamp::new(100))
             .expect("challenge");
@@ -3112,7 +3112,7 @@ mod tests {
     async fn runtime_rate_limits_req_connections() {
         let root = temp_root("runtime-req-connection-rate-limit");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root, 8)).expect("runtime");
         let rule = runtime.config().rate_limits().req().per_connection();
         let key = TangleRateLimitKey::connection(TangleRateLimitScope::Req, 77);
         for _ in 0..rule.max_hits() {
@@ -3120,7 +3120,7 @@ mod tests {
                 .rate_limiter()
                 .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
         }
-        let handle = TangleRuntimeHandle::new(runtime);
+        let handle = TenantRuntimeHandle::new(runtime);
         let mut auth = handle.auth_state().await.expect("auth");
         let subscription_id = SubscriptionId::new("limited-req-connection").expect("subscription");
         let filters = vec![filter_from_value(&json!({"kinds": [1], "limit": 1})).expect("filter")];
@@ -3152,7 +3152,7 @@ mod tests {
     async fn runtime_rate_limits_req_filter_groups() {
         let root = temp_root("runtime-req-group-rate-limit");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root, 8)).expect("runtime");
         let group_id = GroupId::new("Farm").expect("group");
         let rule = runtime.config().rate_limits().req().per_group();
         let key = TangleRateLimitKey::group(TangleRateLimitScope::Req, group_id);
@@ -3161,7 +3161,7 @@ mod tests {
                 .rate_limiter()
                 .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
         }
-        let handle = TangleRuntimeHandle::new(runtime);
+        let handle = TenantRuntimeHandle::new(runtime);
         let mut auth = handle.auth_state().await.expect("auth");
         let subscription_id = SubscriptionId::new("limited-req-group").expect("subscription");
         let filters =
@@ -3252,8 +3252,8 @@ mod tests {
     async fn runtime_count_hll_accepts_public_pocket_selector() {
         let root = temp_root("runtime-count-hll");
         let _ = std::fs::remove_dir_all(&root);
-        let handle = TangleRuntimeHandle::new(
-            TangleRuntime::open(runtime_config(&root, 8)).expect("runtime"),
+        let handle = TenantRuntimeHandle::new(
+            TenantRuntime::open(runtime_config(&root, 8)).expect("runtime"),
         );
         let mut auth = handle.auth_state().await.expect("auth");
         let target = "c".repeat(64);
@@ -3329,7 +3329,7 @@ mod tests {
     async fn runtime_rate_limits_count_peer_ips() {
         let root = temp_root("runtime-count-ip-rate-limit");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root, 8)).expect("runtime");
         let rule = runtime.config().rate_limits().count().per_ip();
         let peer_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 9));
         let key = TangleRateLimitKey::ip(TangleRateLimitScope::Count, peer_ip);
@@ -3338,7 +3338,7 @@ mod tests {
                 .rate_limiter()
                 .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
         }
-        let handle = TangleRuntimeHandle::new(runtime);
+        let handle = TenantRuntimeHandle::new(runtime);
         let mut auth = handle.auth_state().await.expect("auth");
         let subscription_id = SubscriptionId::new("limited-count-ip").expect("subscription");
         let filters = vec![
@@ -3371,8 +3371,8 @@ mod tests {
     async fn runtime_rejects_search_req_and_count_as_unsupported() {
         let root = temp_root("runtime-search-unsupported");
         let _ = std::fs::remove_dir_all(&root);
-        let handle = TangleRuntimeHandle::new(
-            TangleRuntime::open(runtime_config(&root, 8)).expect("runtime"),
+        let handle = TenantRuntimeHandle::new(
+            TenantRuntime::open(runtime_config(&root, 8)).expect("runtime"),
         );
         let mut auth = handle.auth_state().await.expect("auth");
         let req_id = SubscriptionId::new("search-req").expect("req");
@@ -3422,7 +3422,7 @@ mod tests {
     async fn runtime_rate_limits_count_filter_kinds() {
         let root = temp_root("runtime-count-kind-rate-limit");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root, 8)).expect("runtime");
         let kind = Kind::new(1).expect("kind");
         let rule = runtime.config().rate_limits().count().per_kind();
         let key = TangleRateLimitKey::kind(TangleRateLimitScope::Count, kind);
@@ -3431,7 +3431,7 @@ mod tests {
                 .rate_limiter()
                 .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
         }
-        let handle = TangleRuntimeHandle::new(runtime);
+        let handle = TenantRuntimeHandle::new(runtime);
         let mut auth = handle.auth_state().await.expect("auth");
         let subscription_id = SubscriptionId::new("limited-count-kind").expect("subscription");
         let filters = vec![
@@ -3463,7 +3463,7 @@ mod tests {
     async fn runtime_refuses_broad_count_queries_before_rate_limits() {
         let root = temp_root("runtime-count-broad-refusal");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root, 8)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root, 8)).expect("runtime");
         let rule = runtime.config().rate_limits().count().broad();
         let key = TangleRateLimitKey::query_class(
             TangleRateLimitScope::Count,
@@ -3474,7 +3474,7 @@ mod tests {
                 .rate_limiter()
                 .record(key.clone(), rule, UnixTimestamp::new(1_714_124_433));
         }
-        let handle = TangleRuntimeHandle::new(runtime);
+        let handle = TenantRuntimeHandle::new(runtime);
         let mut auth = handle.auth_state().await.expect("auth");
         let subscription_id = SubscriptionId::new("limited-count-broad").expect("subscription");
         let filters = vec![filter_from_value(&json!({"limit": 1})).expect("filter")];
@@ -3506,8 +3506,8 @@ mod tests {
     async fn runtime_refuses_expensive_count_queries_deterministically() {
         let root = temp_root("runtime-count-expensive-refusal");
         let _ = std::fs::remove_dir_all(&root);
-        let handle = TangleRuntimeHandle::new(
-            TangleRuntime::open(runtime_config(&root, 8)).expect("runtime"),
+        let handle = TenantRuntimeHandle::new(
+            TenantRuntime::open(runtime_config(&root, 8)).expect("runtime"),
         );
         let mut auth = handle.auth_state().await.expect("auth");
         let cases = [
@@ -3559,8 +3559,8 @@ mod tests {
     async fn runtime_publishes_generated_group_event_offsets_for_live_fanout() {
         let root = temp_root("runtime-generated-offset-fanout");
         let _ = std::fs::remove_dir_all(&root);
-        let handle = TangleRuntimeHandle::new(
-            TangleRuntime::open(runtime_config(&root, 8)).expect("runtime"),
+        let handle = TenantRuntimeHandle::new(
+            TenantRuntime::open(runtime_config(&root, 8)).expect("runtime"),
         );
         let mut offsets = handle.subscribe_events().await;
         let mut auth = handle.auth_state().await.expect("auth");
@@ -3680,8 +3680,8 @@ mod tests {
     async fn runtime_group_concurrency_duplicate_create_accepts_one_projection() {
         let root = temp_root("runtime-group-concurrency-duplicate-create");
         let _ = std::fs::remove_dir_all(&root);
-        let handle = TangleRuntimeHandle::new(
-            TangleRuntime::open(runtime_config(&root, 32)).expect("runtime"),
+        let handle = TenantRuntimeHandle::new(
+            TenantRuntime::open(runtime_config(&root, 32)).expect("runtime"),
         );
         let mut offsets = handle.subscribe_events().await;
         let owner_auth =
@@ -3753,8 +3753,8 @@ mod tests {
     async fn runtime_group_concurrency_duplicate_join_accepts_one_membership() {
         let root = temp_root("runtime-group-concurrency-duplicate-join");
         let _ = std::fs::remove_dir_all(&root);
-        let handle = TangleRuntimeHandle::new(
-            TangleRuntime::open(runtime_config_with_public_join(&root, 32)).expect("runtime"),
+        let handle = TenantRuntimeHandle::new(
+            TenantRuntime::open(runtime_config_with_public_join(&root, 32)).expect("runtime"),
         );
         let mut offsets = handle.subscribe_events().await;
         let mut owner_auth =
@@ -3821,8 +3821,8 @@ mod tests {
     async fn runtime_group_concurrency_join_and_leave_match_rebuild() {
         let root = temp_root("runtime-group-concurrency-join-leave");
         let _ = std::fs::remove_dir_all(&root);
-        let handle = TangleRuntimeHandle::new(
-            TangleRuntime::open(runtime_config_with_public_join(&root, 32)).expect("runtime"),
+        let handle = TenantRuntimeHandle::new(
+            TenantRuntime::open(runtime_config_with_public_join(&root, 32)).expect("runtime"),
         );
         let mut owner_auth = authenticated_runtime_state(
             &handle,
@@ -3914,8 +3914,8 @@ mod tests {
     async fn runtime_group_concurrency_delete_tombstone_blocks_normal_write() {
         let root = temp_root("runtime-group-concurrency-delete-write");
         let _ = std::fs::remove_dir_all(&root);
-        let handle = TangleRuntimeHandle::new(
-            TangleRuntime::open(runtime_config(&root, 32)).expect("runtime"),
+        let handle = TenantRuntimeHandle::new(
+            TenantRuntime::open(runtime_config(&root, 32)).expect("runtime"),
         );
         let mut owner_auth =
             authenticated_runtime_state(&handle, FixtureKey::Owner, "owner-delete", 1_714_126_400)
@@ -3999,8 +3999,8 @@ mod tests {
     async fn runtime_group_concurrency_membership_mutation_matches_rebuild() {
         let root = temp_root("runtime-group-concurrency-membership-mutation");
         let _ = std::fs::remove_dir_all(&root);
-        let handle = TangleRuntimeHandle::new(
-            TangleRuntime::open(runtime_config(&root, 32)).expect("runtime"),
+        let handle = TenantRuntimeHandle::new(
+            TenantRuntime::open(runtime_config(&root, 32)).expect("runtime"),
         );
         let mut owner_auth = authenticated_runtime_state(
             &handle,
@@ -4084,8 +4084,8 @@ mod tests {
     async fn runtime_shared_services_progress_under_concurrent_event_query_count_and_fanout() {
         let root = temp_root("runtime-shared-concurrency");
         let _ = std::fs::remove_dir_all(&root);
-        let handle = TangleRuntimeHandle::new(
-            TangleRuntime::open(runtime_config(&root, 32)).expect("runtime"),
+        let handle = TenantRuntimeHandle::new(
+            TenantRuntime::open(runtime_config(&root, 32)).expect("runtime"),
         );
         let base_time = 1_714_126_000;
         let mut owner_auth = handle.auth_state().await.expect("owner auth");
@@ -4616,7 +4616,7 @@ mod tests {
     }
 
     async fn authenticated_runtime_state(
-        handle: &TangleRuntimeHandle,
+        handle: &TenantRuntimeHandle,
         key: FixtureKey,
         challenge: &str,
         now: u64,
@@ -4646,7 +4646,7 @@ mod tests {
     }
 
     async fn runtime_event_reply(
-        handle: &TangleRuntimeHandle,
+        handle: &TenantRuntimeHandle,
         event: Event,
         auth: &mut BaseAuthState,
         now: u64,
@@ -4665,7 +4665,7 @@ mod tests {
     }
 
     fn runtime_pocket_event_reply(
-        handle: &TangleRuntimeHandle,
+        handle: &TenantRuntimeHandle,
         event: &PocketEvent,
         auth: &mut BaseAuthState,
     ) -> RelayMessage {
@@ -4677,7 +4677,7 @@ mod tests {
     }
 
     async fn runtime_group_count(
-        handle: &TangleRuntimeHandle,
+        handle: &TenantRuntimeHandle,
         subscription_id: &str,
         group_id: &str,
         kind: u32,
@@ -4784,7 +4784,7 @@ mod tests {
     }
 
     fn assert_runtime_member_status(
-        handle: &TangleRuntimeHandle,
+        handle: &TenantRuntimeHandle,
         group_id: &str,
         pubkey: &PublicKeyHex,
         status: MemberStatus,
@@ -4802,7 +4802,7 @@ mod tests {
         );
     }
 
-    fn assert_live_projection_matches_rebuild(handle: &TangleRuntimeHandle, group_id: &str) {
+    fn assert_live_projection_matches_rebuild(handle: &TenantRuntimeHandle, group_id: &str) {
         let group_id = GroupId::new(group_id).expect("group");
         let groups = handle.inner.groups.as_ref().expect("groups");
         let live = groups.projection();
@@ -4829,7 +4829,7 @@ mod tests {
         );
     }
 
-    fn rebuilt_projection(handle: &TangleRuntimeHandle) -> GroupProjection {
+    fn rebuilt_projection(handle: &TenantRuntimeHandle) -> GroupProjection {
         let groups = handle.inner.groups.as_ref().expect("groups");
         let limits = groups.limits();
         let events = handle

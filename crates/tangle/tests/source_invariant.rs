@@ -43,6 +43,30 @@ fn tangle_v1_mvp_authority_requires_virtual_relay_tenancy() {
 }
 
 #[test]
+fn tenant_runtime_surface_has_no_stale_single_runtime_api_names() {
+    let workspace_root = workspace_root();
+    let runtime_source =
+        fs::read_to_string(workspace_root.join("crates/tangle_runtime/src/runtime.rs"))
+            .expect("runtime source");
+    let lib_source = fs::read_to_string(workspace_root.join("crates/tangle_runtime/src/lib.rs"))
+        .expect("lib source");
+    for forbidden in [
+        "pub struct TangleRuntime {",
+        "TangleRuntimeHandle",
+        "TangleRuntimeShared",
+        "load_base_relay_runtime_config",
+        "open_tangle_runtime_from_config_path",
+    ] {
+        assert!(
+            !runtime_source.contains(forbidden) && !lib_source.contains(forbidden),
+            "stale single-runtime API name remains: {forbidden}"
+        );
+    }
+    assert!(runtime_source.contains("pub struct TenantRuntime"));
+    assert!(runtime_source.contains("pub struct TenantRuntimeHandle"));
+}
+
+#[test]
 fn scanner_removes_test_gated_items_without_removing_production_items() {
     let source = [
         "#[cfg(test)]\n",

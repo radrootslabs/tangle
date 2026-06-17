@@ -203,7 +203,7 @@ pub async fn run_with_config(
         .map_err(|error| error.to_string())?;
     tangle_runtime::logging::log_runtime_config_loaded(&config);
     let runtime =
-        tangle_runtime::runtime::TangleRuntime::open(config).map_err(|error| error.to_string())?;
+        tangle_runtime::runtime::TenantRuntime::open(config).map_err(|error| error.to_string())?;
     tangle_runtime::server::serve_until_shutdown(runtime)
         .await
         .map_err(|error| error.to_string())

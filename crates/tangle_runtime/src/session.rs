@@ -12,8 +12,8 @@ use crate::{
         outbound::RuntimeRelayMessage,
     },
     runtime::{
-        TangleClientMessageMetricKind, TangleClientRateLimitContext, TangleRuntimeHandle,
-        TangleRuntimeLimits,
+        TangleClientMessageMetricKind, TangleClientRateLimitContext, TangleRuntimeLimits,
+        TenantRuntimeHandle,
     },
 };
 use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket};
@@ -34,7 +34,7 @@ pub struct TangleWebSocketSession {
     outbound: TangleOutboundSender,
     outbound_receiver: mpsc::Receiver<Message>,
     shutdown: watch::Receiver<bool>,
-    runtime: TangleRuntimeHandle,
+    runtime: TenantRuntimeHandle,
     limits: TangleRuntimeLimits,
     auth: BaseAuthState,
     subscriptions: LiveSubscriptionSet,
@@ -47,7 +47,7 @@ impl TangleWebSocketSession {
     pub fn new(
         limits: TangleRuntimeLimits,
         shutdown: watch::Receiver<bool>,
-        runtime: TangleRuntimeHandle,
+        runtime: TenantRuntimeHandle,
         auth: BaseAuthState,
         events: TangleEventReceiver,
     ) -> Result<Self, BaseRelayError> {
@@ -57,7 +57,7 @@ impl TangleWebSocketSession {
     pub fn new_with_peer(
         limits: TangleRuntimeLimits,
         shutdown: watch::Receiver<bool>,
-        runtime: TangleRuntimeHandle,
+        runtime: TenantRuntimeHandle,
         auth: BaseAuthState,
         events: TangleEventReceiver,
         peer_ip: Option<IpAddr>,
@@ -573,7 +573,7 @@ mod tests {
         event_bus::TangleEventReceiver,
         rate_limits::{TangleRateLimitKey, TangleRateLimitScope},
         relay::core::{BaseRelayLimitSettings, BaseRelayLimits},
-        runtime::{TangleRuntime, TangleRuntimeHandle, TangleRuntimeLimits, TangleShutdownSignal},
+        runtime::{TangleRuntimeLimits, TangleShutdownSignal, TenantRuntime, TenantRuntimeHandle},
     };
     use axum::extract::ws::Message;
     use serde_json::json;
@@ -814,7 +814,7 @@ mod tests {
         let root = temp_root("connection-scope");
         let _ = std::fs::remove_dir_all(&root);
         let runtime =
-            TangleRuntimeHandle::new(TangleRuntime::open(runtime_config(&root)).expect("runtime"));
+            TenantRuntimeHandle::new(TenantRuntime::open(runtime_config(&root)).expect("runtime"));
         let metrics = runtime.metrics();
         let auth_a = runtime.auth_state().await.expect("auth a");
         let auth_b = runtime.auth_state().await.expect("auth b");
@@ -900,8 +900,8 @@ mod tests {
         let shutdown = TangleShutdownSignal::new();
         let root = temp_root("current-auth-live");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntimeHandle::new(
-            TangleRuntime::open(runtime_config_with_groups(&root)).expect("runtime"),
+        let runtime = TenantRuntimeHandle::new(
+            TenantRuntime::open(runtime_config_with_groups(&root)).expect("runtime"),
         );
         let mut owner_auth = runtime.auth_state().await.expect("owner auth");
         owner_auth
@@ -1053,7 +1053,7 @@ mod tests {
         let root = temp_root("complete-req-lifecycle");
         let _ = std::fs::remove_dir_all(&root);
         let runtime =
-            TangleRuntimeHandle::new(TangleRuntime::open(runtime_config(&root)).expect("runtime"));
+            TenantRuntimeHandle::new(TenantRuntime::open(runtime_config(&root)).expect("runtime"));
         let mut auth = runtime.auth_state().await.expect("auth");
         let events = runtime.subscribe_events().await;
         let mut session = TangleWebSocketSession::new(
@@ -1159,8 +1159,8 @@ mod tests {
         let shutdown = TangleShutdownSignal::new();
         let root = temp_root("redacted-req-close");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntimeHandle::new(
-            TangleRuntime::open(runtime_config_with_groups(&root)).expect("runtime"),
+        let runtime = TenantRuntimeHandle::new(
+            TenantRuntime::open(runtime_config_with_groups(&root)).expect("runtime"),
         );
         let mut owner_auth = runtime.auth_state().await.expect("owner auth");
         owner_auth
@@ -1279,7 +1279,7 @@ mod tests {
         let root = temp_root("chorus-close-scope-parity");
         let _ = std::fs::remove_dir_all(&root);
         let runtime =
-            TangleRuntimeHandle::new(TangleRuntime::open(runtime_config(&root)).expect("runtime"));
+            TenantRuntimeHandle::new(TenantRuntime::open(runtime_config(&root)).expect("runtime"));
         let metrics = runtime.metrics();
         let auth_a = runtime.auth_state().await.expect("auth a");
         let auth_b = runtime.auth_state().await.expect("auth b");
@@ -1395,9 +1395,9 @@ mod tests {
         let shutdown = TangleShutdownSignal::new();
         let root = temp_root("rate-limited-req");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root)).expect("runtime");
         let rule = runtime.config().rate_limits().req().per_connection();
-        let runtime = TangleRuntimeHandle::new(runtime);
+        let runtime = TenantRuntimeHandle::new(runtime);
         let auth = runtime.auth_state().await.expect("auth");
         let events = runtime.subscribe_events().await;
         let now = current_unix_timestamp();
@@ -1450,12 +1450,12 @@ mod tests {
         let root = temp_root("event-receiver-lag");
         let _ = std::fs::remove_dir_all(&root);
         let runtime =
-            TangleRuntime::open(runtime_config_with_outbound_queue(&root, 1)).expect("runtime");
+            TenantRuntime::open(runtime_config_with_outbound_queue(&root, 1)).expect("runtime");
         let auth = runtime.auth_state().expect("auth");
         let events = runtime.event_bus().subscribe();
         assert_eq!(runtime.event_bus().publish(StoreOffset::new(1)), 1);
         assert_eq!(runtime.event_bus().publish(StoreOffset::new(2)), 1);
-        let runtime = TangleRuntimeHandle::new(runtime);
+        let runtime = TenantRuntimeHandle::new(runtime);
         let metrics = runtime.metrics();
         let mut session = TangleWebSocketSession::new(
             session_limits(1),
@@ -1482,8 +1482,8 @@ mod tests {
         let shutdown = TangleShutdownSignal::new();
         let live_root = temp_root("chorus-live-fanout-parity");
         let _ = std::fs::remove_dir_all(&live_root);
-        let runtime = TangleRuntimeHandle::new(
-            TangleRuntime::open(runtime_config_with_outbound_queue(&live_root, 1))
+        let runtime = TenantRuntimeHandle::new(
+            TenantRuntime::open(runtime_config_with_outbound_queue(&live_root, 1))
                 .expect("runtime"),
         );
         let metrics = runtime.metrics();
@@ -1555,12 +1555,12 @@ mod tests {
         let lag_root = temp_root("chorus-live-lag-parity");
         let _ = std::fs::remove_dir_all(&lag_root);
         let runtime =
-            TangleRuntime::open(runtime_config_with_outbound_queue(&lag_root, 1)).expect("runtime");
+            TenantRuntime::open(runtime_config_with_outbound_queue(&lag_root, 1)).expect("runtime");
         let auth = runtime.auth_state().expect("auth");
         let events = runtime.event_bus().subscribe();
         assert_eq!(runtime.event_bus().publish(StoreOffset::new(1)), 1);
         assert_eq!(runtime.event_bus().publish(StoreOffset::new(2)), 1);
-        let runtime = TangleRuntimeHandle::new(runtime);
+        let runtime = TenantRuntimeHandle::new(runtime);
         let metrics = runtime.metrics();
         let mut lagged = TangleWebSocketSession::new(
             session_limits(1),
@@ -1783,16 +1783,16 @@ mod tests {
     fn session_runtime(
         name: &str,
     ) -> (
-        TangleRuntimeHandle,
+        TenantRuntimeHandle,
         crate::relay::auth::BaseAuthState,
         TangleEventReceiver,
     ) {
         let root = temp_root(name);
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root)).expect("runtime");
         let auth = runtime.auth_state().expect("auth");
         let events = runtime.event_bus().subscribe();
-        (TangleRuntimeHandle::new(runtime), auth, events)
+        (TenantRuntimeHandle::new(runtime), auth, events)
     }
 
     fn req(subscription_id: SubscriptionId) -> ClientMessage {

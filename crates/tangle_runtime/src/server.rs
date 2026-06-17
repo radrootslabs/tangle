@@ -6,8 +6,8 @@ use crate::{
     nip11::{BaseRelayInfoConfig, BaseRelayInfoDocument, base_relay_info_response},
     ops::{BaseRelayReadinessCheckStatus, BaseRelayReadinessHandle, base_relay_ops_router},
     runtime::{
-        TangleRuntime, TangleRuntimeHandle, TangleRuntimeLimits, TangleRuntimeMetrics,
-        TangleShutdownSignal,
+        TangleRuntimeLimits, TangleRuntimeMetrics, TangleShutdownSignal, TenantRuntime,
+        TenantRuntimeHandle,
     },
     session::TangleWebSocketSession,
 };
@@ -48,7 +48,7 @@ impl TangleServeReport {
 }
 
 pub async fn serve_until_shutdown(
-    runtime: TangleRuntime,
+    runtime: TenantRuntime,
 ) -> Result<TangleServeReport, BaseRelayError> {
     let listener = TcpListener::bind(runtime.config().listen_addr())
         .await
@@ -57,7 +57,7 @@ pub async fn serve_until_shutdown(
 }
 
 pub async fn serve_listener_until_shutdown(
-    runtime: TangleRuntime,
+    runtime: TenantRuntime,
     listener: TcpListener,
 ) -> Result<TangleServeReport, BaseRelayError> {
     let listen_addr = listener
@@ -70,7 +70,7 @@ pub async fn serve_listener_until_shutdown(
     let limits = runtime.limits();
     let metrics = runtime.metrics().clone();
     let shutdown_signal = runtime.shutdown_signal().clone();
-    let runtime = TangleRuntimeHandle::new(runtime);
+    let runtime = TenantRuntimeHandle::new(runtime);
     let router = tangle_http_router(
         readiness,
         info,
@@ -111,7 +111,7 @@ pub fn tangle_http_router(
     limits: TangleRuntimeLimits,
     metrics: TangleRuntimeMetrics,
     shutdown: TangleShutdownSignal,
-    runtime: TangleRuntimeHandle,
+    runtime: TenantRuntimeHandle,
 ) -> Router {
     Router::new()
         .route("/", get(tangle_root))
@@ -129,7 +129,7 @@ struct TangleHttpState {
     info: BaseRelayInfoDocument,
     limits: TangleRuntimeLimits,
     shutdown: TangleShutdownSignal,
-    runtime: TangleRuntimeHandle,
+    runtime: TenantRuntimeHandle,
 }
 
 async fn tangle_root(
@@ -174,7 +174,7 @@ mod tests {
         config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
         nip11::BaseRelayInfoConfig,
         ops::BaseRelayReadinessCheckStatus,
-        runtime::{TangleRuntime, TangleRuntimeHandle, TangleShutdownSignal},
+        runtime::{TangleShutdownSignal, TenantRuntime, TenantRuntimeHandle},
     };
     use axum::{body::to_bytes, extract::ConnectInfo};
     use futures_util::{SinkExt, StreamExt};
@@ -205,7 +205,7 @@ mod tests {
     async fn serve_until_shutdown_binds_listener_and_exits_on_signal() {
         let root = temp_root("serve-until-shutdown");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root)).expect("runtime");
         let shutdown = runtime.shutdown_signal().clone();
         let task = tokio::spawn(serve_until_shutdown(runtime));
 
@@ -224,7 +224,7 @@ mod tests {
     async fn serve_until_shutdown_accepts_websocket_upgrade() {
         let root = temp_root("websocket-upgrade");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root)).expect("runtime");
         let shutdown = runtime.shutdown_signal().clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
         let address = listener.local_addr().expect("address");
@@ -260,7 +260,7 @@ mod tests {
     async fn serve_until_shutdown_closes_websocket_sessions() {
         let root = temp_root("websocket-shutdown");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root)).expect("runtime");
         let shutdown = runtime.shutdown_signal().clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
         let address = listener.local_addr().expect("address");
@@ -301,7 +301,7 @@ mod tests {
     async fn websocket_session_dispatches_base_client_messages() {
         let root = temp_root("websocket-dispatch");
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = TangleRuntime::open(runtime_config(&root)).expect("runtime");
+        let runtime = TenantRuntime::open(runtime_config(&root)).expect("runtime");
         let shutdown = runtime.shutdown_signal().clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
         let address = listener.local_addr().expect("address");
@@ -421,7 +421,7 @@ mod tests {
             .expect("info config")
             .build_document()
             .expect("info");
-        let runtime = TangleRuntime::open(config).expect("runtime");
+        let runtime = TenantRuntime::open(config).expect("runtime");
         let readiness = runtime.readiness_handle();
         readiness.set_server_bind(BaseRelayReadinessCheckStatus::Ready);
         let limits = runtime.limits();
@@ -432,7 +432,7 @@ mod tests {
             limits,
             metrics,
             TangleShutdownSignal::new(),
-            TangleRuntimeHandle::new(runtime),
+            TenantRuntimeHandle::new(runtime),
         );
         let nip11 = router
             .clone()

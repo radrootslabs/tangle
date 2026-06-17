@@ -20,11 +20,10 @@ pub mod tenant;
 use std::{fmt, fs, path::Path, path::PathBuf};
 
 use config::{
-    BaseRelayRuntimeConfig, TangleHostRuntimeConfigSet, parse_base_relay_runtime_config_json,
-    parse_tangle_host_runtime_config_json, parse_tenant_runtime_config_json,
+    TangleHostRuntimeConfigSet, parse_tangle_host_runtime_config_json,
+    parse_tenant_runtime_config_json,
 };
 use errors::BaseRelayError;
-use runtime::TangleRuntime;
 
 pub const TANGLE_RELAY_SOFTWARE: &str = "https://github.com/radrootslabs/tangle";
 pub const TANGLE_RELAY_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -79,17 +78,6 @@ impl fmt::Display for TangleRuntimeLoadError {
 
 impl std::error::Error for TangleRuntimeLoadError {}
 
-pub fn load_base_relay_runtime_config(
-    path: impl AsRef<Path>,
-) -> Result<BaseRelayRuntimeConfig, TangleRuntimeLoadError> {
-    let path = path.as_ref();
-    let raw = fs::read_to_string(path).map_err(|source| TangleRuntimeLoadError::ReadConfig {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    parse_base_relay_runtime_config_json(&raw).map_err(TangleRuntimeLoadError::ParseConfig)
-}
-
 pub fn load_tangle_host_runtime_config(
     path: impl AsRef<Path>,
 ) -> Result<TangleHostRuntimeConfigSet, TangleRuntimeLoadError> {
@@ -132,13 +120,6 @@ pub fn load_tangle_host_runtime_config(
         tenants.push(tenant);
     }
     TangleHostRuntimeConfigSet::new(host, tenants).map_err(TangleRuntimeLoadError::ParseConfig)
-}
-
-pub fn open_tangle_runtime_from_config_path(
-    path: impl AsRef<Path>,
-) -> Result<TangleRuntime, TangleRuntimeLoadError> {
-    let config = load_base_relay_runtime_config(path)?;
-    TangleRuntime::open(config).map_err(TangleRuntimeLoadError::OpenRelay)
 }
 
 fn resolve_config_path(base: Option<&Path>, path: &Path) -> PathBuf {
