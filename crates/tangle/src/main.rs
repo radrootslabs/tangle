@@ -65,6 +65,36 @@ async fn main() -> ExitCode {
                 }
             }
         }
+        tangle::TangleCommand::TenantBackup => match run_tenant_backup(&invocation) {
+            Ok(output) => {
+                println!("{output}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::from(2)
+            }
+        },
+        tangle::TangleCommand::TenantRestore => match run_tenant_restore(&invocation) {
+            Ok(output) => {
+                println!("{output}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::from(2)
+            }
+        },
+        tangle::TangleCommand::TenantExport => match run_tenant_export(&invocation) {
+            Ok(output) => {
+                println!("{output}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::from(2)
+            }
+        },
     }
 }
 
@@ -79,6 +109,52 @@ fn config_path_or_error(invocation: &tangle::TangleInvocation) -> Result<String,
         .map_err(|error| error.to_string())
 }
 
+fn tenant_id_or_error(invocation: &tangle::TangleInvocation) -> Result<String, String> {
+    tangle::require_tenant_id(invocation)
+        .map(str::to_owned)
+        .map_err(|error| error.to_string())
+}
+
+fn output_path_or_error(invocation: &tangle::TangleInvocation) -> Result<String, String> {
+    tangle::require_output_path(invocation)
+        .map(str::to_owned)
+        .map_err(|error| error.to_string())
+}
+
+fn input_path_or_error(invocation: &tangle::TangleInvocation) -> Result<String, String> {
+    tangle::require_input_path(invocation)
+        .map(str::to_owned)
+        .map_err(|error| error.to_string())
+}
+
+fn target_data_dir_or_error(invocation: &tangle::TangleInvocation) -> Result<String, String> {
+    tangle::require_target_data_dir(invocation)
+        .map(str::to_owned)
+        .map_err(|error| error.to_string())
+}
+
+fn run_tenant_backup(invocation: &tangle::TangleInvocation) -> Result<String, String> {
+    let config = config_path_or_error(invocation)?;
+    let tenant = tenant_id_or_error(invocation)?;
+    let output = output_path_or_error(invocation)?;
+    tangle::backup_tenant(&config, &tenant, &output, invocation.include_secrets())
+}
+
+fn run_tenant_restore(invocation: &tangle::TangleInvocation) -> Result<String, String> {
+    let config = config_path_or_error(invocation)?;
+    let tenant = tenant_id_or_error(invocation)?;
+    let input = input_path_or_error(invocation)?;
+    let target_data_dir = target_data_dir_or_error(invocation)?;
+    tangle::restore_tenant(&config, &tenant, &input, &target_data_dir)
+}
+
+fn run_tenant_export(invocation: &tangle::TangleInvocation) -> Result<String, String> {
+    let config = config_path_or_error(invocation)?;
+    let tenant = tenant_id_or_error(invocation)?;
+    let output = output_path_or_error(invocation)?;
+    tangle::export_tenant(&config, &tenant, &output)
+}
+
 #[cfg(test)]
 mod tests {
     #[tokio::test]
@@ -86,6 +162,11 @@ mod tests {
         let run = tangle::TangleInvocation::new(tangle::TangleCommand::Run, None);
         assert_eq!(
             super::run_server(&run).await.expect_err("run config"),
+            "--config requires a value"
+        );
+        let backup = tangle::TangleInvocation::new(tangle::TangleCommand::TenantBackup, None);
+        assert_eq!(
+            super::run_tenant_backup(&backup).expect_err("backup config"),
             "--config requires a value"
         );
     }

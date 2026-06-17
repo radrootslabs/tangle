@@ -10,7 +10,10 @@ usage:
   tangle run --config PATH
   tangle config validate --config PATH
   tangle config inspect --config PATH --redacted
-  tangle tenant list --config PATH";
+  tangle tenant list --config PATH
+  tangle tenant backup --config PATH --tenant TENANT_ID --output PATH
+  tangle tenant restore --config PATH --tenant TENANT_ID --input PATH --target-data-dir PATH
+  tangle tenant export --config PATH --tenant TENANT_ID --output PATH";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TangleCommand {
@@ -20,6 +23,9 @@ pub enum TangleCommand {
     ConfigValidate,
     ConfigInspect,
     TenantList,
+    TenantBackup,
+    TenantRestore,
+    TenantExport,
 }
 
 impl TangleCommand {
@@ -31,6 +37,9 @@ impl TangleCommand {
             Self::ConfigValidate => "config validate",
             Self::ConfigInspect => "config inspect",
             Self::TenantList => "tenant list",
+            Self::TenantBackup => "tenant backup",
+            Self::TenantRestore => "tenant restore",
+            Self::TenantExport => "tenant export",
         }
     }
 }
@@ -39,7 +48,12 @@ impl TangleCommand {
 pub struct TangleInvocation {
     command: TangleCommand,
     config_path: Option<String>,
+    tenant_id: Option<String>,
+    input_path: Option<String>,
+    output_path: Option<String>,
+    target_data_dir: Option<String>,
     redacted: bool,
+    include_secrets: bool,
 }
 
 impl TangleInvocation {
@@ -55,7 +69,33 @@ impl TangleInvocation {
         Self {
             command,
             config_path,
+            tenant_id: None,
+            input_path: None,
+            output_path: None,
+            target_data_dir: None,
             redacted,
+            include_secrets: false,
+        }
+    }
+
+    pub fn new_with_admin_options(
+        command: TangleCommand,
+        config_path: Option<String>,
+        tenant_id: Option<String>,
+        input_path: Option<String>,
+        output_path: Option<String>,
+        target_data_dir: Option<String>,
+        include_secrets: bool,
+    ) -> Self {
+        Self {
+            command,
+            config_path,
+            tenant_id,
+            input_path,
+            output_path,
+            target_data_dir,
+            redacted: false,
+            include_secrets,
         }
     }
 
@@ -67,8 +107,28 @@ impl TangleInvocation {
         self.config_path.as_deref()
     }
 
+    pub fn tenant_id(&self) -> Option<&str> {
+        self.tenant_id.as_deref()
+    }
+
+    pub fn input_path(&self) -> Option<&str> {
+        self.input_path.as_deref()
+    }
+
+    pub fn output_path(&self) -> Option<&str> {
+        self.output_path.as_deref()
+    }
+
+    pub fn target_data_dir(&self) -> Option<&str> {
+        self.target_data_dir.as_deref()
+    }
+
     pub fn redacted(&self) -> bool {
         self.redacted
+    }
+
+    pub fn include_secrets(&self) -> bool {
+        self.include_secrets
     }
 }
 
@@ -141,6 +201,9 @@ where
         },
         "tenant" => match args.next().as_deref() {
             Some("list") => TangleCommand::TenantList,
+            Some("backup") => TangleCommand::TenantBackup,
+            Some("restore") => TangleCommand::TenantRestore,
+            Some("export") => TangleCommand::TenantExport,
             Some(command) => {
                 return Err(TangleCliError::UnknownCommand(format!("tenant {command}")));
             }
@@ -149,7 +212,12 @@ where
         _ => return Err(TangleCliError::UnknownCommand(first)),
     };
     let mut config_path = None;
+    let mut tenant_id = None;
+    let mut input_path = None;
+    let mut output_path = None;
+    let mut target_data_dir = None;
     let mut redacted = false;
+    let mut include_secrets = false;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--config" => {
@@ -161,8 +229,47 @@ where
                 };
                 config_path = Some(path);
             }
+            "--tenant" if command_accepts_tenant(command) => {
+                if tenant_id.is_some() {
+                    return Err(TangleCliError::RepeatedOption("--tenant"));
+                }
+                let Some(value) = args.next() else {
+                    return Err(TangleCliError::MissingOptionValue("--tenant"));
+                };
+                tenant_id = Some(value);
+            }
+            "--input" if command == TangleCommand::TenantRestore => {
+                if input_path.is_some() {
+                    return Err(TangleCliError::RepeatedOption("--input"));
+                }
+                let Some(path) = args.next() else {
+                    return Err(TangleCliError::MissingOptionValue("--input"));
+                };
+                input_path = Some(path);
+            }
+            "--output" if command_accepts_output(command) => {
+                if output_path.is_some() {
+                    return Err(TangleCliError::RepeatedOption("--output"));
+                }
+                let Some(path) = args.next() else {
+                    return Err(TangleCliError::MissingOptionValue("--output"));
+                };
+                output_path = Some(path);
+            }
+            "--target-data-dir" if command == TangleCommand::TenantRestore => {
+                if target_data_dir.is_some() {
+                    return Err(TangleCliError::RepeatedOption("--target-data-dir"));
+                }
+                let Some(path) = args.next() else {
+                    return Err(TangleCliError::MissingOptionValue("--target-data-dir"));
+                };
+                target_data_dir = Some(path);
+            }
             "--redacted" if command == TangleCommand::ConfigInspect => {
                 redacted = true;
+            }
+            "--include-secrets" if command == TangleCommand::TenantBackup => {
+                include_secrets = true;
             }
             _ => {
                 return Err(TangleCliError::UnexpectedArgument {
@@ -178,17 +285,46 @@ where
             argument: "--config".to_owned(),
         });
     }
-    Ok(TangleInvocation::new_with_options(
+    Ok(TangleInvocation {
         command,
         config_path,
+        tenant_id,
+        input_path,
+        output_path,
+        target_data_dir,
         redacted,
-    ))
+        include_secrets,
+    })
 }
 
 pub fn require_config_path(invocation: &TangleInvocation) -> Result<&str, TangleCliError> {
     invocation
         .config_path()
         .ok_or(TangleCliError::MissingOptionValue("--config"))
+}
+
+pub fn require_tenant_id(invocation: &TangleInvocation) -> Result<&str, TangleCliError> {
+    invocation
+        .tenant_id()
+        .ok_or(TangleCliError::MissingOptionValue("--tenant"))
+}
+
+pub fn require_input_path(invocation: &TangleInvocation) -> Result<&str, TangleCliError> {
+    invocation
+        .input_path()
+        .ok_or(TangleCliError::MissingOptionValue("--input"))
+}
+
+pub fn require_output_path(invocation: &TangleInvocation) -> Result<&str, TangleCliError> {
+    invocation
+        .output_path()
+        .ok_or(TangleCliError::MissingOptionValue("--output"))
+}
+
+pub fn require_target_data_dir(invocation: &TangleInvocation) -> Result<&str, TangleCliError> {
+    invocation
+        .target_data_dir()
+        .ok_or(TangleCliError::MissingOptionValue("--target-data-dir"))
 }
 
 pub async fn run_with_config(
@@ -297,6 +433,48 @@ pub fn list_tenants(config_path: &str) -> Result<String, String> {
     Ok(lines.join("\n"))
 }
 
+pub fn backup_tenant(
+    config_path: &str,
+    tenant_id: &str,
+    output: &str,
+    include_secrets: bool,
+) -> Result<String, String> {
+    let report =
+        tangle_runtime::backup::backup_tenant(tangle_runtime::backup::TenantBackupRequest {
+            config_path,
+            tenant_id,
+            output,
+            include_secrets,
+        })?;
+    serde_json::to_string_pretty(&report).map_err(|error| error.to_string())
+}
+
+pub fn restore_tenant(
+    config_path: &str,
+    tenant_id: &str,
+    input: &str,
+    target_data_dir: &str,
+) -> Result<String, String> {
+    let report =
+        tangle_runtime::backup::restore_tenant(tangle_runtime::backup::TenantRestoreRequest {
+            config_path,
+            tenant_id,
+            input,
+            target_data_dir,
+        })?;
+    serde_json::to_string_pretty(&report).map_err(|error| error.to_string())
+}
+
+pub fn export_tenant(config_path: &str, tenant_id: &str, output: &str) -> Result<String, String> {
+    let report =
+        tangle_runtime::export::export_tenant(tangle_runtime::export::TenantExportRequest {
+            config_path,
+            tenant_id,
+            output,
+        })?;
+    serde_json::to_string_pretty(&report).map_err(|error| error.to_string())
+}
+
 fn command_accepts_config(command: TangleCommand) -> bool {
     matches!(
         command,
@@ -304,6 +482,23 @@ fn command_accepts_config(command: TangleCommand) -> bool {
             | TangleCommand::ConfigValidate
             | TangleCommand::ConfigInspect
             | TangleCommand::TenantList
+            | TangleCommand::TenantBackup
+            | TangleCommand::TenantRestore
+            | TangleCommand::TenantExport
+    )
+}
+
+fn command_accepts_tenant(command: TangleCommand) -> bool {
+    matches!(
+        command,
+        TangleCommand::TenantBackup | TangleCommand::TenantRestore | TangleCommand::TenantExport
+    )
+}
+
+fn command_accepts_output(command: TangleCommand) -> bool {
+    matches!(
+        command,
+        TangleCommand::TenantBackup | TangleCommand::TenantExport
     )
 }
 
@@ -311,8 +506,9 @@ fn command_accepts_config(command: TangleCommand) -> bool {
 mod tests {
     use super::{
         PACKAGE_NAME, PACKAGE_VERSION, TangleCliError, TangleCommand, TangleInvocation,
-        inspect_config, list_tenants, parse_tangle_invocation, require_config_path, usage_output,
-        validate_config, version_output,
+        inspect_config, list_tenants, parse_tangle_invocation, require_config_path,
+        require_input_path, require_output_path, require_target_data_dir, require_tenant_id,
+        usage_output, validate_config, version_output,
     };
 
     #[test]
@@ -326,7 +522,7 @@ mod tests {
     fn usage_lists_only_v2_command_surface() {
         assert_eq!(
             usage_output(),
-            "usage:\n  tangle [--version]\n  tangle run --config PATH\n  tangle config validate --config PATH\n  tangle config inspect --config PATH --redacted\n  tangle tenant list --config PATH"
+            "usage:\n  tangle [--version]\n  tangle run --config PATH\n  tangle config validate --config PATH\n  tangle config inspect --config PATH --redacted\n  tangle tenant list --config PATH\n  tangle tenant backup --config PATH --tenant TENANT_ID --output PATH\n  tangle tenant restore --config PATH --tenant TENANT_ID --input PATH --target-data-dir PATH\n  tangle tenant export --config PATH --tenant TENANT_ID --output PATH"
         );
     }
 
@@ -389,6 +585,74 @@ mod tests {
                 Some("config/tangle.host.example.json".to_owned())
             )
         );
+        assert_eq!(
+            parse_tangle_invocation([
+                "tenant",
+                "backup",
+                "--config",
+                "config/tangle.host.example.json",
+                "--tenant",
+                "farmers-market",
+                "--output",
+                "backup"
+            ])
+            .expect("tenant backup"),
+            TangleInvocation::new_with_admin_options(
+                TangleCommand::TenantBackup,
+                Some("config/tangle.host.example.json".to_owned()),
+                Some("farmers-market".to_owned()),
+                None,
+                Some("backup".to_owned()),
+                None,
+                false
+            )
+        );
+        assert_eq!(
+            parse_tangle_invocation([
+                "tenant",
+                "restore",
+                "--config",
+                "config/tangle.host.example.json",
+                "--tenant",
+                "farmers-market",
+                "--input",
+                "backup",
+                "--target-data-dir",
+                "runtime/restored"
+            ])
+            .expect("tenant restore"),
+            TangleInvocation::new_with_admin_options(
+                TangleCommand::TenantRestore,
+                Some("config/tangle.host.example.json".to_owned()),
+                Some("farmers-market".to_owned()),
+                Some("backup".to_owned()),
+                None,
+                Some("runtime/restored".to_owned()),
+                false
+            )
+        );
+        assert_eq!(
+            parse_tangle_invocation([
+                "tenant",
+                "export",
+                "--config",
+                "config/tangle.host.example.json",
+                "--tenant",
+                "farmers-market",
+                "--output",
+                "events.jsonl"
+            ])
+            .expect("tenant export"),
+            TangleInvocation::new_with_admin_options(
+                TangleCommand::TenantExport,
+                Some("config/tangle.host.example.json".to_owned()),
+                Some("farmers-market".to_owned()),
+                None,
+                Some("events.jsonl".to_owned()),
+                None,
+                false
+            )
+        );
     }
 
     #[test]
@@ -442,6 +706,102 @@ mod tests {
             require_config_path(&TangleInvocation::new(TangleCommand::Run, None))
                 .expect_err("config"),
             TangleCliError::MissingOptionValue("--config")
+        );
+    }
+
+    #[test]
+    fn tenant_admin_required_options_report_missing_values() {
+        let backup = TangleInvocation::new(TangleCommand::TenantBackup, None);
+        let restore = TangleInvocation::new(TangleCommand::TenantRestore, None);
+
+        assert_eq!(
+            require_tenant_id(&backup).expect_err("tenant"),
+            TangleCliError::MissingOptionValue("--tenant")
+        );
+        assert_eq!(
+            require_output_path(&backup).expect_err("output"),
+            TangleCliError::MissingOptionValue("--output")
+        );
+        assert_eq!(
+            require_input_path(&restore).expect_err("input"),
+            TangleCliError::MissingOptionValue("--input")
+        );
+        assert_eq!(
+            require_target_data_dir(&restore).expect_err("target"),
+            TangleCliError::MissingOptionValue("--target-data-dir")
+        );
+    }
+
+    #[test]
+    fn tenant_admin_parser_accepts_backup_restore_export_commands() {
+        assert_eq!(
+            parse_tangle_invocation([
+                "tenant",
+                "backup",
+                "--config",
+                "host.json",
+                "--tenant",
+                "market",
+                "--output",
+                "backup",
+                "--include-secrets"
+            ])
+            .expect("backup"),
+            TangleInvocation::new_with_admin_options(
+                TangleCommand::TenantBackup,
+                Some("host.json".to_owned()),
+                Some("market".to_owned()),
+                None,
+                Some("backup".to_owned()),
+                None,
+                true
+            )
+        );
+        assert_eq!(
+            parse_tangle_invocation([
+                "tenant",
+                "restore",
+                "--config",
+                "host.json",
+                "--tenant",
+                "market",
+                "--input",
+                "backup",
+                "--target-data-dir",
+                "runtime/market"
+            ])
+            .expect("restore"),
+            TangleInvocation::new_with_admin_options(
+                TangleCommand::TenantRestore,
+                Some("host.json".to_owned()),
+                Some("market".to_owned()),
+                Some("backup".to_owned()),
+                None,
+                Some("runtime/market".to_owned()),
+                false
+            )
+        );
+        assert_eq!(
+            parse_tangle_invocation([
+                "tenant",
+                "export",
+                "--config",
+                "host.json",
+                "--tenant",
+                "market",
+                "--output",
+                "events.jsonl"
+            ])
+            .expect("export"),
+            TangleInvocation::new_with_admin_options(
+                TangleCommand::TenantExport,
+                Some("host.json".to_owned()),
+                Some("market".to_owned()),
+                None,
+                Some("events.jsonl".to_owned()),
+                None,
+                false
+            )
         );
     }
 

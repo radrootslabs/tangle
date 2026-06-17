@@ -1328,6 +1328,7 @@ dependencies = [
  "http",
  "serde",
  "serde_json",
+ "sha2",
  "tangle_crypto",
  "tangle_groups",
  "tangle_protocol",

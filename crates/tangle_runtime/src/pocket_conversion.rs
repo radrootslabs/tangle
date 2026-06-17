@@ -5,9 +5,9 @@ use crate::errors::BaseRelayError;
 use std::str;
 use tangle_protocol::EventId;
 #[cfg(test)]
-use tangle_protocol::Filter;
-#[cfg(test)]
-use tangle_protocol::{Event, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent};
+use tangle_protocol::{
+    Event, Filter, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
+};
 #[cfg(test)]
 use tangle_store_pocket::PocketEvent;
 use tangle_store_pocket::PocketEventId;

@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
+pub mod backup;
 pub(crate) mod client_message;
 pub mod config;
 pub mod errors;
 pub mod event_bus;
+pub mod export;
 pub mod groups;
 pub mod host;
 pub mod logging;

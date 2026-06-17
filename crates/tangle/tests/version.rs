@@ -29,7 +29,7 @@ fn tangle_without_args_reports_usage() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "usage:\n  tangle [--version]\n  tangle run --config PATH\n  tangle config validate --config PATH\n  tangle config inspect --config PATH --redacted\n  tangle tenant list --config PATH\n"
+        format!("{}\n", tangle::usage_output())
     );
     assert!(output.stderr.is_empty());
 }
@@ -45,7 +45,7 @@ fn tangle_unknown_arg_reports_usage_error() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
-        "unknown command: --unknown\nusage:\n  tangle [--version]\n  tangle run --config PATH\n  tangle config validate --config PATH\n  tangle config inspect --config PATH --redacted\n  tangle tenant list --config PATH\n"
+        format!("unknown command: --unknown\n{}\n", tangle::usage_output())
     );
 }
 
