@@ -24,8 +24,12 @@ use tangle_protocol::{
     UnixTimestamp, UnsignedEvent, event_to_value, filter_from_value, filter_to_value,
 };
 use tangle_runtime::{
-    config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
+    config::{
+        BaseRelayRuntimeConfig, TangleHostRuntimeConfigSet, parse_base_relay_runtime_config_json,
+        parse_tangle_host_runtime_config_json, parse_tenant_runtime_config_json,
+    },
     errors::BaseRelayError,
+    host::TangleHostRuntime,
     nip11::BaseRelayInfoConfig,
     relay::{auth::BaseAuthState, core::BaseRelay},
     runtime::TenantRuntime,
@@ -349,21 +353,22 @@ async fn tangle_run_serves_until_shutdown() {
     let _ = std::fs::remove_dir_all(&root);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
-    let runtime = TenantRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let runtime = host_runtime(&root, address);
     let shutdown = runtime.shutdown_signal().clone();
     let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
 
-    let health = wait_for_http_ok(address, "/healthz", None).await;
-    let ready = wait_for_http_ok(address, "/readyz", None).await;
-    let metrics = wait_for_http_ok(address, "/metricsz", None).await;
+    let ready = wait_for_http_ok(address, "/.well-known/tangle/ready", None).await;
+    let metrics = wait_for_http_ok(address, "/.well-known/tangle/metrics", None).await;
+    let tenants = wait_for_http_ok(address, "/.well-known/tangle/tenants", None).await;
     let nip11 = wait_for_http_ok(address, "/", Some("application/nostr+json")).await;
 
-    assert!(health.contains(r#""status":"ok""#));
     assert!(ready.contains(r#""status":"ready""#));
-    assert!(ready.contains(r#""server_bind":"ready""#));
+    assert!(ready.contains(r#""active_tenants":"ready""#));
     assert!(metrics.contains(r#""tangle_readiness_ready":true"#));
+    assert!(metrics.contains(r#""tangle_host_active_tenants":1"#));
     assert!(metrics.contains(r#""tangle_ws_connections_current":0"#));
     assert!(metrics.contains(r#""tangle_stored_event_offsets_total":0"#));
+    assert!(tenants.contains(r#""tenant_id":"acceptance-relay""#));
     assert!(nip11.contains(r#""name":"tangle""#));
     assert!(
         nip11
@@ -391,7 +396,7 @@ async fn websocket_clients_use_nip01_nip42_and_nip45_flows() {
     let _ = std::fs::remove_dir_all(&root);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
-    let runtime = TenantRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let runtime = host_runtime(&root, address);
     let shutdown = runtime.shutdown_signal().clone();
     let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
     let mut first = connect_nostr_socket(address).await;
@@ -560,7 +565,7 @@ async fn websocket_public_relay_covers_query_count_ephemeral_and_rejection_flows
     let _ = std::fs::remove_dir_all(&root);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
-    let runtime = TenantRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let runtime = host_runtime(&root, address);
     let shutdown = runtime.shutdown_signal().clone();
     let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
     let mut publisher = connect_nostr_socket(address).await;
@@ -754,7 +759,7 @@ async fn websocket_healthy_subscriber_receives_more_than_outbound_capacity() {
     let _ = std::fs::remove_dir_all(&root);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
-    let runtime = TenantRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let runtime = host_runtime(&root, address);
     let shutdown = runtime.shutdown_signal().clone();
     let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
     let mut publisher = connect_nostr_socket(address).await;
@@ -817,7 +822,7 @@ async fn websocket_nip29_group_lifecycle_state_and_live_paths_are_integrated() {
     let _ = std::fs::remove_dir_all(&root);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
-    let runtime = TenantRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let runtime = host_runtime(&root, address);
     let shutdown = runtime.shutdown_signal().clone();
     let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
     let mut owner = connect_nostr_socket(address).await;
@@ -1005,7 +1010,7 @@ async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_
     let _ = std::fs::remove_dir_all(&root);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
-    let runtime = TenantRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let runtime = host_runtime(&root, address);
     let shutdown = runtime.shutdown_signal().clone();
     let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
     let mut owner_writer = connect_nostr_socket(address).await;
@@ -1431,7 +1436,7 @@ async fn websocket_private_and_hidden_groups_do_not_leak_through_query_count_or_
     )
     .await;
 
-    let metrics = wait_for_http_ok(address, "/metricsz", None).await;
+    let metrics = wait_for_http_ok(address, "/.well-known/tangle/metrics", None).await;
     for private_value in [
         "PrivateSocket",
         "HiddenSocket",
@@ -1485,7 +1490,7 @@ async fn nip11_includes_cors_headers_and_truthful_supported_nips() {
     let _ = std::fs::remove_dir_all(&root);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
-    let runtime = TenantRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let runtime = host_runtime(&root, address);
     let shutdown = runtime.shutdown_signal().clone();
     let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
 
@@ -2173,7 +2178,7 @@ async fn relay_generated_events_are_stored_projected_and_broadcast_to_websocket_
     let _ = std::fs::remove_dir_all(&root);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
-    let runtime = TenantRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let runtime = host_runtime(&root, address);
     let shutdown = runtime.shutdown_signal().clone();
     let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
     let mut owner = connect_nostr_socket(address).await;
@@ -2283,7 +2288,7 @@ async fn private_relay_generated_events_reach_authorized_websocket_subscribers()
     let _ = std::fs::remove_dir_all(&root);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
-    let runtime = TenantRuntime::open(runtime_config(&root, address)).expect("runtime");
+    let runtime = host_runtime(&root, address);
     let shutdown = runtime.shutdown_signal().clone();
     let task = tokio::spawn(serve_listener_until_shutdown(runtime, listener));
     let mut owner_writer = connect_nostr_socket(address).await;
@@ -2391,6 +2396,107 @@ async fn private_relay_generated_events_reach_authorized_websocket_subscribers()
 fn runtime_config(root: &Path, listen_addr: SocketAddr) -> BaseRelayRuntimeConfig {
     parse_base_relay_runtime_config_json(&runtime_config_value(root, listen_addr).to_string())
         .expect("config")
+}
+
+fn host_runtime(root: &Path, listen_addr: SocketAddr) -> TangleHostRuntime {
+    let host = parse_tangle_host_runtime_config_json(
+        &json!({
+            "listen_addr": listen_addr.to_string(),
+            "tenant_config_dir": "tenants",
+            "limits": {
+                "max_total_connections": 128,
+                "max_total_subscriptions": 1024,
+                "tenant_startup_concurrency": 4
+            }
+        })
+        .to_string(),
+    )
+    .expect("host config");
+    let tenant = parse_tenant_runtime_config_json(
+        &json!({
+            "tenant_id": "acceptance-relay",
+            "tenant_schema": "acceptance_relay",
+            "host": "relay.radroots.test",
+            "relay_url": "wss://relay.radroots.test",
+            "info": {
+                "name": "tangle"
+            },
+            "pocket": {
+                "data_directory": root.join("pocket"),
+                "sync_policy": "flush_on_shutdown"
+            },
+            "pocket_query": {
+              "allow_scraping": false,
+              "allow_scrape_if_limited_to": 100,
+              "allow_scrape_if_max_seconds": 3600
+            },
+            "groups": {
+                "enabled": true,
+                "canonical_relay_url": "wss://relay.radroots.test",
+                "relay_secret": TANGLE_V2_RELAY_SECRET_HEX,
+                "owner_pubkeys": [FixtureKey::Owner.public_key().as_str()]
+            },
+            "auth": {
+                "challenge_ttl_seconds": 300,
+                "created_at_skew_seconds": 600
+            },
+            "limits": {
+                "max_message_length": 1048576,
+                "max_subid_length": 64,
+                "max_subscriptions_per_connection": 64,
+                "max_filters_per_request": 10,
+                "max_tag_values_per_filter": 100,
+                "max_query_complexity": 2048,
+                "max_limit": 500,
+                "default_limit": 100,
+                "max_event_tags": 200,
+                "max_content_length": 65536,
+                "broadcast_channel_capacity": 8,
+                "per_connection_outbound_queue": 8
+            },
+            "rate_limits": {
+                "auth": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 120},
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 30},
+                    "failures": {"window_seconds": 300, "max_hits": 5},
+                    "failures_per_ip": {"window_seconds": 300, "max_hits": 20}
+                },
+                "event": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 600},
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 120},
+                    "per_kind": {"window_seconds": 60, "max_hits": 1000}
+                },
+                "group": {
+                    "write_per_ip": {"window_seconds": 60, "max_hits": 300},
+                    "write_per_pubkey": {"window_seconds": 60, "max_hits": 60},
+                    "write_per_group": {"window_seconds": 60, "max_hits": 90},
+                    "write_per_kind": {"window_seconds": 60, "max_hits": 300},
+                    "join_flow": {"window_seconds": 300, "max_hits": 10},
+                    "join_flow_per_ip": {"window_seconds": 300, "max_hits": 30}
+                },
+                "req": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 600},
+                    "per_connection": {"window_seconds": 60, "max_hits": 120},
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 240},
+                    "per_group": {"window_seconds": 60, "max_hits": 240},
+                    "per_kind": {"window_seconds": 60, "max_hits": 500},
+                    "broad": {"window_seconds": 60, "max_hits": 30}
+                },
+                "count": {
+                    "per_ip": {"window_seconds": 60, "max_hits": 300},
+                    "per_connection": {"window_seconds": 60, "max_hits": 60},
+                    "per_pubkey": {"window_seconds": 60, "max_hits": 120},
+                    "per_group": {"window_seconds": 60, "max_hits": 120},
+                    "per_kind": {"window_seconds": 60, "max_hits": 240},
+                    "broad": {"window_seconds": 60, "max_hits": 20}
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("tenant config");
+    let config = TangleHostRuntimeConfigSet::new(host, vec![tenant]).expect("host config set");
+    TangleHostRuntime::open(config).expect("host runtime")
 }
 
 fn runtime_config_value(root: &Path, listen_addr: SocketAddr) -> Value {
@@ -2501,7 +2607,8 @@ fn http_get(address: SocketAddr, path: &str, accept: Option<&str>) -> std::io::R
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(200))?;
     stream.set_read_timeout(Some(Duration::from_millis(500)))?;
     stream.set_write_timeout(Some(Duration::from_millis(500)))?;
-    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n");
+    let mut request =
+        format!("GET {path} HTTP/1.1\r\nHost: relay.radroots.test\r\nConnection: close\r\n");
     if let Some(accept) = accept {
         request.push_str(&format!("Accept: {accept}\r\n"));
     }
@@ -2530,6 +2637,10 @@ async fn connect_nostr_socket(address: SocketAddr) -> TestWebSocket {
     request.headers_mut().insert(
         header::SEC_WEBSOCKET_PROTOCOL,
         http::HeaderValue::from_static("nostr"),
+    );
+    request.headers_mut().insert(
+        header::HOST,
+        http::HeaderValue::from_static("relay.radroots.test"),
     );
     let (socket, response) = tokio_tungstenite::connect_async(request)
         .await

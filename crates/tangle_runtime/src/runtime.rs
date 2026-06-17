@@ -809,6 +809,10 @@ impl TenantRuntimeHandle {
         self.inner.readiness.clone()
     }
 
+    pub fn limits(&self) -> TangleRuntimeLimits {
+        self.inner.limits
+    }
+
     pub async fn auth_state(&self) -> Result<BaseAuthState, BaseRelayError> {
         self.inner.config.auth_state()
     }

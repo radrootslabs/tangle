@@ -209,21 +209,26 @@ fn tangle_run_starts_server_and_stays_alive_until_shutdown() {
     .expect("write config");
 
     let mut child = TangleChild::spawn(&config_path);
-    let health = wait_for_http_ok(listen_addr, "/healthz", None);
-    let ready = wait_for_http_ok(listen_addr, "/readyz", None);
+    let ready = wait_for_http_ok(listen_addr, "/.well-known/tangle/ready", None);
+    let metrics = wait_for_http_ok(listen_addr, "/.well-known/tangle/metrics", None);
+    let tenants = wait_for_http_ok(listen_addr, "/.well-known/tangle/tenants", None);
     let nip11 = wait_for_http_ok(listen_addr, "/", Some("application/nostr+json"));
-    let health_value =
-        serde_json::from_str::<serde_json::Value>(response_body(&health)).expect("health json");
     let ready_value =
         serde_json::from_str::<serde_json::Value>(response_body(&ready)).expect("ready json");
+    let metrics_value =
+        serde_json::from_str::<serde_json::Value>(response_body(&metrics)).expect("metrics json");
+    let tenants_value =
+        serde_json::from_str::<serde_json::Value>(response_body(&tenants)).expect("tenants json");
     let nip11_value =
         serde_json::from_str::<serde_json::Value>(response_body(&nip11)).expect("nip11 json");
 
-    assert_eq!(health_value["status"], "ok");
     assert_eq!(ready_value["status"], "ready");
-    assert_eq!(ready_value["checks"]["server_bind"], "ready");
-    assert_eq!(ready_value["checks"]["pocket_storage"], "ready");
-    assert_eq!(nip11_value["name"], "tangle");
+    assert_eq!(ready_value["checks"]["active_tenants"], "ready");
+    assert_eq!(metrics_value["tangle_host_configured_tenants"], 1);
+    assert_eq!(metrics_value["tangle_host_active_tenants"], 1);
+    assert_eq!(tenants_value["tenants"][0]["tenant_id"], "farmers-market");
+    assert_eq!(tenants_value["tenants"][0]["ready"], true);
+    assert_eq!(nip11_value["name"], "Radroots Farmers Market");
     assert_eq!(nip11_value["limitation"]["max_message_length"], 1_048_576);
     assert_eq!(nip11_value["limitation"]["max_subscriptions"], 64);
     assert_eq!(nip11_value["limitation"]["max_filters"], 10);
@@ -327,7 +332,7 @@ fn http_get(address: SocketAddr, path: &str, accept: Option<&str>) -> std::io::R
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(200))?;
     stream.set_read_timeout(Some(Duration::from_millis(500)))?;
     stream.set_write_timeout(Some(Duration::from_millis(500)))?;
-    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {address}\r\n");
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: relay.radroots.test\r\n");
     if let Some(accept) = accept {
         request.push_str("Accept: ");
         request.push_str(accept);

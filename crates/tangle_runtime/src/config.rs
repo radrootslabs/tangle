@@ -61,22 +61,6 @@ impl TangleHostRuntimeConfigSet {
     pub fn active_tenants(&self) -> impl Iterator<Item = &TenantRuntimeConfig> {
         self.tenants.iter().filter(|tenant| !tenant.inactive())
     }
-
-    pub fn single_active_runtime_config(&self) -> Result<BaseRelayRuntimeConfig, BaseRelayError> {
-        let mut active = self.active_tenants();
-        let Some(tenant) = active.next() else {
-            return Err(BaseRelayError::invalid(
-                "at least one active tenant is required",
-            ));
-        };
-        if active.next().is_some() {
-            return Err(BaseRelayError::invalid(
-                "multi-tenant HTTP routing is not implemented yet",
-            ));
-        }
-        Ok(tenant
-            .to_base_relay_runtime_config(self.host.listen_addr(), self.host.tracing().clone()))
-    }
 }
 
 impl TangleHostRuntimeConfig {

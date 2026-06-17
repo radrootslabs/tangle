@@ -77,6 +77,10 @@ impl LiveSubscriptionSet {
         }
     }
 
+    pub(crate) fn contains(&self, subscription_id: &SubscriptionId) -> bool {
+        self.subscriptions.contains_key(subscription_id)
+    }
+
     pub(crate) fn close_all(&mut self) -> usize {
         let closed = self.subscriptions.len();
         self.subscriptions.clear();

@@ -4,6 +4,7 @@ use crate::{
     client_message::{RuntimeClientMessage, parse_runtime_client_message},
     errors::BaseRelayError,
     event_bus::{TangleEventReceiveError, TangleEventReceiver},
+    host::{TangleHostResourceLimiter, TangleHostSubscriptionPermit},
     logging,
     relay::{
         auth::{BaseAuthState, generate_auth_challenge},
@@ -18,6 +19,7 @@ use crate::{
 };
 use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket};
 use std::{
+    collections::BTreeMap,
     net::IpAddr,
     sync::atomic::{AtomicU64, Ordering},
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -38,6 +40,8 @@ pub struct TangleWebSocketSession {
     limits: TangleRuntimeLimits,
     auth: BaseAuthState,
     subscriptions: LiveSubscriptionSet,
+    host_resources: Option<TangleHostResourceLimiter>,
+    host_subscription_permits: BTreeMap<SubscriptionId, TangleHostSubscriptionPermit>,
     events: TangleEventReceiver,
 }
 
@@ -62,6 +66,20 @@ impl TangleWebSocketSession {
         events: TangleEventReceiver,
         peer_ip: Option<IpAddr>,
     ) -> Result<Self, BaseRelayError> {
+        Self::new_with_peer_and_host_resources(
+            limits, shutdown, runtime, auth, events, peer_ip, None,
+        )
+    }
+
+    pub fn new_with_peer_and_host_resources(
+        limits: TangleRuntimeLimits,
+        shutdown: watch::Receiver<bool>,
+        runtime: TenantRuntimeHandle,
+        auth: BaseAuthState,
+        events: TangleEventReceiver,
+        peer_ip: Option<IpAddr>,
+        host_resources: Option<TangleHostResourceLimiter>,
+    ) -> Result<Self, BaseRelayError> {
         let outbound_queue_capacity = limits.outbound_queue_capacity();
         let (sender, receiver) = mpsc::channel(outbound_queue_capacity);
         let subscriptions = LiveSubscriptionSet::new(
@@ -82,6 +100,8 @@ impl TangleWebSocketSession {
             limits,
             auth,
             subscriptions,
+            host_resources,
+            host_subscription_permits: BTreeMap::new(),
             events,
         })
     }
@@ -108,7 +128,7 @@ impl TangleWebSocketSession {
         metrics.record_session_opened();
         logging::log_websocket_session_opened(self.connection_id, self.peer_ip);
         if !self.issue_auth_challenge() {
-            let closed_subscriptions = self.subscriptions.close_all();
+            let closed_subscriptions = self.close_all_subscriptions();
             metrics.record_subscriptions_closed(closed_subscriptions);
             metrics.record_session_closed();
             metrics.record_event_bus_receivers(
@@ -168,7 +188,7 @@ impl TangleWebSocketSession {
                 }
             }
         }
-        let closed_subscriptions = self.subscriptions.close_all();
+        let closed_subscriptions = self.close_all_subscriptions();
         metrics.record_subscriptions_closed(closed_subscriptions);
         metrics.record_session_closed();
         metrics.record_event_bus_receivers(metrics.event_bus_receivers_current().saturating_sub(1));
@@ -307,6 +327,7 @@ impl TangleWebSocketSession {
                     .base_relay_limits()
                     .validate_subscription_id(&subscription_id)?;
                 if self.subscriptions.close(&subscription_id) == CloseResult::Closed {
+                    self.host_subscription_permits.remove(&subscription_id);
                     metrics.record_subscriptions_closed(1);
                 }
                 Ok(Vec::new())
@@ -358,6 +379,7 @@ impl TangleWebSocketSession {
             return Ok(vec![message.into()]);
         }
         let should_subscribe = !pocket_filters_are_complete(&filters);
+        let already_subscribed = self.subscriptions.contains(&subscription_id);
         if should_subscribe {
             self.subscriptions
                 .ensure_can_subscribe(&subscription_id, &filters)?;
@@ -374,12 +396,30 @@ impl TangleWebSocketSession {
         let closes_subscription = report.group_read_denied();
         let replies = report.into_messages();
         if should_subscribe && !closes_subscription {
+            let host_permit = if already_subscribed {
+                None
+            } else {
+                self.host_resources
+                    .as_ref()
+                    .map(|resources| resources.try_open_subscriptions(1))
+                    .transpose()?
+            };
             self.subscriptions
                 .subscribe(subscription_id.clone(), filters)?;
+            if let Some(permit) = host_permit {
+                self.host_subscription_permits
+                    .insert(subscription_id.clone(), permit);
+            }
             metrics.record_subscription_opened();
             logging::log_subscription_opened(self.connection_id, &subscription_id);
         }
         Ok(replies)
+    }
+
+    fn close_all_subscriptions(&mut self) -> usize {
+        let closed = self.subscriptions.close_all();
+        self.host_subscription_permits.clear();
+        closed
     }
 
     fn client_rate_limit_context(&self) -> TangleClientRateLimitContext {

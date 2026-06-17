@@ -15,7 +15,7 @@ use std::{
     },
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TangleHostRuntime {
     config: TangleHostRuntimeConfigSet,
     registry: TenantRegistry,

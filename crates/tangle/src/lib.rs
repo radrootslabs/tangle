@@ -196,14 +196,17 @@ pub async fn run_with_config(
 ) -> Result<tangle_runtime::server::TangleServeReport, String> {
     let config_set = tangle_runtime::load_tangle_host_runtime_config(config_path)
         .map_err(|error| error.to_string())?;
-    let config = config_set
-        .single_active_runtime_config()
+    tangle_runtime::logging::init_tangle_tracing(config_set.host().tracing())
         .map_err(|error| error.to_string())?;
-    tangle_runtime::logging::init_tangle_tracing(config.tracing())
+    for tenant in config_set.active_tenants() {
+        let config = tenant.to_base_relay_runtime_config(
+            config_set.host().listen_addr(),
+            config_set.host().tracing().clone(),
+        );
+        tangle_runtime::logging::log_runtime_config_loaded(&config);
+    }
+    let runtime = tangle_runtime::host::TangleHostRuntime::open(config_set)
         .map_err(|error| error.to_string())?;
-    tangle_runtime::logging::log_runtime_config_loaded(&config);
-    let runtime =
-        tangle_runtime::runtime::TenantRuntime::open(config).map_err(|error| error.to_string())?;
     tangle_runtime::server::serve_until_shutdown(runtime)
         .await
         .map_err(|error| error.to_string())

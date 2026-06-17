@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use crate::{
-    config::{BaseRelayRuntimeConfig, BaseRelayRuntimeLimitsConfig},
+    config::{BaseRelayRuntimeConfig, BaseRelayRuntimeLimitsConfig, TenantRuntimeConfig},
     errors::BaseRelayError,
 };
 use axum::{
@@ -69,6 +69,27 @@ impl BaseRelayInfoConfig {
             restricted_writes: true,
             supported_nips: supported_nips_for_runtime(runtime),
         })
+    }
+
+    pub fn from_tenant_config(tenant: &TenantRuntimeConfig) -> Result<Self, BaseRelayError> {
+        let mut config = Self {
+            name: tenant.info().name().to_owned(),
+            description: tenant.info().description().map(str::to_owned),
+            contact: tenant.info().contact().map(str::to_owned),
+            icon: tenant.info().icon().map(str::to_owned),
+            groups: tenant.groups().clone(),
+            limits: tenant.limits(),
+            software: crate::TANGLE_RELAY_SOFTWARE.to_owned(),
+            version: crate::TANGLE_RELAY_VERSION.to_owned(),
+            payment_required: false,
+            restricted_writes: true,
+            supported_nips: supported_nips_for_group_capability(tenant.groups().enabled()),
+        };
+        if config.name.trim().is_empty() {
+            return Err(BaseRelayError::invalid("relay name must not be empty"));
+        }
+        config.name = config.name.trim().to_owned();
+        Ok(config)
     }
 
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
