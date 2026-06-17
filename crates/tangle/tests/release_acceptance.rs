@@ -23,10 +23,15 @@ fn release_acceptance_app_covers_release_candidate_validation_ladder() {
         "cargo clippy --workspace --all-targets -- -D warnings",
         "cargo test --workspace",
         "cargo test -p tangle_runtime --test base_relay_v2",
+        "cargo test -p tangle_runtime isolation",
+        "cargo test -p tangle_runtime server",
+        "cargo test -p tangle_runtime auth",
+        "cargo test -p tangle_runtime backup",
+        "cargo test -p tangle_runtime export",
         "cargo test -p tangle_groups",
         "cargo test -p tangle_store_pocket",
         "cargo test -p tangle_bench",
-        "cargo run -p tangle_bench --bin tangle-benchmark-report",
+        "cargo run -p tangle_bench --bin tangle-benchmark-report -- --profile virtual-relay-tenancy",
     ] {
         assert!(
             release.contains(required),

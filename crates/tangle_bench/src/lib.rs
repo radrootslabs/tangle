@@ -42,6 +42,9 @@ pub const SCENARIO_PROJECTION_REBUILD: &str = "projection_rebuild";
 pub const SCENARIO_OUTBOX_REPLAY: &str = "outbox_replay";
 pub const SCENARIO_BROADCAST_LAG: &str = "broadcast_lag";
 pub const SCENARIO_MEMORY_PROFILE: &str = "memory_profile";
+pub const SCENARIO_VIRTUAL_RELAY_FANOUT_1_PERCENT: &str = "virtual_relay_fanout_1_percent";
+pub const SCENARIO_VIRTUAL_RELAY_FANOUT_10_PERCENT: &str = "virtual_relay_fanout_10_percent";
+pub const SCENARIO_VIRTUAL_RELAY_FANOUT_100_PERCENT: &str = "virtual_relay_fanout_100_percent";
 pub const POCKET_SOURCE_REPOSITORY: &str = "https://github.com/triesap/pocket";
 pub const POCKET_SOURCE_REVISION: &str = "329334f20948c796c6016b673b92551ac4855ad7";
 
@@ -130,6 +133,7 @@ impl BenchDatasetConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BenchmarkProfileName {
     Smoke,
+    VirtualRelayTenancy,
     Medium,
     LargeSmoke,
     Proof10m,
@@ -142,6 +146,7 @@ impl BenchmarkProfileName {
     pub fn parse(value: &str) -> Result<Self, String> {
         match value {
             "smoke" => Ok(Self::Smoke),
+            "virtual-relay-tenancy" => Ok(Self::VirtualRelayTenancy),
             "medium" => Ok(Self::Medium),
             "large-smoke" => Ok(Self::LargeSmoke),
             "proof-10m" => Ok(Self::Proof10m),
@@ -149,7 +154,7 @@ impl BenchmarkProfileName {
             "proof-join-storm" => Ok(Self::ProofJoinStorm),
             "proof-slow-client" => Ok(Self::ProofSlowClient),
             _ => Err(format!(
-                "unknown benchmark profile `{value}`; expected smoke, medium, large-smoke, proof-10m, proof-large-group, proof-join-storm, or proof-slow-client"
+                "unknown benchmark profile `{value}`; expected smoke, virtual-relay-tenancy, medium, large-smoke, proof-10m, proof-large-group, proof-join-storm, or proof-slow-client"
             )),
         }
     }
@@ -157,6 +162,7 @@ impl BenchmarkProfileName {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Smoke => "smoke",
+            Self::VirtualRelayTenancy => "virtual-relay-tenancy",
             Self::Medium => "medium",
             Self::LargeSmoke => "large-smoke",
             Self::Proof10m => "proof-10m",
@@ -166,9 +172,10 @@ impl BenchmarkProfileName {
         }
     }
 
-    pub fn all() -> [Self; 7] {
+    pub fn all() -> [Self; 8] {
         [
             Self::Smoke,
+            Self::VirtualRelayTenancy,
             Self::Medium,
             Self::LargeSmoke,
             Self::Proof10m,
@@ -199,6 +206,7 @@ impl BenchmarkProfile {
     pub fn from_name(name: BenchmarkProfileName) -> Self {
         match name {
             BenchmarkProfileName::Smoke => Self::smoke(),
+            BenchmarkProfileName::VirtualRelayTenancy => Self::virtual_relay_tenancy(),
             BenchmarkProfileName::Medium => Self::medium(),
             BenchmarkProfileName::LargeSmoke => Self::large_smoke(),
             BenchmarkProfileName::Proof10m => Self::proof_10m(),
@@ -213,6 +221,14 @@ impl BenchmarkProfile {
             BenchmarkProfileName::Smoke,
             BenchDatasetConfig::smoke(),
             BenchmarkThresholds::smoke(),
+        )
+    }
+
+    pub fn virtual_relay_tenancy() -> Self {
+        Self::new(
+            BenchmarkProfileName::VirtualRelayTenancy,
+            BenchDatasetConfig::smoke(),
+            BenchmarkThresholds::large_smoke(),
         )
     }
 
@@ -345,6 +361,73 @@ impl BenchmarkProfile {
 
     pub fn proof_claim_eligible(&self) -> bool {
         self.name.is_proof() && self.target_hardware_evidence.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtualRelayTenancyConfig {
+    pub tenant_count: usize,
+    pub subscriptions_per_tenant: usize,
+    pub max_pending_events_per_subscription: usize,
+}
+
+impl VirtualRelayTenancyConfig {
+    pub fn mvp() -> Self {
+        Self {
+            tenant_count: 10,
+            subscriptions_per_tenant: 2_000,
+            max_pending_events_per_subscription: 16,
+        }
+    }
+
+    fn validate(self) -> Result<Self, String> {
+        if self.tenant_count < 10 {
+            return Err("virtual relay tenancy benchmark requires at least 10 tenants".to_owned());
+        }
+        if self.subscriptions_per_tenant < 2_000 {
+            return Err(
+                "virtual relay tenancy benchmark requires at least 2,000 subscriptions per busiest tenant"
+                    .to_owned(),
+            );
+        }
+        if self.aggregate_active_subscriptions() < 20_000 {
+            return Err(
+                "virtual relay tenancy benchmark requires at least 20,000 aggregate subscriptions"
+                    .to_owned(),
+            );
+        }
+        if self.max_pending_events_per_subscription == 0 {
+            return Err(
+                "virtual relay tenancy benchmark pending event capacity must be greater than zero"
+                    .to_owned(),
+            );
+        }
+        Ok(self)
+    }
+
+    pub fn aggregate_active_subscriptions(self) -> usize {
+        self.tenant_count * self.subscriptions_per_tenant
+    }
+
+    pub fn busiest_tenant_active_subscriptions(self) -> usize {
+        self.subscriptions_per_tenant
+    }
+
+    fn one_percent_fanout(self) -> usize {
+        self.aggregate_active_subscriptions() / 100
+    }
+
+    fn ten_percent_fanout(self) -> usize {
+        self.aggregate_active_subscriptions() / 10
+    }
+
+    fn to_json(self) -> serde_json::Value {
+        json!({
+            "tenant_count": self.tenant_count,
+            "aggregate_active_subscriptions": self.aggregate_active_subscriptions(),
+            "busiest_tenant_active_subscriptions": self.busiest_tenant_active_subscriptions(),
+            "max_pending_events_per_subscription": self.max_pending_events_per_subscription
+        })
     }
 }
 
@@ -647,6 +730,7 @@ pub struct ScenarioReport {
     pub p95_micros: u64,
     pub p99_micros: u64,
     pub max_rss_bytes: u64,
+    pub observations: BTreeMap<String, serde_json::Value>,
 }
 
 impl ScenarioReport {
@@ -676,7 +760,13 @@ impl ScenarioReport {
             p95_micros: percentile(&samples, 95),
             p99_micros: percentile(&samples, 99),
             max_rss_bytes,
+            observations: BTreeMap::new(),
         }
+    }
+
+    fn with_observations(mut self, observations: BTreeMap<String, serde_json::Value>) -> Self {
+        self.observations = observations;
+        self
     }
 
     fn pass_latency_gate(&self, p95_threshold_micros: u64) -> bool {
@@ -715,7 +805,8 @@ impl ScenarioReport {
             },
             "memory": {
                 "max_rss_bytes": self.max_rss_bytes
-            }
+            },
+            "observations": &self.observations
         })
     }
 }
@@ -911,7 +1002,7 @@ impl BenchmarkRunReport {
         let outbox_replay = run_outbox_replay_benchmark(&dataset)?;
         let broadcast_lag = run_broadcast_lag_benchmark(&dataset)?;
         let memory_profile = run_memory_profile_benchmark(&dataset)?;
-        let scenarios = vec![
+        let mut scenarios = vec![
             pocket_query,
             read_gate,
             count_resource_controls,
@@ -920,6 +1011,11 @@ impl BenchmarkRunReport {
             broadcast_lag,
             memory_profile,
         ];
+        if profile.name() == BenchmarkProfileName::VirtualRelayTenancy {
+            scenarios.extend(run_virtual_relay_tenancy_benchmarks(
+                VirtualRelayTenancyConfig::mvp(),
+            )?);
+        }
         let validation_summary = validation_summary(&scenarios, thresholds)?;
         let dataset_profile = DatasetProfile::from_dataset(&dataset)?;
         Ok(Self {
@@ -991,6 +1087,13 @@ impl BenchmarkRunReport {
                     .target_hardware_evidence()
                     .unwrap_or("absent")
             },
+            "tangle_v1_mvp": {
+                "benchmark_evidence": virtual_relay_tenancy_summary_json(
+                    self.profile.name(),
+                    &self.scenarios
+                ),
+                "external_integration": external_integration_json()
+            },
             "artifacts": {
                 "summary_json": "summary.json",
                 "dataset_events_jsonl": "dataset-events.jsonl"
@@ -1004,6 +1107,51 @@ fn pocket_source_json() -> serde_json::Value {
         "repository": POCKET_SOURCE_REPOSITORY,
         "revision": POCKET_SOURCE_REVISION,
         "crates": ["pocket-db", "pocket-types"]
+    })
+}
+
+fn virtual_relay_tenancy_summary_json(
+    profile_name: BenchmarkProfileName,
+    scenarios: &[ScenarioReport],
+) -> serde_json::Value {
+    let fanout_scenarios = [
+        SCENARIO_VIRTUAL_RELAY_FANOUT_1_PERCENT,
+        SCENARIO_VIRTUAL_RELAY_FANOUT_10_PERCENT,
+        SCENARIO_VIRTUAL_RELAY_FANOUT_100_PERCENT,
+    ]
+    .into_iter()
+    .filter_map(|name| scenarios.iter().find(|scenario| scenario.scenario == name))
+    .map(ScenarioReport::to_json)
+    .collect::<Vec<_>>();
+    let status = if profile_name == BenchmarkProfileName::VirtualRelayTenancy
+        && fanout_scenarios.len() == 3
+    {
+        "pass"
+    } else {
+        "not_run"
+    };
+    json!({
+        "status": status,
+        "required_profile": BenchmarkProfileName::VirtualRelayTenancy.as_str(),
+        "configured_profile": profile_name.as_str(),
+        "target": VirtualRelayTenancyConfig::mvp().to_json(),
+        "fanout_scenarios": fanout_scenarios
+    })
+}
+
+fn external_integration_json() -> serde_json::Value {
+    json!({
+        "runner": "radroots_testing_tangle_integration",
+        "local_status": "unavailable",
+        "unavailable_command": "cargo test -p radroots_testing_tangle_integration -- tangle_v1_mvp",
+        "repo_boundary": "not present in the standalone Tangle workspace",
+        "required_scenarios": [
+            "host_routing",
+            "tenant_isolation",
+            "auth_realm_isolation",
+            "nip29_same_group_isolation",
+            "backup_export_boundaries"
+        ]
     })
 }
 
@@ -1391,6 +1539,194 @@ fn run_memory_profile_benchmark(dataset: &BenchDataset) -> Result<ScenarioReport
     ))
 }
 
+struct VirtualRelayTenantBench {
+    tenant_index: usize,
+    relay: BaseRelay,
+}
+
+fn run_virtual_relay_tenancy_benchmarks(
+    config: VirtualRelayTenancyConfig,
+) -> Result<Vec<ScenarioReport>, String> {
+    let config = config.validate()?;
+    let mut tenants = materialize_virtual_relay_tenants(config)?;
+    let scenarios = [
+        (
+            SCENARIO_VIRTUAL_RELAY_FANOUT_1_PERCENT,
+            "fanout-001",
+            1,
+            config.one_percent_fanout(),
+        ),
+        (
+            SCENARIO_VIRTUAL_RELAY_FANOUT_10_PERCENT,
+            "fanout-010",
+            10,
+            config.ten_percent_fanout(),
+        ),
+        (
+            SCENARIO_VIRTUAL_RELAY_FANOUT_100_PERCENT,
+            "fanout-100",
+            100,
+            config.aggregate_active_subscriptions(),
+        ),
+    ];
+    let mut reports = Vec::with_capacity(scenarios.len());
+    for (scenario, tag_value, fanout_percent, expected_messages) in scenarios {
+        reports.push(run_virtual_relay_fanout_scenario(
+            &mut tenants,
+            config,
+            scenario,
+            tag_value,
+            fanout_percent,
+            expected_messages,
+        )?);
+    }
+    for tenant in &mut tenants {
+        tenant.relay.shutdown().map_err(|error| error.to_string())?;
+    }
+    Ok(reports)
+}
+
+fn materialize_virtual_relay_tenants(
+    config: VirtualRelayTenancyConfig,
+) -> Result<Vec<VirtualRelayTenantBench>, String> {
+    let mut tenants = Vec::with_capacity(config.tenant_count);
+    for tenant_index in 0..config.tenant_count {
+        let store_config = bench_store_config(&format!("virtual-relay-tenancy-{tenant_index}"))?;
+        let mut relay = BaseRelay::open(
+            &store_config,
+            relay_limits_with_subscriptions(
+                config.max_pending_events_per_subscription,
+                config.subscriptions_per_tenant,
+            ),
+            PocketQueryConfig::default(),
+        )
+        .map_err(|error| error.to_string())?;
+        for subscription_index in 0..config.subscriptions_per_tenant {
+            let global_index = tenant_index * config.subscriptions_per_tenant + subscription_index;
+            let filter = virtual_relay_subscription_filter(config, tenant_index, global_index)?;
+            relay
+                .handle_pocket_req(
+                    subscription(&format!("vr-{tenant_index:02}-{subscription_index:04}"))?,
+                    vec![filter],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        tenants.push(VirtualRelayTenantBench {
+            tenant_index,
+            relay,
+        });
+    }
+    Ok(tenants)
+}
+
+fn virtual_relay_subscription_filter(
+    config: VirtualRelayTenancyConfig,
+    tenant_index: usize,
+    global_index: usize,
+) -> Result<PocketOwnedFilter, String> {
+    let mut tag_values = vec!["fanout-100"];
+    if tenant_index == 0 {
+        tag_values.push("fanout-010");
+    }
+    if global_index < config.one_percent_fanout() {
+        tag_values.push("fanout-001");
+    }
+    pocket_filter_from_value(&json!({"kinds": [1], "#t": tag_values}))
+}
+
+fn run_virtual_relay_fanout_scenario(
+    tenants: &mut [VirtualRelayTenantBench],
+    config: VirtualRelayTenancyConfig,
+    scenario: &str,
+    tag_value: &str,
+    fanout_percent: u64,
+    expected_messages: usize,
+) -> Result<ScenarioReport, String> {
+    let started = Instant::now();
+    let mut samples = Vec::new();
+    let mut observed_messages = 0_usize;
+    let mut publish_tasks = 0_usize;
+    for tenant in tenants {
+        if !virtual_relay_tenant_participates(fanout_percent, tenant.tenant_index) {
+            continue;
+        }
+        let publish_started = Instant::now();
+        let event = pocket_protocol_event(
+            FixtureKey::Member,
+            1_714_800_000
+                + u64::try_from(tenant.tenant_index).expect("tenant index fits in u64")
+                + fanout_percent,
+            1,
+            vec![Tag::from_parts("t", &[tag_value]).map_err(|error| error.to_string())?],
+            &format!("virtual relay fanout {fanout_percent} percent"),
+        )?;
+        let pocket = pocket_event(&event)?;
+        let messages = tenant.relay.fanout_pocket(&pocket);
+        samples.push(elapsed_micros(publish_started));
+        observed_messages += messages
+            .iter()
+            .filter(|message| matches!(message, RuntimeRelayMessage::Event { .. }))
+            .count();
+        publish_tasks += 1;
+    }
+    let elapsed = elapsed_micros(started);
+    let attempted = u64::try_from(expected_messages).expect("expected message count fits in u64");
+    let accepted = u64::try_from(observed_messages).expect("observed message count fits in u64");
+    let rejected = attempted.saturating_sub(accepted) + accepted.saturating_sub(attempted);
+    let max_rss_bytes = estimate_virtual_relay_memory_bytes(config);
+    let mut observations = BTreeMap::new();
+    observations.insert("tenant_count".to_owned(), json!(config.tenant_count));
+    observations.insert(
+        "aggregate_active_subscriptions".to_owned(),
+        json!(config.aggregate_active_subscriptions()),
+    );
+    observations.insert(
+        "busiest_tenant_active_subscriptions".to_owned(),
+        json!(config.busiest_tenant_active_subscriptions()),
+    );
+    observations.insert("fanout_percent".to_owned(), json!(fanout_percent));
+    observations.insert("publish_task_count".to_owned(), json!(publish_tasks));
+    observations.insert(
+        "expected_enqueued_events".to_owned(),
+        json!(expected_messages),
+    );
+    observations.insert(
+        "observed_enqueued_events".to_owned(),
+        json!(observed_messages),
+    );
+    observations.insert(
+        "observable_queue_depth".to_owned(),
+        json!(observed_messages),
+    );
+    observations.insert(
+        "max_pending_events_per_subscription".to_owned(),
+        json!(config.max_pending_events_per_subscription),
+    );
+    observations.insert("memory_estimate_bytes".to_owned(), json!(max_rss_bytes));
+    observations.insert(
+        "tenant_publish_model".to_owned(),
+        json!("one publish per targeted virtual relay tenant"),
+    );
+    Ok(ScenarioReport::new(
+        scenario,
+        attempted,
+        accepted,
+        rejected,
+        elapsed,
+        samples,
+        max_rss_bytes,
+    )
+    .with_observations(observations))
+}
+
+fn virtual_relay_tenant_participates(fanout_percent: u64, tenant_index: usize) -> bool {
+    match fanout_percent {
+        1 | 10 => tenant_index == 0,
+        100 => true,
+        _ => false,
+    }
+}
+
 struct CountResourceControlProbe {
     accepted: u64,
     rejected: u64,
@@ -1516,10 +1852,17 @@ fn materialize_dataset(
 }
 
 fn relay_limits(max_pending_events: usize) -> BaseRelayLimits {
+    relay_limits_with_subscriptions(max_pending_events, 512)
+}
+
+fn relay_limits_with_subscriptions(
+    max_pending_events: usize,
+    max_subscriptions: usize,
+) -> BaseRelayLimits {
     BaseRelayLimits::new(BaseRelayLimitSettings {
         max_pending_events,
         max_subscription_id_length: 64,
-        max_subscriptions: 512,
+        max_subscriptions,
         max_filters_per_request: 10,
         max_tag_values_per_filter: 100,
         max_query_complexity: 610,
@@ -1922,6 +2265,25 @@ fn validation_summary(
     ) {
         failures.push(failure);
     }
+    for name in [
+        SCENARIO_VIRTUAL_RELAY_FANOUT_1_PERCENT,
+        SCENARIO_VIRTUAL_RELAY_FANOUT_10_PERCENT,
+        SCENARIO_VIRTUAL_RELAY_FANOUT_100_PERCENT,
+    ] {
+        let Some(report) = scenarios
+            .iter()
+            .find(|scenario| scenario.scenario.as_str() == name)
+        else {
+            continue;
+        };
+        if let Some(failure) = record_threshold_status(
+            &mut summary,
+            name,
+            report.pass_latency_gate(thresholds.broadcast_lag_p95_micros),
+        ) {
+            failures.push(failure);
+        }
+    }
     if failures.is_empty() {
         Ok(summary)
     } else {
@@ -2137,6 +2499,14 @@ fn estimate_memory_bytes(dataset: &BenchDataset) -> u64 {
         .expect("estimated memory fits in u64")
 }
 
+fn estimate_virtual_relay_memory_bytes(config: VirtualRelayTenancyConfig) -> u64 {
+    let subscription_bytes = config.aggregate_active_subscriptions() * 512;
+    let tenant_bytes = config.tenant_count * 1024 * 1024;
+    (subscription_bytes + tenant_bytes)
+        .try_into()
+        .expect("estimated virtual relay memory fits in u64")
+}
+
 fn percentile(samples: &[u64], percentile: u64) -> u64 {
     if samples.is_empty() {
         return 0;
@@ -2169,7 +2539,9 @@ mod tests {
         BenchmarkProfileName, BenchmarkRunReport, BenchmarkThresholds, POCKET_SOURCE_REPOSITORY,
         POCKET_SOURCE_REVISION, SCENARIO_BROADCAST_LAG, SCENARIO_COUNT_RESOURCE_CONTROLS,
         SCENARIO_GROUP_READ_GATE_OVERHEAD, SCENARIO_MEMORY_PROFILE, SCENARIO_OUTBOX_REPLAY,
-        SCENARIO_POCKET_QUERY_VISIBLE_EVENTS, SCENARIO_PROJECTION_REBUILD, ScenarioReport,
+        SCENARIO_POCKET_QUERY_VISIBLE_EVENTS, SCENARIO_PROJECTION_REBUILD,
+        SCENARIO_VIRTUAL_RELAY_FANOUT_1_PERCENT, SCENARIO_VIRTUAL_RELAY_FANOUT_10_PERCENT,
+        SCENARIO_VIRTUAL_RELAY_FANOUT_100_PERCENT, ScenarioReport, VirtualRelayTenancyConfig,
         generated_state_counts, materialize_dataset,
     };
     use std::collections::BTreeSet;
@@ -2322,6 +2694,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "smoke",
+                "virtual-relay-tenancy",
                 "medium",
                 "large-smoke",
                 "proof-10m",
@@ -2335,6 +2708,12 @@ mod tests {
                 .expect("smoke")
                 .as_str(),
             "smoke"
+        );
+        assert_eq!(
+            BenchmarkProfileName::parse("virtual-relay-tenancy")
+                .expect("virtual")
+                .as_str(),
+            "virtual-relay-tenancy"
         );
         assert_eq!(
             BenchmarkProfileName::parse("medium")
@@ -2356,6 +2735,10 @@ mod tests {
         );
         assert_eq!(
             BenchmarkProfile::smoke().dataset_config(),
+            BenchDatasetConfig::smoke()
+        );
+        assert_eq!(
+            BenchmarkProfile::virtual_relay_tenancy().dataset_config(),
             BenchDatasetConfig::smoke()
         );
         assert_eq!(
@@ -2603,6 +2986,65 @@ mod tests {
         assert_eq!(
             summary["artifacts"]["dataset_events_jsonl"],
             "dataset-events.jsonl"
+        );
+        assert_eq!(
+            summary["tangle_v1_mvp"]["benchmark_evidence"]["status"],
+            "not_run"
+        );
+        assert_eq!(
+            summary["tangle_v1_mvp"]["benchmark_evidence"]["required_profile"],
+            "virtual-relay-tenancy"
+        );
+        assert_eq!(
+            summary["tangle_v1_mvp"]["external_integration"]["runner"],
+            "radroots_testing_tangle_integration"
+        );
+        assert_eq!(
+            summary["tangle_v1_mvp"]["external_integration"]["local_status"],
+            "unavailable"
+        );
+    }
+
+    #[test]
+    fn virtual_relay_tenancy_profile_contract_matches_mvp_target() {
+        let config = VirtualRelayTenancyConfig::mvp();
+
+        assert_eq!(config.tenant_count, 10);
+        assert_eq!(config.aggregate_active_subscriptions(), 20_000);
+        assert_eq!(config.busiest_tenant_active_subscriptions(), 2_000);
+        assert_eq!(config.one_percent_fanout(), 200);
+        assert_eq!(config.ten_percent_fanout(), 2_000);
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            BenchmarkProfile::virtual_relay_tenancy().name(),
+            BenchmarkProfileName::VirtualRelayTenancy
+        );
+    }
+
+    #[test]
+    fn virtual_relay_tenancy_summary_requires_three_fanout_scenarios() {
+        let summary = super::virtual_relay_tenancy_summary_json(
+            BenchmarkProfileName::VirtualRelayTenancy,
+            &[
+                passing_scenario(SCENARIO_VIRTUAL_RELAY_FANOUT_1_PERCENT),
+                passing_scenario(SCENARIO_VIRTUAL_RELAY_FANOUT_10_PERCENT),
+                passing_scenario(SCENARIO_VIRTUAL_RELAY_FANOUT_100_PERCENT),
+            ],
+        );
+
+        assert_eq!(summary["status"], "pass");
+        assert_eq!(summary["target"]["tenant_count"], 10);
+        assert_eq!(summary["target"]["aggregate_active_subscriptions"], 20_000);
+        assert_eq!(
+            summary["target"]["busiest_tenant_active_subscriptions"],
+            2_000
+        );
+        assert_eq!(
+            summary["fanout_scenarios"]
+                .as_array()
+                .expect("fanout scenarios")
+                .len(),
+            3
         );
     }
 

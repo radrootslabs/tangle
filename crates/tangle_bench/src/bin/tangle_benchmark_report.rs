@@ -80,7 +80,7 @@ impl BenchmarkReportArgs {
     fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Self>, String> {
         let mut output_root = PathBuf::from(".local/tangle/benchmarks");
         let mut run_id = None;
-        let mut profile_name = BenchmarkProfileName::Smoke;
+        let mut profile_name = BenchmarkProfileName::VirtualRelayTenancy;
         let mut config = BenchDatasetConfig::smoke();
         let mut dataset_overridden = false;
         let mut thresholds_json = None;
@@ -266,7 +266,7 @@ fn path_string(path: &Path) -> String {
 
 fn help_text() -> String {
     [
-        "usage: tangle-benchmark-report [--output-root PATH] [--run-id ID] [--profile smoke|medium|large-smoke|proof-10m|proof-large-group|proof-join-storm|proof-slow-client]",
+        "usage: tangle-benchmark-report [--output-root PATH] [--run-id ID] [--profile smoke|virtual-relay-tenancy|medium|large-smoke|proof-10m|proof-large-group|proof-join-storm|proof-slow-client]",
         "       [--thresholds-json PATH] [--target-hardware-evidence TEXT]",
         "       [--group-count COUNT] [--public-events-per-group COUNT]",
         "       [--private-events-per-group COUNT] [--public-note-count COUNT]",
@@ -281,14 +281,20 @@ mod tests {
     use tangle_bench::{BenchDatasetConfig, BenchmarkProfileName};
 
     #[test]
-    fn benchmark_report_args_default_to_smoke_profile() {
+    fn benchmark_report_args_default_to_virtual_relay_tenancy_profile() {
         let args = BenchmarkReportArgs::parse(["--run-id".to_owned(), "unit".to_owned()])
             .expect("parse")
             .expect("args");
 
-        assert_eq!(args.profile.name(), BenchmarkProfileName::Smoke);
+        assert_eq!(
+            args.profile.name(),
+            BenchmarkProfileName::VirtualRelayTenancy
+        );
         assert_eq!(args.profile.dataset_config(), BenchDatasetConfig::smoke());
-        assert_eq!(args.profile.threshold_source(), "builtin:smoke");
+        assert_eq!(
+            args.profile.threshold_source(),
+            "builtin:virtual-relay-tenancy"
+        );
     }
 
     #[test]

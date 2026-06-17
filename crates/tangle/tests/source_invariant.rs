@@ -67,6 +67,84 @@ fn tenant_runtime_surface_has_no_stale_single_runtime_api_names() {
 }
 
 #[test]
+fn tangle_v1_mvp_source_invariants_guard_tenancy_boundaries() {
+    let workspace_root = workspace_root();
+    let config_source =
+        fs::read_to_string(workspace_root.join("crates/tangle_runtime/src/config.rs"))
+            .expect("config source");
+    let server_source =
+        fs::read_to_string(workspace_root.join("crates/tangle_runtime/src/server.rs"))
+            .expect("server source");
+    let host_source = fs::read_to_string(workspace_root.join("crates/tangle_runtime/src/host.rs"))
+        .expect("host source");
+
+    assert!(
+        config_source.contains("fn reject_legacy_single_relay_config"),
+        "host and tenant config parsing must keep an explicit old-config rejection gate"
+    );
+    assert!(
+        config_source.contains("legacy single-relay config is not supported"),
+        "old single-relay config compatibility must remain rejected"
+    );
+    assert!(
+        config_source.contains("at least one active tenant is required"),
+        "host config must not synthesize a default tenant when no active tenant exists"
+    );
+    assert!(
+        config_source.contains("insert_unique(\"pocket data directory\""),
+        "tenant config validation must reject shared Pocket store directories"
+    );
+    assert!(
+        host_source.contains("tenants_by_host: BTreeMap<CanonicalHost, TenantRuntimeEntry>"),
+        "host runtime must keep host-keyed virtual relay serving state"
+    );
+    assert!(
+        host_source.contains("host_by_tenant_id: BTreeMap<TenantId, CanonicalHost>"),
+        "host runtime must keep tenant-id lookup separate from host routing"
+    );
+    assert!(
+        server_source
+            .contains(".tenant_by_host(&host)\n        .ok_or(HostResolutionError::Unknown)"),
+        "relay request routing must fail closed when the host is not a configured tenant"
+    );
+    let tenant_resolution = server_source
+        .find("let tenant = match resolve_tenant")
+        .expect("tenant resolution");
+    let websocket_path = server_source
+        .find("match websocket")
+        .expect("websocket path");
+    assert!(
+        tenant_resolution < websocket_path,
+        "server must resolve the tenant before entering websocket or NIP-11 request handling"
+    );
+
+    let mut source_files = Vec::new();
+    collect_rust_files(
+        &workspace_root.join("crates/tangle_runtime/src"),
+        &mut source_files,
+    );
+    collect_rust_files(&workspace_root.join("crates/tangle/src"), &mut source_files);
+    for path in source_files {
+        let source = fs::read_to_string(&path).expect("source file");
+        for forbidden in [
+            "default_tenant",
+            "fallback_tenant",
+            "default tenant",
+            "fallback tenant",
+            "no multi-tenancy",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{} contains forbidden tenancy compatibility text `{forbidden}`",
+                path.strip_prefix(&workspace_root)
+                    .unwrap_or(path.as_path())
+                    .display()
+            );
+        }
+    }
+}
+
+#[test]
 fn scanner_removes_test_gated_items_without_removing_production_items() {
     let source = [
         "#[cfg(test)]\n",
