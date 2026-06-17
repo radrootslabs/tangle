@@ -71,7 +71,7 @@ impl TangleHostRuntimeConfigSet {
         };
         if active.next().is_some() {
             return Err(BaseRelayError::invalid(
-                "multi-tenant host runtime startup is not implemented yet",
+                "multi-tenant HTTP routing is not implemented yet",
             ));
         }
         Ok(tenant
