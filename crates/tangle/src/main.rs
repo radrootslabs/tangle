@@ -29,12 +29,54 @@ async fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        tangle::TangleCommand::ConfigValidate => {
+            match config_path_or_error(&invocation).and_then(|path| tangle::validate_config(&path))
+            {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::from(2)
+                }
+            }
+        }
+        tangle::TangleCommand::ConfigInspect => {
+            match config_path_or_error(&invocation)
+                .and_then(|path| tangle::inspect_config(&path, invocation.redacted()))
+            {
+                Ok(output) => {
+                    println!("{output}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::from(2)
+                }
+            }
+        }
+        tangle::TangleCommand::TenantList => {
+            match config_path_or_error(&invocation).and_then(|path| tangle::list_tenants(&path)) {
+                Ok(output) => {
+                    println!("{output}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::from(2)
+                }
+            }
+        }
     }
 }
 
 async fn run_server(invocation: &tangle::TangleInvocation) -> Result<(), String> {
-    let config_path = tangle::require_config_path(invocation).map_err(|error| error.to_string())?;
-    tangle::run_with_config(config_path).await.map(|_| ())
+    let config_path = config_path_or_error(invocation)?;
+    tangle::run_with_config(&config_path).await.map(|_| ())
+}
+
+fn config_path_or_error(invocation: &tangle::TangleInvocation) -> Result<String, String> {
+    tangle::require_config_path(invocation)
+        .map(str::to_owned)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

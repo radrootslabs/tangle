@@ -29,7 +29,7 @@ fn tangle_without_args_reports_usage() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "usage:\n  tangle [--version]\n  tangle run --config PATH\n"
+        "usage:\n  tangle [--version]\n  tangle run --config PATH\n  tangle config validate --config PATH\n  tangle config inspect --config PATH --redacted\n  tangle tenant list --config PATH\n"
     );
     assert!(output.stderr.is_empty());
 }
@@ -45,7 +45,7 @@ fn tangle_unknown_arg_reports_usage_error() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
-        "unknown command: --unknown\nusage:\n  tangle [--version]\n  tangle run --config PATH\n"
+        "unknown command: --unknown\nusage:\n  tangle [--version]\n  tangle run --config PATH\n  tangle config validate --config PATH\n  tangle config inspect --config PATH --redacted\n  tangle tenant list --config PATH\n"
     );
 }
 
@@ -91,23 +91,44 @@ fn tangle_run_starts_server_and_stays_alive_until_shutdown() {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("runtime root");
     let data_dir = root.join("pocket");
-    let config_path = root.join("runtime.json");
+    let tenant_dir = root.join("tenants");
+    std::fs::create_dir_all(&tenant_dir).expect("tenant dir");
+    let config_path = root.join("host.json");
+    let tenant_config_path = tenant_dir.join("farmers_market.json");
     let listen_addr = reserve_loopback_addr();
     std::fs::write(
         &config_path,
         serde_json::json!({
-            "server": {
-                "listen_addr": listen_addr.to_string(),
-                "relay_url": "wss://relay.radroots.test"
+            "listen_addr": listen_addr.to_string(),
+            "tenant_config_dir": "tenants",
+            "limits": {
+                "max_total_connections": 10000,
+                "max_total_subscriptions": 25000,
+                "tenant_startup_concurrency": 4
+            }
+        })
+        .to_string(),
+    )
+    .expect("write host config");
+    std::fs::write(
+        &tenant_config_path,
+        serde_json::json!({
+            "tenant_id": "farmers-market",
+            "tenant_schema": "farmers_market",
+            "host": "relay.radroots.test",
+            "relay_url": "wss://relay.radroots.test",
+            "inactive": false,
+            "info": {
+                "name": "Radroots Farmers Market"
             },
             "pocket": {
                 "data_directory": data_dir,
-                "sync_policy": "flush_on_shutdown",
-                "query": {
-                  "allow_scraping": false,
-                  "allow_scrape_if_limited_to": 100,
-                  "allow_scrape_if_max_seconds": 3600
-                }
+                "sync_policy": "flush_on_shutdown"
+            },
+            "pocket_query": {
+              "allow_scraping": false,
+              "allow_scrape_if_limited_to": 100,
+              "allow_scrape_if_max_seconds": 3600
             },
             "groups": {
                 "enabled": true,
@@ -122,6 +143,10 @@ fn tangle_run_starts_server_and_stays_alive_until_shutdown() {
                     "max_member_list_pubkeys": 100000,
                     "max_outbox_replay_batch": 1000
                 }
+            },
+            "backup_export": {
+                "backup_enabled": true,
+                "export_enabled": true
             },
             "auth": {
                 "challenge_ttl_seconds": 300,

@@ -9,6 +9,7 @@ description = "Radroots Nostr relay implementation"
 readme = "../../README"
 
 [dependencies]
+serde_json = "1"
 tangle_runtime = { path = "../tangle_runtime" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 

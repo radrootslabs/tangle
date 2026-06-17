@@ -13,7 +13,11 @@ use crate::{
     tenant::{CanonicalHost, TenantId, TenantRelayUrl, TenantSchema},
 };
 use serde::Deserialize;
-use std::{net::SocketAddr, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    net::SocketAddr,
+    path::{Component, Path, PathBuf},
+};
 use tangle_crypto::RelaySigner;
 use tangle_groups::GroupRuntimeConfig;
 use tangle_protocol::{PublicKeyHex, SubscriptionId};
@@ -29,6 +33,50 @@ pub struct TangleHostRuntimeConfig {
     ops: TangleHostOpsConfig,
     trusted_proxy: TangleTrustedProxyConfig,
     tracing: BaseRelayTracingConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TangleHostRuntimeConfigSet {
+    host: TangleHostRuntimeConfig,
+    tenants: Vec<TenantRuntimeConfig>,
+}
+
+impl TangleHostRuntimeConfigSet {
+    pub fn new(
+        host: TangleHostRuntimeConfig,
+        tenants: Vec<TenantRuntimeConfig>,
+    ) -> Result<Self, BaseRelayError> {
+        validate_tenant_config_set(&tenants)?;
+        Ok(Self { host, tenants })
+    }
+
+    pub fn host(&self) -> &TangleHostRuntimeConfig {
+        &self.host
+    }
+
+    pub fn tenants(&self) -> &[TenantRuntimeConfig] {
+        &self.tenants
+    }
+
+    pub fn active_tenants(&self) -> impl Iterator<Item = &TenantRuntimeConfig> {
+        self.tenants.iter().filter(|tenant| !tenant.inactive())
+    }
+
+    pub fn single_active_runtime_config(&self) -> Result<BaseRelayRuntimeConfig, BaseRelayError> {
+        let mut active = self.active_tenants();
+        let Some(tenant) = active.next() else {
+            return Err(BaseRelayError::invalid(
+                "at least one active tenant is required",
+            ));
+        };
+        if active.next().is_some() {
+            return Err(BaseRelayError::invalid(
+                "multi-tenant host runtime startup is not implemented yet",
+            ));
+        }
+        Ok(tenant
+            .to_base_relay_runtime_config(self.host.listen_addr(), self.host.tracing().clone()))
+    }
 }
 
 impl TangleHostRuntimeConfig {
@@ -324,6 +372,25 @@ impl TenantRuntimeConfig {
 
     pub fn backup_export(&self) -> TenantBackupExportConfig {
         self.backup_export
+    }
+
+    pub fn to_base_relay_runtime_config(
+        &self,
+        listen_addr: SocketAddr,
+        tracing: BaseRelayTracingConfig,
+    ) -> BaseRelayRuntimeConfig {
+        BaseRelayRuntimeConfig {
+            listen_addr,
+            relay_url: self.relay_url.as_str().to_owned(),
+            pocket: self.pocket.clone(),
+            pocket_query: self.pocket_query,
+            groups: self.groups.clone(),
+            auth_ttl_seconds: self.auth_ttl_seconds,
+            auth_created_at_skew_seconds: self.auth_created_at_skew_seconds,
+            limits: self.limits,
+            rate_limits: self.rate_limits,
+            tracing,
+        }
     }
 }
 
@@ -1208,12 +1275,78 @@ fn validate_optional_text(
     }
 }
 
+fn validate_tenant_config_set(tenants: &[TenantRuntimeConfig]) -> Result<(), BaseRelayError> {
+    if tenants.iter().all(TenantRuntimeConfig::inactive) {
+        return Err(BaseRelayError::invalid(
+            "at least one active tenant is required",
+        ));
+    }
+    let mut tenant_ids = BTreeSet::new();
+    let mut tenant_schemas = BTreeSet::new();
+    let mut hosts = BTreeSet::new();
+    let mut relay_urls = BTreeSet::new();
+    let mut relay_self_pubkeys = BTreeSet::new();
+    let mut store_paths = BTreeSet::new();
+    for tenant in tenants {
+        insert_unique("tenant_id", tenant.tenant_id().as_str(), &mut tenant_ids)?;
+        insert_unique(
+            "tenant_schema",
+            tenant.tenant_schema().as_str(),
+            &mut tenant_schemas,
+        )?;
+        insert_unique("host", tenant.host().as_str(), &mut hosts)?;
+        insert_unique("relay_url", tenant.relay_url().as_str(), &mut relay_urls)?;
+        if let Some(pubkey) = tenant.relay_self_pubkey()? {
+            insert_unique(
+                "relay self pubkey",
+                pubkey.as_str(),
+                &mut relay_self_pubkeys,
+            )?;
+        }
+        let store_path = canonical_path_key(tenant.pocket_config().data_directory());
+        insert_unique("pocket data directory", &store_path, &mut store_paths)?;
+    }
+    Ok(())
+}
+
+fn insert_unique(
+    field: &str,
+    value: impl Into<String>,
+    values: &mut BTreeSet<String>,
+) -> Result<(), BaseRelayError> {
+    let value = value.into();
+    if values.insert(value.clone()) {
+        Ok(())
+    } else {
+        Err(BaseRelayError::invalid(format!(
+            "duplicate tenant {field}: {value}"
+        )))
+    }
+}
+
+fn canonical_path_key(path: &Path) -> String {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+            Component::RootDir | Component::Prefix(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized.to_string_lossy().into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        BaseRelayTracingFormat, parse_base_relay_runtime_config_json,
-        parse_tangle_host_runtime_config_json, parse_tenant_runtime_config_json,
+        BaseRelayTracingFormat, TangleHostRuntimeConfigSet, TenantRuntimeConfig,
+        parse_base_relay_runtime_config_json, parse_tangle_host_runtime_config_json,
+        parse_tenant_runtime_config_json,
     };
+    use serde_json::{Value, json};
     use std::path::Path;
     use tangle_store_pocket::PocketSyncPolicy;
 
@@ -1225,7 +1358,7 @@ mod tests {
         .expect("host config");
 
         assert_eq!(config.listen_addr().to_string(), "0.0.0.0:7000");
-        assert_eq!(config.tenant_config_dir(), Path::new("config/tenants"));
+        assert_eq!(config.tenant_config_dir(), Path::new("tenants"));
         assert_eq!(config.limits().max_total_connections(), 10_000);
         assert_eq!(config.limits().max_total_subscriptions(), 25_000);
         assert_eq!(config.limits().tenant_startup_concurrency(), 4);
@@ -1288,6 +1421,148 @@ mod tests {
                 .prefixed_message(),
             "invalid: legacy single-relay config is not supported"
         );
+    }
+
+    #[test]
+    fn tangle_host_runtime_config_set_rejects_invalid_tenant_sets() {
+        let host = parse_tangle_host_runtime_config_json(include_str!(
+            "../../../config/tangle.host.example.json"
+        ))
+        .expect("host config");
+        let first = tenant_from_value(first_tenant_value());
+        let second = tenant_from_value(second_tenant_value());
+        TangleHostRuntimeConfigSet::new(host.clone(), vec![first.clone(), second.clone()])
+            .expect("unique tenants");
+
+        assert!(
+            TangleHostRuntimeConfigSet::new(
+                host.clone(),
+                vec![first.clone(), mutate_second("tenant_id", "farmers-market")]
+            )
+            .expect_err("tenant id")
+            .prefixed_message()
+            .contains("duplicate tenant tenant_id")
+        );
+        assert!(
+            TangleHostRuntimeConfigSet::new(
+                host.clone(),
+                vec![
+                    first.clone(),
+                    mutate_second("tenant_schema", "farmers_market")
+                ]
+            )
+            .expect_err("schema")
+            .prefixed_message()
+            .contains("duplicate tenant tenant_schema")
+        );
+        assert!(
+            TangleHostRuntimeConfigSet::new(
+                host.clone(),
+                vec![first.clone(), mutate_second("host", "relay.radroots.test")]
+            )
+            .expect_err("host")
+            .prefixed_message()
+            .contains("duplicate tenant host")
+        );
+        assert!(
+            TangleHostRuntimeConfigSet::new(
+                host.clone(),
+                vec![
+                    first.clone(),
+                    mutate_second("relay_url", "wss://relay.radroots.test")
+                ]
+            )
+            .expect_err("relay url")
+            .prefixed_message()
+            .contains("duplicate tenant relay_url")
+        );
+        assert!(
+            TangleHostRuntimeConfigSet::new(
+                host.clone(),
+                vec![first.clone(), second_with_group_secret("7")]
+            )
+            .expect_err("relay self")
+            .prefixed_message()
+            .contains("duplicate tenant relay self pubkey")
+        );
+        assert!(
+            TangleHostRuntimeConfigSet::new(
+                host.clone(),
+                vec![
+                    first.clone(),
+                    second_with_store_path("./runtime/tenants/farmers_market/pocket")
+                ]
+            )
+            .expect_err("store")
+            .prefixed_message()
+            .contains("duplicate tenant pocket data directory")
+        );
+        assert_eq!(
+            TangleHostRuntimeConfigSet::new(
+                host,
+                vec![inactive_first_tenant(), inactive_second_tenant()]
+            )
+            .expect_err("active tenants")
+            .prefixed_message(),
+            "invalid: at least one active tenant is required"
+        );
+    }
+
+    fn first_tenant_value() -> Value {
+        serde_json::from_str(include_str!(
+            "../../../config/tenants/farmers_market.example.json"
+        ))
+        .expect("tenant json")
+    }
+
+    fn second_tenant_value() -> Value {
+        let mut value = first_tenant_value();
+        value["tenant_id"] = json!("seed-coop");
+        value["tenant_schema"] = json!("seed_coop");
+        value["host"] = json!("seed.relay.radroots.test");
+        value["relay_url"] = json!("wss://seed.relay.radroots.test");
+        value["pocket"]["data_directory"] = json!("runtime/tenants/seed_coop/pocket");
+        value["groups"]["canonical_relay_url"] = json!("wss://seed.relay.radroots.test");
+        value["groups"]["relay_secret"] =
+            json!("8888888888888888888888888888888888888888888888888888888888888888");
+        value
+    }
+
+    fn tenant_from_value(value: Value) -> TenantRuntimeConfig {
+        parse_tenant_runtime_config_json(&value.to_string()).expect("tenant")
+    }
+
+    fn mutate_second(field: &str, field_value: &str) -> TenantRuntimeConfig {
+        let mut value = second_tenant_value();
+        value[field] = json!(field_value);
+        if field == "relay_url" {
+            value["groups"]["canonical_relay_url"] = json!(field_value);
+        }
+        tenant_from_value(value)
+    }
+
+    fn second_with_group_secret(nibble: &str) -> TenantRuntimeConfig {
+        let mut value = second_tenant_value();
+        value["groups"]["relay_secret"] = json!(nibble.repeat(64));
+        tenant_from_value(value)
+    }
+
+    fn second_with_store_path(path: &str) -> TenantRuntimeConfig {
+        let mut value = second_tenant_value();
+        value["pocket"]["data_directory"] = json!(path);
+        tenant_from_value(value)
+    }
+
+    fn inactive_first_tenant() -> TenantRuntimeConfig {
+        let mut value = first_tenant_value();
+        value["inactive"] = json!(true);
+        tenant_from_value(value)
+    }
+
+    fn inactive_second_tenant() -> TenantRuntimeConfig {
+        let mut value = second_tenant_value();
+        value["inactive"] = json!(true);
+        tenant_from_value(value)
     }
 
     #[test]

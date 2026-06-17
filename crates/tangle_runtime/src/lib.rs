@@ -19,7 +19,10 @@ pub mod tenant;
 
 use std::{fmt, fs, path::Path, path::PathBuf};
 
-use config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json};
+use config::{
+    BaseRelayRuntimeConfig, TangleHostRuntimeConfigSet, parse_base_relay_runtime_config_json,
+    parse_tangle_host_runtime_config_json, parse_tenant_runtime_config_json,
+};
 use errors::BaseRelayError;
 use runtime::TangleRuntime;
 
@@ -29,6 +32,14 @@ pub const TANGLE_RELAY_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Debug)]
 pub enum TangleRuntimeLoadError {
     ReadConfig {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    ReadTenantConfigDir {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    ReadTenantConfig {
         path: PathBuf,
         source: std::io::Error,
     },
@@ -43,6 +54,20 @@ impl fmt::Display for TangleRuntimeLoadError {
                 write!(
                     formatter,
                     "failed to read tangle runtime config `{}`: {source}",
+                    path.display()
+                )
+            }
+            Self::ReadTenantConfigDir { path, source } => {
+                write!(
+                    formatter,
+                    "failed to read tangle tenant config directory `{}`: {source}",
+                    path.display()
+                )
+            }
+            Self::ReadTenantConfig { path, source } => {
+                write!(
+                    formatter,
+                    "failed to read tangle tenant config `{}`: {source}",
                     path.display()
                 )
             }
@@ -65,11 +90,65 @@ pub fn load_base_relay_runtime_config(
     parse_base_relay_runtime_config_json(&raw).map_err(TangleRuntimeLoadError::ParseConfig)
 }
 
+pub fn load_tangle_host_runtime_config(
+    path: impl AsRef<Path>,
+) -> Result<TangleHostRuntimeConfigSet, TangleRuntimeLoadError> {
+    let path = path.as_ref();
+    let raw = fs::read_to_string(path).map_err(|source| TangleRuntimeLoadError::ReadConfig {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let host =
+        parse_tangle_host_runtime_config_json(&raw).map_err(TangleRuntimeLoadError::ParseConfig)?;
+    let config_dir = resolve_config_path(path.parent(), host.tenant_config_dir());
+    let mut tenant_paths = fs::read_dir(&config_dir)
+        .map_err(|source| TangleRuntimeLoadError::ReadTenantConfigDir {
+            path: config_dir.clone(),
+            source,
+        })?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| TangleRuntimeLoadError::ReadTenantConfigDir {
+            path: config_dir.clone(),
+            source,
+        })?;
+    tenant_paths.retain(|path| {
+        path.is_file()
+            && path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+    });
+    tenant_paths.sort();
+    let mut tenants = Vec::with_capacity(tenant_paths.len());
+    for tenant_path in tenant_paths {
+        let raw = fs::read_to_string(&tenant_path).map_err(|source| {
+            TangleRuntimeLoadError::ReadTenantConfig {
+                path: tenant_path.clone(),
+                source,
+            }
+        })?;
+        let tenant =
+            parse_tenant_runtime_config_json(&raw).map_err(TangleRuntimeLoadError::ParseConfig)?;
+        tenants.push(tenant);
+    }
+    TangleHostRuntimeConfigSet::new(host, tenants).map_err(TangleRuntimeLoadError::ParseConfig)
+}
+
 pub fn open_tangle_runtime_from_config_path(
     path: impl AsRef<Path>,
 ) -> Result<TangleRuntime, TangleRuntimeLoadError> {
     let config = load_base_relay_runtime_config(path)?;
     TangleRuntime::open(config).map_err(TangleRuntimeLoadError::OpenRelay)
+}
+
+fn resolve_config_path(base: Option<&Path>, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Some(base) = base {
+        base.join(path)
+    } else {
+        path.to_path_buf()
+    }
 }
 
 #[cfg(test)]

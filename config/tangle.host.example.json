@@ -1,6 +1,6 @@
 {
   "listen_addr": "0.0.0.0:7000",
-  "tenant_config_dir": "config/tenants",
+  "tenant_config_dir": "tenants",
   "limits": {
     "max_total_connections": 10000,
     "max_total_subscriptions": 25000,
