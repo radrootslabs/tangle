@@ -32,7 +32,7 @@ use tangle_runtime::{
     host::TangleHostRuntime,
     nip11::BaseRelayInfoConfig,
     relay::{auth::BaseAuthState, core::BaseRelay},
-    runtime::TenantRuntime,
+    runtime::RelayRuntime,
     server::serve_listener_until_shutdown,
 };
 use tangle_store_pocket::{
@@ -1984,14 +1984,14 @@ fn runtime_live_fanout_offset_lookup_does_not_lock_relay_state() {
 fn runtime_shared_shell_does_not_keep_transitional_base_relay_mutex() {
     let runtime = include_str!("../src/runtime.rs");
     let shared_shell = runtime
-        .split("struct TenantRuntimeShared {")
+        .split("struct RelayRuntimeShared {")
         .nth(1)
         .expect("shared shell")
-        .split("impl TenantRuntimeShared")
+        .split("impl RelayRuntimeShared")
         .next()
         .expect("shared shell fields");
     let handle_impl = runtime
-        .split("impl TenantRuntimeHandle")
+        .split("impl RelayRuntimeHandle")
         .nth(1)
         .expect("runtime handle")
         .split("fn auth_response_failed")
@@ -2059,7 +2059,7 @@ fn projection_and_outbox_recover_from_canonical_pocket_events() {
     .expect("note");
 
     {
-        let mut runtime = TenantRuntime::open(config.clone()).expect("runtime");
+        let mut runtime = RelayRuntime::open(config.clone()).expect("runtime");
         assert_relay_ok(
             runtime
                 .relay_mut()
@@ -2105,7 +2105,7 @@ fn projection_and_outbox_recover_from_canonical_pocket_events() {
 
     delete_group_extra_records(config.pocket_config());
 
-    let recovered = TenantRuntime::open(config.clone()).expect("recovered");
+    let recovered = RelayRuntime::open(config.clone()).expect("recovered");
     let readiness = recovered.readiness_state().response();
     assert_eq!(readiness.checks.group_projection, "ready");
     assert_eq!(readiness.checks.group_outbox_replay, "ready");

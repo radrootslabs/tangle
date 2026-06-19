@@ -15,6 +15,7 @@ pub(crate) mod pocket_conversion;
 pub(crate) mod pocket_event_validation;
 pub mod rate_limits;
 pub mod relay;
+pub mod resource_limits;
 pub mod runtime;
 pub mod server;
 pub mod session;

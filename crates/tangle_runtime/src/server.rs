@@ -130,7 +130,7 @@ async fn tangle_root(
             };
             let tenant_runtime = tenant.runtime().clone();
             let session = match tenant_runtime.auth_state().await {
-                Ok(auth) => TangleWebSocketSession::new_with_peer_and_host_resources(
+                Ok(auth) => TangleWebSocketSession::new_with_peer_and_resources(
                     tenant_runtime.limits(),
                     state.runtime.shutdown_signal().subscribe(),
                     tenant_runtime.clone(),

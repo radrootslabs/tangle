@@ -1,31 +1,30 @@
 #![forbid(unsafe_code)]
 
 use crate::{
-    config::{TangleHostLimitsConfig, TangleHostRuntimeConfigSet, TenantRuntimeConfig},
+    config::{TangleHostRuntimeConfigSet, TenantRuntimeConfig},
     errors::BaseRelayError,
     ops::BaseRelayReadinessCheckStatus,
-    runtime::{TangleShutdownSignal, TenantRuntime, TenantRuntimeHandle},
+    resource_limits::RelayResourceLimiter,
+    runtime::{RelayRuntime, RelayRuntimeHandle, TangleShutdownSignal},
     tenant::{CanonicalHost, TenantId, TenantRelayUrl, TenantSchema},
 };
-use std::{
-    collections::BTreeMap,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
 pub struct TangleHostRuntime {
     config: TangleHostRuntimeConfigSet,
     registry: TenantRegistry,
-    resources: TangleHostResourceLimiter,
+    resources: RelayResourceLimiter,
     shutdown: TangleShutdownSignal,
 }
 
 impl TangleHostRuntime {
     pub fn open(config: TangleHostRuntimeConfigSet) -> Result<Self, BaseRelayError> {
-        let resources = TangleHostResourceLimiter::new(config.host().limits());
+        let limits = config.host().limits();
+        let resources = RelayResourceLimiter::new(
+            limits.max_total_connections(),
+            limits.max_total_subscriptions(),
+        );
         let registry = TenantRegistry::open(&config)?;
         Ok(Self {
             config,
@@ -43,7 +42,7 @@ impl TangleHostRuntime {
         &self.registry
     }
 
-    pub fn resources(&self) -> TangleHostResourceLimiter {
+    pub fn resources(&self) -> RelayResourceLimiter {
         self.resources.clone()
     }
 
@@ -288,11 +287,11 @@ impl TenantRegistry {
 #[derive(Clone)]
 pub struct TenantRuntimeEntry {
     config: TenantRuntimeConfig,
-    runtime: TenantRuntimeHandle,
+    runtime: RelayRuntimeHandle,
 }
 
 impl TenantRuntimeEntry {
-    pub fn new(config: TenantRuntimeConfig, runtime: TenantRuntimeHandle) -> Self {
+    pub fn new(config: TenantRuntimeConfig, runtime: RelayRuntimeHandle) -> Self {
         Self { config, runtime }
     }
 
@@ -316,7 +315,7 @@ impl TenantRuntimeEntry {
         self.config.relay_url()
     }
 
-    pub fn runtime(&self) -> &TenantRuntimeHandle {
+    pub fn runtime(&self) -> &RelayRuntimeHandle {
         &self.runtime
     }
 }
@@ -333,145 +332,13 @@ impl std::fmt::Debug for TenantRuntimeEntry {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct TangleHostResourceLimiter {
-    inner: Arc<TangleHostResourceLimiterInner>,
-}
-
-#[derive(Debug)]
-struct TangleHostResourceLimiterInner {
-    max_total_connections: usize,
-    max_total_subscriptions: usize,
-    active_connections: AtomicUsize,
-    active_subscriptions: AtomicUsize,
-}
-
-impl TangleHostResourceLimiter {
-    pub fn new(limits: TangleHostLimitsConfig) -> Self {
-        Self {
-            inner: Arc::new(TangleHostResourceLimiterInner {
-                max_total_connections: limits.max_total_connections(),
-                max_total_subscriptions: limits.max_total_subscriptions(),
-                active_connections: AtomicUsize::new(0),
-                active_subscriptions: AtomicUsize::new(0),
-            }),
-        }
-    }
-
-    pub fn try_open_connection(&self) -> Result<TangleHostConnectionPermit, BaseRelayError> {
-        increment_with_limit(
-            &self.inner.active_connections,
-            1,
-            self.inner.max_total_connections,
-            "host total connection limit exceeded",
-        )?;
-        Ok(TangleHostConnectionPermit {
-            resources: self.inner.clone(),
-            released: false,
-        })
-    }
-
-    pub fn try_open_subscriptions(
-        &self,
-        count: usize,
-    ) -> Result<TangleHostSubscriptionPermit, BaseRelayError> {
-        if count == 0 {
-            return Err(BaseRelayError::invalid(
-                "subscription reservation count must be greater than zero",
-            ));
-        }
-        increment_with_limit(
-            &self.inner.active_subscriptions,
-            count,
-            self.inner.max_total_subscriptions,
-            "host total subscription limit exceeded",
-        )?;
-        Ok(TangleHostSubscriptionPermit {
-            resources: self.inner.clone(),
-            count,
-            released: false,
-        })
-    }
-
-    pub fn active_connections(&self) -> usize {
-        self.inner.active_connections.load(Ordering::Relaxed)
-    }
-
-    pub fn active_subscriptions(&self) -> usize {
-        self.inner.active_subscriptions.load(Ordering::Relaxed)
-    }
-
-    pub fn max_total_connections(&self) -> usize {
-        self.inner.max_total_connections
-    }
-
-    pub fn max_total_subscriptions(&self) -> usize {
-        self.inner.max_total_subscriptions
-    }
-}
-
-#[derive(Debug)]
-pub struct TangleHostConnectionPermit {
-    resources: Arc<TangleHostResourceLimiterInner>,
-    released: bool,
-}
-
-impl TangleHostConnectionPermit {
-    pub fn release(mut self) {
-        self.release_inner();
-    }
-
-    fn release_inner(&mut self) {
-        if !self.released {
-            self.resources
-                .active_connections
-                .fetch_sub(1, Ordering::Relaxed);
-            self.released = true;
-        }
-    }
-}
-
-impl Drop for TangleHostConnectionPermit {
-    fn drop(&mut self) {
-        self.release_inner();
-    }
-}
-
-#[derive(Debug)]
-pub struct TangleHostSubscriptionPermit {
-    resources: Arc<TangleHostResourceLimiterInner>,
-    count: usize,
-    released: bool,
-}
-
-impl TangleHostSubscriptionPermit {
-    pub fn release(mut self) {
-        self.release_inner();
-    }
-
-    fn release_inner(&mut self) {
-        if !self.released {
-            self.resources
-                .active_subscriptions
-                .fetch_sub(self.count, Ordering::Relaxed);
-            self.released = true;
-        }
-    }
-}
-
-impl Drop for TangleHostSubscriptionPermit {
-    fn drop(&mut self) {
-        self.release_inner();
-    }
-}
-
 fn open_tenant_runtime(
     config: &TangleHostRuntimeConfigSet,
     tenant: &TenantRuntimeConfig,
 ) -> Result<TenantRuntimeEntry, BaseRelayError> {
     let runtime_config = tenant
         .to_base_relay_runtime_config(config.host().listen_addr(), config.host().tracing().clone());
-    let runtime = TenantRuntime::open(runtime_config).map_err(|error| {
+    let runtime = RelayRuntime::open(runtime_config).map_err(|error| {
         BaseRelayError::error(format!(
             "failed to open active tenant `{}`: {}",
             tenant.tenant_id(),
@@ -480,7 +347,7 @@ fn open_tenant_runtime(
     })?;
     Ok(TenantRuntimeEntry::new(
         tenant.clone(),
-        TenantRuntimeHandle::new(runtime),
+        RelayRuntimeHandle::new(runtime),
     ))
 }
 
@@ -503,36 +370,16 @@ fn active_tenants_ready(registry: &TenantRegistry) -> BaseRelayReadinessCheckSta
     }
 }
 
-fn increment_with_limit(
-    counter: &AtomicUsize,
-    amount: usize,
-    limit: usize,
-    message: &'static str,
-) -> Result<(), BaseRelayError> {
-    let mut current = counter.load(Ordering::Relaxed);
-    loop {
-        let Some(next) = current.checked_add(amount) else {
-            return Err(BaseRelayError::restricted(message));
-        };
-        if next > limit {
-            return Err(BaseRelayError::restricted(message));
-        }
-        match counter.compare_exchange(current, next, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return Ok(()),
-            Err(actual) => current = actual,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{TangleHostResourceLimiter, TangleHostRuntime};
+    use super::TangleHostRuntime;
     use crate::{
         config::{
-            TangleHostLimitsConfig, TangleHostRuntimeConfigSet,
-            parse_tangle_host_runtime_config_json, parse_tenant_runtime_config_json,
+            TangleHostRuntimeConfigSet, parse_tangle_host_runtime_config_json,
+            parse_tenant_runtime_config_json,
         },
         ops::BaseRelayReadinessCheckStatus,
+        resource_limits::RelayResourceLimiter,
         tenant::{CanonicalHost, TenantId},
     };
     use serde_json::json;
@@ -739,8 +586,7 @@ mod tests {
 
     #[test]
     fn host_caps_reject_aggregate_connection_and_subscription_limits() {
-        let resources =
-            TangleHostResourceLimiter::new(TangleHostLimitsConfig::new(1, 2, 4).expect("limits"));
+        let resources = RelayResourceLimiter::new(1, 2);
 
         let connection = resources.try_open_connection().expect("connection");
         assert_eq!(resources.active_connections(), 1);

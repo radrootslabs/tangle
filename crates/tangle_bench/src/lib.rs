@@ -24,7 +24,7 @@ use tangle_runtime::{
         core::{BaseRelay, BaseRelayLimitSettings, BaseRelayLimits},
         outbound::RuntimeRelayMessage,
     },
-    runtime::{TenantRuntime, TenantRuntimeHandle},
+    runtime::{RelayRuntime, RelayRuntimeHandle},
 };
 use tangle_store_pocket::{
     PocketEventId, PocketKind, PocketOwnedEvent, PocketOwnedFilter, PocketOwnedTags, PocketPubkey,
@@ -1736,8 +1736,8 @@ struct CountResourceControlProbe {
 async fn runtime_count_resource_control_probe() -> Result<CountResourceControlProbe, String> {
     let root = bench_temp_root("count-resource-controls-runtime");
     let _ = fs::remove_dir_all(&root);
-    let handle = TenantRuntimeHandle::new(
-        TenantRuntime::open(bench_runtime_config(&root)?).map_err(|error| error.to_string())?,
+    let handle = RelayRuntimeHandle::new(
+        RelayRuntime::open(bench_runtime_config(&root)?).map_err(|error| error.to_string())?,
     );
     let mut auth = handle
         .auth_state()

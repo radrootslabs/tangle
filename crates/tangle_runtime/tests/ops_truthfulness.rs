@@ -15,7 +15,7 @@ use tangle_runtime::{
     ops::BaseRelayReadinessCheckStatus,
     rate_limits::{TangleRateLimitKey, TangleRateLimitScope, TangleRateLimiter},
     relay::{auth::BaseAuthState, core::BaseRelay},
-    runtime::TenantRuntime,
+    runtime::RelayRuntime,
 };
 use tangle_store_pocket::parse_pocket_event_json;
 use tangle_store_pocket::{PocketEvent, PocketKind, PocketOwnedEvent, PocketOwnedTags, PocketTime};
@@ -210,7 +210,7 @@ fn operations_surfaces_match_enforced_runtime_contracts() {
             .is_allowed()
     );
 
-    let runtime = TenantRuntime::open(config.clone()).expect("runtime");
+    let runtime = RelayRuntime::open(config.clone()).expect("runtime");
     let pre_bind = runtime.readiness_state().response();
     assert_eq!(pre_bind.status, "not_ready");
     assert_eq!(pre_bind.checks.server_bind, "not_ready");

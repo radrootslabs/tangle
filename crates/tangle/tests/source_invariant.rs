@@ -43,7 +43,7 @@ fn tangle_v1_mvp_authority_requires_virtual_relay_tenancy() {
 }
 
 #[test]
-fn tenant_runtime_surface_has_no_stale_single_runtime_api_names() {
+fn relay_runtime_surface_has_no_stale_single_runtime_api_names() {
     let workspace_root = workspace_root();
     let runtime_source =
         fs::read_to_string(workspace_root.join("crates/tangle_runtime/src/runtime.rs"))
@@ -54,6 +54,9 @@ fn tenant_runtime_surface_has_no_stale_single_runtime_api_names() {
         "pub struct TangleRuntime {",
         "TangleRuntimeHandle",
         "TangleRuntimeShared",
+        "pub struct TenantRuntime {",
+        "TenantRuntimeHandle",
+        "TenantRuntimeShared",
         "load_base_relay_runtime_config",
         "open_tangle_runtime_from_config_path",
     ] {
@@ -62,8 +65,8 @@ fn tenant_runtime_surface_has_no_stale_single_runtime_api_names() {
             "stale single-runtime API name remains: {forbidden}"
         );
     }
-    assert!(runtime_source.contains("pub struct TenantRuntime"));
-    assert!(runtime_source.contains("pub struct TenantRuntimeHandle"));
+    assert!(runtime_source.contains("pub struct RelayRuntime"));
+    assert!(runtime_source.contains("pub struct RelayRuntimeHandle"));
 }
 
 #[test]
@@ -77,6 +80,9 @@ fn tangle_v1_mvp_source_invariants_guard_tenancy_boundaries() {
             .expect("server source");
     let host_source = fs::read_to_string(workspace_root.join("crates/tangle_runtime/src/host.rs"))
         .expect("host source");
+    let session_source =
+        fs::read_to_string(workspace_root.join("crates/tangle_runtime/src/session.rs"))
+            .expect("session source");
 
     assert!(
         config_source.contains("fn reject_legacy_single_relay_config"),
@@ -106,6 +112,14 @@ fn tangle_v1_mvp_source_invariants_guard_tenancy_boundaries() {
         server_source
             .contains(".tenant_by_host(&host)\n        .ok_or(HostResolutionError::Unknown)"),
         "relay request routing must fail closed when the host is not a configured tenant"
+    );
+    assert!(
+        session_source.contains("resource_limits::{RelayResourceLimiter, RelaySubscriptionPermit}"),
+        "websocket sessions must depend on neutral relay resource admission types"
+    );
+    assert!(
+        !session_source.contains("host::{RelayResourceLimiter, RelaySubscriptionPermit}"),
+        "websocket sessions must not import host-layer resource permits"
     );
     let tenant_resolution = server_source
         .find("let tenant = match resolve_tenant")
