@@ -109,9 +109,17 @@ fn tangle_v1_mvp_source_invariants_guard_tenancy_boundaries() {
         "host runtime must keep tenant-id lookup separate from host routing"
     );
     assert!(
-        server_source
-            .contains(".tenant_by_host(&host)\n        .ok_or(HostResolutionError::Unknown)"),
-        "relay request routing must fail closed when the host is not a configured tenant"
+        host_source.contains(".tenant_by_host(&host)")
+            && host_source.contains(".ok_or(HostResolutionError::Unknown)"),
+        "host shell request routing must fail closed when the host is not a configured tenant"
+    );
+    assert!(
+        !server_source.contains(".tenant_by_host(&host)"),
+        "server HTTP handling must not own tenant host lookup"
+    );
+    assert!(
+        server_source.contains(".tenant_inventory()"),
+        "server tenant inventory route must use the host-owned inventory snapshot"
     );
     assert!(
         session_source.contains("resource_limits::{RelayResourceLimiter, RelaySubscriptionPermit}"),
@@ -122,7 +130,7 @@ fn tangle_v1_mvp_source_invariants_guard_tenancy_boundaries() {
         "websocket sessions must not import host-layer resource permits"
     );
     let tenant_resolution = server_source
-        .find("let tenant = match resolve_tenant")
+        .find("let tenant = match state.runtime.tenant_for_request")
         .expect("tenant resolution");
     let websocket_path = server_source
         .find("match websocket")

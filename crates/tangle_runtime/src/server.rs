@@ -2,12 +2,11 @@
 
 use crate::{
     errors::BaseRelayError,
-    host::{TangleHostRuntime, TenantRuntimeEntry},
+    host::{HostResolutionError, TangleHostRuntime, TenantRuntimeEntry},
     logging,
     nip11::{BaseRelayInfoConfig, BaseRelayInfoDocument, base_relay_info_response},
     ops::BaseRelayReadinessCheckStatus,
     session::TangleWebSocketSession,
-    tenant::CanonicalHost,
 };
 use axum::{
     Json, Router,
@@ -18,8 +17,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use http::{HeaderMap, StatusCode, header};
-use std::{collections::BTreeSet, net::SocketAddr};
+use http::{HeaderMap, StatusCode};
+use std::net::SocketAddr;
 use tokio::net::TcpListener;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,7 +114,7 @@ async fn tangle_root(
     websocket: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
     headers: HeaderMap,
 ) -> Response {
-    let tenant = match resolve_tenant(&state.runtime, &headers, peer_addr) {
+    let tenant = match state.runtime.tenant_for_request(&headers, peer_addr) {
         Ok(tenant) => tenant.clone(),
         Err(error) => return error.into_response(),
     };
@@ -249,115 +248,28 @@ async fn tangle_host_metrics(State(state): State<TangleHttpState>) -> Json<serde
 }
 
 async fn tangle_host_tenants(State(state): State<TangleHttpState>) -> Json<serde_json::Value> {
-    let active_tenant_ids = state
-        .runtime
-        .registry()
-        .active_tenants()
-        .map(|tenant| tenant.tenant_id().as_str().to_owned())
-        .collect::<BTreeSet<_>>();
     let tenants = state
         .runtime
-        .config()
-        .tenants()
-        .iter()
+        .tenant_inventory()
+        .into_iter()
         .map(|tenant| {
-            let active = active_tenant_ids.contains(tenant.tenant_id().as_str());
-            let readiness = state
-                .runtime
-                .registry()
-                .tenant_by_id(tenant.tenant_id())
-                .map(|entry| entry.runtime().readiness_handle().snapshot().is_ready());
             serde_json::json!({
                 "tenant_id": tenant.tenant_id().as_str(),
                 "tenant_schema": tenant.tenant_schema().as_str(),
                 "host": tenant.host().as_str(),
                 "relay_url": tenant.relay_url().as_str(),
-                "status": if active { "active" } else { "inactive" },
-                "ready": readiness.unwrap_or(false)
+                "status": if tenant.active() { "active" } else { "inactive" },
+                "ready": tenant.ready()
             })
         })
         .collect::<Vec<_>>();
     Json(serde_json::json!({ "tenants": tenants }))
 }
 
-fn resolve_tenant<'a>(
-    runtime: &'a TangleHostRuntime,
-    headers: &HeaderMap,
-    peer_addr: SocketAddr,
-) -> Result<&'a TenantRuntimeEntry, HostResolutionError> {
-    let host = resolve_request_host(headers, peer_addr, runtime.config().host().trusted_proxy())?;
-    runtime
-        .registry()
-        .tenant_by_host(&host)
-        .ok_or(HostResolutionError::Unknown)
-}
-
 fn tenant_info_document(
     tenant: &TenantRuntimeEntry,
 ) -> Result<BaseRelayInfoDocument, BaseRelayError> {
     BaseRelayInfoConfig::from_tenant_config(tenant.config())?.build_document()
-}
-
-fn resolve_request_host(
-    headers: &HeaderMap,
-    peer_addr: SocketAddr,
-    trusted_proxy: &crate::config::TangleTrustedProxyConfig,
-) -> Result<CanonicalHost, HostResolutionError> {
-    let forwarded_host = trusted_proxy_peer_enabled(trusted_proxy, peer_addr)
-        .then(|| forwarded_host_header(headers))
-        .flatten();
-    let host = forwarded_host
-        .or_else(|| {
-            headers
-                .get(header::HOST)
-                .and_then(|value| value.to_str().ok())
-        })
-        .ok_or(HostResolutionError::Missing)?;
-    let host = host
-        .split(',')
-        .next()
-        .map(str::trim)
-        .filter(|host| !host.is_empty())
-        .ok_or(HostResolutionError::Missing)?;
-    CanonicalHost::new(host).map_err(|_| HostResolutionError::Invalid)
-}
-
-fn trusted_proxy_peer_enabled(
-    trusted_proxy: &crate::config::TangleTrustedProxyConfig,
-    peer_addr: SocketAddr,
-) -> bool {
-    trusted_proxy.enabled()
-        && trusted_proxy
-            .trusted_peers()
-            .iter()
-            .any(|peer| peer == &peer_addr.ip().to_string() || peer == &peer_addr.to_string())
-}
-
-fn forwarded_host_header(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get("x-forwarded-host")
-        .and_then(|value| value.to_str().ok())
-        .or_else(|| {
-            headers
-                .get("forwarded")
-                .and_then(|value| value.to_str().ok())
-                .and_then(forwarded_host_value)
-        })
-}
-
-fn forwarded_host_value(value: &str) -> Option<&str> {
-    value.split(';').find_map(|part| {
-        let (name, value) = part.trim().split_once('=')?;
-        name.eq_ignore_ascii_case("host")
-            .then(|| value.trim_matches('"'))
-    })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HostResolutionError {
-    Missing,
-    Invalid,
-    Unknown,
 }
 
 impl IntoResponse for HostResolutionError {

@@ -8,7 +8,9 @@ use crate::{
     runtime::{RelayRuntime, RelayRuntimeHandle, TangleShutdownSignal},
     tenant::{CanonicalHost, TenantId, TenantRelayUrl, TenantSchema},
 };
+use http::{HeaderMap, header};
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 
 #[derive(Debug, Clone)]
 pub struct TangleHostRuntime {
@@ -75,6 +77,33 @@ impl TangleHostRuntime {
         )
     }
 
+    pub fn tenant_for_request(
+        &self,
+        headers: &HeaderMap,
+        peer_addr: SocketAddr,
+    ) -> Result<&TenantRuntimeEntry, HostResolutionError> {
+        let host = resolve_request_host(headers, peer_addr, self.config.host().trusted_proxy())?;
+        self.registry
+            .tenant_by_host(&host)
+            .ok_or(HostResolutionError::Unknown)
+    }
+
+    pub fn tenant_inventory(&self) -> Vec<TangleHostTenantInventoryItem> {
+        let mut items = Vec::with_capacity(self.config.tenants().len());
+        for tenant in self.config.tenants() {
+            let runtime = self.registry.tenant_by_id(tenant.tenant_id());
+            items.push(TangleHostTenantInventoryItem::new(
+                tenant.tenant_id().clone(),
+                tenant.tenant_schema().clone(),
+                tenant.host().clone(),
+                tenant.relay_url().clone(),
+                runtime.is_some(),
+                runtime.map(|entry| entry.runtime().readiness_handle().snapshot().is_ready()),
+            ));
+        }
+        items
+    }
+
     pub async fn shutdown(&self) -> Result<TangleHostShutdownReport, BaseRelayError> {
         self.shutdown.request_shutdown();
         let mut closed_subscriptions = 0;
@@ -85,6 +114,60 @@ impl TangleHostRuntime {
             self.registry.active_tenant_count(),
             closed_subscriptions,
         ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TangleHostTenantInventoryItem {
+    tenant_id: TenantId,
+    tenant_schema: TenantSchema,
+    host: CanonicalHost,
+    relay_url: TenantRelayUrl,
+    active: bool,
+    ready: Option<bool>,
+}
+
+impl TangleHostTenantInventoryItem {
+    pub fn new(
+        tenant_id: TenantId,
+        tenant_schema: TenantSchema,
+        host: CanonicalHost,
+        relay_url: TenantRelayUrl,
+        active: bool,
+        ready: Option<bool>,
+    ) -> Self {
+        Self {
+            tenant_id,
+            tenant_schema,
+            host,
+            relay_url,
+            active,
+            ready,
+        }
+    }
+
+    pub fn tenant_id(&self) -> &TenantId {
+        &self.tenant_id
+    }
+
+    pub fn tenant_schema(&self) -> &TenantSchema {
+        &self.tenant_schema
+    }
+
+    pub fn host(&self) -> &CanonicalHost {
+        &self.host
+    }
+
+    pub fn relay_url(&self) -> &TenantRelayUrl {
+        &self.relay_url
+    }
+
+    pub fn active(&self) -> bool {
+        self.active
+    }
+
+    pub fn ready(&self) -> bool {
+        self.ready.unwrap_or(false)
     }
 }
 
@@ -332,6 +415,13 @@ impl std::fmt::Debug for TenantRuntimeEntry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostResolutionError {
+    Missing,
+    Invalid,
+    Unknown,
+}
+
 fn open_tenant_runtime(
     config: &TangleHostRuntimeConfigSet,
     tenant: &TenantRuntimeConfig,
@@ -368,6 +458,61 @@ fn active_tenants_ready(registry: &TenantRegistry) -> BaseRelayReadinessCheckSta
     } else {
         BaseRelayReadinessCheckStatus::NotReady
     }
+}
+
+fn resolve_request_host(
+    headers: &HeaderMap,
+    peer_addr: SocketAddr,
+    trusted_proxy: &crate::config::TangleTrustedProxyConfig,
+) -> Result<CanonicalHost, HostResolutionError> {
+    let forwarded_host = trusted_proxy_peer_enabled(trusted_proxy, peer_addr)
+        .then(|| forwarded_host_header(headers))
+        .flatten();
+    let host = forwarded_host
+        .or_else(|| {
+            headers
+                .get(header::HOST)
+                .and_then(|value| value.to_str().ok())
+        })
+        .ok_or(HostResolutionError::Missing)?;
+    let host = host
+        .split(',')
+        .next()
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .ok_or(HostResolutionError::Missing)?;
+    CanonicalHost::new(host).map_err(|_| HostResolutionError::Invalid)
+}
+
+fn trusted_proxy_peer_enabled(
+    trusted_proxy: &crate::config::TangleTrustedProxyConfig,
+    peer_addr: SocketAddr,
+) -> bool {
+    trusted_proxy.enabled()
+        && trusted_proxy
+            .trusted_peers()
+            .iter()
+            .any(|peer| peer == &peer_addr.ip().to_string() || peer == &peer_addr.to_string())
+}
+
+fn forwarded_host_header(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("x-forwarded-host")
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            headers
+                .get("forwarded")
+                .and_then(|value| value.to_str().ok())
+                .and_then(forwarded_host_value)
+        })
+}
+
+fn forwarded_host_value(value: &str) -> Option<&str> {
+    value.split(';').find_map(|part| {
+        let (name, value) = part.trim().split_once('=')?;
+        name.eq_ignore_ascii_case("host")
+            .then(|| value.trim_matches('"'))
+    })
 }
 
 #[cfg(test)]
