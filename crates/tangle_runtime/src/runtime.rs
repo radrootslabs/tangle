@@ -115,6 +115,7 @@ impl EventAdmissionDecision {
 pub struct RelayEventContext {
     event_id: String,
     pubkey: String,
+    created_at: u64,
     kind: u32,
     tags: Vec<Vec<String>>,
     content: String,
@@ -124,6 +125,7 @@ impl RelayEventContext {
     pub fn new(
         event_id: String,
         pubkey: String,
+        created_at: u64,
         kind: u32,
         tags: Vec<Vec<String>>,
         content: String,
@@ -131,6 +133,7 @@ impl RelayEventContext {
         Self {
             event_id,
             pubkey,
+            created_at,
             kind,
             tags,
             content,
@@ -157,6 +160,7 @@ impl RelayEventContext {
         Ok(Self {
             event_id: event.id().to_string(),
             pubkey: event.pubkey().to_string(),
+            created_at: event.created_at().as_u64(),
             kind: u32::from(event.kind().as_u16()),
             tags,
             content,
@@ -169,6 +173,10 @@ impl RelayEventContext {
 
     pub fn pubkey(&self) -> &str {
         &self.pubkey
+    }
+
+    pub fn created_at(&self) -> u64 {
+        self.created_at
     }
 
     pub fn kind(&self) -> u32 {
@@ -2683,11 +2691,14 @@ mod tests {
         let admissions = hooks.admissions.lock().expect("admissions");
         assert_eq!(admissions.len(), 2);
         assert_eq!(admissions[0].event().event_id(), rejected.id().as_str());
+        assert_eq!(admissions[0].event().created_at(), 1_714_124_433);
         assert_eq!(admissions[1].event().event_id(), accepted.id().as_str());
+        assert_eq!(admissions[1].event().created_at(), 1_714_124_434);
         drop(admissions);
         let stored = hooks.stored.lock().expect("stored");
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].event().event_id(), accepted.id().as_str());
+        assert_eq!(stored[0].event().created_at(), 1_714_124_434);
         assert_eq!(stored[0].store_offsets().len(), 1);
 
         let _ = std::fs::remove_dir_all(root);
