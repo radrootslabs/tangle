@@ -593,14 +593,14 @@ mod tests {
     #[test]
     fn group_policy_rejects_compatibility_fields() {
         let error = parse_group_runtime_config_json(
-            r#"{"enabled": false, "policy": {"compat_zooid_closed_means_restricted": true}}"#,
+            r#"{"enabled": false, "policy": {"compat_closed_means_restricted": true}}"#,
         )
         .expect_err("compat");
 
         assert!(
             error
                 .message()
-                .contains("unknown field `compat_zooid_closed_means_restricted`")
+                .contains("unknown field `compat_closed_means_restricted`")
         );
     }
 
