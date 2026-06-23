@@ -165,6 +165,9 @@ async fn tangle_root(
 }
 
 async fn tangle_host_ready(State(state): State<TangleHttpState>) -> Response {
+    if !state.runtime.config().host().ops().enabled() {
+        return host_ops_disabled_response();
+    }
     let readiness = state.runtime.readiness_state();
     let status = if readiness.is_ready() {
         StatusCode::OK
@@ -186,7 +189,10 @@ async fn tangle_host_ready(State(state): State<TangleHttpState>) -> Response {
         .into_response()
 }
 
-async fn tangle_host_metrics(State(state): State<TangleHttpState>) -> Json<serde_json::Value> {
+async fn tangle_host_metrics(State(state): State<TangleHttpState>) -> Response {
+    if !state.runtime.config().host().ops().enabled() {
+        return host_ops_disabled_response();
+    }
     let metrics = state.runtime.metrics_snapshot();
     let mut values = serde_json::Map::new();
     values.insert(
@@ -244,10 +250,21 @@ async fn tangle_host_metrics(State(state): State<TangleHttpState>) -> Json<serde
             }
         }
     }
-    Json(serde_json::Value::Object(values))
+    Json(serde_json::Value::Object(values)).into_response()
 }
 
-async fn tangle_host_tenants(State(state): State<TangleHttpState>) -> Json<serde_json::Value> {
+async fn tangle_host_tenants(State(state): State<TangleHttpState>) -> Response {
+    let ops = state.runtime.config().host().ops();
+    if !ops.enabled() {
+        return host_ops_disabled_response();
+    }
+    if !ops.expose_tenant_inventory() {
+        return (
+            StatusCode::NOT_FOUND,
+            "tangle host tenant inventory is disabled",
+        )
+            .into_response();
+    }
     let tenants = state
         .runtime
         .tenant_inventory()
@@ -263,7 +280,11 @@ async fn tangle_host_tenants(State(state): State<TangleHttpState>) -> Json<serde
             })
         })
         .collect::<Vec<_>>();
-    Json(serde_json::json!({ "tenants": tenants }))
+    Json(serde_json::json!({ "tenants": tenants })).into_response()
+}
+
+fn host_ops_disabled_response() -> Response {
+    (StatusCode::NOT_FOUND, "tangle host ops are disabled").into_response()
 }
 
 fn tenant_info_document(
@@ -683,6 +704,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tangle_http_router_enforces_host_ops_config() {
+        let root = temp_root("http-router-ops-config");
+        let _ = std::fs::remove_dir_all(&root);
+        let inventory_enabled = ready_runtime(host_runtime_with_ops(&root, true, true));
+        let inventory_disabled = ready_runtime(host_runtime_with_ops(&root, true, false));
+        let ops_disabled = ready_runtime(host_runtime_with_ops(&root, false, true));
+
+        let tenants = host_ops_response(
+            &tangle_http_router(inventory_enabled),
+            "/.well-known/tangle/tenants",
+        )
+        .await;
+        assert_eq!(tenants.status(), http::StatusCode::OK);
+        let tenants_json = response_json(tenants).await;
+        assert_eq!(tenants_json["tenants"][0]["tenant_id"], "test-relay");
+
+        let tenants = host_ops_response(
+            &tangle_http_router(inventory_disabled),
+            "/.well-known/tangle/tenants",
+        )
+        .await;
+        assert_eq!(tenants.status(), http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            response_text(tenants).await,
+            "tangle host tenant inventory is disabled"
+        );
+
+        let router = tangle_http_router(ops_disabled);
+        for path in [
+            "/.well-known/tangle/ready",
+            "/.well-known/tangle/metrics",
+            "/.well-known/tangle/tenants",
+        ] {
+            let response = host_ops_response(&router, path).await;
+            assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
+            assert_eq!(
+                response_text(response).await,
+                "tangle host ops are disabled"
+            );
+        }
+
+        let nip11 = nip11_response(&router, Some("relay.radroots.test"), None, 39_002).await;
+        assert_eq!(nip11.status(), http::StatusCode::OK);
+        let nip11_json = response_json(nip11).await;
+        assert_eq!(nip11_json["name"], "Radroots Test Relay");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn tangle_http_router_routes_by_host_and_fails_closed() {
         let root = temp_root("host-routing");
         let _ = std::fs::remove_dir_all(&root);
@@ -916,18 +987,29 @@ mod tests {
     }
 
     fn host_runtime(root: &Path) -> TangleHostRuntime {
-        host_runtime_from_tenants(vec![tenant_config_value(
-            root,
-            TenantConfigFixture {
-                tenant_id: "test-relay",
-                tenant_schema: "test_relay",
-                host: "relay.radroots.test",
-                relay_url: "wss://relay.radroots.test",
-                name: "Radroots Test Relay",
-                inactive: false,
-                relay_secret_byte: 0x77,
-            },
-        )])
+        host_runtime_with_ops(root, true, true)
+    }
+
+    fn host_runtime_with_ops(
+        root: &Path,
+        ops_enabled: bool,
+        expose_tenant_inventory: bool,
+    ) -> TangleHostRuntime {
+        host_runtime_from_tenants_with_host(
+            host_config_value_with_ops(ops_enabled, expose_tenant_inventory),
+            vec![tenant_config_value(
+                root,
+                TenantConfigFixture {
+                    tenant_id: "test-relay",
+                    tenant_schema: "test_relay",
+                    host: "relay.radroots.test",
+                    relay_url: "wss://relay.radroots.test",
+                    name: "Radroots Test Relay",
+                    inactive: false,
+                    relay_secret_byte: 0x77,
+                },
+            )],
+        )
     }
 
     fn multi_host_runtime(root: &Path) -> TangleHostRuntime {
@@ -972,8 +1054,15 @@ mod tests {
     }
 
     fn host_runtime_from_tenants(tenant_values: Vec<serde_json::Value>) -> TangleHostRuntime {
-        let host = parse_tangle_host_runtime_config_json(&host_config_value().to_string())
-            .expect("host config");
+        host_runtime_from_tenants_with_host(host_config_value(), tenant_values)
+    }
+
+    fn host_runtime_from_tenants_with_host(
+        host_value: serde_json::Value,
+        tenant_values: Vec<serde_json::Value>,
+    ) -> TangleHostRuntime {
+        let host =
+            parse_tangle_host_runtime_config_json(&host_value.to_string()).expect("host config");
         let tenants = tenant_values
             .into_iter()
             .map(|tenant| parse_tenant_runtime_config_json(&tenant.to_string()).expect("tenant"))
@@ -983,6 +1072,13 @@ mod tests {
     }
 
     fn host_config_value() -> serde_json::Value {
+        host_config_value_with_ops(true, true)
+    }
+
+    fn host_config_value_with_ops(
+        ops_enabled: bool,
+        expose_tenant_inventory: bool,
+    ) -> serde_json::Value {
         json!({
             "listen_addr": "127.0.0.1:0",
             "tenant_config_dir": "tenants",
@@ -990,6 +1086,10 @@ mod tests {
                 "max_total_connections": 64,
                 "max_total_subscriptions": 256,
                 "tenant_startup_concurrency": 4
+            },
+            "ops": {
+                "enabled": ops_enabled,
+                "expose_tenant_inventory": expose_tenant_inventory
             }
         })
     }
@@ -1109,6 +1209,29 @@ mod tests {
             .oneshot(builder.body(Body::empty()).expect("request"))
             .await
             .expect("response")
+    }
+
+    async fn host_ops_response(router: &axum::Router, path: &str) -> http::Response<Body> {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+    }
+
+    fn ready_runtime(runtime: TangleHostRuntime) -> TangleHostRuntime {
+        for tenant in runtime.registry().active_tenants() {
+            tenant
+                .runtime()
+                .readiness_handle()
+                .set_server_bind(crate::ops::BaseRelayReadinessCheckStatus::Ready);
+        }
+        runtime
     }
 
     async fn response_json(response: http::Response<Body>) -> serde_json::Value {
