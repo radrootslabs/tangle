@@ -19,9 +19,10 @@ use crate::{
         auth::BaseAuthState,
         core::{
             BaseRelay, BaseRelayCountQuery, BaseRelayCountReport, BaseRelayEventWrite,
-            BaseRelayLimits, BaseRelayQueryMetrics, BaseRelayQueryReport, BaseRelayReqQuery,
-            BaseRelayShutdownReport,
+            BaseRelayFilterLimitMode, BaseRelayLimits, BaseRelayQueryMetrics, BaseRelayQueryReport,
+            BaseRelayReqQuery, BaseRelayShutdownReport, matched_filter_context,
         },
+        filter::{BaseRelayMatchedFilterContext, BaseRelayRequestedKinds},
         live::LiveSubscriptionSet,
         outbound::{RuntimeRelayMessage, protocol_control_messages},
     },
@@ -31,6 +32,7 @@ use std::{
     collections::BTreeSet,
     fmt, fs,
     net::IpAddr,
+    num::NonZeroU32,
     path::Path,
     str,
     sync::{
@@ -90,6 +92,10 @@ pub trait RelayRuntimeHooks: Send + Sync {
     }
 
     fn event_stored(&self, _context: &RelayEventStoredContext) {}
+
+    fn plan_query(&self, _context: &RelayQueryProjectionContext) -> RelayProjectionQueryPlan {
+        RelayProjectionQueryPlan::default()
+    }
 
     fn project_event(
         &self,
@@ -172,6 +178,100 @@ impl RelayEventProjectionDecision {
     pub fn replace_with_stored_offset(store_offset: u64) -> Self {
         Self::ReplaceWithStoredOffset { store_offset }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RelayProjectionQueryPlan {
+    limit: RelayProjectionQueryLimit,
+}
+
+impl RelayProjectionQueryPlan {
+    pub fn limit_after_projection(candidate_limit: NonZeroU32) -> Self {
+        Self {
+            limit: RelayProjectionQueryLimit::AfterProjection { candidate_limit },
+        }
+    }
+
+    pub fn limit(&self) -> RelayProjectionQueryLimit {
+        self.limit
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RelayProjectionQueryLimit {
+    #[default]
+    BeforeProjection,
+    AfterProjection {
+        candidate_limit: NonZeroU32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayQueryProjectionContext {
+    subscription_id: SubscriptionId,
+    projection: RelayProjectionContext,
+    filters: Vec<RelayMatchedFilterContext>,
+}
+
+impl RelayQueryProjectionContext {
+    pub fn new(
+        subscription_id: SubscriptionId,
+        projection: RelayProjectionContext,
+        filters: Vec<RelayMatchedFilterContext>,
+    ) -> Self {
+        Self {
+            subscription_id,
+            projection,
+            filters,
+        }
+    }
+
+    pub fn subscription_id(&self) -> &SubscriptionId {
+        &self.subscription_id
+    }
+
+    pub fn projection(&self) -> &RelayProjectionContext {
+        &self.projection
+    }
+
+    pub fn filters(&self) -> &[RelayMatchedFilterContext] {
+        &self.filters
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayMatchedFilterContext {
+    filter_index: usize,
+    requested_kinds: RelayRequestedKinds,
+}
+
+impl RelayMatchedFilterContext {
+    fn from_base(context: &BaseRelayMatchedFilterContext) -> Self {
+        let requested_kinds = match context.requested_kinds() {
+            BaseRelayRequestedKinds::Absent => RelayRequestedKinds::Absent,
+            BaseRelayRequestedKinds::Explicit(kinds) => {
+                RelayRequestedKinds::Explicit(kinds.clone())
+            }
+        };
+        Self {
+            filter_index: context.filter_index(),
+            requested_kinds,
+        }
+    }
+
+    pub fn filter_index(&self) -> usize {
+        self.filter_index
+    }
+
+    pub fn requested_kinds(&self) -> &RelayRequestedKinds {
+        &self.requested_kinds
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayRequestedKinds {
+    Absent,
+    Explicit(BTreeSet<u32>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,11 +415,22 @@ pub struct RelayEventStoredContext {
     store_offsets: Vec<u64>,
 }
 
+struct RelayEventProjectionRequest<'a> {
+    subscription_id: &'a SubscriptionId,
+    projection: &'a RelayProjectionContext,
+    source: RelayEventProjectionSource,
+    event: &'a PocketEvent,
+    auth: &'a BaseAuthState,
+    matched_filter: &'a BaseRelayMatchedFilterContext,
+    filter: &'a PocketFilter,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayEventProjectionContext {
     subscription_id: SubscriptionId,
     projection: RelayProjectionContext,
     source: RelayEventProjectionSource,
+    matched_filter: RelayMatchedFilterContext,
     event: RelayEventContext,
 }
 
@@ -328,12 +439,14 @@ impl RelayEventProjectionContext {
         subscription_id: SubscriptionId,
         projection: RelayProjectionContext,
         source: RelayEventProjectionSource,
+        matched_filter: RelayMatchedFilterContext,
         event: RelayEventContext,
     ) -> Self {
         Self {
             subscription_id,
             projection,
             source,
+            matched_filter,
             event,
         }
     }
@@ -348,6 +461,10 @@ impl RelayEventProjectionContext {
 
     pub fn source(&self) -> RelayEventProjectionSource {
         self.source
+    }
+
+    pub fn matched_filter(&self) -> &RelayMatchedFilterContext {
+        &self.matched_filter
     }
 
     pub fn event(&self) -> &RelayEventContext {
@@ -886,12 +1003,14 @@ impl RelayRuntimeShared {
     fn project_query_report(
         &self,
         report: BaseRelayQueryReport,
+        filters: &[PocketOwnedFilter],
         projection: &RelayProjectionContext,
         auth: &BaseAuthState,
     ) -> Result<BaseRelayQueryReport, BaseRelayError> {
         let group_read_denied = report.group_read_denied();
         let query_metrics = report.query_metrics();
-        let messages = self.project_runtime_messages(report.into_messages(), projection, auth)?;
+        let messages =
+            self.project_runtime_messages(report.into_messages(), filters, projection, auth)?;
         let returned_events = messages
             .iter()
             .filter(|message| matches!(message, RuntimeRelayMessage::Event { .. }))
@@ -907,23 +1026,32 @@ impl RelayRuntimeShared {
     fn project_runtime_messages(
         &self,
         messages: Vec<RuntimeRelayMessage>,
+        filters: &[PocketOwnedFilter],
         projection: &RelayProjectionContext,
         auth: &BaseAuthState,
     ) -> Result<Vec<RuntimeRelayMessage>, BaseRelayError> {
         let mut output = Vec::with_capacity(messages.len());
+        let mut event_ids = BTreeSet::new();
         for message in messages {
             match message {
                 RuntimeRelayMessage::Event {
                     subscription_id,
                     event,
                 } => {
-                    if let Some(projected) = self.project_event_output(
-                        &subscription_id,
-                        projection,
-                        RelayEventProjectionSource::HistoricalQuery,
-                        &event,
-                        auth,
-                    )? {
+                    let (matched_filter, filter) =
+                        self.matched_filter_for_event(filters, &event)?;
+                    if let Some(projected) =
+                        self.project_event_output(RelayEventProjectionRequest {
+                            subscription_id: &subscription_id,
+                            projection,
+                            source: RelayEventProjectionSource::HistoricalQuery,
+                            event: &event,
+                            auth,
+                            matched_filter: &matched_filter,
+                            filter,
+                        })?
+                        && event_ids.insert(projected.id())
+                    {
                         output.push(RuntimeRelayMessage::event(subscription_id, projected));
                     }
                 }
@@ -935,16 +1063,22 @@ impl RelayRuntimeShared {
 
     fn project_event_output(
         &self,
-        subscription_id: &SubscriptionId,
-        projection: &RelayProjectionContext,
-        source: RelayEventProjectionSource,
-        event: &PocketEvent,
-        auth: &BaseAuthState,
+        request: RelayEventProjectionRequest<'_>,
     ) -> Result<Option<PocketOwnedEvent>, BaseRelayError> {
+        let RelayEventProjectionRequest {
+            subscription_id,
+            projection,
+            source,
+            event,
+            auth,
+            matched_filter,
+            filter,
+        } = request;
         let context = RelayEventProjectionContext::new(
             subscription_id.clone(),
             projection.clone(),
             source,
+            RelayMatchedFilterContext::from_base(matched_filter),
             RelayEventContext::from_pocket_event(event)?,
         );
         match self.hooks.project_event(&context) {
@@ -960,13 +1094,117 @@ impl RelayRuntimeShared {
                     self.groups.as_ref(),
                     &replacement,
                     &group_auth,
-                )? {
+                )? && filter
+                    .event_matches(&replacement)
+                    .map_err(|error| BaseRelayError::error(error.to_string()))?
+                {
                     Ok(Some(replacement))
                 } else {
                     Ok(None)
                 }
             }
         }
+    }
+
+    fn matched_filter_for_event<'a>(
+        &self,
+        filters: &'a [PocketOwnedFilter],
+        event: &PocketEvent,
+    ) -> Result<(BaseRelayMatchedFilterContext, &'a PocketFilter), BaseRelayError> {
+        for (filter_index, filter) in filters.iter().enumerate() {
+            if filter
+                .event_matches(event)
+                .map_err(|error| BaseRelayError::error(error.to_string()))?
+            {
+                return Ok((matched_filter_context(filter_index, filter), filter));
+            }
+        }
+        Err(BaseRelayError::error(
+            "query output did not match any request filter",
+        ))
+    }
+
+    fn query_projected_req_with_auth_report(
+        &self,
+        subscription_id: SubscriptionId,
+        filters: Vec<PocketOwnedFilter>,
+        search_present: bool,
+        auth: &BaseAuthState,
+        projection: &RelayProjectionContext,
+        candidate_limit: NonZeroU32,
+    ) -> Result<BaseRelayQueryReport, BaseRelayError> {
+        self.limits
+            .base_relay_limits()
+            .validate_subscription_id(&subscription_id)?;
+        self.limits
+            .base_relay_limits()
+            .validate_pocket_filters(&filters)?;
+        if let Some(message) =
+            BaseRelay::unsupported_search_present_closed(&subscription_id, search_present)
+        {
+            return Ok(BaseRelayQueryReport::new(
+                vec![message.into()],
+                false,
+                BaseRelayQueryMetrics::default(),
+            ));
+        }
+        let group_auth = GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned());
+        let mut output = Vec::new();
+        let mut group_read_denied = false;
+        let mut query_metrics = BaseRelayQueryMetrics::default();
+        for (filter_index, filter) in filters.iter().enumerate() {
+            let report = BaseRelay::query_filter_events_report_with_services(
+                &self.store,
+                self.groups.as_ref(),
+                self.limits.base_relay_limits(),
+                self.config.pocket_query_config(),
+                filter,
+                &group_auth,
+                BaseRelayFilterLimitMode::Override(candidate_limit.get()),
+            )?;
+            group_read_denied |= report.group_read_denied();
+            query_metrics = query_metrics.add(report.query_metrics());
+            let events = BaseRelay::sort_and_dedupe_query_events(report.into_events());
+            let matched_filter = matched_filter_context(filter_index, filter);
+            let mut projected = Vec::new();
+            for event in events {
+                if let Some(event) = self.project_event_output(RelayEventProjectionRequest {
+                    subscription_id: &subscription_id,
+                    projection,
+                    source: RelayEventProjectionSource::HistoricalQuery,
+                    event: &event,
+                    auth,
+                    matched_filter: &matched_filter,
+                    filter,
+                })? {
+                    projected.push(event);
+                }
+            }
+            let mut projected = BaseRelay::sort_and_dedupe_query_events(projected);
+            projected.truncate(
+                self.limits
+                    .base_relay_limits()
+                    .effective_pocket_filter_limit_for_query(filter),
+            );
+            output.extend(projected);
+        }
+        let events = BaseRelay::sort_and_dedupe_query_events(output);
+        let query_metrics = query_metrics.with_returned_events(events.len());
+        let mut messages = events
+            .into_iter()
+            .map(|event| RuntimeRelayMessage::event(subscription_id.clone(), event))
+            .collect::<Vec<_>>();
+        if group_read_denied {
+            let group_auth = GroupAuthContext::new(auth.authenticated_pubkeys().iter().cloned());
+            messages.push(BaseRelay::redacted_req_closed(subscription_id, &group_auth).into());
+        } else {
+            messages.push(RelayMessage::Eose(subscription_id).into());
+        }
+        Ok(BaseRelayQueryReport::new(
+            messages,
+            group_read_denied,
+            query_metrics,
+        ))
     }
 
     fn handle_count_with_auth_report(
@@ -1413,12 +1651,13 @@ impl RelayRuntimeHandle {
                 }
                 let report = self.inner.query_req_with_auth_report(
                     subscription_id,
-                    filters,
+                    filters.clone(),
                     search_present,
                     auth,
                 )?;
                 let report = self.inner.project_query_report(
                     report,
+                    &filters,
                     &RelayProjectionContext::default(),
                     auth,
                 )?;
@@ -1598,13 +1837,40 @@ impl RelayRuntimeHandle {
         projection: &RelayProjectionContext,
     ) -> Result<BaseRelayQueryReport, BaseRelayError> {
         let started_at = Instant::now();
-        let report = self.inner.query_req_with_auth_report(
-            subscription_id,
-            filters,
-            search_present,
-            auth,
-        )?;
-        let report = self.inner.project_query_report(report, projection, auth)?;
+        let context = RelayQueryProjectionContext::new(
+            subscription_id.clone(),
+            projection.clone(),
+            filters
+                .iter()
+                .enumerate()
+                .map(|(index, filter)| {
+                    RelayMatchedFilterContext::from_base(&matched_filter_context(index, filter))
+                })
+                .collect(),
+        );
+        let plan = self.inner.hooks.plan_query(&context);
+        let report = match plan.limit() {
+            RelayProjectionQueryLimit::BeforeProjection => {
+                let report = self.inner.query_req_with_auth_report(
+                    subscription_id,
+                    filters.clone(),
+                    search_present,
+                    auth,
+                )?;
+                self.inner
+                    .project_query_report(report, &filters, projection, auth)?
+            }
+            RelayProjectionQueryLimit::AfterProjection { candidate_limit } => {
+                self.inner.query_projected_req_with_auth_report(
+                    subscription_id,
+                    filters,
+                    search_present,
+                    auth,
+                    projection,
+                    candidate_limit,
+                )?
+            }
+        };
         if report.group_read_denied() {
             self.inner.metrics.record_group_read_denial();
         }
@@ -1647,17 +1913,26 @@ impl RelayRuntimeHandle {
                 .unwrap_or(false)
         })?;
         let mut messages = Vec::with_capacity(subscriptions.len());
-        for subscription_id in subscriptions {
-            if let Some(projected) = self.inner.project_event_output(
-                &subscription_id,
-                projection,
-                RelayEventProjectionSource::LiveFanout {
-                    store_offset: offset.as_u64(),
-                },
-                &pocket_event,
-                auth,
-            )? {
-                messages.push(RuntimeRelayMessage::event(subscription_id, projected));
+        for matched in subscriptions {
+            let matched_filter = matched.matched_filter_context();
+            if let Some(projected) =
+                self.inner
+                    .project_event_output(RelayEventProjectionRequest {
+                        subscription_id: matched.subscription_id(),
+                        projection,
+                        source: RelayEventProjectionSource::LiveFanout {
+                            store_offset: offset.as_u64(),
+                        },
+                        event: &pocket_event,
+                        auth,
+                        matched_filter: &matched_filter,
+                        filter: matched.filter(),
+                    })?
+            {
+                messages.push(RuntimeRelayMessage::event(
+                    matched.into_subscription_id(),
+                    projected,
+                ));
             }
         }
         Ok(messages)
@@ -2534,7 +2809,8 @@ mod tests {
     use super::{
         BROAD_QUERY_TIME_WINDOW_SECONDS, EventAdmissionDecision, RelayEventAdmissionContext,
         RelayEventProjectionContext, RelayEventProjectionDecision, RelayEventProjectionSource,
-        RelayEventStoredContext, RelayProjectionContext, RelayRuntime, RelayRuntimeHandle,
+        RelayEventStoredContext, RelayProjectionContext, RelayProjectionQueryPlan,
+        RelayQueryProjectionContext, RelayRequestedKinds, RelayRuntime, RelayRuntimeHandle,
         RelayRuntimeHooks, RuntimeClientMessage, TangleBroadQueryReason,
         TangleClientRateLimitContext, TangleQueryClassification, TangleQueryClassifier,
         TangleRuntimeLimits,
@@ -2550,6 +2826,7 @@ mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
         net::{IpAddr, Ipv4Addr},
+        num::NonZeroU32,
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
         time::Duration,
@@ -3051,7 +3328,18 @@ mod tests {
             contexts[0].source(),
             RelayEventProjectionSource::HistoricalQuery
         );
+        assert_eq!(contexts[0].matched_filter().filter_index(), 0);
+        assert_eq!(
+            contexts[0].matched_filter().requested_kinds(),
+            &RelayRequestedKinds::Absent
+        );
         assert_eq!(contexts[0].event().event_id(), event.id().as_str());
+        let query_contexts = hooks.query_contexts();
+        assert_eq!(query_contexts.len(), 1);
+        assert_eq!(
+            query_contexts[0].filters()[0].requested_kinds(),
+            &RelayRequestedKinds::Absent
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3114,6 +3402,11 @@ mod tests {
                 store_offset: offset.as_u64()
             }
         );
+        assert_eq!(contexts[0].matched_filter().filter_index(), 0);
+        assert_eq!(
+            contexts[0].matched_filter().requested_kinds(),
+            &RelayRequestedKinds::Explicit(BTreeSet::from([1]))
+        );
         assert_eq!(contexts[0].event().event_id(), event.id().as_str());
 
         let _ = std::fs::remove_dir_all(root);
@@ -3163,7 +3456,7 @@ mod tests {
         let report = handle
             .query_req_with_auth_report_with_projection_context(
                 subscription_id.clone(),
-                vec![pocket_filter(json!({"ids": [source.id().as_str()]}))],
+                vec![pocket_filter(json!({"kinds": [1]}))],
                 false,
                 &auth,
                 &RelayProjectionContext::named("replace").expect("projection"),
@@ -3202,6 +3495,154 @@ mod tests {
             vec![RuntimeRelayMessage::from(RelayMessage::Eose(
                 missing_subscription
             ))]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_projection_can_apply_query_limit_after_projection() {
+        let root = temp_root("runtime-projection-post-limit");
+        let _ = std::fs::remove_dir_all(&root);
+        let hooks = Arc::new(ProjectingHooks::new(
+            "post-limit",
+            ProjectionHookScope::Historical,
+            Some("drop"),
+            RelayEventProjectionDecision::Suppress,
+        ));
+        hooks.set_query_plan(RelayProjectionQueryPlan::limit_after_projection(
+            NonZeroU32::new(2).expect("candidate limit"),
+        ));
+        let handle = RelayRuntimeHandle::new(
+            RelayRuntime::open_with_hooks(runtime_config(&root, 8), hooks.clone())
+                .expect("runtime"),
+        );
+        let mut auth = handle.auth_state().await.expect("auth");
+        let dropped = tangle_v2_event(FixtureKey::Member, 1_714_124_435, 1, Vec::new(), "drop")
+            .expect("drop");
+        let kept =
+            tangle_v2_event(FixtureKey::Admin, 1_714_124_434, 1, Vec::new(), "keep").expect("keep");
+        assert_accepted_reply(
+            runtime_event_reply(&handle, kept.clone(), &mut auth, 1_714_124_434).await,
+            &kept,
+        );
+        assert_accepted_reply(
+            runtime_event_reply(&handle, dropped.clone(), &mut auth, 1_714_124_435).await,
+            &dropped,
+        );
+        let subscription_id = SubscriptionId::new("post-limit").expect("subscription");
+
+        let report = handle
+            .query_req_with_auth_report_with_projection_context(
+                subscription_id.clone(),
+                vec![pocket_filter(json!({"kinds": [1], "limit": 1}))],
+                false,
+                &auth,
+                &RelayProjectionContext::named("post-limit").expect("projection"),
+            )
+            .await
+            .expect("query");
+        assert!(matches!(
+            report.into_messages().as_slice(),
+            [
+                RuntimeRelayMessage::Event {
+                    subscription_id: delivered,
+                    event
+                },
+                RuntimeRelayMessage::Protocol(RelayMessage::Eose(eose))
+            ] if delivered == &subscription_id
+                && event.id().as_hex_string() == kept.id().as_str()
+                && eose == &subscription_id
+        ));
+        let query_contexts = hooks.query_contexts();
+        assert_eq!(query_contexts.len(), 1);
+        assert_eq!(
+            query_contexts[0].filters()[0].requested_kinds(),
+            &RelayRequestedKinds::Explicit(BTreeSet::from([1]))
+        );
+        assert_eq!(hooks.contexts().len(), 2);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_projection_live_replacement_must_match_original_filter() {
+        let root = temp_root("runtime-projection-live-replace-rematch");
+        let _ = std::fs::remove_dir_all(&root);
+        let hooks = Arc::new(ProjectingHooks::new(
+            "live-replace",
+            ProjectionHookScope::Live,
+            Some("source"),
+            RelayEventProjectionDecision::Emit,
+        ));
+        let handle = RelayRuntimeHandle::new(
+            RelayRuntime::open_with_hooks(runtime_config(&root, 8), hooks.clone())
+                .expect("runtime"),
+        );
+        let mut offsets = handle.subscribe_events().await;
+        let mut auth = handle.auth_state().await.expect("auth");
+        let source = tangle_v2_event(FixtureKey::Member, 1_714_124_433, 7, Vec::new(), "source")
+            .expect("source");
+        let replacement = tangle_v2_event(
+            FixtureKey::Admin,
+            1_714_124_434,
+            1,
+            Vec::new(),
+            "replacement",
+        )
+        .expect("replacement");
+        assert_accepted_reply(
+            runtime_event_reply(&handle, source.clone(), &mut auth, 1_714_124_433).await,
+            &source,
+        );
+        let source_offset = offsets.try_recv().expect("source offset");
+        assert_accepted_reply(
+            runtime_event_reply(&handle, replacement.clone(), &mut auth, 1_714_124_434).await,
+            &replacement,
+        );
+        let replacement_offset = offsets.try_recv().expect("replacement offset");
+        hooks.set_decision(RelayEventProjectionDecision::replace_with_stored_offset(
+            replacement_offset.as_u64(),
+        ));
+        let mut subscriptions = LiveSubscriptionSet::new(8, 64).expect("subscriptions");
+        let source_only = SubscriptionId::new("source-only").expect("source subscription");
+        let source_or_note = SubscriptionId::new("source-or-note").expect("mixed subscription");
+        subscriptions
+            .subscribe(source_only, vec![pocket_filter(json!({"kinds": [7]}))])
+            .expect("source subscribe");
+        subscriptions
+            .subscribe(
+                source_or_note.clone(),
+                vec![pocket_filter(json!({"kinds": [1, 7]}))],
+            )
+            .expect("mixed subscribe");
+
+        let messages = handle
+            .fanout_event_offset_with_projection_context(
+                source_offset,
+                &mut subscriptions,
+                &auth,
+                &RelayProjectionContext::named("live-replace").expect("projection"),
+            )
+            .await
+            .expect("fanout");
+        assert!(matches!(
+            messages.as_slice(),
+            [RuntimeRelayMessage::Event {
+                subscription_id,
+                event
+            }] if subscription_id == &source_or_note
+                && event.id().as_hex_string() == replacement.id().as_str()
+        ));
+        let contexts = hooks.contexts();
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(
+            contexts[0].matched_filter().requested_kinds(),
+            &RelayRequestedKinds::Explicit(BTreeSet::from([7]))
+        );
+        assert_eq!(
+            contexts[1].matched_filter().requested_kinds(),
+            &RelayRequestedKinds::Explicit(BTreeSet::from([1, 7]))
         );
 
         let _ = std::fs::remove_dir_all(root);
@@ -5462,7 +5903,9 @@ mod tests {
         scope: ProjectionHookScope,
         source_content: Option<&'static str>,
         decision: Mutex<RelayEventProjectionDecision>,
+        query_plan: Mutex<RelayProjectionQueryPlan>,
         contexts: Mutex<Vec<RelayEventProjectionContext>>,
+        query_contexts: Mutex<Vec<RelayQueryProjectionContext>>,
     }
 
     impl ProjectingHooks {
@@ -5477,7 +5920,9 @@ mod tests {
                 scope,
                 source_content,
                 decision: Mutex::new(decision),
+                query_plan: Mutex::new(RelayProjectionQueryPlan::default()),
                 contexts: Mutex::new(Vec::new()),
+                query_contexts: Mutex::new(Vec::new()),
             }
         }
 
@@ -5485,8 +5930,16 @@ mod tests {
             *self.decision.lock().expect("decision") = decision;
         }
 
+        fn set_query_plan(&self, plan: RelayProjectionQueryPlan) {
+            *self.query_plan.lock().expect("query plan") = plan;
+        }
+
         fn contexts(&self) -> Vec<RelayEventProjectionContext> {
             self.contexts.lock().expect("contexts").clone()
+        }
+
+        fn query_contexts(&self) -> Vec<RelayQueryProjectionContext> {
+            self.query_contexts.lock().expect("query contexts").clone()
         }
 
         fn scope_matches(&self, source: RelayEventProjectionSource) -> bool {
@@ -5511,6 +5964,14 @@ mod tests {
     }
 
     impl RelayRuntimeHooks for ProjectingHooks {
+        fn plan_query(&self, context: &RelayQueryProjectionContext) -> RelayProjectionQueryPlan {
+            self.query_contexts
+                .lock()
+                .expect("query contexts")
+                .push(context.clone());
+            *self.query_plan.lock().expect("query plan")
+        }
+
         fn project_event(
             &self,
             context: &RelayEventProjectionContext,

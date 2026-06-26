@@ -1,10 +1,10 @@
 #![forbid(unsafe_code)]
 
-use crate::errors::BaseRelayError;
+use crate::{errors::BaseRelayError, relay::filter::BaseRelayMatchedFilterContext};
 use std::collections::BTreeMap;
 use tangle_groups::GroupAuthContext;
 use tangle_protocol::SubscriptionId;
-use tangle_store_pocket::{PocketEvent, PocketOwnedFilter};
+use tangle_store_pocket::{PocketEvent, PocketFilter, PocketOwnedFilter};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LiveSubscriptionSet {
@@ -15,6 +15,43 @@ pub(crate) struct LiveSubscriptionSet {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LiveSubscription {
     filters: Vec<PocketOwnedFilter>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LiveSubscriptionMatch {
+    subscription_id: SubscriptionId,
+    filter_index: usize,
+    filter: PocketOwnedFilter,
+}
+
+impl LiveSubscriptionMatch {
+    fn new(
+        subscription_id: SubscriptionId,
+        filter_index: usize,
+        filter: PocketOwnedFilter,
+    ) -> Self {
+        Self {
+            subscription_id,
+            filter_index,
+            filter,
+        }
+    }
+
+    pub(crate) fn subscription_id(&self) -> &SubscriptionId {
+        &self.subscription_id
+    }
+
+    pub(crate) fn into_subscription_id(self) -> SubscriptionId {
+        self.subscription_id
+    }
+
+    pub(crate) fn filter(&self) -> &PocketFilter {
+        &self.filter
+    }
+
+    pub(crate) fn matched_filter_context(&self) -> BaseRelayMatchedFilterContext {
+        BaseRelayMatchedFilterContext::from_filter(self.filter_index, &self.filter)
+    }
 }
 
 impl LiveSubscriptionSet {
@@ -92,23 +129,29 @@ impl LiveSubscriptionSet {
         event: &PocketEvent,
         auth: &GroupAuthContext,
         visible_to_auth: impl Fn(&PocketEvent, &GroupAuthContext) -> bool,
-    ) -> Result<Vec<SubscriptionId>, BaseRelayError> {
+    ) -> Result<Vec<LiveSubscriptionMatch>, BaseRelayError> {
         self.subscriptions.iter().try_fold(
             Vec::new(),
             |mut matched, (subscription_id, subscription)| {
-                if !subscription
-                    .filters
-                    .iter()
-                    .map(|filter| filter.event_matches(event))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| BaseRelayError::error(error.to_string()))?
-                    .into_iter()
-                    .any(|matches| matches)
-                {
-                    return Ok(matched);
+                let mut matched_filter = None;
+                for (filter_index, filter) in subscription.filters.iter().enumerate() {
+                    if filter
+                        .event_matches(event)
+                        .map_err(|error| BaseRelayError::error(error.to_string()))?
+                    {
+                        matched_filter = Some((filter_index, filter.clone()));
+                        break;
+                    }
                 }
+                let Some((filter_index, filter)) = matched_filter else {
+                    return Ok(matched);
+                };
                 if visible_to_auth(event, auth) {
-                    matched.push(subscription_id.clone());
+                    matched.push(LiveSubscriptionMatch::new(
+                        subscription_id.clone(),
+                        filter_index,
+                        filter,
+                    ));
                 }
                 Ok(matched)
             },
@@ -150,27 +193,42 @@ mod tests {
         let third = tangle_v2_event(FixtureKey::Member, 1_714_124_435, 1, Vec::new(), "third")
             .expect("third");
 
-        assert!(matches!(
+        assert_live_match(
             subscriptions
-                .fanout(&pocket_event(&first), &GroupAuthContext::unauthenticated(), |_, _| true)
+                .fanout(
+                    &pocket_event(&first),
+                    &GroupAuthContext::unauthenticated(),
+                    |_, _| true,
+                )
                 .expect("fanout")
                 .as_slice(),
-            [delivered] if delivered == &subscription_id
-        ));
-        assert!(matches!(
+            &subscription_id,
+            0,
+        );
+        assert_live_match(
             subscriptions
-                .fanout(&pocket_event(&second), &GroupAuthContext::unauthenticated(), |_, _| true)
+                .fanout(
+                    &pocket_event(&second),
+                    &GroupAuthContext::unauthenticated(),
+                    |_, _| true,
+                )
                 .expect("fanout")
                 .as_slice(),
-            [delivered] if delivered == &subscription_id
-        ));
-        assert!(matches!(
+            &subscription_id,
+            0,
+        );
+        assert_live_match(
             subscriptions
-                .fanout(&pocket_event(&third), &GroupAuthContext::unauthenticated(), |_, _| true)
+                .fanout(
+                    &pocket_event(&third),
+                    &GroupAuthContext::unauthenticated(),
+                    |_, _| true,
+                )
                 .expect("fanout")
                 .as_slice(),
-            [delivered] if delivered == &subscription_id
-        ));
+            &subscription_id,
+            0,
+        );
         assert_eq!(subscriptions.close(&subscription_id), CloseResult::Closed);
     }
 
@@ -208,12 +266,10 @@ mod tests {
             .expect("mismatched subscribe");
         let event = pocket_event(&event);
 
-        assert_eq!(
-            subscriptions
-                .fanout(&event, &GroupAuthContext::unauthenticated(), |_, _| true)
-                .expect("fanout"),
-            vec![matched.clone()]
-        );
+        let output = subscriptions
+            .fanout(&event, &GroupAuthContext::unauthenticated(), |_, _| true)
+            .expect("fanout");
+        assert_live_match(output.as_slice(), &matched, 0);
         assert!(
             subscriptions
                 .fanout(&event, &GroupAuthContext::unauthenticated(), |_, _| false)
@@ -225,6 +281,18 @@ mod tests {
     fn pocket_filter(value: serde_json::Value) -> tangle_store_pocket::PocketOwnedFilter {
         let filter = filter_from_value(&value).expect("filter");
         crate::pocket_conversion::tangle_filter_to_pocket(&filter).expect("pocket filter")
+    }
+
+    fn assert_live_match(
+        matches: &[super::LiveSubscriptionMatch],
+        subscription_id: &SubscriptionId,
+        filter_index: usize,
+    ) {
+        assert!(matches!(
+            matches,
+            [delivered] if delivered.subscription_id() == subscription_id
+                && delivered.matched_filter_context().filter_index() == filter_index
+        ));
     }
 
     fn pocket_event(event: &tangle_protocol::Event) -> tangle_store_pocket::PocketOwnedEvent {

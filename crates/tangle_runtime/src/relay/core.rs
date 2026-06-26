@@ -14,6 +14,7 @@ use crate::pocket_event_validation::{
 use crate::relay::outbound::protocol_messages_for_test;
 use crate::relay::{
     auth::BaseAuthState,
+    filter::BaseRelayMatchedFilterContext,
     live::{CloseResult, LiveSubscriptionSet},
     outbound::RuntimeRelayMessage,
 };
@@ -202,7 +203,7 @@ impl BaseRelayCountReport {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct BaseRelayEventQueryReport {
+pub(crate) struct BaseRelayEventQueryReport {
     events: Vec<PocketOwnedEvent>,
     group_read_denied: bool,
     query_metrics: BaseRelayQueryMetrics,
@@ -219,6 +220,18 @@ impl BaseRelayEventQueryReport {
             group_read_denied,
             query_metrics,
         }
+    }
+
+    pub(crate) fn group_read_denied(&self) -> bool {
+        self.group_read_denied
+    }
+
+    pub(crate) fn query_metrics(&self) -> BaseRelayQueryMetrics {
+        self.query_metrics
+    }
+
+    pub(crate) fn into_events(self) -> Vec<PocketOwnedEvent> {
+        self.events
     }
 }
 
@@ -238,7 +251,7 @@ impl BaseRelayQueryMetrics {
         }
     }
 
-    fn add(self, other: Self) -> Self {
+    pub(crate) fn add(self, other: Self) -> Self {
         Self {
             candidates_scanned: self
                 .candidates_scanned
@@ -379,9 +392,10 @@ impl BaseRelayCountHll {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BaseRelayFilterLimitMode {
+pub(crate) enum BaseRelayFilterLimitMode {
     ApplyDefaultLimit,
     PreserveCountLimitless,
+    Override(u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -637,6 +651,10 @@ impl BaseRelayLimits {
         }
     }
 
+    pub(crate) fn effective_pocket_filter_limit_for_query(self, filter: &PocketFilter) -> usize {
+        self.effective_pocket_filter_limit(filter)
+    }
+
     fn validate_pocket_query_complexity(
         &self,
         filters: &[PocketOwnedFilter],
@@ -689,7 +707,7 @@ impl BaseRelay {
         })
     }
 
-    fn redacted_req_closed(
+    pub(crate) fn redacted_req_closed(
         subscription_id: SubscriptionId,
         auth: &GroupAuthContext,
     ) -> RelayMessage {
@@ -1557,8 +1575,8 @@ impl BaseRelay {
             })
             .expect("Pocket live fanout must match")
             .into_iter()
-            .map(|subscription_id| RuntimeRelayMessage::Event {
-                subscription_id,
+            .map(|matched| RuntimeRelayMessage::Event {
+                subscription_id: matched.into_subscription_id(),
                 event: event.to_owned(),
             })
             .collect()
@@ -1808,7 +1826,7 @@ impl BaseRelay {
         }
     }
 
-    fn query_filter_events_report_with_services(
+    pub(crate) fn query_filter_events_report_with_services(
         store: &PocketStoreHandle,
         groups: Option<&GroupServiceHandle>,
         limits: BaseRelayLimits,
@@ -1870,6 +1888,7 @@ impl BaseRelay {
                     .map_err(|_| BaseRelayError::invalid("default filter limit exceeds u32"))?
             }
             (BaseRelayFilterLimitMode::PreserveCountLimitless, _) => u32::MAX,
+            (BaseRelayFilterLimitMode::Override(limit), _) => limit,
             (_, limit) => limit,
         };
         let ids = filter.ids().collect::<Vec<_>>();
@@ -1894,7 +1913,9 @@ impl BaseRelay {
         .map_err(|error| BaseRelayError::error(error.to_string()))
     }
 
-    fn sort_and_dedupe_query_events(mut events: Vec<PocketOwnedEvent>) -> Vec<PocketOwnedEvent> {
+    pub(crate) fn sort_and_dedupe_query_events(
+        mut events: Vec<PocketOwnedEvent>,
+    ) -> Vec<PocketOwnedEvent> {
         events.sort_by(|left, right| {
             let left: &PocketEvent = left;
             let right: &PocketEvent = right;
@@ -1923,6 +1944,13 @@ impl BaseRelay {
             .unwrap_or(Ok(true))
             .map_err(BaseRelayError::from)
     }
+}
+
+pub(crate) fn matched_filter_context(
+    filter_index: usize,
+    filter: &PocketFilter,
+) -> BaseRelayMatchedFilterContext {
+    BaseRelayMatchedFilterContext::from_filter(filter_index, filter)
 }
 
 fn pocket_filters_are_complete(filters: &[PocketOwnedFilter]) -> bool {
