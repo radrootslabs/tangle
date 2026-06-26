@@ -3,6 +3,7 @@
 - this repo owns the `tangle` Nostr relay, including protocol handling, event validation, session admission, rate limiting, storage, indexing or projection boundaries, subscription fanout, group policy, relay-generated state, and relay-owned signing when explicitly part of the relay contract
 - do not make this repo responsible for user private-key custody, client-side signing, signer approval UX, remote-signer session control, wallet flows, account key management, platform-wide artifacts, publication, promotion, or deployment transport unless an approved spec assigns that responsibility here
 - product behavior should follow approved relay specs and repo-local adopted decisions when they conflict with legacy implementation details
+- virtual relay tenancy is required for `tangle_v1_mvp`; host and tenant relay boundaries must remain explicit runtime behavior
 - prefer the smallest coherent change that fully addresses the request; do not mix unrelated cleanup, speculative refactors, compatibility scaffolding, or roadmap work into the same change
 - inspect the relevant implementation, tests, manifests, specs, and docs before changing behavior
 - do not invent requirements, APIs, dependencies, release processes, or external integration behavior

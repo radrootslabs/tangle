@@ -143,7 +143,7 @@ struct BaseRelayGroupCountQuery<'a> {
 }
 
 impl BaseRelayQueryReport {
-    fn new(
+    pub(crate) fn new(
         messages: Vec<RuntimeRelayMessage>,
         group_read_denied: bool,
         query_metrics: BaseRelayQueryMetrics,
@@ -248,7 +248,7 @@ impl BaseRelayQueryMetrics {
         }
     }
 
-    fn with_returned_events(self, returned_events: usize) -> Self {
+    pub(crate) fn with_returned_events(self, returned_events: usize) -> Self {
         Self {
             returned_events: u64::try_from(returned_events).expect("returned events fit in u64"),
             ..self

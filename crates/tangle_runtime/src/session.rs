@@ -13,8 +13,8 @@ use crate::{
     },
     resource_limits::{RelayResourceLimiter, RelaySubscriptionPermit},
     runtime::{
-        RelayRuntimeHandle, TangleClientMessageMetricKind, TangleClientRateLimitContext,
-        TangleRuntimeLimits,
+        RelayProjectionContext, RelayRuntimeHandle, TangleClientMessageMetricKind,
+        TangleClientRateLimitContext, TangleRuntimeLimits,
     },
 };
 use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket};
@@ -43,9 +43,38 @@ pub struct TangleWebSocketSession {
     resource_limiter: Option<RelayResourceLimiter>,
     subscription_permits: BTreeMap<SubscriptionId, RelaySubscriptionPermit>,
     events: TangleEventReceiver,
+    projection: RelayProjectionContext,
 }
 
 static NEXT_TANGLE_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Default)]
+pub struct TangleWebSocketSessionOptions {
+    peer_ip: Option<IpAddr>,
+    resource_limiter: Option<RelayResourceLimiter>,
+    projection: RelayProjectionContext,
+}
+
+impl TangleWebSocketSessionOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_peer_ip(mut self, peer_ip: Option<IpAddr>) -> Self {
+        self.peer_ip = peer_ip;
+        self
+    }
+
+    pub fn with_resource_limiter(mut self, resource_limiter: Option<RelayResourceLimiter>) -> Self {
+        self.resource_limiter = resource_limiter;
+        self
+    }
+
+    pub fn with_projection_context(mut self, projection: RelayProjectionContext) -> Self {
+        self.projection = projection;
+        self
+    }
+}
 
 impl TangleWebSocketSession {
     pub fn new(
@@ -78,6 +107,26 @@ impl TangleWebSocketSession {
         peer_ip: Option<IpAddr>,
         resource_limiter: Option<RelayResourceLimiter>,
     ) -> Result<Self, BaseRelayError> {
+        Self::new_with_options(
+            limits,
+            shutdown,
+            runtime,
+            auth,
+            events,
+            TangleWebSocketSessionOptions::new()
+                .with_peer_ip(peer_ip)
+                .with_resource_limiter(resource_limiter),
+        )
+    }
+
+    pub fn new_with_options(
+        limits: TangleRuntimeLimits,
+        shutdown: watch::Receiver<bool>,
+        runtime: RelayRuntimeHandle,
+        auth: BaseAuthState,
+        events: TangleEventReceiver,
+        options: TangleWebSocketSessionOptions,
+    ) -> Result<Self, BaseRelayError> {
         let outbound_queue_capacity = limits.outbound_queue_capacity();
         let (sender, receiver) = mpsc::channel(outbound_queue_capacity);
         let subscriptions = LiveSubscriptionSet::new(
@@ -86,7 +135,7 @@ impl TangleWebSocketSession {
         )?;
         Ok(Self {
             connection_id: NEXT_TANGLE_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
-            peer_ip,
+            peer_ip: options.peer_ip,
             connected_at: Instant::now(),
             outbound: TangleOutboundSender {
                 sender,
@@ -98,9 +147,10 @@ impl TangleWebSocketSession {
             limits,
             auth,
             subscriptions,
-            resource_limiter,
+            resource_limiter: options.resource_limiter,
             subscription_permits: BTreeMap::new(),
             events,
+            projection: options.projection,
         })
     }
 
@@ -219,7 +269,12 @@ impl TangleWebSocketSession {
         let runtime = self.runtime.clone();
         let auth = self.auth.clone();
         let replies = match runtime
-            .fanout_event_offset(offset, &mut self.subscriptions, &auth)
+            .fanout_event_offset_with_projection_context(
+                offset,
+                &mut self.subscriptions,
+                &auth,
+                &self.projection,
+            )
             .await
         {
             Ok(replies) => replies,
@@ -384,11 +439,12 @@ impl TangleWebSocketSession {
         }
         let report = self
             .runtime
-            .query_req_with_auth_report(
+            .query_req_with_auth_report_with_projection_context(
                 subscription_id.clone(),
                 filters.clone(),
                 search_present,
                 &self.auth,
+                &self.projection,
             )
             .await?;
         let closes_subscription = report.group_read_denied();
