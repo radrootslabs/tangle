@@ -1249,7 +1249,7 @@ impl RelayRuntimeShared {
         let mut output = Vec::new();
         let mut group_read_denied = false;
         let mut query_metrics = BaseRelayQueryMetrics::default();
-        for (filter_index, filter) in filters.iter().enumerate() {
+        for filter in &filters {
             let report = BaseRelay::query_filter_events_report_with_services(
                 &self.store,
                 self.groups.as_ref(),
@@ -1264,13 +1264,14 @@ impl RelayRuntimeShared {
             let events = BaseRelay::sort_and_dedupe_query_events(report.into_events());
             let mut projected = Vec::new();
             for event in events {
+                let matched_filters = self.matched_filters_for_event(&filters, &event)?;
                 if let Some(event) = self.project_event_output(RelayEventProjectionRequest {
                     subscription_id: &subscription_id,
                     projection,
                     source: RelayEventProjectionSource::HistoricalQuery,
                     event: &event,
                     auth,
-                    matched_filters: vec![(matched_filter_context(filter_index, filter), filter)],
+                    matched_filters,
                 })? {
                     projected.push(event);
                 }
@@ -3603,6 +3604,84 @@ mod tests {
             matched_filters[1].requested_kinds(),
             &RelayRequestedKinds::Explicit(BTreeSet::from([1]))
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_projection_post_limit_reports_all_matching_query_filters() {
+        let root = temp_root("runtime-projection-post-limit-all-matched-filters");
+        let _ = std::fs::remove_dir_all(&root);
+        let hooks = Arc::new(ProjectingHooks::new(
+            "post-limit-multi-filter",
+            ProjectionHookScope::Historical,
+            None,
+            RelayEventProjectionDecision::Emit,
+        ));
+        hooks.set_query_plan(RelayProjectionQueryPlan::limit_after_projection(
+            NonZeroU32::new(10).expect("candidate limit"),
+        ));
+        let handle = RelayRuntimeHandle::new(
+            RelayRuntime::open_with_hooks(runtime_config(&root, 8), hooks.clone())
+                .expect("runtime"),
+        );
+        let mut auth = handle.auth_state().await.expect("auth");
+        let event = tangle_v2_event(
+            FixtureKey::Member,
+            1_714_124_433,
+            30078,
+            Vec::new(),
+            "post limit multi filter query",
+        )
+        .expect("event");
+        assert_accepted_reply(
+            runtime_event_reply(&handle, event.clone(), &mut auth, 1_714_124_433).await,
+            &event,
+        );
+        let subscription_id =
+            SubscriptionId::new("post-limit-query-multi-filter").expect("subscription");
+
+        let report = handle
+            .query_req_with_auth_report_with_projection_context(
+                subscription_id.clone(),
+                vec![
+                    pocket_filter(json!({"kinds": [30078]})),
+                    pocket_filter(json!({"ids": [event.id().as_str()]})),
+                ],
+                false,
+                &auth,
+                &RelayProjectionContext::named("post-limit-multi-filter").expect("projection"),
+            )
+            .await
+            .expect("query");
+        assert!(matches!(
+            report.into_messages().as_slice(),
+            [
+                RuntimeRelayMessage::Event {
+                    subscription_id: delivered,
+                    event: delivered_event
+                },
+                RuntimeRelayMessage::Protocol(RelayMessage::Eose(eose))
+            ] if delivered == &subscription_id
+                && delivered_event.id().as_hex_string() == event.id().as_str()
+                && eose == &subscription_id
+        ));
+        let contexts = hooks.contexts();
+        assert_eq!(contexts.len(), 2);
+        for context in contexts {
+            let matched_filters = context.matched_filters();
+            assert_eq!(matched_filters.len(), 2);
+            assert_eq!(matched_filters[0].filter_index(), 0);
+            assert_eq!(
+                matched_filters[0].requested_kinds(),
+                &RelayRequestedKinds::Explicit(BTreeSet::from([30078]))
+            );
+            assert_eq!(matched_filters[1].filter_index(), 1);
+            assert_eq!(
+                matched_filters[1].requested_kinds(),
+                &RelayRequestedKinds::Absent
+            );
+        }
 
         let _ = std::fs::remove_dir_all(root);
     }
