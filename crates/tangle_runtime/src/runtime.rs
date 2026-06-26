@@ -476,8 +476,7 @@ struct RelayEventProjectionRequest<'a> {
     source: RelayEventProjectionSource,
     event: &'a PocketEvent,
     auth: &'a BaseAuthState,
-    matched_filter: &'a BaseRelayMatchedFilterContext,
-    filter: &'a PocketFilter,
+    matched_filters: Vec<(BaseRelayMatchedFilterContext, &'a PocketFilter)>,
 }
 
 struct RelayLiveProjectionDelivery<'a> {
@@ -494,7 +493,7 @@ pub struct RelayEventProjectionContext {
     subscription_id: SubscriptionId,
     projection: RelayProjectionContext,
     source: RelayEventProjectionSource,
-    matched_filter: RelayMatchedFilterContext,
+    matched_filters: Vec<RelayMatchedFilterContext>,
     event: RelayEventContext,
 }
 
@@ -506,11 +505,27 @@ impl RelayEventProjectionContext {
         matched_filter: RelayMatchedFilterContext,
         event: RelayEventContext,
     ) -> Self {
+        Self::new_with_matched_filters(
+            subscription_id,
+            projection,
+            source,
+            vec![matched_filter],
+            event,
+        )
+    }
+
+    pub fn new_with_matched_filters(
+        subscription_id: SubscriptionId,
+        projection: RelayProjectionContext,
+        source: RelayEventProjectionSource,
+        matched_filters: Vec<RelayMatchedFilterContext>,
+        event: RelayEventContext,
+    ) -> Self {
         Self {
             subscription_id,
             projection,
             source,
-            matched_filter,
+            matched_filters,
             event,
         }
     }
@@ -528,7 +543,13 @@ impl RelayEventProjectionContext {
     }
 
     pub fn matched_filter(&self) -> &RelayMatchedFilterContext {
-        &self.matched_filter
+        self.matched_filters
+            .first()
+            .expect("projection context must include at least one matched filter")
+    }
+
+    pub fn matched_filters(&self) -> &[RelayMatchedFilterContext] {
+        &self.matched_filters
     }
 
     pub fn event(&self) -> &RelayEventContext {
@@ -1102,8 +1123,7 @@ impl RelayRuntimeShared {
                     subscription_id,
                     event,
                 } => {
-                    let (matched_filter, filter) =
-                        self.matched_filter_for_event(filters, &event)?;
+                    let matched_filters = self.matched_filters_for_event(filters, &event)?;
                     if let Some(projected) =
                         self.project_event_output(RelayEventProjectionRequest {
                             subscription_id: &subscription_id,
@@ -1111,8 +1131,7 @@ impl RelayRuntimeShared {
                             source: RelayEventProjectionSource::HistoricalQuery,
                             event: &event,
                             auth,
-                            matched_filter: &matched_filter,
-                            filter,
+                            matched_filters,
                         })?
                         && event_ids.insert(projected.id())
                     {
@@ -1135,14 +1154,16 @@ impl RelayRuntimeShared {
             source,
             event,
             auth,
-            matched_filter,
-            filter,
+            matched_filters,
         } = request;
-        let context = RelayEventProjectionContext::new(
+        let context = RelayEventProjectionContext::new_with_matched_filters(
             subscription_id.clone(),
             projection.clone(),
             source,
-            RelayMatchedFilterContext::from_base(matched_filter),
+            matched_filters
+                .iter()
+                .map(|(matched_filter, _)| RelayMatchedFilterContext::from_base(matched_filter))
+                .collect(),
             RelayEventContext::from_pocket_event(event)?,
         );
         match self.hooks.project_event(&context) {
@@ -1158,9 +1179,16 @@ impl RelayRuntimeShared {
                     self.groups.as_ref(),
                     &replacement,
                     &group_auth,
-                )? && filter
-                    .event_matches(&replacement)
-                    .map_err(|error| BaseRelayError::error(error.to_string()))?
+                )? && matched_filters
+                    .iter()
+                    .try_fold(false, |matched, (_, filter)| {
+                        if matched {
+                            return Ok(true);
+                        }
+                        filter
+                            .event_matches(&replacement)
+                            .map_err(|error| BaseRelayError::error(error.to_string()))
+                    })?
                 {
                     Ok(Some(replacement))
                 } else {
@@ -1170,22 +1198,27 @@ impl RelayRuntimeShared {
         }
     }
 
-    fn matched_filter_for_event<'a>(
+    fn matched_filters_for_event<'a>(
         &self,
         filters: &'a [PocketOwnedFilter],
         event: &PocketEvent,
-    ) -> Result<(BaseRelayMatchedFilterContext, &'a PocketFilter), BaseRelayError> {
+    ) -> Result<Vec<(BaseRelayMatchedFilterContext, &'a PocketFilter)>, BaseRelayError> {
+        let mut matched_filters = Vec::new();
         for (filter_index, filter) in filters.iter().enumerate() {
             if filter
                 .event_matches(event)
                 .map_err(|error| BaseRelayError::error(error.to_string()))?
             {
-                return Ok((matched_filter_context(filter_index, filter), filter));
+                let filter: &PocketFilter = filter;
+                matched_filters.push((matched_filter_context(filter_index, filter), filter));
             }
         }
-        Err(BaseRelayError::error(
-            "query output did not match any request filter",
-        ))
+        if matched_filters.is_empty() {
+            return Err(BaseRelayError::error(
+                "query output did not match any request filter",
+            ));
+        }
+        Ok(matched_filters)
     }
 
     fn query_projected_req_with_auth_report(
@@ -1229,7 +1262,6 @@ impl RelayRuntimeShared {
             group_read_denied |= report.group_read_denied();
             query_metrics = query_metrics.add(report.query_metrics());
             let events = BaseRelay::sort_and_dedupe_query_events(report.into_events());
-            let matched_filter = matched_filter_context(filter_index, filter);
             let mut projected = Vec::new();
             for event in events {
                 if let Some(event) = self.project_event_output(RelayEventProjectionRequest {
@@ -1238,8 +1270,7 @@ impl RelayRuntimeShared {
                     source: RelayEventProjectionSource::HistoricalQuery,
                     event: &event,
                     auth,
-                    matched_filter: &matched_filter,
-                    filter,
+                    matched_filters: vec![(matched_filter_context(filter_index, filter), filter)],
                 })? {
                     projected.push(event);
                 }
@@ -1655,11 +1686,6 @@ impl RelayRuntimeHandle {
                         .metrics
                         .record_outbox_pending_events(group_outbox_pending_events.unwrap_or(0));
                 }
-                for offset in result.stored_offsets() {
-                    self.inner.metrics.record_stored_event_offset();
-                    let receivers = self.inner.event_bus.publish(*offset);
-                    self.inner.metrics.record_event_bus_publish(receivers);
-                }
                 if !result.stored_offsets().is_empty() {
                     logging::log_event_stored(
                         &event_id,
@@ -1674,6 +1700,11 @@ impl RelayRuntimeHandle {
                             .map(|offset| offset.as_u64())
                             .collect(),
                     ));
+                }
+                for offset in result.stored_offsets() {
+                    self.inner.metrics.record_stored_event_offset();
+                    let receivers = self.inner.event_bus.publish(*offset);
+                    self.inner.metrics.record_event_bus_publish(receivers);
                 }
                 let message = result.into_message();
                 record_event_metrics(&self.inner.metrics, &message, is_group_event, started_at);
@@ -2021,7 +2052,6 @@ impl RelayRuntimeHandle {
                 })?;
         for matched in subscriptions {
             let subscription_id = matched.subscription_id().clone();
-            let matched_filter = matched.matched_filter_context();
             if let Some(projected) =
                 self.inner
                     .project_event_output(RelayEventProjectionRequest {
@@ -2030,8 +2060,11 @@ impl RelayRuntimeHandle {
                         source: RelayEventProjectionSource::LiveFanout { store_offset },
                         event,
                         auth: delivery.auth,
-                        matched_filter: &matched_filter,
-                        filter: matched.filter(),
+                        matched_filters: matched
+                            .matched_filter_contexts()
+                            .into_iter()
+                            .zip(matched.filters())
+                            .collect(),
                     })?
             {
                 let event_id = projected.id().as_hex_string();
@@ -2938,7 +2971,7 @@ mod tests {
         net::{IpAddr, Ipv4Addr},
         num::NonZeroU32,
         path::{Path, PathBuf},
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, mpsc},
         time::Duration,
     };
     use tangle_crypto::RelaySigner;
@@ -3224,6 +3257,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_runs_stored_event_hook_before_offset_publish() {
+        let root = temp_root("runtime-stored-hook-before-offset-publish");
+        let _ = std::fs::remove_dir_all(&root);
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let hooks = Arc::new(BlockingStoredHooks {
+            started_sender: Mutex::new(Some(started_sender)),
+            release_receiver: Mutex::new(release_receiver),
+        });
+        let runtime =
+            RelayRuntime::open_with_hooks(runtime_config(&root, 8), hooks).expect("runtime");
+        let handle = RelayRuntimeHandle::new(runtime);
+        let mut offsets = handle.subscribe_events().await;
+        let event = tangle_v2_event(
+            FixtureKey::Member,
+            1_714_124_433,
+            1,
+            Vec::new(),
+            "stored hook before publish",
+        )
+        .expect("event");
+        let task_handle = handle.clone();
+        let event_for_task = event.clone();
+        let task = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            runtime.block_on(async move {
+                let mut auth = task_handle.auth_state().await.expect("auth");
+                runtime_event_reply(&task_handle, event_for_task, &mut auth, 1_714_124_433).await
+            })
+        });
+
+        started_receiver
+            .recv_timeout(Duration::from_secs(3))
+            .expect("stored hook started");
+        assert!(offsets.try_recv().is_err());
+        release_sender.send(()).expect("release hook");
+        assert_accepted_reply(task.join().expect("event task"), &event);
+        offsets.try_recv().expect("offset after hook release");
+        handle.shutdown().await.expect("shutdown");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn runtime_hooks_reject_events_and_observe_stored_offsets() {
         let root = temp_root("runtime-hooks");
         let _ = std::fs::remove_dir_all(&root);
@@ -3449,6 +3529,79 @@ mod tests {
         assert_eq!(
             query_contexts[0].filters()[0].requested_kinds(),
             &RelayRequestedKinds::Absent
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_projection_context_reports_all_matching_query_filters() {
+        let root = temp_root("runtime-projection-query-all-matched-filters");
+        let _ = std::fs::remove_dir_all(&root);
+        let hooks = Arc::new(ProjectingHooks::new(
+            "multi-filter",
+            ProjectionHookScope::Historical,
+            None,
+            RelayEventProjectionDecision::Emit,
+        ));
+        let handle = RelayRuntimeHandle::new(
+            RelayRuntime::open_with_hooks(runtime_config(&root, 8), hooks.clone())
+                .expect("runtime"),
+        );
+        let mut auth = handle.auth_state().await.expect("auth");
+        let event = tangle_v2_event(
+            FixtureKey::Member,
+            1_714_124_433,
+            1,
+            Vec::new(),
+            "multi filter query",
+        )
+        .expect("event");
+        assert_accepted_reply(
+            runtime_event_reply(&handle, event.clone(), &mut auth, 1_714_124_433).await,
+            &event,
+        );
+        let subscription_id = SubscriptionId::new("query-multi-filter").expect("subscription");
+
+        let report = handle
+            .query_req_with_auth_report_with_projection_context(
+                subscription_id.clone(),
+                vec![
+                    pocket_filter(json!({"ids": [event.id().as_str()]})),
+                    pocket_filter(json!({"kinds": [1]})),
+                ],
+                false,
+                &auth,
+                &RelayProjectionContext::named("multi-filter").expect("projection"),
+            )
+            .await
+            .expect("query");
+        assert!(matches!(
+            report.into_messages().as_slice(),
+            [
+                RuntimeRelayMessage::Event {
+                    subscription_id: delivered,
+                    event: delivered_event
+                },
+                RuntimeRelayMessage::Protocol(RelayMessage::Eose(eose))
+            ] if delivered == &subscription_id
+                && delivered_event.id().as_hex_string() == event.id().as_str()
+                && eose == &subscription_id
+        ));
+        let contexts = hooks.contexts();
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].matched_filter().filter_index(), 0);
+        let matched_filters = contexts[0].matched_filters();
+        assert_eq!(matched_filters.len(), 2);
+        assert_eq!(matched_filters[0].filter_index(), 0);
+        assert_eq!(
+            matched_filters[0].requested_kinds(),
+            &RelayRequestedKinds::Absent
+        );
+        assert_eq!(matched_filters[1].filter_index(), 1);
+        assert_eq!(
+            matched_filters[1].requested_kinds(),
+            &RelayRequestedKinds::Explicit(BTreeSet::from([1]))
         );
 
         let _ = std::fs::remove_dir_all(root);
@@ -6084,6 +6237,24 @@ mod tests {
 
         fn event_stored(&self, context: &RelayEventStoredContext) {
             self.stored.lock().expect("stored").push(context.clone());
+        }
+    }
+
+    struct BlockingStoredHooks {
+        started_sender: Mutex<Option<mpsc::SyncSender<()>>>,
+        release_receiver: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl RelayRuntimeHooks for BlockingStoredHooks {
+        fn event_stored(&self, _context: &RelayEventStoredContext) {
+            if let Some(sender) = self.started_sender.lock().expect("started sender").take() {
+                sender.send(()).expect("send hook start");
+            }
+            self.release_receiver
+                .lock()
+                .expect("release receiver")
+                .recv()
+                .expect("receive hook release");
         }
     }
 

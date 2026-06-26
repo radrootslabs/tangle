@@ -20,20 +20,17 @@ struct LiveSubscription {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LiveSubscriptionMatch {
     subscription_id: SubscriptionId,
-    filter_index: usize,
-    filter: PocketOwnedFilter,
+    matched_filters: Vec<(usize, PocketOwnedFilter)>,
 }
 
 impl LiveSubscriptionMatch {
     fn new(
         subscription_id: SubscriptionId,
-        filter_index: usize,
-        filter: PocketOwnedFilter,
+        matched_filters: Vec<(usize, PocketOwnedFilter)>,
     ) -> Self {
         Self {
             subscription_id,
-            filter_index,
-            filter,
+            matched_filters,
         }
     }
 
@@ -45,12 +42,25 @@ impl LiveSubscriptionMatch {
         self.subscription_id
     }
 
-    pub(crate) fn filter(&self) -> &PocketFilter {
-        &self.filter
+    #[cfg(test)]
+    pub(crate) fn matched_filter_context(&self) -> BaseRelayMatchedFilterContext {
+        let (filter_index, filter) = &self.matched_filters[0];
+        BaseRelayMatchedFilterContext::from_filter(*filter_index, filter)
     }
 
-    pub(crate) fn matched_filter_context(&self) -> BaseRelayMatchedFilterContext {
-        BaseRelayMatchedFilterContext::from_filter(self.filter_index, &self.filter)
+    pub(crate) fn matched_filter_contexts(&self) -> Vec<BaseRelayMatchedFilterContext> {
+        self.matched_filters
+            .iter()
+            .map(|(filter_index, filter)| {
+                BaseRelayMatchedFilterContext::from_filter(*filter_index, filter)
+            })
+            .collect()
+    }
+
+    pub(crate) fn filters(&self) -> impl Iterator<Item = &PocketFilter> {
+        self.matched_filters
+            .iter()
+            .map(|(_, filter)| -> &PocketFilter { filter })
     }
 }
 
@@ -133,24 +143,22 @@ impl LiveSubscriptionSet {
         self.subscriptions.iter().try_fold(
             Vec::new(),
             |mut matched, (subscription_id, subscription)| {
-                let mut matched_filter = None;
+                let mut matched_filters = Vec::new();
                 for (filter_index, filter) in subscription.filters.iter().enumerate() {
                     if filter
                         .event_matches(event)
                         .map_err(|error| BaseRelayError::error(error.to_string()))?
                     {
-                        matched_filter = Some((filter_index, filter.clone()));
-                        break;
+                        matched_filters.push((filter_index, filter.clone()));
                     }
                 }
-                let Some((filter_index, filter)) = matched_filter else {
+                if matched_filters.is_empty() {
                     return Ok(matched);
-                };
+                }
                 if visible_to_auth(event, auth) {
                     matched.push(LiveSubscriptionMatch::new(
                         subscription_id.clone(),
-                        filter_index,
-                        filter,
+                        matched_filters,
                     ));
                 }
                 Ok(matched)
