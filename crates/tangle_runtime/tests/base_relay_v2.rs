@@ -648,7 +648,7 @@ fn auth_integration_covers_challenge_edges() {
         )
         .expect_err("relay")
         .prefixed_message(),
-        "auth-required: auth relay does not match canonical relay URL"
+        "auth-required: auth relay does not match accepted relay URL"
     );
 }
 

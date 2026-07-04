@@ -860,7 +860,7 @@ mod tests {
                 "OK",
                 alpha_auth.id().as_str(),
                 false,
-                "auth-required: auth relay does not match canonical relay URL"
+                "auth-required: auth relay does not match accepted relay URL"
             ])
         );
 

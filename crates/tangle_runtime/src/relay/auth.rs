@@ -27,6 +27,7 @@ pub fn generate_auth_challenge() -> Result<String, BaseRelayError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaseAuthState {
     relay_url: String,
+    accepted_relay_urls: BTreeSet<String>,
     challenge_ttl_seconds: u64,
     created_at_skew_seconds: u64,
     challenge: Option<BaseAuthChallenge>,
@@ -55,11 +56,21 @@ impl BaseAuthState {
         }
         Ok(Self {
             relay_url,
+            accepted_relay_urls: BTreeSet::new(),
             challenge_ttl_seconds,
             created_at_skew_seconds,
             challenge: None,
             authenticated_pubkeys: BTreeSet::new(),
         })
+    }
+
+    pub fn accept_relay_url(&mut self, relay_url: impl Into<String>) -> Result<(), BaseRelayError> {
+        let relay_url = relay_url.into();
+        if relay_url.trim().is_empty() {
+            return Err(BaseRelayError::invalid("auth relay URL must not be empty"));
+        }
+        self.accepted_relay_urls.insert(relay_url);
+        Ok(())
     }
 
     pub fn issue_challenge(
@@ -92,9 +103,9 @@ impl BaseAuthState {
             .challenge
             .as_ref()
             .ok_or_else(|| BaseRelayError::auth_required("auth challenge is missing"))?;
-        if auth.relay() != self.relay_url {
+        if !self.accepts_relay_url(auth.relay()) {
             return Err(BaseRelayError::auth_required(
-                "auth relay does not match canonical relay URL",
+                "auth relay does not match accepted relay URL",
             ));
         }
         if auth.challenge() != challenge.value {
@@ -140,9 +151,9 @@ impl BaseAuthState {
             .challenge
             .as_ref()
             .ok_or_else(|| BaseRelayError::auth_required("auth challenge is missing"))?;
-        if auth.relay() != self.relay_url {
+        if !self.accepts_relay_url(auth.relay()) {
             return Err(BaseRelayError::auth_required(
-                "auth relay does not match canonical relay URL",
+                "auth relay does not match accepted relay URL",
             ));
         }
         if auth.challenge() != challenge.value {
@@ -177,6 +188,10 @@ impl BaseAuthState {
 
     pub fn authenticated_pubkeys(&self) -> &BTreeSet<PublicKeyHex> {
         &self.authenticated_pubkeys
+    }
+
+    fn accepts_relay_url(&self, relay_url: &str) -> bool {
+        relay_url == self.relay_url || self.accepted_relay_urls.contains(relay_url)
     }
 }
 
@@ -465,6 +480,51 @@ mod tests {
     }
 
     #[test]
+    fn auth_state_accepts_explicit_additional_relay_urls() {
+        let mut auth =
+            BaseAuthState::new("wss://relay.radroots.test", 60, 600).expect("auth state");
+        assert_eq!(
+            auth.accept_relay_url("")
+                .expect_err("empty alias")
+                .prefixed_message(),
+            "invalid: auth relay URL must not be empty"
+        );
+        auth.accept_relay_url("wss://relay.radroots.test/es")
+            .expect("alias");
+        auth.issue_challenge("challenge-a", UnixTimestamp::new(100))
+            .expect("challenge");
+
+        let alias_event = signed_event(
+            7,
+            22_242,
+            auth_tags_for("wss://relay.radroots.test/es", "challenge-a"),
+            105,
+        );
+        let base_event = signed_auth_event(8, "challenge-a", 106);
+        let alias_pocket_event = signed_pocket_event(
+            9,
+            22_242,
+            pocket_auth_tags_for("wss://relay.radroots.test/es", "challenge-a"),
+            107,
+        );
+
+        let alias_pubkey = auth
+            .authenticate(&alias_event, UnixTimestamp::new(105))
+            .expect("alias event");
+        let base_pubkey = auth
+            .authenticate(&base_event, UnixTimestamp::new(106))
+            .expect("base event");
+        let alias_pocket_pubkey = auth
+            .authenticate_pocket(&alias_pocket_event, UnixTimestamp::new(107))
+            .expect("alias pocket event");
+
+        assert!(auth.authenticated_pubkeys().contains(&alias_pubkey));
+        assert!(auth.authenticated_pubkeys().contains(&base_pubkey));
+        assert!(auth.authenticated_pubkeys().contains(&alias_pocket_pubkey));
+        assert_eq!(auth.authenticated_pubkeys().len(), 3);
+    }
+
+    #[test]
     fn auth_state_preserves_chorus_auth_parity() {
         let mut auth = BaseAuthState::new("wss://relay.radroots.test", 20, 10).expect("auth state");
         auth.issue_challenge("challenge-a", UnixTimestamp::new(100))
@@ -527,7 +587,7 @@ mod tests {
             )
             .expect_err("relay")
             .prefixed_message(),
-            "auth-required: auth relay does not match canonical relay URL"
+            "auth-required: auth relay does not match accepted relay URL"
         );
         assert_eq!(
             auth.authenticate(
@@ -670,7 +730,7 @@ mod tests {
                     105,
                 ),
                 105,
-                "auth-required: auth relay does not match canonical relay URL",
+                "auth-required: auth relay does not match accepted relay URL",
             ),
             (
                 signed_pocket_auth_event(9, "wrong", 105),

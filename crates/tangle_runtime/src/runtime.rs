@@ -45,7 +45,7 @@ use tangle_groups::{
     GroupAuthContext, GroupEventClass, GroupId, KIND_GROUP_JOIN_REQUEST, StoreOffset,
     validate_client_group_event_structure,
 };
-use tangle_protocol::{Kind, RelayMessage, SubscriptionId, UnixTimestamp};
+use tangle_protocol::{Kind, PublicKeyHex, RelayMessage, SubscriptionId, UnixTimestamp};
 use tangle_store_pocket::{
     PocketEvent, PocketFilter, PocketOwnedEvent, PocketOwnedFilter, PocketStoreHandle, PocketTime,
 };
@@ -218,6 +218,7 @@ pub struct RelayQueryProjectionContext {
     subscription_id: SubscriptionId,
     projection: RelayProjectionContext,
     filters: Vec<RelayMatchedFilterContext>,
+    authenticated_pubkeys: Vec<PublicKeyHex>,
 }
 
 impl RelayQueryProjectionContext {
@@ -226,10 +227,20 @@ impl RelayQueryProjectionContext {
         projection: RelayProjectionContext,
         filters: Vec<RelayMatchedFilterContext>,
     ) -> Self {
+        Self::new_with_authenticated_pubkeys(subscription_id, projection, filters, Vec::new())
+    }
+
+    pub fn new_with_authenticated_pubkeys(
+        subscription_id: SubscriptionId,
+        projection: RelayProjectionContext,
+        filters: Vec<RelayMatchedFilterContext>,
+        authenticated_pubkeys: Vec<PublicKeyHex>,
+    ) -> Self {
         Self {
             subscription_id,
             projection,
             filters,
+            authenticated_pubkeys,
         }
     }
 
@@ -243,6 +254,10 @@ impl RelayQueryProjectionContext {
 
     pub fn filters(&self) -> &[RelayMatchedFilterContext] {
         &self.filters
+    }
+
+    pub fn authenticated_pubkeys(&self) -> &[PublicKeyHex] {
+        &self.authenticated_pubkeys
     }
 }
 
@@ -286,6 +301,7 @@ pub struct RelayLiveProjectionContext {
     projection: RelayProjectionContext,
     source_store_offset: u64,
     event: RelayEventContext,
+    authenticated_pubkeys: Vec<PublicKeyHex>,
 }
 
 impl RelayLiveProjectionContext {
@@ -294,10 +310,20 @@ impl RelayLiveProjectionContext {
         source_store_offset: u64,
         event: RelayEventContext,
     ) -> Self {
+        Self::new_with_authenticated_pubkeys(projection, source_store_offset, event, Vec::new())
+    }
+
+    pub fn new_with_authenticated_pubkeys(
+        projection: RelayProjectionContext,
+        source_store_offset: u64,
+        event: RelayEventContext,
+        authenticated_pubkeys: Vec<PublicKeyHex>,
+    ) -> Self {
         Self {
             projection,
             source_store_offset,
             event,
+            authenticated_pubkeys,
         }
     }
 
@@ -311,6 +337,10 @@ impl RelayLiveProjectionContext {
 
     pub fn event(&self) -> &RelayEventContext {
         &self.event
+    }
+
+    pub fn authenticated_pubkeys(&self) -> &[PublicKeyHex] {
+        &self.authenticated_pubkeys
     }
 }
 
@@ -495,6 +525,7 @@ pub struct RelayEventProjectionContext {
     source: RelayEventProjectionSource,
     matched_filters: Vec<RelayMatchedFilterContext>,
     event: RelayEventContext,
+    authenticated_pubkeys: Vec<PublicKeyHex>,
 }
 
 impl RelayEventProjectionContext {
@@ -505,12 +536,31 @@ impl RelayEventProjectionContext {
         matched_filter: RelayMatchedFilterContext,
         event: RelayEventContext,
     ) -> Self {
-        Self::new_with_matched_filters(
+        Self::new_with_authenticated_pubkeys(
+            subscription_id,
+            projection,
+            source,
+            matched_filter,
+            event,
+            Vec::new(),
+        )
+    }
+
+    pub fn new_with_authenticated_pubkeys(
+        subscription_id: SubscriptionId,
+        projection: RelayProjectionContext,
+        source: RelayEventProjectionSource,
+        matched_filter: RelayMatchedFilterContext,
+        event: RelayEventContext,
+        authenticated_pubkeys: Vec<PublicKeyHex>,
+    ) -> Self {
+        Self::new_with_matched_filters_and_authenticated_pubkeys(
             subscription_id,
             projection,
             source,
             vec![matched_filter],
             event,
+            authenticated_pubkeys,
         )
     }
 
@@ -521,12 +571,31 @@ impl RelayEventProjectionContext {
         matched_filters: Vec<RelayMatchedFilterContext>,
         event: RelayEventContext,
     ) -> Self {
+        Self::new_with_matched_filters_and_authenticated_pubkeys(
+            subscription_id,
+            projection,
+            source,
+            matched_filters,
+            event,
+            Vec::new(),
+        )
+    }
+
+    pub fn new_with_matched_filters_and_authenticated_pubkeys(
+        subscription_id: SubscriptionId,
+        projection: RelayProjectionContext,
+        source: RelayEventProjectionSource,
+        matched_filters: Vec<RelayMatchedFilterContext>,
+        event: RelayEventContext,
+        authenticated_pubkeys: Vec<PublicKeyHex>,
+    ) -> Self {
         Self {
             subscription_id,
             projection,
             source,
             matched_filters,
             event,
+            authenticated_pubkeys,
         }
     }
 
@@ -554,6 +623,10 @@ impl RelayEventProjectionContext {
 
     pub fn event(&self) -> &RelayEventContext {
         &self.event
+    }
+
+    pub fn authenticated_pubkeys(&self) -> &[PublicKeyHex] {
+        &self.authenticated_pubkeys
     }
 }
 
@@ -1156,16 +1229,18 @@ impl RelayRuntimeShared {
             auth,
             matched_filters,
         } = request;
-        let context = RelayEventProjectionContext::new_with_matched_filters(
-            subscription_id.clone(),
-            projection.clone(),
-            source,
-            matched_filters
-                .iter()
-                .map(|(matched_filter, _)| RelayMatchedFilterContext::from_base(matched_filter))
-                .collect(),
-            RelayEventContext::from_pocket_event(event)?,
-        );
+        let context =
+            RelayEventProjectionContext::new_with_matched_filters_and_authenticated_pubkeys(
+                subscription_id.clone(),
+                projection.clone(),
+                source,
+                matched_filters
+                    .iter()
+                    .map(|(matched_filter, _)| RelayMatchedFilterContext::from_base(matched_filter))
+                    .collect(),
+                RelayEventContext::from_pocket_event(event)?,
+                auth.authenticated_pubkeys().iter().cloned().collect(),
+            );
         match self.hooks.project_event(&context) {
             RelayEventProjectionDecision::Emit => Ok(Some(event.to_owned())),
             RelayEventProjectionDecision::Suppress => Ok(None),
@@ -1933,7 +2008,7 @@ impl RelayRuntimeHandle {
         projection: &RelayProjectionContext,
     ) -> Result<BaseRelayQueryReport, BaseRelayError> {
         let started_at = Instant::now();
-        let context = RelayQueryProjectionContext::new(
+        let context = RelayQueryProjectionContext::new_with_authenticated_pubkeys(
             subscription_id.clone(),
             projection.clone(),
             filters
@@ -1943,6 +2018,7 @@ impl RelayRuntimeHandle {
                     RelayMatchedFilterContext::from_base(&matched_filter_context(index, filter))
                 })
                 .collect(),
+            auth.authenticated_pubkeys().iter().cloned().collect(),
         );
         let plan = self.inner.hooks.plan_query(&context);
         let report = match plan.limit() {
@@ -2015,10 +2091,11 @@ impl RelayRuntimeHandle {
             messages: &mut messages,
         };
         self.fanout_projected_live_event(&pocket_event, offset.as_u64(), &mut delivery)?;
-        let context = RelayLiveProjectionContext::new(
+        let context = RelayLiveProjectionContext::new_with_authenticated_pubkeys(
             projection.clone(),
             offset.as_u64(),
             RelayEventContext::from_pocket_event(&pocket_event)?,
+            auth.authenticated_pubkeys().iter().cloned().collect(),
         );
         for candidate in self.inner.hooks.live_projection_candidates(&context) {
             let Ok(candidate_event) = self.inner.store.event_by_offset(candidate.store_offset())
@@ -3750,6 +3827,125 @@ mod tests {
             &RelayRequestedKinds::Explicit(BTreeSet::from([1]))
         );
         assert_eq!(contexts[0].event().event_id(), event.id().as_str());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_projection_contexts_include_authenticated_pubkeys() {
+        let root = temp_root("runtime-projection-authenticated-pubkeys");
+        let _ = std::fs::remove_dir_all(&root);
+        let hooks = Arc::new(ProjectingHooks::new(
+            "auth-context",
+            ProjectionHookScope::Historical,
+            None,
+            RelayEventProjectionDecision::Emit,
+        ));
+        let handle = RelayRuntimeHandle::new(
+            RelayRuntime::open_with_hooks(runtime_config(&root, 8), hooks.clone())
+                .expect("runtime"),
+        );
+        let mut offsets = handle.subscribe_events().await;
+        let mut auth =
+            authenticated_runtime_state(&handle, FixtureKey::Owner, "challenge-auth-context", 100)
+                .await;
+        let expected_pubkeys = auth
+            .authenticated_pubkeys()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let event = tangle_v2_event(
+            FixtureKey::Member,
+            1_714_124_433,
+            1,
+            Vec::new(),
+            "authenticated projection context",
+        )
+        .expect("event");
+        assert_accepted_reply(
+            runtime_event_reply(&handle, event.clone(), &mut auth, 1_714_124_433).await,
+            &event,
+        );
+        let offset = offsets.try_recv().expect("offset");
+        let query_sub = SubscriptionId::new("query-auth-context").expect("subscription");
+        let projection = RelayProjectionContext::named("auth-context").expect("projection");
+
+        let report = handle
+            .query_req_with_auth_report_with_projection_context(
+                query_sub.clone(),
+                vec![pocket_filter(json!({"ids": [event.id().as_str()]}))],
+                false,
+                &auth,
+                &projection,
+            )
+            .await
+            .expect("query");
+        assert!(matches!(
+            report.into_messages().as_slice(),
+            [
+                RuntimeRelayMessage::Event {
+                    subscription_id,
+                    event: found
+                },
+                RuntimeRelayMessage::Protocol(RelayMessage::Eose(eose))
+            ] if subscription_id == &query_sub
+                && found.id().as_hex_string() == event.id().as_str()
+                && eose == &query_sub
+        ));
+
+        let mut subscriptions = LiveSubscriptionSet::new(8, 64).expect("subscriptions");
+        subscriptions
+            .subscribe(
+                SubscriptionId::new("live-auth-context").expect("subscription"),
+                vec![pocket_filter(json!({"kinds": [1]}))],
+            )
+            .expect("subscribe");
+        assert_eq!(
+            handle
+                .fanout_event_offset_with_projection_context(
+                    offset,
+                    &mut subscriptions,
+                    &auth,
+                    &projection,
+                )
+                .await
+                .expect("fanout")
+                .len(),
+            1
+        );
+
+        let query_contexts = hooks.query_contexts();
+        assert_eq!(query_contexts.len(), 1);
+        assert_eq!(
+            query_contexts[0].authenticated_pubkeys(),
+            expected_pubkeys.as_slice()
+        );
+        let live_contexts = hooks.live_contexts();
+        assert_eq!(live_contexts.len(), 1);
+        assert_eq!(
+            live_contexts[0].authenticated_pubkeys(),
+            expected_pubkeys.as_slice()
+        );
+        let contexts = hooks.contexts();
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(
+            contexts[0].source(),
+            RelayEventProjectionSource::HistoricalQuery
+        );
+        assert_eq!(
+            contexts[0].authenticated_pubkeys(),
+            expected_pubkeys.as_slice()
+        );
+        assert_eq!(
+            contexts[1].source(),
+            RelayEventProjectionSource::LiveFanout {
+                store_offset: offset.as_u64()
+            }
+        );
+        assert_eq!(
+            contexts[1].authenticated_pubkeys(),
+            expected_pubkeys.as_slice()
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
