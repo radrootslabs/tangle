@@ -78,6 +78,15 @@ impl BaseAuthState {
         Ok(RelayMessage::Auth(challenge))
     }
 
+    pub fn accept_relay_url(&mut self, relay_url: impl Into<String>) -> Result<(), BaseRelayError> {
+        let relay_url = relay_url.into();
+        if relay_url.trim().is_empty() {
+            return Err(BaseRelayError::invalid("auth relay URL must not be empty"));
+        }
+        self.relay_url = relay_url;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn authenticate(
         &mut self,
@@ -351,6 +360,50 @@ mod tests {
                 .expect_err("wrong")
                 .prefixed_message(),
             "auth-required: auth challenge does not match"
+        );
+    }
+
+    #[test]
+    fn auth_state_accepts_relay_url_override_for_alias_boundaries() {
+        let mut auth =
+            BaseAuthState::new("wss://relay.radroots.test", 60, 600).expect("auth state");
+        auth.issue_challenge("challenge-a", UnixTimestamp::new(100))
+            .expect("challenge");
+
+        assert_eq!(
+            auth.authenticate(
+                &signed_event(
+                    7,
+                    22_242,
+                    auth_tags_for("wss://alias.radroots.test", "challenge-a"),
+                    120
+                ),
+                UnixTimestamp::new(120)
+            )
+            .expect_err("canonical relay")
+            .prefixed_message(),
+            "auth-required: auth relay does not match canonical relay URL"
+        );
+
+        auth.accept_relay_url("wss://alias.radroots.test")
+            .expect("alias relay");
+        assert!(
+            auth.authenticate(
+                &signed_event(
+                    7,
+                    22_242,
+                    auth_tags_for("wss://alias.radroots.test", "challenge-a"),
+                    120
+                ),
+                UnixTimestamp::new(120)
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            auth.accept_relay_url(" ")
+                .expect_err("blank relay")
+                .prefixed_message(),
+            "invalid: auth relay URL must not be empty"
         );
     }
 
