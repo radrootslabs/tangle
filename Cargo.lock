@@ -872,7 +872,7 @@ dependencies = [
 [[package]]
 name = "pocket-db"
 version = "0.1.0"
-source = "git+https://github.com/triesap/pocket?rev=329334f20948c796c6016b673b92551ac4855ad7#329334f20948c796c6016b673b92551ac4855ad7"
+source = "git+https://github.com/triesap/pocket?rev=d24cf774a31978cf83d2b7289a618d3959bcc645#d24cf774a31978cf83d2b7289a618d3959bcc645"
 dependencies = [
  "heed",
  "libc",
@@ -883,7 +883,7 @@ dependencies = [
 [[package]]
 name = "pocket-types"
 version = "0.1.0"
-source = "git+https://github.com/triesap/pocket?rev=329334f20948c796c6016b673b92551ac4855ad7#329334f20948c796c6016b673b92551ac4855ad7"
+source = "git+https://github.com/triesap/pocket?rev=d24cf774a31978cf83d2b7289a618d3959bcc645#d24cf774a31978cf83d2b7289a618d3959bcc645"
 dependencies = [
  "derive_more",
  "rand 0.9.4",

@@ -46,7 +46,7 @@ pub const SCENARIO_VIRTUAL_RELAY_FANOUT_1_PERCENT: &str = "virtual_relay_fanout_
 pub const SCENARIO_VIRTUAL_RELAY_FANOUT_10_PERCENT: &str = "virtual_relay_fanout_10_percent";
 pub const SCENARIO_VIRTUAL_RELAY_FANOUT_100_PERCENT: &str = "virtual_relay_fanout_100_percent";
 pub const POCKET_SOURCE_REPOSITORY: &str = "https://github.com/triesap/pocket";
-pub const POCKET_SOURCE_REVISION: &str = "329334f20948c796c6016b673b92551ac4855ad7";
+pub const POCKET_SOURCE_REVISION: &str = "d24cf774a31978cf83d2b7289a618d3959bcc645";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BenchDatasetConfig {

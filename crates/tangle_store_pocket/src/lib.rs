@@ -15,7 +15,7 @@ use std::{
 };
 
 pub const POCKET_SOURCE_REPOSITORY: &str = "https://github.com/triesap/pocket";
-pub const POCKET_SOURCE_REVISION: &str = "329334f20948c796c6016b673b92551ac4855ad7";
+pub const POCKET_SOURCE_REVISION: &str = "d24cf774a31978cf83d2b7289a618d3959bcc645";
 
 pub type PocketEvent = Event;
 pub type PocketEventId = Id;
@@ -584,7 +584,7 @@ mod tests {
         assert_eq!(boundary.source_repository(), POCKET_SOURCE_REPOSITORY);
         assert_eq!(
             boundary.source_revision(),
-            "329334f20948c796c6016b673b92551ac4855ad7"
+            "d24cf774a31978cf83d2b7289a618d3959bcc645"
         );
         assert_eq!(boundary.source_revision(), POCKET_SOURCE_REVISION);
     }

@@ -9,7 +9,7 @@ description = "Test fixtures and utilities for Tangle"
 
 [dependencies]
 k256 = { version = "0.13", features = ["schnorr"] }
-pocket-types = { git = "https://github.com/triesap/pocket", rev = "329334f20948c796c6016b673b92551ac4855ad7" }
+pocket-types = { git = "https://github.com/triesap/pocket", rev = "d24cf774a31978cf83d2b7289a618d3959bcc645" }
 serde_json = "1"
 tangle_crypto = { path = "../tangle_crypto" }
 tangle_groups = { path = "../tangle_groups" }
