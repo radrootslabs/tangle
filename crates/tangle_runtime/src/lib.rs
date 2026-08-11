@@ -13,6 +13,7 @@ pub mod nip11;
 pub mod ops;
 pub(crate) mod pocket_conversion;
 pub(crate) mod pocket_event_validation;
+pub mod portable_backup;
 pub mod rate_limits;
 pub mod relay;
 pub mod resource_limits;
