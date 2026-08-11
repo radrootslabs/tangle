@@ -32,6 +32,19 @@ impl RuntimeRelayMessage {
         }
     }
 
+    pub(crate) fn map_protocol(self, mapper: impl FnOnce(RelayMessage) -> RelayMessage) -> Self {
+        match self {
+            Self::Event {
+                subscription_id,
+                event,
+            } => Self::Event {
+                subscription_id,
+                event,
+            },
+            Self::Protocol(message) => Self::Protocol(mapper(message)),
+        }
+    }
+
     pub(crate) fn into_protocol_control_message(self) -> Result<RelayMessage, BaseRelayError> {
         match self {
             Self::Event { .. } => Err(BaseRelayError::error(
@@ -135,6 +148,33 @@ mod tests {
             )
             .expect("json"),
             relay_message_to_value(&message)
+        );
+    }
+
+    #[test]
+    fn protocol_mapping_never_rewrites_event_payloads() {
+        let subscription_id = SubscriptionId::new("outbound-map").expect("subscription");
+        let event = tangle_v2_event(
+            FixtureKey::Member,
+            1_714_124_433,
+            1,
+            Vec::new(),
+            "unchanged",
+        )
+        .expect("event");
+        let pocket = tangle_event_to_pocket(&event).expect("pocket");
+        let event_message = RuntimeRelayMessage::event(subscription_id.clone(), pocket);
+        let mapped_event = event_message
+            .clone()
+            .map_protocol(|_| RelayMessage::Notice("must not replace event payload".to_owned()));
+        assert_eq!(mapped_event, event_message);
+
+        let mapped_protocol =
+            RuntimeRelayMessage::from(RelayMessage::Notice("internal diagnostic".to_owned()))
+                .map_protocol(|_| RelayMessage::Notice("public code".to_owned()));
+        assert_eq!(
+            mapped_protocol,
+            RuntimeRelayMessage::from(RelayMessage::Notice("public code".to_owned()))
         );
     }
 }

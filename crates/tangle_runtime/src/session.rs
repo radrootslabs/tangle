@@ -481,7 +481,9 @@ impl TangleWebSocketSession {
     }
 
     fn send_relay_message(&self, message: RuntimeRelayMessage) -> Result<(), TangleSessionControl> {
-        let text = message
+        let text = self
+            .runtime
+            .sanitize_public_message(message)
             .encode()
             .map_err(|_| TangleSessionControl::Close(outbound_encode_close_message()))?;
         self.outbound

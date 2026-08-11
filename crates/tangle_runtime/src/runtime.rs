@@ -110,6 +110,10 @@ pub trait RelayRuntimeHooks: Send + Sync {
     ) -> RelayEventProjectionDecision {
         RelayEventProjectionDecision::Emit
     }
+
+    fn sanitize_public_message(&self, message: RelayMessage) -> RelayMessage {
+        message
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1611,6 +1615,13 @@ impl RelayRuntimeHandle {
 
     pub fn readiness_handle(&self) -> BaseRelayReadinessHandle {
         self.inner.readiness.clone()
+    }
+
+    pub(crate) fn sanitize_public_message(
+        &self,
+        message: RuntimeRelayMessage,
+    ) -> RuntimeRelayMessage {
+        message.map_protocol(|message| self.inner.hooks.sanitize_public_message(message))
     }
 
     pub fn limits(&self) -> TangleRuntimeLimits {
