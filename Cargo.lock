@@ -1353,7 +1353,6 @@ dependencies = [
 name = "tangle_test_support"
 version = "0.1.0"
 dependencies = [
- "k256",
  "pocket-types",
  "serde_json",
  "tangle_crypto",

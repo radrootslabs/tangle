@@ -18,7 +18,7 @@ tangle_crypto = { path = "../tangle_crypto" }
 tangle_groups = { path = "../tangle_groups" }
 tangle_protocol = { path = "../tangle_protocol" }
 tangle_store_pocket = { path = "../tangle_store_pocket" }
-tokio = { version = "1", features = ["net", "sync"] }
+tokio = { version = "1", features = ["net", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 

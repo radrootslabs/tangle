@@ -1,10 +1,8 @@
 #![forbid(unsafe_code)]
 
 use core::fmt;
-use k256::schnorr::signature::Signer;
-use k256::schnorr::{Signature, SigningKey};
 use pocket_types::OwnedEvent as PocketOwnedEvent;
-use tangle_crypto::{RelaySigner, compute_event_id};
+use tangle_crypto::RelaySigner;
 use tangle_groups::{
     CanonicalRelayUrl, GroupGeneratedEventBuilder, GroupLimitsConfig, GroupOutboxPayload,
     GroupPolicyConfig, GroupRuntimeConfig, GroupRuntimeSettingsConfig, KIND_GROUP_CREATE_GROUP,
@@ -13,8 +11,7 @@ use tangle_groups::{
     RelaySecret,
 };
 use tangle_protocol::{
-    Event, EventId, Kind, PublicKeyHex, SignatureHex, Tag, UnixTimestamp, UnsignedEvent,
-    event_to_value,
+    Event, EventId, Kind, PublicKeyHex, Tag, UnixTimestamp, UnsignedEvent, event_to_value,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,19 +25,18 @@ pub enum FixtureKey {
 
 impl FixtureKey {
     pub fn public_key(self) -> PublicKeyHex {
-        let signing_key = self.signing_key();
-        PublicKeyHex::new(&lower_hex(signing_key.verifying_key().to_bytes().as_ref()))
-            .expect("fixture public key is valid x-only lowercase hex")
+        self.signer().public_key().clone()
     }
 
-    fn signing_key(self) -> SigningKey {
-        match self {
-            Self::Relay => SigningKey::from_bytes(&[9_u8; 32]).expect("relay fixture key"),
-            Self::Owner => SigningKey::from_bytes(&[10_u8; 32]).expect("owner fixture key"),
-            Self::Admin => SigningKey::from_bytes(&[11_u8; 32]).expect("admin fixture key"),
-            Self::Member => SigningKey::from_bytes(&[12_u8; 32]).expect("member fixture key"),
-            Self::Outsider => SigningKey::from_bytes(&[13_u8; 32]).expect("outsider fixture key"),
-        }
+    fn signer(self) -> RelaySigner {
+        let secret_byte = match self {
+            Self::Relay => 9_u8,
+            Self::Owner => 10_u8,
+            Self::Admin => 11_u8,
+            Self::Member => 12_u8,
+            Self::Outsider => 13_u8,
+        };
+        RelaySigner::from_secret_hex(&lower_hex(&[secret_byte; 32])).expect("fixture signing key")
     }
 }
 
@@ -327,16 +323,10 @@ pub fn fixture_event_json(event: &Event) -> serde_json::Value {
 }
 
 fn sign_unsigned_event(fixture_key: FixtureKey, unsigned: UnsignedEvent) -> Result<Event, String> {
-    let signing_key = fixture_key.signing_key();
-    let event_id = compute_event_id(&unsigned);
-    let event_id_bytes =
-        fixed_hex_bytes(event_id.as_str(), 32, "event id").expect("computed event id decodes");
-    let signature: Signature = signing_key.sign(&event_id_bytes);
-    let signature =
-        SignatureHex::new(&lower_hex(signature.to_bytes().as_ref())).expect("signature hex");
-    Ok(Event::new(event_id, unsigned, signature))
+    Ok(fixture_key.signer().sign_unsigned_event(unsigned))
 }
 
+#[cfg(test)]
 fn fixed_hex_bytes(value: &str, expected: usize, scalar: &str) -> Result<Vec<u8>, String> {
     if value.len() != expected * 2 {
         return Err(format!(
@@ -351,6 +341,7 @@ fn fixed_hex_bytes(value: &str, expected: usize, scalar: &str) -> Result<Vec<u8>
     Ok(output)
 }
 
+#[cfg(test)]
 fn hex_value(value: u8, scalar: &str) -> Result<u8, String> {
     match value {
         b'0'..=b'9' => Ok(value - b'0'),

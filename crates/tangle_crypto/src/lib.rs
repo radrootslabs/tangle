@@ -3,7 +3,7 @@
 use core::fmt;
 use std::sync::Arc;
 
-use k256::schnorr::signature::{Signer, Verifier};
+use k256::schnorr::signature::hazmat::{PrehashSigner, PrehashVerifier};
 use k256::schnorr::{Signature, SigningKey, VerifyingKey};
 use pocket_types::{
     Kind as PocketKind, OwnedEvent as PocketOwnedEvent, Tags as PocketTags, Time as PocketTime,
@@ -60,7 +60,7 @@ pub fn verify_event_signature(event: &Event) -> Result<(), String> {
     let signature = Signature::try_from(signature.as_slice())
         .map_err(|_| "event signature is not a valid schnorr signature".to_owned())?;
     verifying_key
-        .verify(&event_id, &signature)
+        .verify_prehash(&event_id, &signature)
         .map_err(|_| "event signature verification failed".to_owned())
 }
 
@@ -89,7 +89,7 @@ pub fn verify_event_signature_bytes(
     let signature = Signature::try_from(signature.as_slice())
         .map_err(|_| "event signature is not a valid schnorr signature".to_owned())?;
     verifying_key
-        .verify(event_id, &signature)
+        .verify_prehash(event_id, &signature)
         .map_err(|_| "event signature verification failed".to_owned())
 }
 
@@ -125,7 +125,10 @@ impl RelaySigner {
         let event_id = compute_event_id(&unsigned);
         let event_id_bytes =
             fixed_hex_bytes(event_id.as_str(), 32, "event id").expect("event id is valid hex");
-        let signature: Signature = self.signing_key.sign(&event_id_bytes);
+        let signature: Signature = self
+            .signing_key
+            .sign_prehash(&event_id_bytes)
+            .expect("validated signing key signs a 32-byte event id");
         let signature = SignatureHex::new(&lower_hex(signature.to_bytes().as_ref()))
             .expect("schnorr signature emits valid hex");
         Event::new(event_id, unsigned, signature)
@@ -255,7 +258,7 @@ mod tests {
         RelaySigner, VerificationService, compute_event_id, compute_event_id_hex, event_id_matches,
         fixed_hex_bytes, lower_hex, verify_event_id, verify_event_signature,
     };
-    use k256::schnorr::signature::Signer;
+    use k256::schnorr::signature::hazmat::PrehashSigner;
     use k256::schnorr::{Signature, SigningKey};
     use pocket_types::{Kind as PocketKind, OwnedTags as PocketOwnedTags, Time as PocketTime};
     use std::time::Duration;
@@ -329,9 +332,20 @@ mod tests {
         );
 
         let event = signer.sign_unsigned_event(unsigned);
+        let pocket_tags = PocketOwnedTags::new(&[["t", "radroots"]]).expect("pocket tags");
+        let pocket = signer
+            .sign_pocket_event(
+                PocketKind::from_u16(1),
+                &pocket_tags,
+                PocketTime::from_u64(1_714_124_433),
+                b"relay generated",
+            )
+            .expect("pocket event");
 
         assert_eq!(event.unsigned().pubkey(), signer.public_key());
         assert_eq!(verify_event_signature(&event), Ok(()));
+        pocket.verify().expect("Pocket accepts protocol signature");
+        assert_eq!(event.id().as_str(), pocket.id().as_hex_string());
         assert_eq!(
             format!("{signer:?}"),
             format!(
@@ -525,7 +539,9 @@ mod tests {
         );
         let event_id = compute_event_id(&unsigned);
         let event_id_bytes = fixed_hex_bytes(event_id.as_str(), 32, "event id").expect("event id");
-        let signature: Signature = signing_key.sign(&event_id_bytes);
+        let signature: Signature = signing_key
+            .sign_prehash(&event_id_bytes)
+            .expect("event signature");
         let signature = SignatureHex::new(&lower_hex(signature.to_bytes().as_ref())).expect("sig");
         Event::new(event_id, unsigned, signature)
     }

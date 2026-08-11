@@ -20,13 +20,17 @@ use crate::{
 use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket};
 use std::{
     collections::BTreeMap,
+    future::pending,
     net::IpAddr,
     sync::atomic::{AtomicU64, Ordering},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tangle_protocol::{RelayMessage, SubscriptionId, UnixTimestamp};
 use tangle_store_pocket::PocketOwnedFilter;
-use tokio::sync::{mpsc, watch};
+use tokio::{
+    sync::{mpsc, watch},
+    time::{MissedTickBehavior, interval_at, timeout},
+};
 
 #[derive(Debug)]
 pub struct TangleWebSocketSession {
@@ -44,6 +48,7 @@ pub struct TangleWebSocketSession {
     subscription_permits: BTreeMap<SubscriptionId, RelaySubscriptionPermit>,
     events: TangleEventReceiver,
     projection: RelayProjectionContext,
+    keepalive: Option<TangleWebSocketKeepaliveConfig>,
 }
 
 static NEXT_TANGLE_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -53,6 +58,55 @@ pub struct TangleWebSocketSessionOptions {
     peer_ip: Option<IpAddr>,
     resource_limiter: Option<RelayResourceLimiter>,
     projection: RelayProjectionContext,
+    keepalive: Option<TangleWebSocketKeepaliveConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TangleWebSocketKeepaliveConfig {
+    ping_interval: Duration,
+    peer_timeout: Duration,
+    write_timeout: Duration,
+}
+
+impl TangleWebSocketKeepaliveConfig {
+    pub fn new(
+        ping_interval: Duration,
+        peer_timeout: Duration,
+        write_timeout: Duration,
+    ) -> Result<Self, BaseRelayError> {
+        if ping_interval.is_zero() || peer_timeout.is_zero() || write_timeout.is_zero() {
+            return Err(BaseRelayError::invalid(
+                "websocket keepalive durations must be greater than zero",
+            ));
+        }
+        if ping_interval >= peer_timeout {
+            return Err(BaseRelayError::invalid(
+                "websocket ping interval must be shorter than peer timeout",
+            ));
+        }
+        if write_timeout > peer_timeout {
+            return Err(BaseRelayError::invalid(
+                "websocket write timeout must not exceed peer timeout",
+            ));
+        }
+        Ok(Self {
+            ping_interval,
+            peer_timeout,
+            write_timeout,
+        })
+    }
+
+    pub fn ping_interval(self) -> Duration {
+        self.ping_interval
+    }
+
+    pub fn peer_timeout(self) -> Duration {
+        self.peer_timeout
+    }
+
+    pub fn write_timeout(self) -> Duration {
+        self.write_timeout
+    }
 }
 
 impl TangleWebSocketSessionOptions {
@@ -72,6 +126,11 @@ impl TangleWebSocketSessionOptions {
 
     pub fn with_projection_context(mut self, projection: RelayProjectionContext) -> Self {
         self.projection = projection;
+        self
+    }
+
+    pub fn with_keepalive(mut self, keepalive: Option<TangleWebSocketKeepaliveConfig>) -> Self {
+        self.keepalive = keepalive;
         self
     }
 }
@@ -151,6 +210,7 @@ impl TangleWebSocketSession {
             subscription_permits: BTreeMap::new(),
             events,
             projection: options.projection,
+            keepalive: options.keepalive,
         })
     }
 
@@ -189,20 +249,41 @@ impl TangleWebSocketSession {
             );
             return;
         }
+        let mut last_peer_activity = Instant::now();
+        let mut keepalive_interval = self.keepalive.map(|config| {
+            let mut interval = interval_at(
+                tokio::time::Instant::now() + config.ping_interval(),
+                config.ping_interval(),
+            );
+            interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            interval
+        });
         loop {
             if self.shutdown_requested() {
-                let _ = socket.send(Message::Close(None)).await;
+                let _ = self
+                    .send_socket_message(&mut socket, Message::Close(None))
+                    .await;
                 break;
             }
             tokio::select! {
                 incoming = socket.recv() => {
                     match incoming {
                         Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                        Some(Ok(Message::Ping(payload))) => {
+                            last_peer_activity = Instant::now();
+                            if !self.send_socket_message(&mut socket, Message::Pong(payload)).await {
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Pong(_))) => {
+                            last_peer_activity = Instant::now();
+                        }
                         Some(Ok(message)) => {
+                            last_peer_activity = Instant::now();
                             match self.handle_incoming_message(message).await {
                                 TangleSessionControl::Continue => {}
                                 TangleSessionControl::Close(message) => {
-                                    let _ = socket.send(message).await;
+                                    let _ = self.send_socket_message(&mut socket, message).await;
                                     break;
                                 }
                                 TangleSessionControl::Stop => break,
@@ -214,7 +295,7 @@ impl TangleWebSocketSession {
                     let Some(message) = outgoing else {
                         break;
                     };
-                    if socket.send(message).await.is_err() {
+                    if !self.send_socket_message(&mut socket, message).await {
                         break;
                     }
                 }
@@ -222,7 +303,7 @@ impl TangleWebSocketSession {
                     match self.handle_event_receive_result(event).await {
                         TangleSessionControl::Continue => {}
                         TangleSessionControl::Close(message) => {
-                            let _ = socket.send(message).await;
+                            let _ = self.send_socket_message(&mut socket, message).await;
                             break;
                         }
                         TangleSessionControl::Stop => break,
@@ -230,7 +311,24 @@ impl TangleWebSocketSession {
                 }
                 changed = self.shutdown.changed() => {
                     if changed.is_err() || self.shutdown_requested() {
-                        let _ = socket.send(Message::Close(None)).await;
+                        let _ = self.send_socket_message(&mut socket, Message::Close(None)).await;
+                        break;
+                    }
+                }
+                _ = keepalive_tick(&mut keepalive_interval) => {
+                    let Some(config) = self.keepalive else {
+                        continue;
+                    };
+                    if last_peer_activity.elapsed() >= config.peer_timeout() {
+                        let _ = self
+                            .send_socket_message(&mut socket, keepalive_timeout_close_message())
+                            .await;
+                        break;
+                    }
+                    if !self
+                        .send_socket_message(&mut socket, Message::Ping(Vec::new().into()))
+                        .await
+                    {
                         break;
                     }
                 }
@@ -510,6 +608,24 @@ impl TangleWebSocketSession {
             TangleOutboundQueueError::Closed => TangleSessionControl::Stop,
         }
     }
+
+    async fn send_socket_message(&self, socket: &mut WebSocket, message: Message) -> bool {
+        match self.keepalive {
+            Some(config) => timeout(config.write_timeout(), socket.send(message))
+                .await
+                .is_ok_and(|result| result.is_ok()),
+            None => socket.send(message).await.is_ok(),
+        }
+    }
+}
+
+async fn keepalive_tick(interval: &mut Option<tokio::time::Interval>) {
+    match interval {
+        Some(interval) => {
+            interval.tick().await;
+        }
+        None => pending::<()>().await,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -537,6 +653,13 @@ fn outbound_encode_close_message() -> Message {
     Message::Close(Some(CloseFrame {
         code: 1011,
         reason: Utf8Bytes::from_static("outbound relay message encode failed"),
+    }))
+}
+
+fn keepalive_timeout_close_message() -> Message {
+    Message::Close(Some(CloseFrame {
+        code: 1001,
+        reason: Utf8Bytes::from_static("websocket peer timeout"),
     }))
 }
 
@@ -660,8 +783,9 @@ fn protocol_client_message_to_runtime_for_session_test(
 #[cfg(test)]
 mod tests {
     use super::{
-        TangleOutboundQueueError, TangleSessionControl, TangleWebSocketSession,
-        current_unix_timestamp, event_stream_lag_close_message, outbound_queue_full_close_message,
+        TangleOutboundQueueError, TangleSessionControl, TangleWebSocketKeepaliveConfig,
+        TangleWebSocketSession, current_unix_timestamp, event_stream_lag_close_message,
+        keepalive_timeout_close_message, outbound_queue_full_close_message,
     };
     use crate::{
         config::{BaseRelayRuntimeConfig, parse_base_relay_runtime_config_json},
@@ -673,7 +797,10 @@ mod tests {
     };
     use axum::extract::ws::Message;
     use serde_json::json;
-    use std::path::{Path, PathBuf};
+    use std::{
+        path::{Path, PathBuf},
+        time::Duration,
+    };
     use tangle_crypto::RelaySigner;
     use tangle_groups::{KIND_GROUP_CREATE_GROUP, StoreOffset};
     use tangle_protocol::{
@@ -700,6 +827,48 @@ mod tests {
         .expect("session");
 
         assert!(session.connected_at() >= before);
+    }
+
+    #[test]
+    fn websocket_keepalive_config_is_bounded_and_explicit() {
+        let config = TangleWebSocketKeepaliveConfig::new(
+            Duration::from_secs(30),
+            Duration::from_secs(90),
+            Duration::from_secs(5),
+        )
+        .expect("keepalive");
+        assert_eq!(config.ping_interval(), Duration::from_secs(30));
+        assert_eq!(config.peer_timeout(), Duration::from_secs(90));
+        assert_eq!(config.write_timeout(), Duration::from_secs(5));
+        assert!(
+            TangleWebSocketKeepaliveConfig::new(
+                Duration::ZERO,
+                Duration::from_secs(90),
+                Duration::from_secs(5),
+            )
+            .is_err()
+        );
+        assert!(
+            TangleWebSocketKeepaliveConfig::new(
+                Duration::from_secs(90),
+                Duration::from_secs(90),
+                Duration::from_secs(5),
+            )
+            .is_err()
+        );
+        assert!(
+            TangleWebSocketKeepaliveConfig::new(
+                Duration::from_secs(30),
+                Duration::from_secs(90),
+                Duration::from_secs(91),
+            )
+            .is_err()
+        );
+        let Message::Close(Some(frame)) = keepalive_timeout_close_message() else {
+            panic!("keepalive close frame")
+        };
+        assert_eq!(frame.code, 1001);
+        assert_eq!(frame.reason, "websocket peer timeout");
     }
 
     #[test]
