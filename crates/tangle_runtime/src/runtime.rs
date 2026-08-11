@@ -93,6 +93,10 @@ pub trait RelayRuntimeHooks: Send + Sync {
 
     fn event_stored(&self, _context: &RelayEventStoredContext) {}
 
+    fn storage_used_bytes(&self) -> Option<u64> {
+        None
+    }
+
     fn plan_query(&self, _context: &RelayQueryProjectionContext) -> RelayProjectionQueryPlan {
         RelayProjectionQueryPlan::default()
     }
@@ -1749,9 +1753,11 @@ impl RelayRuntimeHandle {
                     rate_limit_context.connection_id(),
                     now.as_u64(),
                 );
-                if let EventAdmissionDecision::Reject { message } =
-                    self.inner.hooks.admit_event(&admission)
-                {
+                let admission_decision = self.inner.hooks.admit_event(&admission);
+                if let Some(used_bytes) = self.inner.hooks.storage_used_bytes() {
+                    self.inner.metrics.record_disk_used_bytes(used_bytes);
+                }
+                if let EventAdmissionDecision::Reject { message } = admission_decision {
                     let message = RelayMessage::Ok {
                         event_id,
                         accepted: false,
@@ -2428,6 +2434,7 @@ struct TangleRuntimeMetricsInner {
     count_messages: AtomicU64,
     auth_messages: AtomicU64,
     close_messages: AtomicU64,
+    active_subscriptions: AtomicUsize,
     opened_subscriptions: AtomicU64,
     closed_subscriptions: AtomicU64,
     stored_event_offsets: AtomicU64,
@@ -2479,6 +2486,7 @@ pub struct TangleRuntimeMetricsSnapshot {
     tangle_count_messages_total: u64,
     tangle_auth_messages_total: u64,
     tangle_close_messages_total: u64,
+    tangle_subscriptions_current: usize,
     tangle_subscriptions_opened_total: u64,
     tangle_subscriptions_closed_total: u64,
     tangle_stored_event_offsets_total: u64,
@@ -2545,6 +2553,10 @@ impl TangleRuntimeMetricsSnapshot {
         self.tangle_subscriptions_opened_total
     }
 
+    pub fn active_subscriptions(&self) -> usize {
+        self.tangle_subscriptions_current
+    }
+
     pub fn closed_subscriptions(&self) -> u64 {
         self.tangle_subscriptions_closed_total
     }
@@ -2571,6 +2583,7 @@ impl TangleRuntimeMetrics {
                 count_messages: AtomicU64::new(0),
                 auth_messages: AtomicU64::new(0),
                 close_messages: AtomicU64::new(0),
+                active_subscriptions: AtomicUsize::new(0),
                 opened_subscriptions: AtomicU64::new(0),
                 closed_subscriptions: AtomicU64::new(0),
                 stored_event_offsets: AtomicU64::new(0),
@@ -2618,6 +2631,7 @@ impl TangleRuntimeMetrics {
             tangle_count_messages_total: self.count_messages(),
             tangle_auth_messages_total: self.auth_messages(),
             tangle_close_messages_total: self.close_messages(),
+            tangle_subscriptions_current: self.active_subscriptions(),
             tangle_subscriptions_opened_total: self.opened_subscriptions(),
             tangle_subscriptions_closed_total: self.closed_subscriptions(),
             tangle_stored_event_offsets_total: self.stored_event_offsets(),
@@ -2687,6 +2701,10 @@ impl TangleRuntimeMetrics {
 
     pub fn opened_subscriptions(&self) -> u64 {
         self.inner.opened_subscriptions.load(Ordering::Relaxed)
+    }
+
+    pub fn active_subscriptions(&self) -> usize {
+        self.inner.active_subscriptions.load(Ordering::Relaxed)
     }
 
     pub fn closed_subscriptions(&self) -> u64 {
@@ -2855,12 +2873,28 @@ impl TangleRuntimeMetrics {
 
     pub fn record_subscription_opened(&self) -> u64 {
         self.inner
+            .active_subscriptions
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
             .opened_subscriptions
             .fetch_add(1, Ordering::Relaxed)
             + 1
     }
 
     pub fn record_subscriptions_closed(&self, count: usize) -> u64 {
+        let mut current = self.active_subscriptions();
+        loop {
+            let remaining = current.saturating_sub(count);
+            match self.inner.active_subscriptions.compare_exchange(
+                current,
+                remaining,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
         self.inner.closed_subscriptions.fetch_add(
             u64::try_from(count).expect("subscription count fits in u64"),
             Ordering::Relaxed,
@@ -3150,8 +3184,10 @@ mod tests {
         assert_eq!(runtime.metrics().client_messages(), 1);
         assert_eq!(runtime.metrics().req_messages(), 1);
         assert_eq!(runtime.metrics().record_subscription_opened(), 1);
+        assert_eq!(runtime.metrics().active_subscriptions(), 1);
         assert_eq!(runtime.metrics().opened_subscriptions(), 1);
         assert_eq!(runtime.metrics().record_subscriptions_closed(1), 1);
+        assert_eq!(runtime.metrics().active_subscriptions(), 0);
         assert_eq!(runtime.metrics().closed_subscriptions(), 1);
         assert_eq!(runtime.metrics().record_stored_event_offset(), 1);
         assert_eq!(runtime.metrics().stored_event_offsets(), 1);
@@ -3182,6 +3218,7 @@ mod tests {
         assert_eq!(snapshot.total_sessions(), 1);
         assert_eq!(snapshot.client_messages(), 1);
         assert_eq!(snapshot.req_messages(), 1);
+        assert_eq!(snapshot.active_subscriptions(), 0);
         assert_eq!(snapshot.opened_subscriptions(), 1);
         assert_eq!(snapshot.closed_subscriptions(), 1);
         assert_eq!(snapshot.stored_event_offsets(), 1);
@@ -3240,6 +3277,7 @@ mod tests {
 
         assert_eq!(value["tangle_readiness_ready"], true);
         assert_eq!(value["tangle_ws_connections_current"], 1);
+        assert_eq!(value["tangle_subscriptions_current"], 0);
         assert_eq!(value["tangle_auth_success_total"], 1);
         assert_eq!(value["tangle_event_admitted_total"], 1);
         assert_eq!(value["tangle_event_bus_published_offsets_total"], 1);

@@ -562,8 +562,10 @@ impl TangleWebSocketSession {
                 self.subscription_permits
                     .insert(subscription_id.clone(), permit);
             }
-            metrics.record_subscription_opened();
-            logging::log_subscription_opened(self.connection_id, &subscription_id);
+            if !already_subscribed {
+                metrics.record_subscription_opened();
+                logging::log_subscription_opened(self.connection_id, &subscription_id);
+            }
         }
         Ok(replies)
     }
@@ -1154,7 +1156,8 @@ mod tests {
         assert_eq!(snapshot.client_messages(), 5);
         assert_eq!(snapshot.req_messages(), 3);
         assert_eq!(snapshot.close_messages(), 2);
-        assert_eq!(snapshot.opened_subscriptions(), 3);
+        assert_eq!(snapshot.active_subscriptions(), 0);
+        assert_eq!(snapshot.opened_subscriptions(), 2);
         assert_eq!(snapshot.closed_subscriptions(), 2);
 
         let _ = std::fs::remove_dir_all(root);

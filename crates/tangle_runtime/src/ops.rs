@@ -342,6 +342,7 @@ mod tests {
                 "tangle_req_messages_total",
                 "tangle_runtime_uptime_seconds",
                 "tangle_stored_event_offsets_total",
+                "tangle_subscriptions_current",
                 "tangle_subscriptions_closed_total",
                 "tangle_subscriptions_opened_total",
                 "tangle_ws_connections_current",
@@ -356,6 +357,7 @@ mod tests {
         assert_eq!(metrics_value["tangle_ws_connections_total"], 1);
         assert_eq!(metrics_value["tangle_client_messages_total"], 1);
         assert_eq!(metrics_value["tangle_req_messages_total"], 1);
+        assert_eq!(metrics_value["tangle_subscriptions_current"], 1);
         assert_eq!(metrics_value["tangle_subscriptions_opened_total"], 1);
         assert_eq!(metrics_value["tangle_auth_success_total"], 1);
         assert_eq!(metrics_value["tangle_auth_failure_total"], 1);
