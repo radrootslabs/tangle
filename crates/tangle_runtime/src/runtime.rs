@@ -1793,6 +1793,9 @@ impl RelayRuntimeHandle {
                             .map(|offset| offset.as_u64())
                             .collect(),
                     ));
+                    if let Some(used_bytes) = self.inner.hooks.storage_used_bytes() {
+                        self.inner.metrics.record_disk_used_bytes(used_bytes);
+                    }
                 }
                 for offset in result.stored_offsets() {
                     self.inner.metrics.record_stored_event_offset();
@@ -3507,6 +3510,7 @@ mod tests {
         assert_eq!(stored[0].event().event_id(), accepted.id().as_str());
         assert_eq!(stored[0].event().created_at(), 1_714_124_434);
         assert_eq!(stored[0].store_offsets().len(), 1);
+        assert_eq!(handle.metrics().disk_used_bytes(), 144);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -6544,6 +6548,7 @@ mod tests {
     struct RecordingHooks {
         admissions: Mutex<Vec<RelayEventAdmissionContext>>,
         stored: Mutex<Vec<RelayEventStoredContext>>,
+        stored_bytes: std::sync::atomic::AtomicU64,
     }
 
     impl RelayRuntimeHooks for RecordingHooks {
@@ -6561,6 +6566,12 @@ mod tests {
 
         fn event_stored(&self, context: &RelayEventStoredContext) {
             self.stored.lock().expect("stored").push(context.clone());
+            self.stored_bytes
+                .store(144, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn storage_used_bytes(&self) -> Option<u64> {
+            Some(self.stored_bytes.load(std::sync::atomic::Ordering::Relaxed))
         }
     }
 
