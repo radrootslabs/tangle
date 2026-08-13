@@ -16,5 +16,6 @@
 - avoid `unsafe` unless it is strictly necessary, locally justified, and documented with nearby invariants
 - validate behavior changes with tests that cover protocol edge cases, authorization boundaries, persistence effects, and subscription behavior where relevant
 - use checked-in, repo-owned validation first; run the smallest documented validation that credibly covers the change
+- `.github/**` and capsule-local CI workflows are forbidden; keep validation forge-agnostic, and place any required monorepo orchestration exclusively under the parent monorepo's root `.act/**` authority
 - if validation cannot run, report exactly what was skipped and why; never claim validation passed unless it actually ran
 - keep commits focused and reviewable, using `<scope>: <imperative summary>` unless a repo convention overrides it
