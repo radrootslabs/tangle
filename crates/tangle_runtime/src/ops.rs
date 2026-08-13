@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 
-use axum::{Json, Router, extract::State, routing::get};
-use http::StatusCode;
+use axum::{Json, Router, extract::State, response::IntoResponse, routing::get};
+use http::{StatusCode, header};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 
-use crate::runtime::{TangleRuntimeMetrics, TangleRuntimeMetricsSnapshot};
+use crate::runtime::TangleRuntimeMetrics;
+
+const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BaseRelayReadinessCheckStatus {
@@ -206,11 +208,15 @@ async fn base_relay_readyz(
     (status, Json(readiness.response()))
 }
 
-async fn base_relay_metricsz(
-    State(state): State<BaseRelayOpsState>,
-) -> Json<TangleRuntimeMetricsSnapshot> {
+async fn base_relay_metricsz(State(state): State<BaseRelayOpsState>) -> impl IntoResponse {
     let readiness = state.readiness.snapshot();
-    Json(state.metrics.snapshot_with_readiness(readiness.is_ready()))
+    (
+        [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
+        state
+            .metrics
+            .snapshot_with_readiness(readiness.is_ready())
+            .prometheus_text(),
+    )
 }
 
 #[cfg(test)]
@@ -222,7 +228,8 @@ mod tests {
     use crate::relay::core::BaseRelayQueryMetrics;
     use crate::runtime::TangleRuntimeMetrics;
     use axum::body::to_bytes;
-    use http::{Request, StatusCode};
+    use http::{Request, StatusCode, header};
+    use std::collections::{BTreeMap, BTreeSet};
     use tower::ServiceExt;
 
     #[tokio::test]
@@ -295,17 +302,26 @@ mod tests {
             .expect("metrics");
 
         assert_eq!(metrics_response.status(), StatusCode::OK);
+        assert_eq!(
+            metrics_response.headers()[header::CONTENT_TYPE],
+            super::PROMETHEUS_CONTENT_TYPE
+        );
         let metrics_body = to_bytes(metrics_response.into_body(), usize::MAX)
             .await
             .expect("body");
-        let metrics_value =
-            serde_json::from_slice::<serde_json::Value>(&metrics_body).expect("json");
-        let keys = metrics_value
-            .as_object()
-            .expect("metrics object")
-            .keys()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
+        let metrics_text = String::from_utf8(metrics_body.to_vec()).expect("utf8");
+        let mut metric_types = BTreeMap::new();
+        let mut metric_values = BTreeMap::new();
+        for line in metrics_text.lines() {
+            if let Some(type_line) = line.strip_prefix("# TYPE ") {
+                let (name, metric_type) = type_line.split_once(' ').expect("metric type");
+                assert!(metric_types.insert(name, metric_type).is_none());
+            } else if !line.is_empty() {
+                let (name, value) = line.split_once(' ').expect("metric sample");
+                assert!(metric_values.insert(name, value).is_none());
+            }
+        }
+        let keys = metric_values.keys().copied().collect::<BTreeSet<_>>();
         assert_eq!(
             keys,
             [
@@ -349,43 +365,54 @@ mod tests {
                 "tangle_ws_connections_total",
             ]
             .into_iter()
-            .map(str::to_owned)
-            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<BTreeSet<_>>()
         );
-        assert_eq!(metrics_value["tangle_readiness_ready"], true);
-        assert_eq!(metrics_value["tangle_ws_connections_current"], 1);
-        assert_eq!(metrics_value["tangle_ws_connections_total"], 1);
-        assert_eq!(metrics_value["tangle_client_messages_total"], 1);
-        assert_eq!(metrics_value["tangle_req_messages_total"], 1);
-        assert_eq!(metrics_value["tangle_subscriptions_current"], 1);
-        assert_eq!(metrics_value["tangle_subscriptions_opened_total"], 1);
-        assert_eq!(metrics_value["tangle_auth_success_total"], 1);
-        assert_eq!(metrics_value["tangle_auth_failure_total"], 1);
-        assert_eq!(metrics_value["tangle_event_admitted_total"], 1);
-        assert_eq!(metrics_value["tangle_event_rejected_total"], 1);
-        assert_eq!(metrics_value["tangle_group_read_denied_total"], 1);
-        assert_eq!(metrics_value["tangle_group_write_denied_total"], 1);
-        assert_eq!(metrics_value["tangle_event_bus_receivers_current"], 2);
-        assert_eq!(metrics_value["tangle_event_bus_published_offsets_total"], 1);
-        assert_eq!(metrics_value["tangle_event_bus_lagged_receivers_total"], 1);
-        assert_eq!(metrics_value["tangle_event_bus_lagged_offsets_total"], 3);
-        assert_eq!(metrics_value["tangle_outbound_queue_full_closes_total"], 1);
-        assert_eq!(metrics_value["tangle_outbox_pending_events"], 5);
-        assert_eq!(metrics_value["tangle_outbox_replayed_events_total"], 1);
-        assert_eq!(metrics_value["tangle_disk_used_bytes"], 89);
+        assert_eq!(metric_types.keys().copied().collect::<BTreeSet<_>>(), keys);
+        assert_eq!(metric_types["tangle_readiness_ready"], "gauge");
+        assert_eq!(metric_types["tangle_ws_connections_total"], "counter");
+        assert_eq!(metric_values["tangle_readiness_ready"], "1");
+        assert_eq!(metric_values["tangle_ws_connections_current"], "1");
+        assert_eq!(metric_values["tangle_ws_connections_total"], "1");
+        assert_eq!(metric_values["tangle_client_messages_total"], "1");
+        assert_eq!(metric_values["tangle_req_messages_total"], "1");
+        assert_eq!(metric_values["tangle_subscriptions_current"], "1");
+        assert_eq!(metric_values["tangle_subscriptions_opened_total"], "1");
+        assert_eq!(metric_values["tangle_auth_success_total"], "1");
+        assert_eq!(metric_values["tangle_auth_failure_total"], "1");
+        assert_eq!(metric_values["tangle_event_admitted_total"], "1");
+        assert_eq!(metric_values["tangle_event_rejected_total"], "1");
+        assert_eq!(metric_values["tangle_group_read_denied_total"], "1");
+        assert_eq!(metric_values["tangle_group_write_denied_total"], "1");
+        assert_eq!(metric_values["tangle_event_bus_receivers_current"], "2");
         assert_eq!(
-            metrics_value["tangle_event_admission_latency_total_micros"],
-            11
+            metric_values["tangle_event_bus_published_offsets_total"],
+            "1"
         );
-        assert_eq!(metrics_value["tangle_event_admission_latency_count"], 1);
-        assert_eq!(metrics_value["tangle_query_latency_total_micros"], 17);
-        assert_eq!(metrics_value["tangle_query_latency_count"], 1);
-        assert_eq!(metrics_value["tangle_query_candidates_scanned_total"], 5);
-        assert_eq!(metrics_value["tangle_query_returned_events_total"], 3);
-        assert_eq!(metrics_value["tangle_query_redacted_events_total"], 2);
-        assert_eq!(metrics_value["tangle_count_refusals_total"], 1);
-        assert_eq!(metrics_value["tangle_broad_query_rejections_total"], 1);
-        let metrics_text = String::from_utf8(metrics_body.to_vec()).expect("utf8");
+        assert_eq!(
+            metric_values["tangle_event_bus_lagged_receivers_total"],
+            "1"
+        );
+        assert_eq!(metric_values["tangle_event_bus_lagged_offsets_total"], "3");
+        assert_eq!(
+            metric_values["tangle_outbound_queue_full_closes_total"],
+            "1"
+        );
+        assert_eq!(metric_values["tangle_outbox_pending_events"], "5");
+        assert_eq!(metric_values["tangle_outbox_replayed_events_total"], "1");
+        assert_eq!(metric_values["tangle_disk_used_bytes"], "89");
+        assert_eq!(
+            metric_values["tangle_event_admission_latency_total_micros"],
+            "11"
+        );
+        assert_eq!(metric_values["tangle_event_admission_latency_count"], "1");
+        assert_eq!(metric_values["tangle_query_latency_total_micros"], "17");
+        assert_eq!(metric_values["tangle_query_latency_count"], "1");
+        assert_eq!(metric_values["tangle_query_candidates_scanned_total"], "5");
+        assert_eq!(metric_values["tangle_query_returned_events_total"], "3");
+        assert_eq!(metric_values["tangle_query_redacted_events_total"], "2");
+        assert_eq!(metric_values["tangle_count_refusals_total"], "1");
+        assert_eq!(metric_values["tangle_broad_query_rejections_total"], "1");
         assert!(!metrics_text.contains("relay_secret"));
         assert!(!metrics_text.contains("invite"));
 
