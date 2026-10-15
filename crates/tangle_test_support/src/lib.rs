@@ -335,7 +335,7 @@ fn fixed_hex_bytes(value: &str, expected: usize, scalar: &str) -> Result<Vec<u8>
         ));
     }
     let mut output = Vec::with_capacity(expected);
-    for chunk in value.as_bytes().chunks_exact(2) {
+    for chunk in value.as_bytes().as_chunks::<2>().0 {
         output.push((hex_value(chunk[0], scalar)? << 4) | hex_value(chunk[1], scalar)?);
     }
     Ok(output)

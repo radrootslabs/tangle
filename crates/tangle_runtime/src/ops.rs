@@ -365,7 +365,6 @@ mod tests {
                 "tangle_ws_connections_total",
             ]
             .into_iter()
-            .into_iter()
             .collect::<BTreeSet<_>>()
         );
         assert_eq!(metric_types.keys().copied().collect::<BTreeSet<_>>(), keys);
