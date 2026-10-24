@@ -55,7 +55,7 @@ pub fn verify_event_signature(event: &Event) -> Result<(), String> {
     .expect("validated public key scalar decodes");
     let signature = fixed_hex_bytes(event.sig().as_str(), 64, "signature")
         .expect("validated signature decodes");
-    let verifying_key = VerifyingKey::from_bytes(&pubkey)
+    let verifying_key = VerifyingKey::from_slice(&pubkey)
         .map_err(|_| "event public key is not a valid secp256k1 x-only key".to_owned())?;
     let signature = Signature::try_from(signature.as_slice())
         .map_err(|_| "event signature is not a valid schnorr signature".to_owned())?;
@@ -84,7 +84,7 @@ pub fn verify_event_signature_bytes(
             lower_hex(event_id)
         ));
     }
-    let verifying_key = VerifyingKey::from_bytes(pubkey)
+    let verifying_key = VerifyingKey::from_slice(pubkey)
         .map_err(|_| "event public key is not a valid secp256k1 x-only key".to_owned())?;
     let signature = Signature::try_from(signature.as_slice())
         .map_err(|_| "event signature is not a valid schnorr signature".to_owned())?;
@@ -105,7 +105,7 @@ impl RelaySigner {
         let bytes: [u8; 32] = bytes
             .try_into()
             .expect("validated relay secret length is 32 bytes");
-        let signing_key = SigningKey::from_bytes(&bytes)
+        let signing_key = SigningKey::from_slice(&bytes)
             .map_err(|_| "relay secret is not a valid secp256k1 signing key".to_owned())?;
         let public_key =
             PublicKeyHex::new(&lower_hex(signing_key.verifying_key().to_bytes().as_ref()))
@@ -526,7 +526,7 @@ mod tests {
     }
 
     fn signed_event() -> Event {
-        let signing_key = SigningKey::from_bytes(&[7_u8; 32]).expect("signing key");
+        let signing_key = SigningKey::from_slice(&[7_u8; 32]).expect("signing key");
         let public_key =
             PublicKeyHex::new(&lower_hex(signing_key.verifying_key().to_bytes().as_ref()))
                 .expect("pubkey");
